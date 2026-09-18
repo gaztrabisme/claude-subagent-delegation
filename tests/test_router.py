@@ -252,13 +252,47 @@ REFUSALS = {
                               f"Your limit will reset at {_later()}]"),
     "zai_1310": (429, lambda: "[1310][Weekly/Monthly Limit Exhausted.]"),
     "zai_1313_exhausted": (429, lambda: "[1313][Fair Usage]"),
+}
+# Refusals of other providers. Arriving on glm they are just errors (M1); the
+# codex driver's own refusal is covered by the mixed-driver tests below.
+FOREIGN = {
     "deepseek_balance": (402, lambda: "Insufficient Balance"),
-    # Codex usage-limit text arriving through a claude lane is read from text;
-    # the codex driver's own refusal is covered by the mixed-driver tests below.
     "codex_usage_limit": (429, lambda: "You've hit your usage limit. Visit "
                                        "https://chatgpt.com/codex/settings/usage to purchase "
                                        "more credits or try again at 1:01 PM."),
 }
+
+
+@pytest.mark.parametrize("code", list(FOREIGN))
+def test_router_foreign_refusal_text_fails_on_its_lane(tmp_path, lanes_on_mock, code):
+    ep = lanes_on_mock
+    status, text = FOREIGN[code]
+    ep.routes["/glm/v1/messages"] = (status, {"error": text()})
+    reg = _registry(tmp_path, ep)
+    try:
+        agent, run = _delegate(reg, tmp_path, "glm")
+        assert run.state == "failed"
+        assert _outcomes(run) == [("glm", "ran", None)]
+        assert reg.lane_state.closed("glm") is None
+    finally:
+        reg.shutdown()
+
+
+def test_router_deepseek_balance_reroutes_from_deepseek(tmp_path, lanes_on_mock):
+    ep = lanes_on_mock
+    ep.routes["/deepseek/v1/messages"] = (402, {"error": "Insufficient Balance"})
+    reg = _registry(tmp_path, ep)
+    try:
+        agent, run = _delegate(reg, tmp_path, "deepseek")
+        assert run.state == COMPLETED
+        assert _outcomes(run)[:3] == [
+            ("deepseek", "refused", "deepseek_balance"),
+            ("codex", "unavailable", None),
+            ("glm", "ran", None),
+        ]
+        assert reg.lane_state.closed("deepseek") is not None
+    finally:
+        reg.shutdown()
 
 
 @pytest.mark.parametrize("code", list(REFUSALS))

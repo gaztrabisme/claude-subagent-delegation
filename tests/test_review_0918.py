@@ -141,3 +141,119 @@ def test_h3_two_registries_on_one_session_root_never_share_an_agent_home(tmp_pat
     finally:
         first.shutdown()
         second.shutdown()
+
+
+# --- M1: refusal codes only on their own lane, 402 only as a status, 7-day cap --------
+
+
+def _cli(text: str) -> list[dict]:
+    from subagent_mcp.runs import exit_event
+
+    cli = {"type": "result", "subtype": "success", "is_error": True, "result": text,
+           "session_id": "s"}
+    return [cli, exit_event(1, "", cli)]
+
+
+def test_m1_omlx_timeout_402_seconds_is_not_a_balance_refusal():
+    from subagent_mcp import router
+
+    text = "API Error: 500 upstream request timed out after 402 s"
+    assert router.classify_refusal("omlx", _cli(text)) is None
+    assert router.classify_refusal("deepseek", _cli(text)) is None
+    assert not router.no_retry(text)
+
+
+def test_m1_bppc_402_payment_required_does_not_close_bppc():
+    from subagent_mcp import router
+
+    assert router.classify_refusal("bppc", _cli("402 Payment Required from proxy")) is None
+    found = router.classify_refusal("deepseek", _cli("402 Payment Required from proxy"))
+    assert found is not None and found.code == "deepseek_balance"
+    assert router.classify_refusal(
+        "deepseek", _cli('API Error: 402 {"error":{"message":"x"}}')).code == "deepseek_balance"
+
+
+def test_m1_zai_codes_only_on_glm_and_codex_limit_only_on_codex():
+    from subagent_mcp import router
+
+    zai = "API Error: Request rejected (429) · [1308][Usage limit reached. reset at 2099-01-01 00:00:00]"
+    assert router.classify_refusal("deepseek", _cli(zai)) is None
+    assert router.classify_refusal("omlx", _cli(zai)) is None
+    assert router.classify_refusal("glm", _cli(zai)).code == "zai_1308"
+    codex = "You've hit your usage limit. Try again at 1:01 PM."
+    assert router.classify_refusal("glm", _cli(codex)) is None
+    assert router.classify_refusal("codex", codex).code == "codex_usage_limit"
+
+
+def test_m1_glm_reset_2099_closes_at_most_seven_days():
+    from datetime import datetime, timedelta
+
+    from subagent_mcp import router
+
+    zai = "API Error: Request rejected (429) · [1308][Usage limit reached. reset at 2099-01-01 00:00:00]"
+    refusal = router.classify_refusal("glm", _cli(zai))
+    now = datetime(2026, 9, 18, 12, 0).astimezone()
+    until = router.close_until(refusal, balance_close_hours=6, throttle_close_minutes=15,
+                               now=now)
+    assert until == now + timedelta(days=7)
+
+
+def test_m1_lane_state_caps_old_entries_and_reopens(tmp_path):
+    import json
+    from datetime import datetime, timedelta
+
+    from subagent_mcp.lane_state import LaneState
+
+    state = LaneState(tmp_path)
+    state.close("glm", datetime(2099, 1, 1).astimezone(), "zai_1308", "m")
+    entry = state.closed("glm")
+    assert entry is not None
+    assert entry["closed_until"] <= datetime.now().astimezone() + timedelta(days=7, seconds=5)
+    # An entry written before the cap existed is capped on read from its set_at.
+    set_at = datetime.now().astimezone() - timedelta(days=8)
+    (tmp_path / "lane_state.json").write_text(json.dumps({"glm": {
+        "closed_until": "2099-01-01T00:00:00+07:00", "code": "zai_1308", "message": "m",
+        "set_at": set_at.isoformat()}}))
+    assert state.closed("glm") is None
+    state.close("deepseek", datetime.now().astimezone() + timedelta(hours=1), "deepseek_balance",
+                "m")
+    assert state.reopen("deepseek") is not None
+    assert state.closed("deepseek") is None
+    assert state.reopen("deepseek") is None
+
+
+def test_m1_reopen_cli(tmp_path, capsys):
+    import sys
+    from datetime import datetime, timedelta
+
+    from subagent_mcp.lane_state import LaneState
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import reopen_lane
+
+    LaneState(tmp_path).close("glm", datetime.now().astimezone() + timedelta(hours=1),
+                              "zai_1308", "m")
+    assert reopen_lane.main(["--session-root", str(tmp_path)]) == 0
+    assert "glm: closed until" in capsys.readouterr().out
+    assert reopen_lane.main(["--session-root", str(tmp_path), "glm"]) == 0
+    assert "glm: reopened" in capsys.readouterr().out
+    assert LaneState(tmp_path).closed("glm") is None
+
+
+# --- L4: one Codex reset parser; the year is optional ---------------------------------
+
+
+def test_l4_codex_reset_without_a_year():
+    from datetime import datetime
+
+    from subagent_mcp import codex_driver, router
+
+    now = datetime(2026, 9, 18, 12, 0).astimezone()
+    text = "try again at Sep 20th 1:29 PM"
+    assert router.codex_reset(text, now) == datetime(2026, 9, 20, 13, 29).astimezone()
+    assert codex_driver.parse_reset(text, now) == router.codex_reset(text, now)
+    # A date already past this year is next year's.
+    assert router.codex_reset("try again at Jan 2nd 9:00 AM", now) == datetime(
+        2027, 1, 2, 9, 0).astimezone()
+    assert router.codex_reset("try again at Sep 20th, 2026 1:29 PM", now) == datetime(
+        2026, 9, 20, 13, 29).astimezone()

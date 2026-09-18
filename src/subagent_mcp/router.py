@@ -38,14 +38,45 @@ HOP_UNAVAILABLE = "unavailable"
 # closure: the next dispatch probes the lane again.
 ADMISSION = "admission"
 
-_BALANCE_RE = re.compile(r"insufficient balance|\b402\b", re.IGNORECASE)
-_CODEX_LIMIT = "you've hit your usage limit"
-_CODEX_AT_RE = re.compile(
-    r"try again at\s+("
-    r"[A-Z][a-z]{2,8}\s+\d{1,2}(?:st|nd|rd|th)?,\s*\d{4}\s+\d{1,2}:\d{2}\s*[AP]M"
-    r"|\d{1,2}:\d{2}\s*[AP]M)",
+# An empty DeepSeek balance: its message, or HTTP 402 as a status (not any
+# "402" in the text, such as "timed out after 402 s").
+_BALANCE_RE = re.compile(
+    r"insufficient balance"
+    r"|(?:\bhttp(?:/\d(?:\.\d)?)?|\bstatus(?:[ _]code)?|\bapi error|\berror)\s*[:=]?\s*\(?402\b"
+    r"|\b402\s+payment required",
     re.IGNORECASE,
 )
+_CODEX_LIMIT = "you've hit your usage limit"
+# "try again at [Sep 20th[, 2026]] 1:29 PM". One parser for both drivers.
+_CODEX_AT_RE = re.compile(
+    r"try again at\s+"
+    r"(?:(?P<month>[A-Za-z]{3,9})\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"(?:(?P<year>\d{4})\s+)?)?"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>[AaPp][Mm])",
+)
+_MONTHS = {
+    name: index
+    for index, names in enumerate(
+        (
+            ("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+            ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+            ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"),
+            ("dec", "december"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+
+# The longest any refusal keeps a lane closed, whatever reset time it quotes.
+MAX_CLOSE = timedelta(days=7)
+
+# Which lane each refusal code can come from. A code seen on another lane is
+# text that happens to match, not that provider's refusal.
+LANE_OF_CODE = {
+    ZAI_1308: "glm", ZAI_1310: "glm", ZAI_1313_EXHAUSTED: "glm",
+    DEEPSEEK_BALANCE: "deepseek", CODEX_USAGE_LIMIT: "codex",
+}
 
 
 def no_retry(text: str) -> bool:
@@ -169,29 +200,40 @@ def codex_reset(text: str, now: datetime | None = None) -> datetime | None:
     """The time a Codex usage-limit message says to try again, in local time.
 
     "1:01 PM" is today, or tomorrow when that time has already passed.
-    "Sep 20th, 2026 1:29 PM" is that date.
+    "Sep 20th, 2026 1:29 PM" is that date. "Sep 20th 1:29 PM" (no year) is
+    this year, or next year when that date has already passed.
+    Returned timezone-aware.
     """
     match = _CODEX_AT_RE.search(text or "")
     if match is None:
         return None
-    raw = " ".join(match.group(1).split())
-    now = now or _local_now()
-    if raw[0].isdigit():
+    hour = int(match["hour"])
+    if not 1 <= hour <= 12 or int(match["minute"]) > 59:
+        return None
+    hour = hour % 12 + (12 if match["ampm"].lower() == "pm" else 0)
+    minute = int(match["minute"])
+    current = now or _local_now()
+    if match["month"]:
+        month = _MONTHS.get(match["month"].lower())
+        if month is None:
+            return None
         try:
-            clock = datetime.strptime(raw.upper().replace(" ", ""), "%I:%M%p")
+            if match["year"]:
+                when = current.replace(year=int(match["year"]), month=month,
+                                       day=int(match["day"]), hour=hour, minute=minute,
+                                       second=0, microsecond=0)
+            else:
+                when = current.replace(month=month, day=int(match["day"]), hour=hour,
+                                       minute=minute, second=0, microsecond=0)
+                if when <= current:
+                    when = when.replace(year=when.year + 1)
         except ValueError:
             return None
-        when = now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
-        if when <= now:
-            when += timedelta(days=1)
-        return when
-    cleaned = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", raw, flags=re.IGNORECASE)
-    for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
-        try:
-            return datetime.strptime(cleaned, fmt).astimezone()
-        except ValueError:
-            continue
-    return None
+        return when.astimezone()
+    when = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if when <= current:
+        when += timedelta(days=1)
+    return when.astimezone()
 
 
 def zai_reset_at(raw: str | None) -> datetime | None:
@@ -206,6 +248,10 @@ def zai_reset_at(raw: str | None) -> datetime | None:
 
 def classify_refusal(lane: str, events_or_error: list[dict[str, Any]] | str) -> Refusal | None:
     """The refusal in a run's events (or an error string), or None.
+
+    Each code is read only on its own lane: z.ai codes on glm, an empty
+    balance on deepseek, a usage limit on codex. The local lanes never refuse
+    this way; their failures are the run's result.
 
     None means whatever went wrong is not a refusal the router acts on: a
     plain 429 without a z.ai code, an auth error, a crash. Those fail the run
@@ -230,14 +276,18 @@ def classify_refusal(lane: str, events_or_error: list[dict[str, Any]] | str) -> 
     message = runs._clip(text, 300)
     low = text.lower()
 
-    if _CODEX_LIMIT in low.replace("’", "'"):
-        return Refusal(CODEX_USAGE_LIMIT, message, codex_reset(text))
-    code = runs.zai_code(evidence)
-    if code in runs.ZAI_QUOTA_CODES:
-        return Refusal(f"zai_{code}", message, zai_reset_at(runs.zai_reset(evidence)))
-    if code == runs.ZAI_THROTTLE_CODE:
-        return Refusal(ZAI_1313_EXHAUSTED, message, None)
-    if _BALANCE_RE.search(text):
+    if lane == "codex":
+        if _CODEX_LIMIT in low.replace("’", "'"):
+            return Refusal(CODEX_USAGE_LIMIT, message, codex_reset(text))
+        return None
+    if lane == "glm":
+        code = runs.zai_code(evidence)
+        if code in runs.ZAI_QUOTA_CODES:
+            return Refusal(f"zai_{code}", message, zai_reset_at(runs.zai_reset(evidence)))
+        if code == runs.ZAI_THROTTLE_CODE:
+            return Refusal(ZAI_1313_EXHAUSTED, message, None)
+        return None
+    if lane == "deepseek" and _BALANCE_RE.search(text):
         return Refusal(DEEPSEEK_BALANCE, message, None)
     return None
 
@@ -289,15 +339,17 @@ def close_until(
     A quoted reset time closes it until then. An empty balance gives no reset
     time, so it closes for balance_close_hours; a spent 1313 throttle for
     throttle_close_minutes. A failed health gate never closes a lane: it is
-    checked again on every dispatch.
+    checked again on every dispatch. No closure is longer than MAX_CLOSE.
     """
     now = now or _local_now()
     if refusal.code == HEALTH_FAILED:
         return None
     if refusal.reset_at is not None:
-        return refusal.reset_at if refusal.reset_at > now else None
-    if refusal.code == DEEPSEEK_BALANCE:
-        return now + timedelta(hours=balance_close_hours)
-    if refusal.code == ZAI_1313_EXHAUSTED:
-        return now + timedelta(minutes=throttle_close_minutes)
-    return None
+        until = refusal.reset_at if refusal.reset_at > now else None
+    elif refusal.code == DEEPSEEK_BALANCE:
+        until = now + timedelta(hours=balance_close_hours)
+    elif refusal.code == ZAI_1313_EXHAUSTED:
+        until = now + timedelta(minutes=throttle_close_minutes)
+    else:
+        until = None
+    return min(until, now + MAX_CLOSE) if until is not None else None

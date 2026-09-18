@@ -42,7 +42,8 @@ def test_lane_state_write_is_atomic_and_keeps_other_lanes(tmp_path: Path):
     state.close("glm", until, "zai_1308", "a")
     state.close("deepseek", until, "deepseek_balance", "b")
     assert state.closed("glm") is not None and state.closed("deepseek") is not None
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["lane_state.json"]
+    # No temp file left behind; the lock file is the only other entry.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["lane_state.json", "lane_state.json.lock"]
 
 
 def test_lane_state_expired_entry_is_ignored(tmp_path: Path):

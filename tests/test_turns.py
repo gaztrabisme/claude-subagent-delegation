@@ -243,3 +243,37 @@ def test_codex_turn_gets_the_turn_completed_usage(fake_codex, tmp_path: Path, tr
         assert turns[0]["lane"] == "codex" and len(turns[0]["tool_calls"]) == run.usage.steps
     finally:
         reg.shutdown()
+
+
+def test_meter_usage_only_in_stream_events_after_a_tool_result():
+    """U-T1: GLM's usage arrives only in message_delta, and a denied tool's
+    result can come back before that delta. The turn still gets it."""
+    meter = _Meter(0, 100.0)
+    stream = lambda event: {"type": "stream_event", "event": event}  # noqa: E731
+    zero = {"input_tokens": 0, "output_tokens": 0}
+    meter.see(stream({"type": "message_start", "message": {
+        "id": "m1", "model": "glm", "usage": zero}}), 101.0)
+    meter.see(stream({"type": "content_block_start", "index": 0}), 102.0)
+    meter.see({"type": "assistant", "message": {"id": "m1", "model": "glm", "usage": zero,
+               "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}},
+              103.0)
+    meter.see({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "denied"}]}}, 103.5)
+    meter.see(stream({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                      "usage": {"input_tokens": 3805, "output_tokens": 189,
+                                "cache_read_input_tokens": 0}}), 104.0)
+    meter.see(stream({"type": "message_stop"}), 104.0)
+    meter.see(stream({"type": "message_start", "message": {
+        "id": "m2", "model": "glm", "usage": zero}}), 105.0)
+    meter.see(stream({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                      "usage": {"input_tokens": 250, "output_tokens": 79,
+                                "cache_read_input_tokens": 3776}}), 106.0)
+    meter.see(stream({"type": "message_stop"}), 106.0)
+    first, second = meter.records()
+    assert (first["input"], first["output"], first["stop_reason"]) == (3805, 189, "tool_use")
+    assert first["tool_calls"] == ["Bash"]
+    # The second request went out at the tool result, not at the late message_stop.
+    assert second["ts_start"] == 103.5
+    assert (second["input"], second["cache_read"], second["stop_reason"]) == (250, 3776, "end_turn")
+    # Without a result event (a failed or cancelled run) the sum still holds it.
+    assert meter.usage()["input"] == 4055 and meter.usage()["output"] == 268

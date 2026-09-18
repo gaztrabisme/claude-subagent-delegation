@@ -41,18 +41,21 @@ cache_read_multiplier = 0.025   # overrides cache_multipliers.cache_read
 #   local:     fixed per-run cost `usd` (0 for hardware already owned).
 
 [provider.glm]
+# z.ai GLM Coding Plan, USD per month (Gary, 2026-09-18). Spread evenly over that month's glm runs.
 kind = "flat_plan"
-monthly_usd = "null"
+monthly_usd = 80
 
 [provider.codex]
 kind = "flat_plan"
 monthly_usd = "null"
 
 [provider.deepseek]
+# deepseek-v4-pro peak rates, USD per 1M tokens, from https://api-docs.deepseek.com/quick_start/pricing
+# (read 2026-09-18). Off-peak is half; peak is used so the saving is not overstated.
 kind = "per_token"
-input = "null"
-output = "null"
-cache_read = "null"
+input = 1.32
+output = 3.96
+cache_read = 0.044
 
 [provider.bppc]
 kind = "local"

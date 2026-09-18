@@ -21,7 +21,7 @@ UAT at close:
 | 4.3 | PASS |
 | 4.4 | bppc PASS; deepseek DEFERRED (402 Insufficient Balance) |
 | 5.1–5.3 | PASS |
-| 5.4 | PASS (net saving null until provider prices are filled) |
+| 5.4 | PASS: net saving glm $711.67, deepseek $172.82, bppc $0.68 (`data/cost-2026-09-18/`) |
 | 6.1 | PASS (max_agents 1, decisions S7) |
 | R.1 | PASS (3 HIGH fixed; open items carry reasons) |
 | R.2 | PASS (no remote; nothing pushed) |
@@ -62,3 +62,4 @@ UAT at close:
 | 09:45 | F1 | Claude Agent | done 5294af8..197c681. Coordinator UAT: 465 passed; hook_isolation PASS; smoke bppc PASS (8940 tokens, deny ~/.ssh/config, run_summary VRAM 15762 MB, decode 94.4/78.5 tok/s); smoke omlx PASS; smoke glm PASS (turns 12132 = run 12132, U-T1 fixed live) |
 | 09:50 | 5.4 | coordinator | cost_join on final code exit 0: 736 runs; glm cf $1103.89 vs parent $312.22 |
 | 09:52 | R.4 | coordinator | ~/.claude.json backed up to ~/.claude.json.bak-2026-09-18; subagent added (keys copied from old entries, tuned knobs carried over); glm-subagent and qwen-subagent removed; deepseek-subagent kept. stdio probe: server "subagent", six tools |
+| 10:25 | 5.4 | coordinator | DeepSeek peak rates from api-docs.deepseek.com (1.32/3.96/0.044 per 1M); GLM plan $80/month (Gary). Net saving glm $711.67, deepseek $172.82. Test that read the real pricing file moved to a fixture by GLM (4c5cd5e; GLM lane open again); 466 passed |

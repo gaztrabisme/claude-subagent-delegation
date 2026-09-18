@@ -1,0 +1,5 @@
+level,children,completed,verified,failures,level_wall_s,output_tokens,aggregate_tps,ttft_median_s,ttft_p90_s,decode_tps_mean,peak_model_memory_used,peak_swap_mb,swap_growth_mb
+1,1,1,1,0,16.05,322,20.062,3.927,3.927,67.195,12942867455.0,0.0,0.0
+2,2,2,2,0,41.514,759,18.283,7.606,10.481,22.02,12942867455.0,0.0,0.0
+4,4,4,4,0,170.456,1300,7.627,15.794,26.485,8.422,12942867455.0,0.0,0.0
+8,8,8,8,0,357.432,2936,8.214,130.223,180.698,8.753,12942867455.0,0.0,0.0

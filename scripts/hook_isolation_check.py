@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""Check that a workspace's own .claude settings cannot switch the guard off.
+"""Check that the claude driver's PreToolUse guard holds, with no paid call.
 
-No paid calls. A local mock Anthropic-compatible endpoint answers every
-request that offers tools with one `tool_use`: Bash `echo hi > x`. A fake
-supervisor on the approval socket records each hook request and denies it.
-The real `claude` runs with the argv and env this server builds
-(`Agent._argv`, `Settings.child_env`), in a workspace whose
-`.claude/settings.json` and `.claude/settings.local.json` set
-`disableAllHooks: true` and a permissions allow rule for Bash.
+A local mock Anthropic-compatible endpoint answers every request that offers
+tools with one `tool_use`: Bash `echo hi > x`. A fake supervisor on the
+approval socket denies every hook request and records it. The real `claude`
+runs with the argv and env this package builds (`runs.Agent._argv`,
+`Settings.child_env`, `Settings.hooks_config`), not a copy of them.
 
-Passes (exit 0) when the hook fired for that call and `x` was not written.
-Then runs a control with `--setting-sources project,local`, where the planted
-file should take effect (no hook, `x` written), to show the plant is live.
+Three runs, all required for exit 0:
+
+  (a) hook       server argv, clean workspace: the deny-all hook sees the
+                 call and `x` is not written.
+  (b) no hook    the same argv with a hooks-free --settings file: `x` is
+                 written, so the mock and the tool really execute and (a)'s
+                 block is the hook's doing.
+  (c) planted    server argv in a workspace whose .claude/settings.json and
+                 settings.local.json set `disableAllHooks` and allow Bash: the
+                 hook still fires and `x` is not written.
+
+A fourth, informational run loads the planted files on purpose
+(`--setting-sources project,local`) to show the plant is live.
 
     uv run python scripts/hook_isolation_check.py
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import socket
@@ -148,12 +157,31 @@ def run_claude(argv: list[str], env: dict, workspace: Path) -> subprocess.Comple
                           timeout=120)
 
 
+def _run_case(label: str, argv: list[str], env: dict, workspace: Path,
+              seen: list[dict]) -> tuple[bool, bool]:
+    """(hook saw the probe, x written) for one claude run in `workspace`."""
+    seen.clear()
+    MockAnthropic.requests.clear()
+    (workspace / "x").unlink(missing_ok=True)
+    result = run_claude(argv, env, workspace)
+    hooked = any((r.get("tool_input") or {}).get("command") == COMMAND for r in seen)
+    written = (workspace / "x").exists()
+    print(f"{label}: claude exit={result.returncode} model_requests="
+          f"{len(MockAnthropic.requests)} hook_requests={len(seen)} "
+          f"hook_saw_probe={hooked} x_written={written}")
+    if not MockAnthropic.requests:
+        print(f"  stderr tail: {result.stderr.strip()[-400:]}")
+    return hooked, written
+
+
 def main() -> int:
     scratch = Path(tempfile.mkdtemp(prefix="sam-hookcheck-")).resolve()
-    workspace = scratch / "ws"
-    (workspace / ".claude").mkdir(parents=True)
+    clean = scratch / "clean"
+    clean.mkdir()
+    planted = scratch / "planted"
+    (planted / ".claude").mkdir(parents=True)
     for name in ("settings.json", "settings.local.json"):
-        (workspace / ".claude" / name).write_text(json.dumps(PLANT))
+        (planted / ".claude" / name).write_text(json.dumps(PLANT))
     sock = f"/tmp/sam-hc-{os.getpid()}.sock"
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), MockAnthropic)
@@ -163,7 +191,7 @@ def main() -> int:
     threading.Thread(target=fake_supervisor, args=(sock, seen, stop), daemon=True).start()
 
     os.environ.update({
-        "SAM_WORKSPACE": str(workspace),
+        "SAM_WORKSPACE": str(clean),
         "SAM_SESSION_ROOT": str(scratch / "sessions"),
         "SAM_GLM_BASE_URL": f"http://127.0.0.1:{httpd.server_address[1]}",
         "GLM_API_KEY": "mock-key",
@@ -173,41 +201,51 @@ def main() -> int:
     })
     settings = Settings.from_env()
     lane = settings.lane("glm")
-    agent = SimpleNamespace(settings=settings, workspace=workspace, agent_id="a1",
-                            model="mock-model", lane=lane)
-    argv = Agent._argv(agent, "Run the probe command.", None)  # type: ignore[arg-type]
     env = settings.child_env("a1", lane, "mock-model")
+
+    def argv_for(workspace: Path) -> list[str]:
+        agent = SimpleNamespace(settings=settings, workspace=workspace, agent_id="a1",
+                                model="mock-model", lane=lane)
+        return Agent._argv(agent, "Run the probe command.", None)  # type: ignore[arg-type]
+
+    # The same argv with the per-agent settings file rebuilt without hooks.
+    unhooked = dataclasses.replace(settings, supervisor="off")
+    no_hook_settings = unhooked.hooks_config("a1-nohook", lane, "mock-model")
     print(f"scratch: {scratch}")
     print(f"planted: {json.dumps(PLANT)}")
     try:
-        result = run_claude(argv, env, workspace)
-        hooked = [r for r in seen if (r.get("tool_input") or {}).get("command") == COMMAND]
-        written = (workspace / "x").exists()
-        print(f"server argv: claude exit={result.returncode} model_requests="
-              f"{len(MockAnthropic.requests)} hook_requests={len(seen)} "
-              f"hook_saw_probe={bool(hooked)} x_written={written}")
-        passed = bool(hooked) and not written
+        argv = argv_for(clean)
+        hooked, written = _run_case("(a) hook, clean workspace", argv, env, clean, seen)
+        a_ok = hooked and not written
 
-        # Control: let the planted project/local settings load.
         control = list(argv)
-        control[control.index("--setting-sources") + 1] = "project,local"
-        seen.clear()
-        MockAnthropic.requests.clear()
-        (workspace / "x").unlink(missing_ok=True)
-        result = run_claude(control, env, workspace)
-        written = (workspace / "x").exists()
-        print(f"control (--setting-sources project,local): claude exit={result.returncode} "
-              f"model_requests={len(MockAnthropic.requests)} hook_requests={len(seen)} "
-              f"x_written={written}")
-        live = not seen and written
-        print("control: the planted file takes effect when loaded" if live
-              else "control: INCONCLUSIVE, the planted file did not disable the hook")
+        control[control.index("--settings") + 1] = str(no_hook_settings)
+        hooked, written = _run_case("(b) no hook (control)", control, env, clean, seen)
+        b_ok = written and not hooked
+
+        argv = argv_for(planted)
+        hooked, written = _run_case("(c) hook, planted .claude settings", argv, env, planted,
+                                    seen)
+        c_ok = hooked and not written
+
+        loaded = list(argv)
+        loaded[loaded.index("--setting-sources") + 1] = "project,local"
+        hooked, written = _run_case("(info) planted files loaded on purpose", loaded, env,
+                                    planted, seen)
+        print("info: the planted file takes effect when loaded" if written and not hooked
+              else "info: the planted file did not disable the hook even when loaded")
     finally:
         stop.set()
         httpd.shutdown()
         Path(sock).unlink(missing_ok=True)
-    print("PASS: the hook fired and denied despite the planted settings" if passed
-          else "FAIL: the hook did not gate the call")
+    checks = {"(a) deny-all hook blocks the call": a_ok,
+              "(b) without the hook the call runs": b_ok,
+              "(c) workspace .claude settings ignored": c_ok}
+    for name, ok in checks.items():
+        print(f"{'ok  ' if ok else 'FAIL'} {name}")
+    passed = all(checks.values())
+    print("PASS: hook isolation holds on the claude driver" if passed
+          else "FAIL: hook isolation does not hold")
     return 0 if passed else 1
 
 

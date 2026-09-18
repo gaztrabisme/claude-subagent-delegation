@@ -193,6 +193,7 @@ class Trace:
             admission=getattr(hop, "admission", None),
             would_refuse=getattr(hop, "would_refuse", None),
             admit_reason=getattr(hop, "admit_reason", None),
+            cold_load=getattr(hop, "cold_load", False),
         )
 
     def calibration(self, *, run_id: str, chars: int, output_tokens: int, assumed: float) -> None:

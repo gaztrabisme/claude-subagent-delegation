@@ -11,6 +11,10 @@ omlx: GET the lane's health_url with its key. Healthy when it answers 200 with
 status "ok". models_loaded 0 is still healthy (the first request loads the
 model), but the result carries cold_load so the run can allow for it.
 
+gpubox's :8080 is a proxy that stops llama.cpp when idle and starts it on the
+first request. Its /health then answers {"status": "ok", "backend": "stopped"}:
+healthy, with cold_load set, like oMLX with no model loaded.
+
 Cloud lanes have no gate: their refusals come back in the child's own error.
 
 Nothing here starts a model server. A lane whose server is down fails its
@@ -139,6 +143,15 @@ def gpubox_hosts(env: Mapping[str, str] | None = None,
     return seen
 
 
+def _backend_stopped(body: bytes) -> bool:
+    """True when gpubox's proxy says its llama.cpp backend is stopped (idle)."""
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("backend") == "stopped"
+
+
 def check_gpubox(lane: Lane, env: Mapping[str, str] | None = None) -> Health:
     """Resolve gpubox's base URL, or report that no host answered."""
     env = os.environ if env is None else env
@@ -146,7 +159,7 @@ def check_gpubox(lane: Lane, env: Mapping[str, str] | None = None) -> Health:
         # SAM_GPUBOX_BASE_URL: no resolution, but still gated.
         found = _http_get(f"{lane.base_url}/health")
         if found is not None and found[0] == 200:
-            return Health(True, lane.base_url)
+            return Health(True, lane.base_url, cold_load=_backend_stopped(found[1]))
         return Health(False, None, f"gpubox: {lane.base_url}/health did not answer 200")
     port = int(env.get("SAM_GPUBOX_PORT") or GPUBOX_PORT)
     hosts = gpubox_hosts(env, _tailscale_status())
@@ -154,7 +167,7 @@ def check_gpubox(lane: Lane, env: Mapping[str, str] | None = None) -> Health:
         base = f"http://{host}:{port}"
         found = _http_get(f"{base}/health")
         if found is not None and found[0] == 200:
-            return Health(True, base)
+            return Health(True, base, cold_load=_backend_stopped(found[1]))
     return Health(
         False, None, f"gpubox: no host answered /health on :{port} (tried {', '.join(hosts)})"
     )

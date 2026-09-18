@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parents[1] / "src" / "glm_subagent_mcp" / "runtime" / "approval_hook.py"
+HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent_mcp" / "runtime" / "approval_hook.py"
 
 
 def _run_hook(env: dict, stdin: str, extra_args: list[str] | None = None) -> subprocess.CompletedProcess:
@@ -29,7 +29,7 @@ def _decision(stdout: str) -> dict:
 
 def test_missing_socket_denies_with_json(monkeypatch, tmp_path: Path):
     env = {**os.environ}
-    env.pop("GSA_APPROVAL_SOCKET", None)
+    env.pop("SAM_APPROVAL_SOCKET", None)
     result = _run_hook(env, json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
     assert result.returncode == 2
     out = _decision(result.stdout)
@@ -38,7 +38,7 @@ def test_missing_socket_denies_with_json(monkeypatch, tmp_path: Path):
 
 
 def test_allow_and_deny_from_unix_socket(tmp_path: Path):
-    sock_path = Path("/tmp") / f"gsa-hook-test-{tmp_path.name}.sock"
+    sock_path = Path("/tmp") / f"sam-hook-test-{tmp_path.name}.sock"
     sock_path.unlink(missing_ok=True)
     replies = {"allow": {"action": "allow", "reason": "ok"}, "deny": {"action": "deny", "reason": "nope"}}
     planned = ["allow", "deny"]
@@ -64,7 +64,7 @@ def test_allow_and_deny_from_unix_socket(tmp_path: Path):
         if sock_path.exists():
             break
         __import__("time").sleep(0.02)
-    env = {**__import__("os").environ, "GSA_APPROVAL_SOCKET": str(sock_path)}
+    env = {**__import__("os").environ, "SAM_APPROVAL_SOCKET": str(sock_path)}
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
     allowed = _run_hook(env, payload, ["--agent", "a1"])
     denied = _run_hook(env, payload, ["--agent", "a1"])
@@ -77,7 +77,7 @@ def test_allow_and_deny_from_unix_socket(tmp_path: Path):
 
 
 def test_unreachable_socket_denies(tmp_path: Path):
-    env = {**__import__("os").environ, "GSA_APPROVAL_SOCKET": str(tmp_path / "missing.sock")}
+    env = {**__import__("os").environ, "SAM_APPROVAL_SOCKET": str(tmp_path / "missing.sock")}
     result = _run_hook(env, "{}")
     assert result.returncode == 2
     assert _decision(result.stdout)["permissionDecision"] == "deny"

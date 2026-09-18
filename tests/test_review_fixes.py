@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 
-from glm_subagent_mcp import runs
-from glm_subagent_mcp.config import APPROVAL_HOOK, Settings
-from glm_subagent_mcp.guard import (
+from subagent_mcp import runs
+from subagent_mcp.config import APPROVAL_HOOK, Settings
+from subagent_mcp.guard import (
     ALLOW,
     DENY,
     ESCALATE,
@@ -22,7 +22,7 @@ from glm_subagent_mcp.guard import (
     classify_path_write,
     protect,
 )
-from glm_subagent_mcp.runs import (
+from subagent_mcp.runs import (
     COMPLETED,
     FAILED,
     Registry,
@@ -41,7 +41,7 @@ HOME = str(Path.home())
 @pytest.fixture
 def ws() -> Iterator[Path]:
     """The review's workspace: under $HOME, with `x` -> `sub/a/b` and scripts."""
-    root = Path(tempfile.mkdtemp(dir=Path.home(), prefix=".gsa-review-")).resolve()
+    root = Path(tempfile.mkdtemp(dir=Path.home(), prefix=".sam-review-")).resolve()
     (root / "sub" / "a" / "b").mkdir(parents=True)
     (root / "x").symlink_to("sub/a/b")
     for name in ("t.sh", "t.py", "t.js", "t.pl", "t.rb"):
@@ -186,10 +186,10 @@ def test_n8_git_hooks_and_config_are_protected(ws):
 
 
 def test_i0a_session_root_is_outside_the_workspace_and_protected(ws, monkeypatch):
-    monkeypatch.delenv("GSA_SESSION_ROOT", raising=False)
-    monkeypatch.setenv("GSA_WORKSPACE", str(ws))
+    monkeypatch.delenv("SAM_SESSION_ROOT", raising=False)
+    monkeypatch.setenv("SAM_WORKSPACE", str(ws))
     settings = Settings.from_env()
-    assert settings.session_root == (Path.home() / ".glm-subagent" / "sessions").resolve()
+    assert settings.session_root == (Path.home() / ".subagent-mcp" / "sessions").resolve()
     # Wherever it is configured, writes under it are refused.
     sessions = ws / "sessions"
     protect(sessions)
@@ -367,7 +367,7 @@ def test_p10_more_sensitive_paths_and_the_childs_key(ws, tmp_path, monkeypatch):
     ], ws)
     monkeypatch.setenv("GLM_API_KEY", "server-copy")
     env = make_settings(tmp_path).child_env("a1")
-    assert "GLM_API_KEY" not in env and env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
+    assert "GLM_API_KEY" not in env and env["ANTHROPIC_AUTH_TOKEN"] == "server-copy"
 
 
 # --- P11: deleting an unexpanded path ---------------------------------------------
@@ -403,7 +403,7 @@ def _registry(tmp_path, monkeypatch, script: list[list[dict[str, Any]]], **overr
         spawned.append(FakeProcess(events, argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg
@@ -449,7 +449,7 @@ def test_r2_backoff_never_outlasts_the_run_deadline(tmp_path, monkeypatch):
 
 
 def test_r2_zero_retries_is_accepted(monkeypatch):
-    monkeypatch.setenv("GSA_RATE_LIMIT_RETRIES", "0")
+    monkeypatch.setenv("SAM_RATE_LIMIT_RETRIES", "0")
     assert Settings.from_env().rate_limit_retries == 0
 
 

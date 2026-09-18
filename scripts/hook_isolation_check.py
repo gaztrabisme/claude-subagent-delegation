@@ -32,8 +32,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from glm_subagent_mcp.config import Settings  # noqa: E402
-from glm_subagent_mcp.runs import Agent  # noqa: E402
+from subagent_mcp.config import Settings  # noqa: E402
+from subagent_mcp.runs import Agent  # noqa: E402
 
 COMMAND = "echo hi > x"
 PLANT = {
@@ -149,12 +149,12 @@ def run_claude(argv: list[str], env: dict, workspace: Path) -> subprocess.Comple
 
 
 def main() -> int:
-    scratch = Path(tempfile.mkdtemp(prefix="gsa-hookcheck-")).resolve()
+    scratch = Path(tempfile.mkdtemp(prefix="sam-hookcheck-")).resolve()
     workspace = scratch / "ws"
     (workspace / ".claude").mkdir(parents=True)
     for name in ("settings.json", "settings.local.json"):
         (workspace / ".claude" / name).write_text(json.dumps(PLANT))
-    sock = f"/tmp/gsa-hc-{os.getpid()}.sock"
+    sock = f"/tmp/sam-hc-{os.getpid()}.sock"
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), MockAnthropic)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -163,19 +163,20 @@ def main() -> int:
     threading.Thread(target=fake_supervisor, args=(sock, seen, stop), daemon=True).start()
 
     os.environ.update({
-        "GSA_WORKSPACE": str(workspace),
-        "GSA_SESSION_ROOT": str(scratch / "sessions"),
-        "GSA_BASE_URL": f"http://127.0.0.1:{httpd.server_address[1]}",
+        "SAM_WORKSPACE": str(workspace),
+        "SAM_SESSION_ROOT": str(scratch / "sessions"),
+        "SAM_GLM_BASE_URL": f"http://127.0.0.1:{httpd.server_address[1]}",
         "GLM_API_KEY": "mock-key",
-        "GSA_SUPERVISOR": "auto",
-        "GSA_APPROVAL_SOCKET": sock,
-        "GSA_MAX_STEPS": "3",
+        "SAM_SUPERVISOR": "auto",
+        "SAM_APPROVAL_SOCKET": sock,
+        "SAM_MAX_STEPS": "3",
     })
     settings = Settings.from_env()
+    lane = settings.lane("glm")
     agent = SimpleNamespace(settings=settings, workspace=workspace, agent_id="a1",
-                            model="mock-model")
+                            model="mock-model", lane=lane)
     argv = Agent._argv(agent, "Run the probe command.", None)  # type: ignore[arg-type]
-    env = settings.child_env("a1")
+    env = settings.child_env("a1", lane, "mock-model")
     print(f"scratch: {scratch}")
     print(f"planted: {json.dumps(PLANT)}")
     try:

@@ -1,7 +1,7 @@
 """Rate-limit outage behaviour: honest classification + bounded retry.
 
 Uses the FakeProcess seam from test_runs (spawn is monkeypatched via
-``glm_subagent_mcp.runs._spawn_claude``; no real ``claude`` is ever spawned).
+``subagent_mcp.runs._spawn_claude``; no real ``claude`` is ever spawned).
 Failure events are built through the real ``classify_exit`` so the fakes
 produce exactly what a real ``ClaudeProcess.events()`` would yield.
 """
@@ -12,8 +12,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from glm_subagent_mcp import runs
-from glm_subagent_mcp.runs import (
+from subagent_mcp import runs
+from subagent_mcp.runs import (
     COMPLETED,
     FAILED,
     ClaudeProcess,
@@ -62,7 +62,7 @@ def _registry(tmp_path: Path, monkeypatch, script, **overrides):
         tmp_path, rate_limit_retries=2, rate_limit_backoff=0.01, **overrides
     )
     spawn, spawned = _scripted_spawn(script)
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg

@@ -87,7 +87,7 @@ def run_verification(
         )
     except subprocess.TimeoutExpired:
         limit = (
-            f"GSA_VERIFY_TIMEOUT ({settings.verify_timeout:g}s)"
+            f"SAM_VERIFY_TIMEOUT ({settings.verify_timeout:g}s)"
             if timeout >= settings.verify_timeout
             else f"the run's remaining deadline ({timeout:g}s)"
         )

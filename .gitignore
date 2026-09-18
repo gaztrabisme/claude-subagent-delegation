@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.gsa-sessions/
+.dsh-sessions/
+.DS_Store
+.ref/
+.mcp.json
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

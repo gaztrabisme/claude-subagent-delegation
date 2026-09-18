@@ -1,0 +1,47 @@
+[project]
+name = "glm-subagent-mcp"
+version = "0.1.0"
+description = "Delegate work to a Claude Code subprocess billed against a GLM Coding Plan."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["mcp", "glm", "claude-code", "subagent", "z.ai"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "mcp>=2.0.0",
+]
+
+[project.scripts]
+glm-subagent-mcp = "glm_subagent_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/gaztrabisme/glm-subagent-mcp"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/glm_subagent_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["BLE001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

@@ -23,6 +23,7 @@ def _tailscale(lan: str | None = "192.0.2.50", host: str = "gpubox") -> dict:
     return {"Peer": {
         "nodekey:aaa": {"HostName": "devmac", "CurAddr": "192.0.2.216:41641"},
         "nodekey:bbb": {"HostName": host, "CurAddr": "",
+                        "TailscaleIPs": ["198.51.100.34", "fd7a:115c:a1e0::1"],
                         "Addrs": ["198.51.100.34:41641", *addrs],
                         "Endpoints": ["[fd7a::1]:41641"]},
     }}

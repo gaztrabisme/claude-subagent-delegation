@@ -253,7 +253,8 @@ REFUSALS = {
     "zai_1310": (429, lambda: "[1310][Weekly/Monthly Limit Exhausted.]"),
     "zai_1313_exhausted": (429, lambda: "[1313][Fair Usage]"),
     "deepseek_balance": (402, lambda: "Insufficient Balance"),
-    # The codex driver lands in U3; the refusal is read from text either way.
+    # Codex usage-limit text arriving through a claude lane is read from text;
+    # the codex driver's own refusal is covered by the mixed-driver tests below.
     "codex_usage_limit": (429, lambda: "You've hit your usage limit. Visit "
                                        "https://chatgpt.com/codex/settings/usage to purchase "
                                        "more credits or try again at 1:01 PM."),
@@ -444,7 +445,8 @@ def test_router_continue_stays_on_the_lane_that_ran(tmp_path, lanes_on_mock):
         reg.shutdown()
 
 
-def test_router_codex_is_listed_and_marked_unavailable(tmp_path, lanes_on_mock):
+def test_router_codex_without_cli_is_unavailable(tmp_path, lanes_on_mock):
+    # conftest points SAM_CODEX_BIN at a path that does not exist.
     ep = lanes_on_mock
     ep.routes["/glm/v1/messages"] = (429, {"error": "[1310][Weekly Limit Exhausted.]"})
     reg = _registry(tmp_path, ep)
@@ -452,7 +454,8 @@ def test_router_codex_is_listed_and_marked_unavailable(tmp_path, lanes_on_mock):
         _, run = _delegate(reg, tmp_path, "glm")
         codex = run.hops[1]
         assert (codex["lane"], codex["outcome"]) == ("codex", "unavailable")
-        assert "not available in this build" in codex["message"]
+        assert (codex["driver"], codex["guard"]) == ("codex", "sandbox")
+        assert "not on PATH" in codex["message"]
     finally:
         reg.shutdown()
 
@@ -491,3 +494,148 @@ def test_router_src_never_starts_a_local_model():
         capture_output=True, text=True,
     )
     assert found.returncode == 1 and found.stdout == ""
+
+
+# --- mixed drivers: codex and claude hops in one delegation ------------------------
+
+CODEX_RESET = datetime(2026, 9, 20, 13, 29).astimezone()
+CODEX_THREAD = "01a0a0de-91f8-7441-a178-a154caba9282"  # success.jsonl
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    """Local time fixed before the fixture's 2026-09-20 13:29 reset, so the
+    closure is live whatever day the suite runs."""
+    from subagent_mcp import lane_state
+
+    now = datetime(2026, 9, 18, 12, 0).astimezone()
+    monkeypatch.setattr(router, "_local_now", lambda: now)
+    monkeypatch.setattr(lane_state, "_now", lambda: now)
+    return now
+
+
+def _mixed(tmp_path: Path, ep, names: tuple[str, ...], **overrides) -> Registry:
+    """A registry whose only lanes are `names`, so the chain is exactly them."""
+    settings = make_settings(
+        tmp_path, lanes={n: ep.lanes[n] for n in names}, rate_limit_retries=1,
+        rate_limit_backoff=0.001, throttle_backoff=0.001, **overrides)
+    return Registry(settings, start_reaper=False)
+
+
+def test_router_codex_usage_limit_then_glm_and_continue_stays(
+    tmp_path, lanes_on_mock, fake_codex, frozen_now
+):
+    ep = lanes_on_mock
+    fake_codex.use("usage_limit.jsonl")
+    trace = tmp_path / "trace.jsonl"
+    reg = _mixed(tmp_path, ep, ("codex", "glm"), trace=str(trace))
+    try:
+        agent, run = _delegate(reg, tmp_path, "codex")
+        assert run.state == COMPLETED, run.error
+        assert _outcomes(run) == [("codex", "refused", "codex_usage_limit"),
+                                  ("glm", "ran", None)]
+        codex_hop, glm_hop = run.hops
+        assert codex_hop["reset_at"] == CODEX_RESET.isoformat()
+        assert codex_hop["closed_until"] == CODEX_RESET.isoformat()
+        assert (codex_hop["driver"], codex_hop["guard"]) == ("codex", "sandbox")
+        assert (glm_hop["driver"], glm_hop["guard"]) == ("claude", "hook")
+        entry = LaneState(reg.settings.session_root).closed("codex")
+        assert entry is not None and entry["code"] == "codex_usage_limit"
+        assert entry["closed_until"] == CODEX_RESET
+        assert len(fake_codex.calls()) == 1
+        assert _msgs(ep, "glm") == 1
+        assert (run.lane, run.driver, run.guard) == ("glm", "claude", "hook")
+        assert agent.lane.name == "glm" and agent.driver.name == "claude"
+        glm_session = agent.session_id
+        assert glm_session == f"sess-{ep.url('glm')[-4:]}"
+
+        more = _wait(agent.follow_up("more"))
+        assert more.state == COMPLETED and more.hops == []
+        assert (more.lane, more.driver) == ("glm", "claude")
+        assert len(fake_codex.calls()) == 1
+        assert _msgs(ep, "glm") == 2
+        argv = ep.spawned[-1].argv
+        assert argv[argv.index("--resume") + 1] == glm_session
+    finally:
+        reg.shutdown()
+    records = [json.loads(line) for line in trace.read_text().splitlines()]
+    hops = [(r["lane"], r["driver"], r["guard"]) for r in records if r["kind"] == "hop"]
+    assert hops == [("codex", "codex", "sandbox"), ("glm", "claude", "hook")]
+    runs_ = [(r["lane"], r["driver"], r["guard"]) for r in records if r["kind"] == "run"]
+    assert runs_ == [("glm", "claude", "hook")] * 2
+
+
+def test_router_glm_refused_then_codex_runs_and_continue_resumes_thread(
+    tmp_path, lanes_on_mock, fake_codex, frozen_now
+):
+    ep = lanes_on_mock
+    ep.routes["/glm/v1/messages"] = (429, {"error": "[1313][Fair Usage]"})
+    trace = tmp_path / "trace.jsonl"
+    reg = _mixed(tmp_path, ep, ("glm", "codex"), trace=str(trace), supervisor="auto")
+    try:
+        agent, run = _delegate(reg, tmp_path, "glm")
+        assert run.state == COMPLETED, run.error
+        assert _outcomes(run) == [("glm", "refused", "zai_1313_exhausted"),
+                                  ("codex", "ran", None)]
+        assert _msgs(ep, "glm") == 2  # one throttle retry on the lane, then reroute
+        assert (run.lane, run.driver, run.guard) == ("codex", "codex", "sandbox+hook")
+        assert run.session_id == agent.session_id == CODEX_THREAD
+        first = fake_codex.calls()[0]["argv"]
+        assert "resume" not in first and "-m" not in first
+
+        more = _wait(agent.follow_up("keep going"), timeout=10)
+        assert more.state == COMPLETED and more.hops == []
+        second = fake_codex.calls()[1]["argv"]
+        assert second[second.index("resume") + 1] == CODEX_THREAD
+        assert _msgs(ep, "glm") == 2
+    finally:
+        reg.shutdown()
+    records = [json.loads(line) for line in trace.read_text().splitlines()]
+    hops = [(r["lane"], r["driver"], r["guard"]) for r in records if r["kind"] == "hop"]
+    assert hops == [("glm", "claude", "hook"), ("codex", "codex", "sandbox+hook")]
+    runs_ = [r for r in records if r["kind"] == "run"]
+    assert [(r["lane"], r["driver"], r["guard"]) for r in runs_] == [
+        ("codex", "codex", "sandbox+hook")] * 2
+    assert runs_[0]["session_id"] == CODEX_THREAD
+
+
+def test_router_codex_closed_second_delegate_spawns_no_codex(
+    tmp_path, lanes_on_mock, fake_codex, frozen_now
+):
+    ep = lanes_on_mock
+    fake_codex.use("usage_limit.jsonl")
+    reg = _mixed(tmp_path, ep, ("codex", "glm"))
+    try:
+        _, first = _delegate(reg, tmp_path, "codex")
+        assert first.lane == "glm" and len(fake_codex.calls()) == 1
+
+        _, second = _delegate(reg, tmp_path, "codex")
+        assert second.state == COMPLETED
+        assert _outcomes(second) == [("codex", "skipped_closed", "codex_usage_limit"),
+                                     ("glm", "ran", None)]
+        assert second.hops[0]["closed_until"] == CODEX_RESET.isoformat()
+        assert len(fake_codex.calls()) == 1  # zero codex spawns while closed
+    finally:
+        reg.shutdown()
+
+
+def test_router_codex_usage_limit_after_work_fails_without_reroute(
+    tmp_path, lanes_on_mock, fake_codex, frozen_now, monkeypatch
+):
+    ep = lanes_on_mock
+    lines = (FIXTURES / "context_full.jsonl").read_text().splitlines()[:-2]
+    lines.append(json.dumps({"type": "turn.failed", "error": {"message": (
+        "You've hit your usage limit. Try again at Sep 20th, 2026 1:29 PM.")}}))
+    fixture = tmp_path / "limit_after_work.jsonl"
+    fixture.write_text("\n".join(lines) + "\n")
+    monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(fixture))
+    reg = _mixed(tmp_path, ep, ("codex", "glm"))
+    try:
+        _, run = _delegate(reg, tmp_path, "codex")
+        assert run.state == FAILED
+        assert run.finish_reason == "usage_limit_after_work"
+        assert _outcomes(run) == [("codex", "ran", None)]
+        assert _msgs(ep, "glm") == 0
+        assert LaneState(reg.settings.session_root).closed("codex") is None
+    finally:
+        reg.shutdown()

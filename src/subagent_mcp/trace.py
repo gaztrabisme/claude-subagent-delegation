@@ -33,8 +33,8 @@ from typing import Any
 from .config import log
 
 # 2: run records carry the Claude Code session_id (2026-09-18)
-# 3: one "hop" record per lane the router tried; run records carry lane and
-#    provider (2026-09-18)
+# 3: one "hop" record per lane the router tried; run and hop records carry
+#    lane, provider, driver and guard (2026-09-18)
 SCHEMA = 3
 
 
@@ -93,7 +93,7 @@ class Trace:
             latency_ms=round(latency_ms, 1),
         )
 
-    def run(self, run: Any, workspace: str, model: str) -> None:
+    def run(self, run: Any, workspace: str, model: str, guard: str | None = None) -> None:
         verification = run.verification_result
         distil: dict[str, Any] = {"distilled": run.distilled, "truncated": run.truncated}
         if run.distilled:
@@ -106,7 +106,9 @@ class Trace:
             model=model,
             lane=getattr(run, "lane", None),
             provider=getattr(run, "provider", None),
+            driver=getattr(run, "driver", None),
             workspace=workspace,
+            guard=guard or getattr(run, "guard", None) or "hook",
             state=run.state,
             finish_reason=run.finish_reason,
             elapsed_seconds=round((run.finished_at or 0) - (run.started_at or 0), 2),
@@ -129,6 +131,8 @@ class Trace:
             hop=hop.index,
             lane=hop.lane,
             provider=hop.provider,
+            driver=getattr(hop, "driver", None),
+            guard=getattr(hop, "guard", None),
             model=hop.model,
             outcome=hop.outcome,
             code=hop.code,

@@ -23,6 +23,7 @@ def _tailscale(lan: str | None = "192.168.1.50", host: str = "bppc") -> dict:
     return {"Peer": {
         "nodekey:aaa": {"HostName": "mcbob", "CurAddr": "192.168.1.216:41641"},
         "nodekey:bbb": {"HostName": host, "CurAddr": "",
+                        "TailscaleIPs": ["100.106.185.34", "fd7a:115c:a1e0::1"],
                         "Addrs": ["100.106.185.34:41641", *addrs],
                         "Endpoints": ["[fd7a::1]:41641"]},
     }}

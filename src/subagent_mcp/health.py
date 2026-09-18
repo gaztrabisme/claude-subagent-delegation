@@ -1,15 +1,16 @@
 """Health gates for the local lanes, checked at dispatch.
 
 bppc: its LAN address changes with DHCP, so the base URL is resolved each time
-a run is dispatched. Hosts are tried in order: the LAN address `tailscale
-status --json` reports for bppc, then SAM_BPPC_LAN_HOSTS (comma-separated,
-default 192.168.1.17), then the stable Tailscale address. The first whose
-/health answers 200 within 2 s wins. SAM_BPPC_BASE_URL skips the resolution
-and is probed as given.
+a run is dispatched. Hosts are tried in order: the RFC1918 address `tailscale
+status --json` reports for the peer holding bppc's tailnet IP, then
+SAM_BPPC_LAN_HOSTS (comma-separated, default 192.168.1.17), then the stable
+Tailscale address. The first whose /health answers 200 within 2 s wins.
+SAM_BPPC_BASE_URL skips the resolution and is probed as given.
 
 omlx: GET the lane's health_url with its key. Healthy when it answers 200 with
-status "ok". models_loaded 0 is still healthy (the first request loads the
-model), but the result carries cold_load so the run can allow for it.
+status "ok". The lane's model missing from loaded_models is still healthy (the
+first request loads it), but the result carries cold_load so the run can
+allow for it.
 
 bppc's :8080 is a proxy that stops llama.cpp when idle and starts it on the
 first request. Its /health then answers {"status": "ok", "backend": "stopped"}:
@@ -26,6 +27,7 @@ gate and the router moves on.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
@@ -93,9 +95,28 @@ def _tailscale_status() -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def bppc_lan_from_tailscale(status: Mapping[str, Any] | None) -> str | None:
-    """bppc's LAN IPv4 from tailscale status: the first non-100.x address in
-    CurAddr, Addrs or Endpoints of the peer whose HostName is bppc."""
+def _rfc1918(ip: str) -> bool:
+    """A private LAN IPv4 (10/8, 172.16/12, 192.168/16) in dotted-quad form."""
+    try:
+        address = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return any(address in net for net in _PRIVATE_NETS)
+
+
+_PRIVATE_NETS = tuple(ipaddress.IPv4Network(n) for n in
+                      ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def bppc_lan_from_tailscale(status: Mapping[str, Any] | None,
+                            tailnet_ip: str = BPPC_TAILSCALE_HOST) -> str | None:
+    """bppc's LAN IPv4 from tailscale status.
+
+    The peer is the one whose TailscaleIPs include `tailnet_ip` (a HostName
+    can be claimed by any node). Its address is the first RFC1918 one in
+    CurAddr, Addrs or Endpoints; a public endpoint (STUN) is never used, since
+    the prompt and key go to it over plain HTTP.
+    """
     if not isinstance(status, Mapping):
         return None
     peers = status.get("Peer") or {}
@@ -104,8 +125,8 @@ def bppc_lan_from_tailscale(status: Mapping[str, Any] | None) -> str | None:
     for peer in peers.values():
         if not isinstance(peer, Mapping):
             continue
-        host = str(peer.get("HostName") or "").lower()
-        if host != "bppc" and not host.startswith(("bppc-", "bppc.")):
+        ips = peer.get("TailscaleIPs")
+        if not isinstance(ips, list) or tailnet_ip not in [str(x) for x in ips]:
             continue
         candidates = [str(peer.get("CurAddr") or "")]
         for key in ("Addrs", "Endpoints"):
@@ -118,14 +139,8 @@ def bppc_lan_from_tailscale(status: Mapping[str, Any] | None) -> str | None:
                 continue
             if ":" in ip:  # ip:port or bare IPv6
                 ip = ip.rsplit(":", 1)[0].strip("[]")
-            parts = ip.split(".")
-            if len(parts) != 4 or parts[0] == "100":
-                continue
-            try:
-                if all(0 <= int(x) <= 255 for x in parts):
-                    return ip
-            except ValueError:
-                continue
+            if _rfc1918(ip):
+                return ip
     return None
 
 
@@ -134,13 +149,14 @@ def bppc_hosts(env: Mapping[str, str] | None = None,
     """Hosts to probe for bppc, in order, without duplicates."""
     env = os.environ if env is None else env
     hosts: list[str] = []
-    lan = bppc_lan_from_tailscale(status)
+    tailnet = (env.get("SAM_BPPC_TAILSCALE_HOST") or BPPC_TAILSCALE_HOST).strip()
+    lan = bppc_lan_from_tailscale(status, tailnet)
     if lan:
         hosts.append(lan)
     listed = env.get("SAM_BPPC_LAN_HOSTS")
     listed = BPPC_LAN_HOSTS if listed is None else listed
     hosts.extend(h.strip() for h in listed.split(",") if h.strip())
-    hosts.append((env.get("SAM_BPPC_TAILSCALE_HOST") or BPPC_TAILSCALE_HOST).strip())
+    hosts.append(tailnet)
     seen: list[str] = []
     for host in hosts:
         if host not in seen:
@@ -234,9 +250,18 @@ def check_omlx(lane: Lane) -> Health:
         data = None
     if not isinstance(data, dict) or data.get("status") != "ok":
         return Health(False, None, f"{lane.name}: {lane.health_url} status is not ok")
-    loaded = data.get("models_loaded")
-    cold = isinstance(loaded, int) and loaded == 0
-    return Health(True, lane.base_url, cold_load=cold)
+    return Health(True, lane.base_url, cold_load=omlx_cold(data, lane.model))
+
+
+def omlx_cold(status: Mapping[str, Any], model: str | None) -> bool:
+    """Whether `model` still has to load: absent from loaded_models when the
+    server lists them (another model being loaded says nothing about this
+    one), else no model loaded at all."""
+    listed = status.get("loaded_models")
+    if isinstance(listed, list) and model:
+        return model not in [str(m) for m in listed]
+    loaded = status.get("models_loaded")
+    return isinstance(loaded, int) and loaded == 0
 
 
 def check(lane: Lane, env: Mapping[str, str] | None = None) -> Health:

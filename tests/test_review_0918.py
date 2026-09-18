@@ -257,3 +257,56 @@ def test_l4_codex_reset_without_a_year():
         2027, 1, 2, 9, 0).astimezone()
     assert router.codex_reset("try again at Sep 20th, 2026 1:29 PM", now) == datetime(
         2026, 9, 20, 13, 29).astimezone()
+
+
+# --- M3: bppc is the peer holding its tailnet IP, and only an RFC1918 address -------
+
+
+def test_m3_crafted_peer_named_bppc_is_ignored():
+    from subagent_mcp import health
+
+    status = {"Peer": {
+        "nodekey:evil": {"HostName": "bppc-evil", "TailscaleIPs": ["100.64.0.9"],
+                         "CurAddr": "203.0.113.9:41641", "Addrs": ["192.168.1.66:41641"]},
+        "nodekey:real": {"HostName": "bppc-System-Product-Name",
+                         "TailscaleIPs": ["100.106.185.34"],
+                         "CurAddr": "", "Addrs": ["203.0.113.50:41641", "192.168.1.17:41641"]},
+    }}
+    assert health.bppc_lan_from_tailscale(status) == "192.168.1.17"
+    assert health.bppc_hosts({}, status)[0] == "192.168.1.17"
+
+
+def test_m3_public_endpoint_is_never_used():
+    from subagent_mcp import health
+
+    status = {"Peer": {"nodekey:real": {
+        "HostName": "bppc", "TailscaleIPs": ["100.106.185.34"],
+        "CurAddr": "203.0.113.9:41641", "Addrs": ["100.106.185.34:41641", "8.8.8.8:1"]}}}
+    assert health.bppc_lan_from_tailscale(status) is None
+    assert health.bppc_lan_from_tailscale({"Peer": {"n": {
+        "HostName": "x", "TailscaleIPs": ["100.106.185.34"], "CurAddr": "10.1.2.3:4"}}}) == "10.1.2.3"
+    assert health.bppc_lan_from_tailscale({"Peer": {"n": {
+        "HostName": "x", "TailscaleIPs": ["100.106.185.34"], "CurAddr": "172.32.0.1:4"}}}) is None
+
+
+# --- M8: omlx cold_load is about the lane's model, not the server-wide count ---------
+
+
+def test_m8_omlx_cold_when_its_model_is_not_loaded(monkeypatch, mock_endpoint):
+    from dataclasses import replace
+
+    from subagent_mcp import health
+    from subagent_mcp.lanes import load_lanes
+
+    monkeypatch.setenv("SAM_OMLX_API_KEY", "k")
+    lane = load_lanes({"SAM_OMLX_BASE_URL": mock_endpoint.url("omlx")})["omlx"]
+    lane = replace(lane, health_url=f"{mock_endpoint.url('omlx')}/api/status")
+    mock_endpoint.routes["/omlx/api/status"] = (200, {
+        "status": "ok", "models_loaded": 1, "loaded_models": ["some-other-model"]})
+    assert health.check(lane).cold_load is True
+    mock_endpoint.routes["/omlx/api/status"] = (200, {
+        "status": "ok", "models_loaded": 1, "loaded_models": [lane.model]})
+    assert health.check(lane).cold_load is False
+    # A server that does not list models falls back to the count.
+    assert health.omlx_cold({"models_loaded": 0}, lane.model) is True
+    assert health.omlx_cold({"models_loaded": 2}, lane.model) is False

@@ -28,7 +28,7 @@ from . import health, router
 from .config import Settings, log
 from .guard import protect
 from .lane_state import LaneState
-from .lanes import FALLBACK_MODES, Lane
+from .lanes import DRIVER_CLAUDE, DRIVER_CODEX, FALLBACK_MODES, Lane
 from .trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
 
@@ -130,6 +130,7 @@ class Usage:
         self.cache_write += int(
             usage.get("cache_creation_input_tokens") or usage.get("cacheWriteTokens") or 0
         )
+        self.reasoning += int(usage.get("reasoning_output_tokens") or 0)
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -535,6 +536,10 @@ class Run:
     lane: str | None = None
     fallback: str | None = None
     provider: str | None = None
+    # The driver ("claude" / "codex") and guard ("hook" / "sandbox+hook") of
+    # the lane the run is on; a routed run takes the values of the lane that ran.
+    driver: str | None = None
+    guard: str | None = None
     # Set on a delegate's run: it walks the lane chain. Continues never do.
     route: bool = False
     # Lanes the router tried, as router.Hop dicts, in order.
@@ -551,6 +556,7 @@ class Run:
             "phase": self.phase,
             "lane": self.lane,
             "provider": self.provider,
+            "driver": self.driver,
             "fallback": self.fallback,
             "task": _clip(self.prompt, 120),
             "finish_reason": self.finish_reason,
@@ -589,8 +595,73 @@ class Run:
         self.transcript.append(line)
 
 
+class ClaudeDriver:
+    """Runs a turn as ``claude -p`` against the lane's Anthropic-compatible endpoint.
+
+    A driver is stateless; per-agent state (the hooks file, CODEX_HOME) lives
+    under the agent's session directory. The Agent picks one per lane, so a
+    delegate can refuse on one driver and run on the other.
+    """
+
+    name = DRIVER_CLAUDE
+    # Whether a run needs the lane's API key in this server's environment.
+    needs_api_key = True
+
+    def guard(self, settings: Settings) -> str:
+        """What stands between the child and the machine, for the trace."""
+        return "hook"
+
+    def boot(self, agent: Agent, lane: Lane) -> str | None:
+        """Why this driver cannot run for `agent` on `lane`, or None."""
+        try:
+            agent.settings.hooks_config(agent.agent_id, lane, agent.model)
+            probe = subprocess.run(
+                [agent.settings.claude_bin, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if probe.returncode != 0:
+                return (
+                    probe.stderr.strip() or probe.stdout.strip()
+                    or f"{agent.settings.claude_bin} --version exited {probe.returncode}"
+                )
+        except FileNotFoundError:
+            return f"{agent.settings.claude_bin!r} is not on PATH; install Claude Code"
+        except Exception as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+        return None
+
+    def spawn(self, agent: Agent, prompt: str, resume: str | None) -> ClaudeProcess:
+        argv = agent._argv(prompt, resume)
+        env = agent.settings.child_env(agent.agent_id, agent.lane, agent.model)
+        return _spawn_claude(argv, env, str(agent.workspace))
+
+    def refusal(self, lane: Lane, events: list[dict[str, Any]]) -> router.Refusal | None:
+        """The before-work refusal in a turn's events, or None."""
+        return router.classify_refusal(lane.name, events)
+
+
+CLAUDE_DRIVER = ClaudeDriver()
+
+
+def driver_for(lane: Lane) -> Any:
+    """The driver object for a lane (ClaudeDriver or codex_driver.CodexDriver)."""
+    if lane.driver == DRIVER_CODEX:
+        from .codex_driver import CODEX_DRIVER  # codex_driver imports this module
+
+        return CODEX_DRIVER
+    return CLAUDE_DRIVER
+
+
 class Agent:
-    """One Claude Code session, driven by a serial task queue."""
+    """One child session, driven by a serial task queue.
+
+    The session runs on one lane and that lane's driver. A delegate may move
+    along the chain before any work is done; from the first hop that runs,
+    `lane`, `driver` and `session_id` (a claude session_id or a codex
+    thread_id) belong together for every continue.
+    """
 
     def __init__(
         self,
@@ -612,6 +683,10 @@ class Agent:
         # every continue stays on the lane that ran.
         self.lane = lane or settings.lane()
         self.fallback = fallback
+        self.driver = driver_for(self.lane)
+        # Driver name -> its boot result (None when it can run). Filled
+        # lazily: a later hop's driver is checked only when the walk gets there.
+        self._booted: dict[str, str | None] = {}
         self.chain = list(chain) if chain else [self.lane]
         self.lane_state = lane_state
         self._lane_load = lane_load
@@ -675,6 +750,8 @@ class Agent:
             lane=self.lane.name,
             fallback=self.fallback,
             provider=self.lane.provider,
+            driver=self.driver.name,
+            guard=self.driver.guard(self.settings),
             route=route,
         )
         run.transcript = deque(maxlen=self.settings.transcript_limit)
@@ -769,26 +846,15 @@ class Agent:
 
     def _boot(self) -> None:
         try:
-            self.settings.hooks_config(self.agent_id, self.lane, self.model)
-            probe = subprocess.run(
-                [self.settings.claude_bin, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if probe.returncode != 0:
-                self._start_error = (
-                    probe.stderr.strip() or probe.stdout.strip()
-                    or f"{self.settings.claude_bin} --version exited {probe.returncode}"
-                )
-        except FileNotFoundError:
-            self._start_error = (
-                f"{self.settings.claude_bin!r} is not on PATH; install Claude Code"
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._start_error = f"{type(exc).__name__}: {exc}"
+            self._start_error = self._boot_driver(self.driver, self.lane)
         finally:
             self._ready.set()
+
+    def _boot_driver(self, driver: Any, lane: Lane) -> str | None:
+        """Boot `driver` for this agent once; the reason it cannot run, or None."""
+        if driver.name not in self._booted:
+            self._booted[driver.name] = driver.boot(self, lane)
+        return self._booted[driver.name]
 
     def _worker(self) -> None:
         self._boot()
@@ -845,6 +911,10 @@ class Agent:
             argv.extend(["--resume", resume])
         return argv
 
+    def _spawn(self, prompt: str, resume: str | None) -> ClaudeProcess:
+        """One turn's child process, on the current lane's driver."""
+        return self.driver.spawn(self, prompt, resume)
+
     def _execute(self, run: Run) -> None:
         run.started_at = _now()
         run.deadline = run.started_at + self.lane.run_timeout
@@ -855,7 +925,7 @@ class Agent:
                 self._finish(run)
                 return
         else:
-            if not self.lane.api_key():
+            if self.driver.needs_api_key and not self.lane.api_key():
                 run.state = FAILED
                 run.error = self._missing_key(self.lane)
                 run.phase = PHASE_DONE
@@ -915,10 +985,12 @@ class Agent:
         """Run a delegate on the first lane in the chain that takes it.
 
         Per lane: skip it when it is unavailable in this build, has no key, is
-        full, or is closed in lane memory; run its health gate; spawn. A
-        refusal before any work moves to the next lane and may close this one
-        on disk. Anything else, including a failure after work started, is
-        the run's result and ends the walk. Returns False when no lane ran it.
+        full, is closed in lane memory, or its driver cannot start; run its
+        health gate; spawn on that lane's driver. A refusal before any work
+        (read by the driver: router.classify_refusal for claude, codex_refusal
+        for codex) moves to the next lane and may close this one on disk.
+        Anything else, including a failure after work started, is the run's
+        result and ends the walk. Returns False when no lane ran it.
         """
         primary_model = self.model
         last_refusal: str | None = None
@@ -926,9 +998,11 @@ class Agent:
             if self._closing:
                 return False
             model = primary_model if index == 0 else (lane.model or "")
-            hop = router.Hop(index, lane.name, lane.provider, model, router.HOP_UNAVAILABLE)
+            driver = driver_for(lane)
+            hop = router.Hop(index, lane.name, lane.provider, model, router.HOP_UNAVAILABLE,
+                             driver=driver.name, guard=driver.guard(self.settings))
             reason = lane.unavailable()
-            if reason is None and not lane.api_key():
+            if reason is None and driver.needs_api_key and not lane.api_key():
                 reason = self._missing_key(lane)
             if (
                 reason is None
@@ -949,6 +1023,11 @@ class Agent:
                 hop.closed_until = entry["closed_until"]
                 self._hop(run, hop)
                 continue
+            reason = self._boot_driver(driver, lane)
+            if reason is not None:
+                hop.message = reason
+                self._hop(run, hop)
+                continue
             gate = health.check(lane)
             if not gate.ok:
                 hop.outcome = router.HOP_HEALTH_FAILED
@@ -960,10 +1039,13 @@ class Agent:
                 lane = dataclasses.replace(lane, base_url=gate.base_url)
 
             self.lane = lane
+            self.driver = driver
             self.model = model
             self.session_id = None
             run.lane = lane.name
             run.provider = lane.provider
+            run.driver = hop.driver
+            run.guard = hop.guard
             run.cold_load = gate.cold_load
             extra = self.settings.omlx_cold_load_seconds if gate.cold_load else 0.0
             run.deadline = _now() + lane.run_timeout + extra
@@ -971,7 +1053,7 @@ class Agent:
             events = self._collect(run, run.prompt, resume=None)
             refusal = None
             if not run.worked and run.trip is None and not self._closing:
-                refusal = router.classify_refusal(lane.name, events)
+                refusal = driver.refusal(lane, events)
             if refusal is None:
                 hop.outcome = router.HOP_RAN
                 self._hop(run, hop)
@@ -1051,9 +1133,7 @@ class Agent:
         """
         attempt = 0
         while True:
-            argv = self._argv(prompt, resume)
-            env = self.settings.child_env(self.agent_id, self.lane, self.model)
-            proc = _spawn_claude(argv, env, str(self.workspace))
+            proc = self._spawn(prompt, resume)
             self._current = proc
             collected: list[dict[str, Any]] = []
             watch = _Watch(run, self.settings, self.signatures, self.lane.max_steps)

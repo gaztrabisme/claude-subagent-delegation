@@ -95,12 +95,18 @@ class Hop:
     message: str | None = None
     reset_at: datetime | None = None
     closed_until: datetime | None = None
+    # The lane's driver ("claude" / "codex") and its guard ("hook" /
+    # "sandbox+hook"), whether or not the hop ran.
+    driver: str | None = None
+    guard: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "hop": self.index,
             "lane": self.lane,
             "provider": self.provider,
+            "driver": self.driver,
+            "guard": self.guard,
             "model": self.model,
             "outcome": self.outcome,
             "code": self.code,

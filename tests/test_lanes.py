@@ -182,7 +182,6 @@ def _delegate(server, tmp_path: Path, **kwargs):
     [
         ({"lane": "nope"}, "unknown lane"),
         ({"fallback": "sideways"}, "unknown fallback"),
-        ({"lane": "codex"}, "not available in this build"),
     ],
 )
 def test_delegate_rejects_without_spawning(server, tmp_path: Path, kwargs, words):

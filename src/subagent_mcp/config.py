@@ -166,6 +166,11 @@ class Settings:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def guard_hook_command(self, agent_id: str, *extra: str) -> str:
+        """The PreToolUse guard hook command line for one agent, any driver."""
+        parts = [sys.executable, str(APPROVAL_HOOK), "--agent", agent_id, *extra]
+        return " ".join(shlex.quote(p) for p in parts)
+
     def hooks_config(
         self, agent_id: str, lane: Lane | None = None, model: str | None = None
     ) -> Path:
@@ -181,10 +186,7 @@ class Settings:
         if self.supervisor == "off":
             hooks: dict = {}
         else:
-            command = (
-                f"{shlex.quote(sys.executable)} {shlex.quote(str(APPROVAL_HOOK))} "
-                f"--agent {shlex.quote(agent_id)}"
-            )
+            command = self.guard_hook_command(agent_id)
             hooks = {
                 "PreToolUse": [
                     {

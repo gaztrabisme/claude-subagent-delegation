@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,9 @@ def _lane_keys(monkeypatch):
     for name in KEY_ENVS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GLM_API_KEY", "test-key")
+    # No test may reach the real Codex CLI or the user's Codex login.
+    monkeypatch.setenv("SAM_CODEX_BIN", "/nonexistent/codex-disabled-in-tests")
+    monkeypatch.setenv("CODEX_HOME", "/nonexistent/codex-home-disabled-in-tests")
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:
@@ -151,3 +155,68 @@ def mock_endpoint():
     yield endpoint
     MOCK_PORTS.discard(endpoint.port)
     endpoint.close()
+
+
+# --- a fake `codex` binary replaying tests/fixtures/codex -----------------------
+
+CODEX_FIXTURES = Path(__file__).parent / "fixtures" / "codex"
+
+FAKE_CODEX = """\
+import json, os, sys
+argv = sys.argv[1:]
+stdin = sys.stdin.read()
+record = {
+    "argv": argv,
+    "stdin": stdin,
+    "env": {k: os.environ.get(k) for k in (
+        "CODEX_HOME", "SAM_APPROVAL_SOCKET", "GLM_API_KEY", "ANTHROPIC_AUTH_TOKEN")},
+    "cwd": os.getcwd(),
+}
+with open(os.environ["FAKE_CODEX_RECORD"], "a") as fh:
+    fh.write(json.dumps(record) + "\\n")
+fixture = os.environ["FAKE_CODEX_FIXTURE"]
+failed = False
+with open(fixture) as fh:
+    for line in fh:
+        if line.strip():
+            sys.stdout.write(line if line.endswith("\\n") else line + "\\n")
+            failed = failed or json.loads(line).get("type") == "turn.failed"
+sys.stdout.flush()
+sys.exit(1 if failed else 0)
+"""
+
+
+@pytest.fixture
+def fake_codex(tmp_path: Path, monkeypatch):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    binary = bindir / "codex"
+    binary.write_text(f"#!{sys.executable}\n{FAKE_CODEX}")
+    binary.chmod(0o755)
+    record = tmp_path / "codex-calls.jsonl"
+    user_home = tmp_path / "user-codex"
+    user_home.mkdir()
+    (user_home / "auth.json").write_text('{"fake": "login"}')
+    (user_home / "config.toml").write_text(
+        'notify = ["/bin/echo"]\nmodel = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n'
+        '[mcp_servers.x]\ncommand = "x"\n'
+    )
+    (user_home / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"hooks": [{"type": "command", "command": "/bin/sh /user/own-hook.sh"}]}]}}))
+    monkeypatch.setenv("SAM_CODEX_BIN", str(binary))
+    monkeypatch.setenv("CODEX_HOME", str(user_home))
+    monkeypatch.setenv("FAKE_CODEX_RECORD", str(record))
+    monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(CODEX_FIXTURES / "success.jsonl"))
+
+    class Fake:
+        home = user_home
+
+        def use(self, fixture: str) -> None:
+            monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(CODEX_FIXTURES / fixture))
+
+        def calls(self) -> list[dict]:
+            if not record.exists():
+                return []
+            return [json.loads(line) for line in record.read_text().splitlines()]
+
+    return Fake()

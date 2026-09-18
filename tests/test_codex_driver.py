@@ -367,3 +367,13 @@ def test_translator_counts_items_once():
     ]
     assert len(tool_uses) == 9
     assert out[-1]["type"] == "result" and out[-1]["is_error"] is False
+
+
+def test_hook_codex_forwards_workdir_and_payload_cwd(supervisor_socket):
+    """H1: the classifier sees where the command runs."""
+    out = _hook(supervisor_socket, {**CODEX_PAYLOAD, "tool_name": "exec_command",
+                                    "tool_input": {"cmd": "cat id_ed25519", "workdir": "~/.ssh"}})
+    assert out.returncode == 0
+    seen = supervisor_socket.seen[0]
+    assert seen["tool_input"] == {"command": "cat id_ed25519", "workdir": "~/.ssh"}
+    assert seen["cwd"] == "/w"

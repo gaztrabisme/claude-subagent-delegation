@@ -74,7 +74,13 @@ def requests(tool_name: str, tool_input, codex: bool) -> list[tuple[str, object]
             command = tool_input.get("cmd")
         if isinstance(command, list):
             command = shlex.join(str(part) for part in command)
-        return [("Bash", {"command": command} if command is not None else {})]
+        args = {"command": command} if command is not None else {}
+        workdir = tool_input.get("workdir") if isinstance(tool_input, dict) else None
+        if workdir is not None:
+            # The guard resolves relative paths against it and refuses one
+            # outside the workspace.
+            args["workdir"] = workdir
+        return [("Bash", args)]
     if tool_name == "apply_patch":
         patch = tool_input
         if isinstance(tool_input, dict):
@@ -147,6 +153,7 @@ def main() -> None:
             "tool_name": name,
             "tool_input": args,
             "workspace": workspace,
+            "cwd": payload.get("cwd"),
             "agent_id": agent_id(),
         }
         try:

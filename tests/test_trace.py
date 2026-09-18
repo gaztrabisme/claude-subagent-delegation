@@ -1,4 +1,4 @@
-"""Trace record shape. Schema 2 added session_id to run records."""
+"""Trace record shape. Schema 2 added session_id to run records; 3 added hop records and run lane/provider."""
 
 from __future__ import annotations
 
@@ -18,6 +18,6 @@ def test_run_record_carries_session_id_and_current_schema(tmp_path: Path):
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     record = json.loads(lines[0])
-    assert record["schema"] == SCHEMA == 2
+    assert record["schema"] == SCHEMA == 3
     assert record["kind"] == "run"
     assert record["session_id"] == "sess-xyz"

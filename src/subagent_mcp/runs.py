@@ -7,6 +7,7 @@ re-enters the same session via ``--resume``.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -18,13 +19,15 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import health, router
 from .config import Settings, log
 from .guard import protect
+from .lane_state import LaneState
 from .lanes import FALLBACK_MODES, Lane
 from .trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
@@ -531,6 +534,14 @@ class Run:
     session_id: str | None = None
     lane: str | None = None
     fallback: str | None = None
+    provider: str | None = None
+    # Set on a delegate's run: it walks the lane chain. Continues never do.
+    route: bool = False
+    # Lanes the router tried, as router.Hop dicts, in order.
+    hops: list[dict[str, Any]] = field(default_factory=list)
+    # Whether the child did any work in this run: a tool call or output tokens.
+    worked: bool = False
+    cold_load: bool = False
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -539,6 +550,7 @@ class Run:
             "state": self.state,
             "phase": self.phase,
             "lane": self.lane,
+            "provider": self.provider,
             "fallback": self.fallback,
             "task": _clip(self.prompt, 120),
             "finish_reason": self.finish_reason,
@@ -562,6 +574,10 @@ class Run:
             out["verification"] = self.verification_result.as_dict()
         if self.verification_note:
             out["verification_note"] = self.verification_note
+        if self.hops:
+            out["hops"] = list(self.hops)
+        if self.cold_load:
+            out["cold_load"] = True
         if self.error:
             out["error"] = self.error
         if self.error_detail:
@@ -586,12 +602,19 @@ class Agent:
         trace: Trace | None = None,
         lane: Lane | None = None,
         fallback: str = "full",
+        chain: list[Lane] | None = None,
+        lane_state: LaneState | None = None,
+        lane_load: Callable[[str, Agent], int] | None = None,
     ):
         self.trace = trace
-        # The lane this agent runs on. Routing between lanes comes later;
-        # today every run of the agent uses this one.
+        # The lane this agent runs on. The delegate's run may move it along
+        # `chain` (router.chain) when a lane refuses before work; after that
+        # every continue stays on the lane that ran.
         self.lane = lane or settings.lane()
         self.fallback = fallback
+        self.chain = list(chain) if chain else [self.lane]
+        self.lane_state = lane_state
+        self._lane_load = lane_load
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -634,7 +657,12 @@ class Agent:
         return self._start_error
 
     def submit(
-        self, prompt: str, verification: str | None = None, *, note: str | None = None
+        self,
+        prompt: str,
+        verification: str | None = None,
+        *,
+        note: str | None = None,
+        route: bool = False,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -646,6 +674,8 @@ class Agent:
             verification_note=note,
             lane=self.lane.name,
             fallback=self.fallback,
+            provider=self.lane.provider,
+            route=route,
         )
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
@@ -656,9 +686,12 @@ class Agent:
         return run
 
     def delegate(self, prompt: str, verification: str) -> Run:
-        """The agent's first run. Its verification is kept for continues."""
+        """The agent's first run. Its verification is kept for continues.
+
+        This run walks the lane chain; continues stay on the lane it ran on.
+        """
         self.delegate_verification = verification
-        return self.submit(prompt, verification=verification)
+        return self.submit(prompt, verification=verification, route=True)
 
     def follow_up(self, message: str, verification: str | None = None) -> Run:
         """A continue. Omitting `verification` reuses the delegate's; "" skips it.
@@ -817,16 +850,19 @@ class Agent:
         run.deadline = run.started_at + self.lane.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
-        if not self.lane.api_key():
-            run.state = FAILED
-            names = ", ".join(self.lane.api_key_envs) or "(none configured)"
-            run.error = f"missing API key for lane {self.lane.name!r}: set one of {names}"
-            run.phase = PHASE_DONE
-            run.finished_at = _now()
-            run.done.set()
-            return
-
-        self._turn(run, run.prompt, resume=self.session_id)
+        if run.route:
+            if not self._route(run):
+                self._finish(run)
+                return
+        else:
+            if not self.lane.api_key():
+                run.state = FAILED
+                run.error = self._missing_key(self.lane)
+                run.phase = PHASE_DONE
+                run.finished_at = _now()
+                run.done.set()
+                return
+            self._turn(run, run.prompt, resume=self.session_id)
         if self._closing or run.trip or run.state in TERMINAL_STATES:
             self._finish(run)
             return
@@ -860,6 +896,113 @@ class Agent:
         else:
             run.state = COMPLETED_UNVERIFIED
         self._finish(run)
+
+    @staticmethod
+    def _missing_key(lane: Lane) -> str:
+        names = ", ".join(lane.api_key_envs) or "(none configured)"
+        return f"missing API key for lane {lane.name!r}: set one of {names}"
+
+    def _hop(self, run: Run, hop: router.Hop) -> None:
+        run.hops.append(hop.as_dict())
+        run.note(f"hop {hop.index}: {hop.lane} {hop.outcome}"
+                 + (f" ({hop.code})" if hop.code else ""))
+        log.info("run %s hop %d: lane %s %s %s", run.run_id, hop.index, hop.lane,
+                 hop.outcome, hop.code or "")
+        if self.trace is not None:
+            self.trace.hop(run_id=run.run_id, agent_id=self.agent_id, hop=hop)
+
+    def _route(self, run: Run) -> bool:
+        """Run a delegate on the first lane in the chain that takes it.
+
+        Per lane: skip it when it is unavailable in this build, has no key, is
+        full, or is closed in lane memory; run its health gate; spawn. A
+        refusal before any work moves to the next lane and may close this one
+        on disk. Anything else, including a failure after work started, is
+        the run's result and ends the walk. Returns False when no lane ran it.
+        """
+        primary_model = self.model
+        last_refusal: str | None = None
+        for index, lane in enumerate(self.chain):
+            if self._closing:
+                return False
+            model = primary_model if index == 0 else (lane.model or "")
+            hop = router.Hop(index, lane.name, lane.provider, model, router.HOP_UNAVAILABLE)
+            reason = lane.unavailable()
+            if reason is None and not lane.api_key():
+                reason = self._missing_key(lane)
+            if (
+                reason is None
+                and index > 0
+                and self._lane_load is not None
+                and self._lane_load(lane.name, self) >= lane.max_agents
+            ):
+                reason = f"lane {lane.name!r} is at its agent limit ({lane.max_agents})"
+            if reason is not None:
+                hop.message = reason
+                self._hop(run, hop)
+                continue
+            entry = self.lane_state.closed(lane.name) if self.lane_state else None
+            if entry is not None:
+                hop.outcome = router.HOP_SKIPPED_CLOSED
+                hop.code = entry.get("code")
+                hop.message = entry.get("message")
+                hop.closed_until = entry["closed_until"]
+                self._hop(run, hop)
+                continue
+            gate = health.check(lane)
+            if not gate.ok:
+                hop.outcome = router.HOP_HEALTH_FAILED
+                hop.code = router.HEALTH_FAILED
+                hop.message = gate.message
+                self._hop(run, hop)
+                continue
+            if gate.base_url and gate.base_url != lane.base_url:
+                lane = dataclasses.replace(lane, base_url=gate.base_url)
+
+            self.lane = lane
+            self.model = model
+            self.session_id = None
+            run.lane = lane.name
+            run.provider = lane.provider
+            run.cold_load = gate.cold_load
+            extra = self.settings.omlx_cold_load_seconds if gate.cold_load else 0.0
+            run.deadline = _now() + lane.run_timeout + extra
+            run.worked = False
+            events = self._collect(run, run.prompt, resume=None)
+            refusal = None
+            if not run.worked and run.trip is None and not self._closing:
+                refusal = router.classify_refusal(lane.name, events)
+            if refusal is None:
+                hop.outcome = router.HOP_RAN
+                self._hop(run, hop)
+                for event in events:
+                    self._ingest(run, event)
+                return True
+            hop.outcome = router.HOP_REFUSED
+            hop.code = refusal.code
+            hop.message = refusal.message
+            hop.reset_at = refusal.reset_at
+            until = router.close_until(
+                refusal,
+                balance_close_hours=self.settings.balance_close_hours,
+                throttle_close_minutes=self.settings.throttle_close_minutes,
+            )
+            if until is not None and self.lane_state is not None:
+                self.lane_state.close(lane.name, until, refusal.code, refusal.message)
+                hop.closed_until = until
+            self._hop(run, hop)
+            last_refusal = refusal.message
+        if self._closing:
+            return False
+        tried = "; ".join(
+            f"{h['lane']} {h['outcome']}" + (f" ({h['code']})" if h.get("code") else "")
+            for h in run.hops
+        )
+        run.state = FAILED
+        run.error = f"no lane took the run: {tried}"
+        run.error_detail = last_refusal
+        run.finish_reason = "no_lane"
+        return False
 
     def _distill(self, run: Run) -> str:
         prompt = DISTIL_PROMPT.format(limit=self.settings.result_cap_chars)
@@ -936,12 +1079,16 @@ class Agent:
             succeeded = any(
                 e.get("type") == "result" and not e.get("is_error") for e in collected
             )
+            # Across attempts: work done before a retried 429 still counts.
+            run.worked = run.worked or router.did_work(collected)
             code = terminal.get("zai_code") if isinstance(terminal, dict) else None
             retryable = (
                 isinstance(terminal, dict)
                 and terminal.get("error_kind") == "rate_limited"
                 # A spent plan quota resets hours later; retrying burns wall clock.
                 and code not in ZAI_QUOTA_CODES
+                # Nor does an empty balance or a usage limit.
+                and not router.no_retry(str(terminal.get("error") or ""))
                 and not succeeded
                 and run.trip is None
                 and not self._closing
@@ -1073,6 +1220,7 @@ class Registry:
             settings.trace, settings.session_root
         )
         protect(settings.session_root)
+        self.lane_state = LaneState(settings.session_root)
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()
@@ -1188,9 +1336,24 @@ class Registry:
                 trace=self.trace,
                 lane=chosen,
                 fallback=fallback,
+                chain=[
+                    self.settings.lanes[n]
+                    for n in router.chain(chosen.name, fallback)
+                    if n in self.settings.lanes
+                ],
+                lane_state=self.lane_state,
+                lane_load=self._lane_load,
             )
             self._agents[agent_id] = agent
             return agent
+
+    def _lane_load(self, lane: str, asking: Agent) -> int:
+        """Live agents other than `asking` currently on `lane`."""
+        with self._lock:
+            return sum(
+                1 for a in self._agents.values()
+                if a is not asking and not a.closed and a.lane.name == lane
+            )
 
     def agent(self, agent_id: str) -> Agent:
         with self._lock:

@@ -96,6 +96,11 @@ class Settings:
     throttle_backoff: float
     default_lane: str = DEFAULT_LANE
     lanes: dict[str, Lane] = field(default_factory=dict)
+    # Lane memory: how long a refusal with no reset time keeps a lane closed.
+    balance_close_hours: float = 6.0
+    throttle_close_minutes: float = 15.0
+    # Extra time a run gets when oMLX reports no model loaded yet.
+    omlx_cold_load_seconds: float = 120.0
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -143,6 +148,9 @@ class Settings:
             throttle_backoff=_float_env("SAM_THROTTLE_BACKOFF", 60.0) or 60.0,
             default_lane=os.environ.get("SAM_DEFAULT_LANE") or DEFAULT_LANE,
             lanes=load_lanes(os.environ),
+            balance_close_hours=_float_env("SAM_BALANCE_CLOSE_HOURS", 6.0) or 6.0,
+            throttle_close_minutes=_float_env("SAM_THROTTLE_CLOSE_MINUTES", 15.0) or 15.0,
+            omlx_cold_load_seconds=_float_env("SAM_OMLX_COLD_LOAD_SECONDS", 120.0) or 120.0,
         )
 
     def lane(self, name: str | None = None) -> Lane:

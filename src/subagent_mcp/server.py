@@ -170,9 +170,13 @@ async def delegate(
         wait_seconds: Block up to this long for the run to finish. 0 returns at once.
         lane: Backend to run on: codex, deepseek, glm, bppc or omlx. Defaults
             to the server's default lane (SAM_DEFAULT_LANE, glm unless set).
-        fallback: Which other lanes may take the work if this one cannot:
-            "full", "local" or "none". Recorded but not acted on yet; the run
-            stays on the named lane.
+        fallback: Which other lanes may take the work if this one refuses
+            before doing any work (quota spent, balance empty, usage limit,
+            local server down): "full" tries the other cloud lanes then bppc
+            and omlx, "local" only bppc and omlx, "none" no other lane. A
+            failure after work started is never moved. The result's `lane`
+            names the lane that ran and `hops` lists every lane tried.
+            continue always stays on that lane.
     """
     try:
         chosen = registry.select_lane(lane, fallback)
@@ -216,7 +220,7 @@ async def delegate(
     out = _result(run)
     out["workspace"] = str(resolved)
     out["model"] = agent.model
-    out["lane"] = agent.lane.name
+    out["lane"] = run.lane or agent.lane.name
     out["fallback"] = agent.fallback
     return out
 

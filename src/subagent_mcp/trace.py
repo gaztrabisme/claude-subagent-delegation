@@ -32,7 +32,10 @@ from typing import Any
 
 from .config import log
 
-SCHEMA = 2  # 2: run records carry the Claude Code session_id (2026-09-18)
+# 2: run records carry the Claude Code session_id (2026-09-18)
+# 3: one "hop" record per lane the router tried; run records carry lane and
+#    provider (2026-09-18)
+SCHEMA = 3
 
 
 class Trace:
@@ -101,6 +104,8 @@ class Trace:
             agent_id=run.agent_id,
             session_id=run.session_id,
             model=model,
+            lane=getattr(run, "lane", None),
+            provider=getattr(run, "provider", None),
             workspace=workspace,
             state=run.state,
             finish_reason=run.finish_reason,
@@ -113,6 +118,22 @@ class Trace:
             **distil,
             verification=verification.as_dict() if verification else None,
             error=run.error,
+        )
+
+    def hop(self, *, run_id: str, agent_id: str, hop: Any) -> None:
+        """One lane the router tried for a run (a router.Hop)."""
+        self.write(
+            "hop",
+            run_id=run_id,
+            agent_id=agent_id,
+            hop=hop.index,
+            lane=hop.lane,
+            provider=hop.provider,
+            model=hop.model,
+            outcome=hop.outcome,
+            code=hop.code,
+            reset_at=hop.reset_at.isoformat() if hop.reset_at else None,
+            closed_until=hop.closed_until.isoformat() if hop.closed_until else None,
         )
 
     def calibration(self, *, run_id: str, chars: int, output_tokens: int, assumed: float) -> None:

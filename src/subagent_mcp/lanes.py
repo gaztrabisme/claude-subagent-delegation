@@ -35,8 +35,8 @@ OMLX_SETTINGS = Path(".omlx") / "settings.json"
 class Lane:
     """One backend a child can run on, with its resolved knobs.
 
-    base_url None means the lane has no endpoint in this build: bppc's address
-    is resolved at run time in a later unit, and codex needs none because the
+    base_url None means the address is not fixed: bppc's (resolver "bppc")
+    is found at dispatch by the health gate, and codex needs none because the
     Codex CLI owns its own connection. model None means the driver's own
     configured model.
     """
@@ -56,6 +56,7 @@ class Lane:
     run_timeout: float
     idle_timeout: float
     health_url: str | None
+    resolver: str | None = None
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         """The first set key in `api_key_envs`, else `default_api_key`."""
@@ -70,7 +71,7 @@ class Lane:
         """Why this build cannot run a child on this lane, or None."""
         if self.driver != DRIVER_CLAUDE:
             return f"lane {self.name!r} ({self.driver} driver) is not available in this build"
-        if not self.base_url:
+        if not self.base_url and not self.resolver:
             return f"lane {self.name!r} has no base URL and is not available in this build"
         return None
 
@@ -164,6 +165,7 @@ def _lane(
     run_timeout: float = CLOUD_RUN_TIMEOUT,
     idle_timeout: float = CLOUD_IDLE_TIMEOUT,
     health_url: str | None = None,
+    resolver: str | None = None,
 ) -> Lane:
     url = _text(env, name, "BASE_URL", base_url)
     return Lane(
@@ -182,6 +184,7 @@ def _lane(
         run_timeout=_float(env, name, "RUN_TIMEOUT", run_timeout),
         idle_timeout=_float(env, name, "IDLE_TIMEOUT", idle_timeout),
         health_url=health_url,
+        resolver=resolver,
     )
 
 
@@ -227,6 +230,7 @@ def load_lanes(env: Mapping[str, str]) -> dict[str, Lane]:
             local=True,
             max_agents=1,
             compact_window=40960,
+            resolver="bppc",
         ),
         _lane(
             env,

@@ -9,7 +9,7 @@ from pathlib import Path
 import anyio
 import pytest
 
-from subagent_mcp import runs
+from subagent_mcp import health, runs
 from subagent_mcp.lanes import load_lanes, omlx_settings_key
 from subagent_mcp.runs import COMPLETED, Registry
 
@@ -183,7 +183,6 @@ def _delegate(server, tmp_path: Path, **kwargs):
         ({"lane": "nope"}, "unknown lane"),
         ({"fallback": "sideways"}, "unknown fallback"),
         ({"lane": "codex"}, "not available in this build"),
-        ({"lane": "bppc"}, "not available in this build"),
     ],
 )
 def test_delegate_rejects_without_spawning(server, tmp_path: Path, kwargs, words):
@@ -234,6 +233,8 @@ def test_caller_model_beats_lane_model(server, tmp_path: Path):
 
 def test_omlx_child_gets_lane_values_and_no_sampling(server, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SAM_OMLX_API_KEY", "omlx-key")
+    # The health gate is covered in test_health; here oMLX is up.
+    monkeypatch.setattr(health, "check_omlx", lambda lane: health.Health(True, lane.base_url))
     out = _delegate(server, tmp_path, lane="omlx", wait_seconds=5)
     assert out["state"] == COMPLETED
     proc = server.spawned[0]

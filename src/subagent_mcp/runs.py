@@ -550,6 +550,11 @@ class _Meter:
         self.first_assistant: float | None = None
         self._mark = spawned_at
         self._current: str | None = None
+        # The message the partial-message stream is on. Kept apart from
+        # _current: a denied tool's result can arrive before the message's
+        # own message_delta (which carries its usage and stop_reason), and
+        # that delta still belongs to the message that started the stream.
+        self._stream: str | None = None
 
     def _turn(self, message_id: Any, now: float, model: Any = None) -> dict[str, Any]:
         key = str(message_id) if message_id else (self._current or f"attempt-{self.attempt}")
@@ -581,22 +586,29 @@ class _Meter:
                 message = inner.get("message") if isinstance(inner.get("message"), dict) else {}
                 turn = self._turn(message.get("id"), now, message.get("model"))
                 turn["usage"] = _max_fields(turn["usage"], _usage_fields(message.get("usage")))
-            elif sub in ("content_block_start", "content_block_delta") and self._current:
-                turn = self.turns[self._current]
+                self._stream = self._current
+                return
+            key = self._stream or self._current
+            if key is None or key not in self.turns:
+                return
+            turn = self.turns[key]
+            if sub in ("content_block_start", "content_block_delta"):
                 if turn["ts_first_token"] is None:
                     turn["ts_first_token"] = now
                 if self.first_assistant is None:
                     self.first_assistant = now
-            elif sub == "message_delta" and self._current:
-                turn = self.turns[self._current]
+            elif sub == "message_delta":
                 turn["usage"] = _max_fields(turn["usage"], _usage_fields(inner.get("usage")))
                 delta = inner.get("delta") if isinstance(inner.get("delta"), dict) else {}
                 if delta.get("stop_reason"):
                     turn["stop_reason"] = delta["stop_reason"]
-                turn["ts_end"] = now
-            elif sub == "message_stop" and self._current:
-                self.turns[self._current]["ts_end"] = now
-                self._mark = now
+                turn["ts_end"] = max(turn["ts_end"] or now, now)
+            elif sub == "message_stop":
+                turn["ts_end"] = max(turn["ts_end"] or now, now)
+                if self._current == key:
+                    # No tool result since: the next request goes out now.
+                    self._mark = now
+                self._stream = None
             return
         if kind == "assistant":
             message = event.get("message") if isinstance(event.get("message"), dict) else {}

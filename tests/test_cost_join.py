@@ -13,6 +13,9 @@ pytest.importorskip("pyarrow")
 
 ROOT = Path(__file__).resolve().parents[1]
 FIX = ROOT / "tests" / "fixtures" / "cost"
+# Fixture copy of scripts/pricing.toml with provider prices "null", so tests of
+# unknown-cost handling do not break when the real file gains provider prices.
+PRICING_UNKNOWN = FIX / "pricing_unknown.toml"
 
 
 def _load_module():
@@ -37,7 +40,7 @@ def out(tmp_path_factory):
             "--transcripts",
             str(FIX / "projects"),
             "--pricing",
-            str(ROOT / "scripts" / "pricing.toml"),
+            str(PRICING_UNKNOWN),
             "--out",
             str(out_dir),
         ]
@@ -102,7 +105,7 @@ def test_counterfactual_override(tmp_path):
             "--transcripts",
             str(FIX / "projects"),
             "--pricing",
-            str(ROOT / "scripts" / "pricing.toml"),
+            str(PRICING_UNKNOWN),
             "--out",
             str(tmp_path),
             "--counterfactual",
@@ -121,6 +124,17 @@ def test_unknown_provider_cost_is_null_not_zero(runs, lanes):
     assert a["net_saving_usd_excl_provider"] == pytest.approx(1.30 - 0.02365, abs=1e-9)
     assert pd.isna(lanes.loc["glm", "provider_usd"])
     assert pd.isna(lanes.loc["glm", "net_saving_usd"])
+
+
+def test_real_pricing_file_has_known_provider_costs():
+    # The unknown-cost tests above rely on the nulled fixture; this guards the
+    # real scripts/pricing.toml, where provider prices are filled in.
+    pricing = cost_join.load_pricing(ROOT / "scripts" / "pricing.toml", None)
+    monthly_usd = pricing.providers["glm"]["monthly_usd"]
+    assert isinstance(monthly_usd, (int, float)) and not isinstance(monthly_usd, bool)
+    deepseek = pricing.providers["deepseek"]
+    for key in ("input", "output", "cache_read"):
+        assert isinstance(deepseek[key], (int, float))
 
 
 def test_local_provider_is_zero(runs):
@@ -166,7 +180,7 @@ def test_duplicate_run_id_flagged_and_disambiguated(tmp_path):
             "--transcripts",
             str(FIX / "projects"),
             "--pricing",
-            str(ROOT / "scripts" / "pricing.toml"),
+            str(PRICING_UNKNOWN),
             "--out",
             str(out),
         ]
@@ -178,7 +192,7 @@ def test_duplicate_run_id_flagged_and_disambiguated(tmp_path):
 
 
 def test_unknown_parent_model_priced_at_counterfactual_and_flagged():
-    pricing = cost_join.load_pricing(ROOT / "scripts" / "pricing.toml", None)
+    pricing = cost_join.load_pricing(PRICING_UNKNOWN, None)
     usd, unknown = cost_join.message_usd(
         pricing, {"model": "<synthetic>", "usage": {"input_tokens": 1000, "output_tokens": 0}}
     )

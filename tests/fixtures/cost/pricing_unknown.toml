@@ -1,0 +1,66 @@
+# Copy of scripts/pricing.toml for tests/test_cost_join.py, with every provider
+# price set to "null" so provider costs are unknown. Keep the other sections in
+# sync with scripts/pricing.toml; real provider prices are asserted in
+# test_real_pricing_file_has_known_provider_costs.
+#
+# Model rates are USD per million tokens (Claude list prices).
+# Cache multipliers are relative to the model's input rate.
+#
+# TOML has no null. A value that is absent (commented out) means UNKNOWN:
+# the script reports it as null and never treats it as zero. The strings
+# "null" and "unknown" are read the same way.
+
+# Model the child's tokens are priced at to answer "what would this have cost
+# on Claude". Overridable with --counterfactual. A parent message whose model
+# is not listed below is priced at this model and flagged.
+counterfactual_model = "claude-opus-5"
+
+[cache_multipliers]
+cache_write_5m = 1.25
+cache_write_1h = 2.0
+cache_read = 0.1
+
+[models.claude-opus-5]
+input = 5.00
+output = 25.00
+
+[models.claude-sonnet-5]
+input = 2.00
+output = 10.00
+
+[models.claude-haiku-4-5]
+input = 1.00
+output = 5.00
+
+[models.claude-fable-5-1]
+input = 10.00
+output = 50.00
+cache_read_multiplier = 0.025   # overrides cache_multipliers.cache_read
+
+# Provider actual cost, per lane.
+#   flat_plan: subscription. monthly_usd is spread evenly over that lane's
+#              runs in each calendar month (UTC).
+#   per_token: USD per million tokens; cache_write is billed at the input rate.
+#   local:     fixed per-run cost `usd` (0 for hardware already owned).
+
+[provider.glm]
+kind = "flat_plan"
+monthly_usd = "null"
+
+[provider.codex]
+kind = "flat_plan"
+monthly_usd = "null"
+
+[provider.deepseek]
+kind = "per_token"
+input = "null"
+output = "null"
+cache_read = "null"
+
+[provider.bppc]
+kind = "local"
+usd = 0
+
+[provider.omlx]
+kind = "local"
+usd = 0

@@ -19,8 +19,9 @@ Reader: the coordinator and the build lanes for this run.
 - GLM: last runs have no status recorded; one exit 143 (cancel).
 
 ## MISSING
-- Whether `claude -p` against oMLX `/v1/messages` completes a tool-use turn (streaming, tool_use blocks).
+- ~~Whether oMLX `/v1/messages` returns tool_use blocks~~ — resolved 2026-09-18: REAP returned `tool_use Bash {"command":"ls"}`, stop_reason tool_use, 8.4 s including cold load. Streaming through `claude -p` is proven by U4 4.2.
 - Whether DeepSeek's Anthropic endpoint serves deepseek-v4-pro with tool use; cannot test with no balance.
-- A guard for the Codex lane: Codex has no PreToolUse hook; its own sandbox is the only gate.
+- ~~A guard for the Codex lane~~ — codex-cli 0.153 has stable hooks (`features list`: hooks stable) with PreToolUse in `$CODEX_HOME/hooks.json` and `--dangerously-bypass-hook-trust` for automation. U3 installs the guard there too; live proof waits for the 09-20 quota reset.
+- Parent transcripts carry no subagent session id; the MCP server gets no parent session id in its env. The cost join keys on run_id found in the parent's tool_result.
 
 Grounded: G and D wikis and code, report.md, ~/.claude.json lane env, live probes → one server with two child drivers (`claude -p`, `codex exec`); four of five lanes run through G's guarded runtime; Codex runs in its own sandbox.

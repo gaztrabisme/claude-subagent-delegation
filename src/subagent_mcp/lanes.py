@@ -57,6 +57,8 @@ class Lane:
     idle_timeout: float
     health_url: str | None
     resolver: str | None = None
+    # A request adapter (adapter.ADAPTERS) the child's requests pass through.
+    adapter: str | None = None
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         """The first set key in `api_key_envs`, else `default_api_key`."""
@@ -94,6 +96,7 @@ class Lane:
             "max_steps": self.max_steps,
             "run_timeout": self.run_timeout,
             "idle_timeout": self.idle_timeout,
+            "adapter": self.adapter,
         }
 
 
@@ -168,8 +171,13 @@ def _lane(
     idle_timeout: float = CLOUD_IDLE_TIMEOUT,
     health_url: str | None = None,
     resolver: str | None = None,
+    adapter: str | None = None,
 ) -> Lane:
     url = _text(env, name, "BASE_URL", base_url)
+    # SAM_<LANE>_ADAPTER=none turns a lane's default adapter off.
+    adapter = _text(env, name, "ADAPTER", adapter)
+    if adapter is not None and adapter.lower() in ("none", "off"):
+        adapter = None
     return Lane(
         name=name,
         driver=driver,
@@ -187,6 +195,7 @@ def _lane(
         idle_timeout=_float(env, name, "IDLE_TIMEOUT", idle_timeout),
         health_url=health_url,
         resolver=resolver,
+        adapter=adapter,
     )
 
 
@@ -233,6 +242,9 @@ def load_lanes(env: Mapping[str, str]) -> dict[str, Lane]:
             max_agents=1,
             compact_window=40960,
             resolver="bppc",
+            # llama.cpp's Qwen3.8 template refuses a system message after the
+            # first user turn, which Claude Code sends.
+            adapter="fold_system",
         ),
         _lane(
             env,
@@ -245,7 +257,9 @@ def load_lanes(env: Mapping[str, str]) -> dict[str, Lane]:
             default_api_key=omlx_settings_key(),
             local=True,
             send_sampling=False,
-            max_agents=4,
+            # Measured on this Mac: aggregate output tok/s 20.1 at 1 child,
+            # 18.3 at 2, 7.6 at 4; p90 TTFT 3.9 s -> 181 s at 4.
+            max_agents=1,
             compact_window=98304,
             health_url="http://127.0.0.1:8000/api/status",
         ),

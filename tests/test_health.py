@@ -141,10 +141,14 @@ def test_health_bppc_cold_load_extends_deadline_and_marks_hop(
         tmp_path: Path, lanes_on_mock, trace_records):  # noqa: F811
     ep = lanes_on_mock
     ep.routes["/bppc/health"] = (200, {"status": "ok", "backend": "stopped"})
+    # The owner's proxy starts its backend on the first proxied request.
+    ep.on_hit["/bppc/v1/models"] = lambda: ep.routes.__setitem__(
+        "/bppc/health", (200, {"status": "ok", "backend": "running"}))
     reg = _registry(tmp_path, ep, bppc_cold_load_seconds=700.0, trace=str(tmp_path / "t.jsonl"))
     try:
         before = time.time()
         _, run = _delegate(reg, tmp_path, "bppc", "none")
+        assert ep.hits["/bppc/v1/models"] == 1
         assert run.cold_load and run.hops[0]["cold_load"] is True
         timeout = reg.settings.lanes["bppc"].run_timeout
         assert run.deadline - before >= timeout + 700 - 1

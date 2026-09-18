@@ -13,11 +13,14 @@ model), but the result carries cold_load so the run can allow for it.
 
 bppc's :8080 is a proxy that stops llama.cpp when idle and starts it on the
 first request. Its /health then answers {"status": "ok", "backend": "stopped"}:
-healthy, with cold_load set, like oMLX with no model loaded.
+healthy, with cold_load set, like oMLX with no model loaded. Before a child
+is spawned on a cold bppc, warm_bppc sends one GET /v1/models through that
+proxy (the owner's proxy then starts its own backend) and polls /health until
+it says "running", bounded by SAM_BPPC_COLD_LOAD_SECONDS.
 
 Cloud lanes have no gate: their refusals come back in the child's own error.
 
-Nothing here starts a model server. A lane whose server is down fails its
+Nothing here starts a model server itself. A lane whose server is down fails its
 gate and the router moves on.
 """
 
@@ -27,6 +30,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -171,6 +176,44 @@ def check_bppc(lane: Lane, env: Mapping[str, str] | None = None) -> Health:
     return Health(
         False, None, f"bppc: no host answered /health on :{port} (tried {', '.join(hosts)})"
     )
+
+
+def _backend_running(body: bytes) -> bool:
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("backend") == "running"
+
+
+WARM_POLL_SECONDS = 2.0
+
+
+def warm_bppc(base_url: str, seconds: float, key: str | None = None,
+              poll: float = WARM_POLL_SECONDS) -> Health:
+    """Wake bppc's backend and wait for it, at most `seconds`.
+
+    One GET <base_url>/v1/models goes through the owner's proxy, which starts
+    its own llama.cpp container and holds the request until it is healthy.
+    That request runs on a side thread; this polls /health until the proxy
+    reports "backend": "running". ok False when the bound passes first.
+    """
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    deadline = time.monotonic() + seconds
+    trigger = threading.Thread(
+        target=_http_get, args=(f"{base_url}/v1/models", headers, max(1.0, seconds)),
+        name="sam-bppc-warm", daemon=True,
+    )
+    trigger.start()
+    while True:
+        found = _http_get(f"{base_url}/health")
+        if found is not None and found[0] == 200 and _backend_running(found[1]):
+            return Health(True, base_url, cold_load=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return Health(False, None,
+                          f"bppc: backend not running {seconds:g}s after the wake request")
+        time.sleep(min(poll, remaining))
 
 
 def check_omlx(lane: Lane) -> Health:

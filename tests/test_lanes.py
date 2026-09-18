@@ -57,7 +57,7 @@ def test_registry_lists_five_lanes_in_order(home):
     bppc, omlx = lanes["bppc"], lanes["omlx"]
     assert (bppc.max_agents, bppc.compact_window, bppc.default_api_key) == (1, 40960, "local")
     assert bppc.health_url is None
-    assert (omlx.max_agents, omlx.compact_window) == (4, 98304)
+    assert (omlx.max_agents, omlx.compact_window) == (1, 98304)
     assert omlx.health_url == "http://127.0.0.1:8000/api/status"
     # Cloud lanes take the Settings defaults.
     glm = lanes["glm"]

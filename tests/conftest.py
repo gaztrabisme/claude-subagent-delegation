@@ -110,15 +110,20 @@ class MockEndpoint:
         self.routes: dict[str, tuple[int, object]] = {}
         self.hits: Counter[str] = Counter()
         self.headers: dict[str, dict[str, str]] = {}
+        # path -> callable run after the request is counted, before the answer.
+        self.on_hit: dict[str, object] = {}
+        self.bodies: dict[str, bytes] = {}
         endpoint = self
 
         class Handler(BaseHTTPRequestHandler):
             def _answer(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
+                endpoint.bodies[self.path] = self.rfile.read(length) if length else b""
                 endpoint.hits[self.path] += 1
                 endpoint.headers[self.path] = dict(self.headers.items())
+                hook = endpoint.on_hit.get(self.path)
+                if callable(hook):
+                    hook()
                 status, body = endpoint.routes.get(self.path, (404, {"error": "not found"}))
                 raw = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(status)

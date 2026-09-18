@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import health, router
+from . import adapter, health, router
 from .config import Settings, log
 from .guard import protect
 from .lane_state import LaneState
@@ -1233,6 +1233,17 @@ class Agent:
                 continue
             if gate.base_url and gate.base_url != lane.base_url:
                 lane = dataclasses.replace(lane, base_url=gate.base_url)
+            if gate.cold_load and lane.resolver == "bppc" and gate.base_url:
+                # Claude Code gives up on a request that waits out a container
+                # start; wake the backend first, bounded by the cold-load time.
+                warm = health.warm_bppc(gate.base_url, self.settings.cold_load_seconds(lane.name),
+                                        lane.api_key())
+                if not warm.ok:
+                    hop.outcome = router.HOP_HEALTH_FAILED
+                    hop.code = router.HEALTH_FAILED
+                    hop.message = warm.message
+                    self._hop(run, hop)
+                    continue
             if self.telemetry is not None and self.telemetry.covers(lane):
                 admission = self.telemetry.admission(lane)
                 hop.admission = admission.snapshot
@@ -1754,3 +1765,4 @@ class Registry:
             if not agent.closed:
                 agent.close("server shutting down", kind=KILL_SHUTDOWN)
         self.telemetry.shutdown()
+        adapter.shutdown()

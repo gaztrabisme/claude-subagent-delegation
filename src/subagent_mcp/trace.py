@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,16 @@ from .config import log
 # 2: run records carry the Claude Code session_id (2026-09-18)
 # 3: one "hop" record per lane the router tried; run and hop records carry
 #    lane, provider, driver and guard (2026-09-18)
+#    Same schema, more kinds (2026-09-18, U5): "turn" (one model response:
+#    tokens, timing, tool calls), "run_summary" (a local-lane run's samples,
+#    peaks, decode tok/s, energy), and "sample" rows in metrics.jsonl. Run
+#    records gained ttft/wall seconds, turns, tool_calls, continues, end
+#    state, verification_passed, guard_verdicts, refusal_code and the parent
+#    context; hop records gained the admission snapshot. Every kind and its
+#    required keys: tests/test_trace_schema.py.
 SCHEMA = 3
+
+KINDS = ("run", "hop", "turn", "sample", "run_summary", "verdict", "calibration")
 
 
 class Trace:
@@ -44,6 +54,9 @@ class Trace:
     def __init__(self, path: Path | None):
         self.path = path
         self._lock = threading.Lock()
+        # Guard verdicts per agent since that agent's last run record. An
+        # agent's runs are serial, so these belong to the run that ends next.
+        self._verdicts: dict[str, Counter[str]] = {}
         if path is not None:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +94,9 @@ class Trace:
         facts: dict[str, Any],
         latency_ms: float,
     ) -> None:
+        if agent_id:
+            with self._lock:
+                self._verdicts.setdefault(agent_id, Counter())[action] += 1
         self.write(
             "verdict",
             agent_id=agent_id,
@@ -93,8 +109,25 @@ class Trace:
             latency_ms=round(latency_ms, 1),
         )
 
+    def take_verdicts(self, agent_id: str) -> dict[str, int]:
+        """allow/deny/escalate counts for `agent_id` since the last call, then reset."""
+        with self._lock:
+            seen = self._verdicts.pop(agent_id, Counter())
+        return {action: seen.get(action, 0) for action in ("allow", "deny", "escalate")}
+
     def run(self, run: Any, workspace: str, model: str, guard: str | None = None) -> None:
         verification = run.verification_result
+        started = run.started_at or 0
+        finished = run.finished_at or 0
+        refusal = next(
+            (h.get("code") for h in reversed(getattr(run, "hops", []) or [])
+             if h.get("outcome") == "refused"),
+            None,
+        )
+        extra: dict[str, Any] = {}
+        parent = getattr(run, "parent", None)
+        if parent:
+            extra["parent"] = parent
         distil: dict[str, Any] = {"distilled": run.distilled, "truncated": run.truncated}
         if run.distilled:
             distil["raw_chars"] = len(run.final_response)
@@ -111,7 +144,17 @@ class Trace:
             guard=guard or getattr(run, "guard", None) or "hook",
             state=run.state,
             finish_reason=run.finish_reason,
-            elapsed_seconds=round((run.finished_at or 0) - (run.started_at or 0), 2),
+            elapsed_seconds=round(finished - started, 2),
+            # Submit to finish, queue wait included; elapsed_seconds starts at dispatch.
+            wall_seconds=round(finished - (run.created_at or started), 2),
+            ttft_seconds=getattr(run, "ttft_seconds", None),
+            turns=len(getattr(run, "turn_log", []) or []),
+            tool_calls=run.usage.steps,
+            continues=getattr(run, "continues", 0),
+            end_state=run.state,
+            verification_passed=verification.passed if verification else None,
+            guard_verdicts=self.take_verdicts(run.agent_id),
+            refusal_code=refusal,
             usage=run.usage.as_dict(),
             # Lengths, not text: the trace is for measuring, not for archiving
             # somebody's source code or a client's data.
@@ -120,7 +163,16 @@ class Trace:
             **distil,
             verification=verification.as_dict() if verification else None,
             error=run.error,
+            **extra,
         )
+
+    def turn(self, **fields: Any) -> None:
+        """One model response (see runs._Meter for the fields)."""
+        self.write("turn", **fields)
+
+    def run_summary(self, *, run_id: str, agent_id: str, lane: str, **fields: Any) -> None:
+        """A local-lane run's telemetry, from its samples and turn records."""
+        self.write("run_summary", run_id=run_id, agent_id=agent_id, lane=lane, **fields)
 
     def hop(self, *, run_id: str, agent_id: str, hop: Any) -> None:
         """One lane the router tried for a run (a router.Hop)."""
@@ -138,6 +190,9 @@ class Trace:
             code=hop.code,
             reset_at=hop.reset_at.isoformat() if hop.reset_at else None,
             closed_until=hop.closed_until.isoformat() if hop.closed_until else None,
+            admission=getattr(hop, "admission", None),
+            would_refuse=getattr(hop, "would_refuse", None),
+            admit_reason=getattr(hop, "admit_reason", None),
         )
 
     def calibration(self, *, run_id: str, chars: int, output_tokens: int, assumed: float) -> None:

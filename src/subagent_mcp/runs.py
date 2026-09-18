@@ -29,6 +29,7 @@ from .config import Settings, log
 from .guard import protect
 from .lane_state import LaneState
 from .lanes import DRIVER_CLAUDE, DRIVER_CODEX, FALLBACK_MODES, Lane
+from .telemetry import Telemetry, open_metrics, summarize
 from .trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
 
@@ -504,6 +505,173 @@ class _Watch:
         return None
 
 
+_USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
+
+
+def _usage_fields(raw: Any) -> dict[str, int]:
+    """A usage dict in the Usage field names, from claude or codex-translated keys."""
+    parsed = Usage()
+    if isinstance(raw, dict):
+        parsed.add(raw)
+    return {key: getattr(parsed, key) for key in _USAGE_KEYS}
+
+
+def _max_fields(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
+    return {key: max(a.get(key, 0), b.get(key, 0)) for key in _USAGE_KEYS}
+
+
+class _Meter:
+    """Token and timing accounting for one attempt, fed every event as it arrives.
+
+    Usage is read per assistant message, not only from the final `result`
+    event, so an attempt that dies, times out or is cancelled still accounts
+    for what it spent. One API response streams as several events carrying the
+    same message id (one per content block, plus the partial-message stream
+    events); each id is counted once, taking the largest value seen per field,
+    since a later event of the same message carries the more complete count.
+
+    The attempt's usage is, per field, the larger of the per-message sum and
+    the result event's own usage: the result is the CLI's aggregate when it
+    exists, the sum is what survives when it does not.
+
+    Timing per message: ts_start is when the request went out (the attempt's
+    spawn, the previous tool result, or the previous message's end);
+    ts_first_token the first content event of that message (the first
+    content_block_delta when partial messages are streamed, else the first
+    assistant event); ts_end its last event.
+    """
+
+    def __init__(self, attempt: int, spawned_at: float):
+        self.attempt = attempt
+        self.spawned_at = spawned_at
+        self.turns: dict[str, dict[str, Any]] = {}
+        self.result_usage: dict[str, int] | None = None
+        self.first_assistant: float | None = None
+        self._mark = spawned_at
+        self._current: str | None = None
+
+    def _turn(self, message_id: Any, now: float, model: Any = None) -> dict[str, Any]:
+        key = str(message_id) if message_id else (self._current or f"attempt-{self.attempt}")
+        turn = self.turns.get(key)
+        if turn is None:
+            turn = {
+                "message_id": str(message_id) if message_id else None,
+                "model": None,
+                "ts_start": self._mark,
+                "ts_first_token": None,
+                "ts_end": None,
+                "usage": dict.fromkeys(_USAGE_KEYS, 0),
+                "tool_calls": [],
+                "tool_ids": set(),
+                "stop_reason": None,
+            }
+            self.turns[key] = turn
+        if isinstance(model, str) and model:
+            turn["model"] = model
+        self._current = key
+        return turn
+
+    def see(self, event: dict[str, Any], now: float) -> None:
+        kind = event.get("type")
+        if kind == "stream_event":
+            inner = event.get("event") if isinstance(event.get("event"), dict) else {}
+            sub = inner.get("type")
+            if sub == "message_start":
+                message = inner.get("message") if isinstance(inner.get("message"), dict) else {}
+                turn = self._turn(message.get("id"), now, message.get("model"))
+                turn["usage"] = _max_fields(turn["usage"], _usage_fields(message.get("usage")))
+            elif sub in ("content_block_start", "content_block_delta") and self._current:
+                turn = self.turns[self._current]
+                if turn["ts_first_token"] is None:
+                    turn["ts_first_token"] = now
+                if self.first_assistant is None:
+                    self.first_assistant = now
+            elif sub == "message_delta" and self._current:
+                turn = self.turns[self._current]
+                turn["usage"] = _max_fields(turn["usage"], _usage_fields(inner.get("usage")))
+                delta = inner.get("delta") if isinstance(inner.get("delta"), dict) else {}
+                if delta.get("stop_reason"):
+                    turn["stop_reason"] = delta["stop_reason"]
+                turn["ts_end"] = now
+            elif sub == "message_stop" and self._current:
+                self.turns[self._current]["ts_end"] = now
+                self._mark = now
+            return
+        if kind == "assistant":
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            if message.get("model") == "<synthetic>":
+                # Claude Code's stand-in for an API error: no model answered.
+                return
+            turn = self._turn(message.get("id"), now, message.get("model"))
+            if self.first_assistant is None:
+                self.first_assistant = now
+            if turn["ts_first_token"] is None:
+                turn["ts_first_token"] = now
+            turn["ts_end"] = max(turn["ts_end"] or now, now)
+            turn["usage"] = _max_fields(turn["usage"], _usage_fields(message.get("usage")))
+            if message.get("stop_reason"):
+                turn["stop_reason"] = message["stop_reason"]
+            content = message.get("content")
+            for index, block in enumerate(content if isinstance(content, list) else []):
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                block_id = block.get("id") or f"{len(turn['tool_calls'])}:{index}"
+                if block.get("id") and block_id in turn["tool_ids"]:
+                    continue
+                turn["tool_ids"].add(block_id)
+                turn["tool_calls"].append(str(block.get("name") or "?"))
+            self._mark = now
+            return
+        if kind == "user":
+            # A tool result: the next message's request goes out now.
+            self._mark = now
+            self._current = None
+            return
+        if kind == "result":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                self.result_usage = _usage_fields(usage)
+
+    def usage(self) -> dict[str, int]:
+        """The attempt's tokens: per field, max(sum over messages, result usage)."""
+        summed = dict.fromkeys(_USAGE_KEYS, 0)
+        for turn in self.turns.values():
+            for key in _USAGE_KEYS:
+                summed[key] += turn["usage"][key]
+        if self.result_usage is None:
+            return summed
+        return _max_fields(summed, self.result_usage)
+
+    def records(self) -> list[dict[str, Any]]:
+        """Turn records, in order. A driver that reports usage only per attempt
+        (codex's turn.completed) has it put on the attempt's last turn."""
+        turns = list(self.turns.values())
+        if (
+            turns
+            and self.result_usage is not None
+            and not any(any(t["usage"].values()) for t in turns)
+        ):
+            turns[-1]["usage"] = dict(self.result_usage)
+        out = []
+        for turn in turns:
+            out.append({
+                "message_id": turn["message_id"],
+                "model": turn["model"],
+                "attempt": self.attempt,
+                "ts_start": round(turn["ts_start"], 3),
+                "ts_first_token": _round(turn["ts_first_token"]),
+                "ts_end": _round(turn["ts_end"]),
+                **turn["usage"],
+                "tool_calls": list(turn["tool_calls"]),
+                "stop_reason": turn["stop_reason"],
+            })
+        return out
+
+
+def _round(value: float | None) -> float | None:
+    return round(value, 3) if value is not None else None
+
+
 @dataclass
 class Run:
     run_id: str
@@ -547,6 +715,17 @@ class Run:
     # Whether the child did any work in this run: a tool call or output tokens.
     worked: bool = False
     cold_load: bool = False
+    # Turn records written so far (runs._Meter.records, plus run-level keys).
+    turn_log: list[dict[str, Any]] = field(default_factory=list)
+    # Dispatch of the attempt that answered first -> its first assistant event.
+    ttft_seconds: float | None = None
+    # Runs this agent had before this one: 0 for the delegate.
+    continues: int = 0
+    # Caller-supplied context (the parent's request metadata), when any.
+    parent: dict[str, Any] | None = None
+    # The local lane this run was sampled on, and the samples (ts, snapshot).
+    sampling_lane: str | None = None
+    samples: list[tuple[float, dict[str, Any]]] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -676,8 +855,10 @@ class Agent:
         chain: list[Lane] | None = None,
         lane_state: LaneState | None = None,
         lane_load: Callable[[str, Agent], int] | None = None,
+        telemetry: Telemetry | None = None,
     ):
         self.trace = trace
+        self.telemetry = telemetry
         # The lane this agent runs on. The delegate's run may move it along
         # `chain` (router.chain) when a lane refuses before work; after that
         # every continue stays on the lane that ran.
@@ -738,6 +919,7 @@ class Agent:
         *,
         note: str | None = None,
         route: bool = False,
+        parent: dict[str, Any] | None = None,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -753,24 +935,33 @@ class Agent:
             driver=self.driver.name,
             guard=self.driver.guard(self.settings),
             route=route,
+            parent=parent or None,
         )
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
+            run.continues = len(self._order)
             self._runs[run.run_id] = run
             self._order.append(run.run_id)
             self._queue.append(run)
             self._wake.notify()
         return run
 
-    def delegate(self, prompt: str, verification: str) -> Run:
+    def delegate(
+        self, prompt: str, verification: str, parent: dict[str, Any] | None = None
+    ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
         This run walks the lane chain; continues stay on the lane it ran on.
         """
         self.delegate_verification = verification
-        return self.submit(prompt, verification=verification, route=True)
+        return self.submit(prompt, verification=verification, route=True, parent=parent)
 
-    def follow_up(self, message: str, verification: str | None = None) -> Run:
+    def follow_up(
+        self,
+        message: str,
+        verification: str | None = None,
+        parent: dict[str, Any] | None = None,
+    ) -> Run:
         """A continue. Omitting `verification` reuses the delegate's; "" skips it.
 
         Wrap-up continues ("stop and report") were sent without one, so they
@@ -782,6 +973,7 @@ class Agent:
             return self.submit(
                 message,
                 verification=self.delegate_verification,
+                parent=parent,
                 note=(
                     "verification omitted: reused the delegate command "
                     f"`{_clip(self.delegate_verification, 200)}`. Pass "
@@ -792,9 +984,10 @@ class Agent:
             return self.submit(
                 message,
                 verification=None,
+                parent=parent,
                 note='verification="" given: skipped, so this run reports completed_unverified',
             )
-        return self.submit(message, verification=verification)
+        return self.submit(message, verification=verification, parent=parent)
 
     def get_run(self, run_id: str) -> Run | None:
         return self._runs.get(run_id)
@@ -885,6 +1078,9 @@ class Agent:
             "--output-format",
             "stream-json",
             "--verbose",
+            # Per-token stream events: the only source of a message's real
+            # first-token time, which decode tok/s and TTFT are measured from.
+            "--include-partial-messages",
             # No --bare: it skips hooks, and the PreToolUse hook is the guard.
             # The flags below restore the isolation --bare gave: built-in tools
             # only, no MCP servers, and no settings but the file passed with
@@ -1037,6 +1233,23 @@ class Agent:
                 continue
             if gate.base_url and gate.base_url != lane.base_url:
                 lane = dataclasses.replace(lane, base_url=gate.base_url)
+            if self.telemetry is not None and self.telemetry.covers(lane):
+                admission = self.telemetry.admission(lane)
+                hop.admission = admission.snapshot
+                hop.would_refuse = admission.would_refuse
+                hop.admit_reason = admission.reason
+                if admission.would_refuse:
+                    log.warning("run %s: lane %s over its admission thresholds (%s)%s",
+                                run.run_id, lane.name, admission.reason,
+                                "; skipped" if admission.refuse else "; log-only")
+                if admission.refuse:
+                    # A skip for this dispatch, not a lane closure.
+                    hop.outcome = router.HOP_REFUSED
+                    hop.code = router.ADMISSION
+                    hop.message = f"admission: {admission.reason}"
+                    self._hop(run, hop)
+                    last_refusal = hop.message
+                    continue
 
             self.lane = lane
             self.driver = driver
@@ -1133,6 +1346,8 @@ class Agent:
         """
         attempt = 0
         while True:
+            self._sample_begin(run)
+            meter = _Meter(attempt, _now())
             proc = self._spawn(prompt, resume)
             self._current = proc
             collected: list[dict[str, Any]] = []
@@ -1140,6 +1355,11 @@ class Agent:
             try:
                 for event in proc.events():
                     self.last_activity = _now()
+                    meter.see(event, self.last_activity)
+                    if event.get("type") == "stream_event":
+                        # Timing only; nothing downstream reads partial messages,
+                        # and one per token would bloat the attempt's event list.
+                        continue
                     collected.append(event)
                     # Trips are decided here, while the child still runs, so
                     # the kill below lands; deciding them after the stream
@@ -1152,6 +1372,10 @@ class Agent:
                         break
             finally:
                 self._current = None
+                self._sample_end(run)
+                # Every attempt's spend counts, including one that is retried,
+                # killed or cancelled: the provider billed it either way.
+                self._account(run, meter)
 
             terminal = next(
                 (e for e in reversed(collected) if e.get("type") == "result"), None
@@ -1206,6 +1430,54 @@ class Agent:
                 return collected
             resume = session or resume
 
+    def _account(self, run: Run, meter: _Meter) -> None:
+        """Add an attempt's tokens to the run and write its turn records."""
+        spent = meter.usage()
+        for key in _USAGE_KEYS:
+            setattr(run.usage, key, getattr(run.usage, key) + spent[key])
+        if run.ttft_seconds is None and meter.first_assistant is not None:
+            run.ttft_seconds = round(meter.first_assistant - meter.spawned_at, 3)
+        for turn in meter.records():
+            record = {
+                "run_id": run.run_id,
+                "agent_id": self.agent_id,
+                "lane": self.lane.name,
+                "provider": self.lane.provider,
+                "turn": len(run.turn_log),
+                **turn,
+                "model": turn["model"] or self.model,
+            }
+            run.turn_log.append(record)
+            if self.trace is not None:
+                self.trace.turn(**record)
+
+    def _sample_begin(self, run: Run) -> None:
+        """Register a child about to start on a local lane with that lane's sampler."""
+        if self.telemetry is None or not self.telemetry.covers(self.lane):
+            return
+        if run.sampling_lane != self.lane.name:
+            # A routed run that moved lanes: the summary covers the lane it ended on.
+            run.samples.clear()
+        run.sampling_lane = self.lane.name
+        self.telemetry.begin(self.lane, run.run_id)
+
+    def _sample_end(self, run: Run) -> None:
+        if self.telemetry is None or run.sampling_lane is None:
+            return
+        run.samples.extend(self.telemetry.end(run.sampling_lane, run.run_id))
+
+    def _summarize(self, run: Run) -> None:
+        """The run_summary record for a run that ran on a local lane."""
+        if self.trace is None or run.sampling_lane is None:
+            return
+        turns = [t for t in run.turn_log if t.get("lane") == run.sampling_lane]
+        self.trace.run_summary(
+            run_id=run.run_id,
+            agent_id=self.agent_id,
+            lane=run.sampling_lane,
+            **summarize(run.samples, turns),
+        )
+
     def _ingest(self, run: Run, event: dict[str, Any]) -> None:
         kind = event.get("type")
         if kind == "stream_event":
@@ -1232,9 +1504,7 @@ class Agent:
                 run.note(f"assistant: {_clip(text, 240)}")
             return
         if kind == "result":
-            usage = event.get("usage")
-            if isinstance(usage, dict):
-                run.usage.add(usage)
+            # Tokens were counted as the events arrived (_Meter, via _account).
             if isinstance(event.get("num_turns"), int):
                 run.usage.turns += event["num_turns"]
             if _hit_max_turns(event) and run.trip is None:
@@ -1285,6 +1555,7 @@ class Agent:
         run.finished_at = _now()
         if self.trace is not None:
             try:
+                self._summarize(run)
                 self.trace.run(run, str(self.workspace), self.model)
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
@@ -1294,10 +1565,19 @@ class Agent:
 class Registry:
     """Owns every live agent for the lifetime of the MCP server process."""
 
-    def __init__(self, settings: Settings, start_reaper: bool = True, trace: Trace | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        start_reaper: bool = True,
+        trace: Trace | None = None,
+        telemetry: Telemetry | None = None,
+    ):
         self.settings = settings
         self.trace = trace if trace is not None else open_trace(
             settings.trace, settings.session_root
+        )
+        self.telemetry = telemetry if telemetry is not None else Telemetry(
+            open_metrics(self.trace, settings.session_root)
         )
         protect(settings.session_root)
         self.lane_state = LaneState(settings.session_root)
@@ -1423,6 +1703,7 @@ class Registry:
                 ],
                 lane_state=self.lane_state,
                 lane_load=self._lane_load,
+                telemetry=self.telemetry,
             )
             self._agents[agent_id] = agent
             return agent
@@ -1471,3 +1752,4 @@ class Registry:
         for agent in self.agents():
             if not agent.closed:
                 agent.close("server shutting down", kind=KILL_SHUTDOWN)
+        self.telemetry.shutdown()

@@ -83,6 +83,31 @@ app = MCPServer(
 PROGRESS_INTERVAL = 3.0
 
 
+def _parent_context(ctx: Context | None) -> dict[str, Any] | None:
+    """The caller's request `_meta` (Claude Code sends its tool-use id there),
+    scalars only, for the trace's run record. None when the caller sent none."""
+    if ctx is None:
+        return None
+    try:
+        meta = ctx.request_context.meta
+        if meta is None:
+            return None
+        if hasattr(meta, "model_dump"):
+            data = meta.model_dump(exclude_none=True, by_alias=True)
+        elif isinstance(meta, dict):
+            data = dict(meta)
+        else:
+            return None
+    except Exception:  # noqa: BLE001 - context is a nicety, never a failure
+        return None
+    out = {
+        str(k): (v[:200] if isinstance(v, str) else v)
+        for k, v in data.items()
+        if k != "progressToken" and isinstance(v, (str, int, float, bool))
+    }
+    return out or None
+
+
 async def _wait_for(run: Run, seconds: float, ctx: Context | None = None) -> None:
     """Block for up to `seconds`, reporting progress while we wait.
 
@@ -215,7 +240,7 @@ async def delegate(
     if start_error is not None:
         raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
     prompt = f"{instructions.strip()}\n\n---\n\n{task}" if instructions else task
-    run = agent.delegate(prompt, verification)
+    run = agent.delegate(prompt, verification, parent=_parent_context(ctx))
     await _wait_for(run, wait_seconds, ctx)
     out = _result(run)
     out["workspace"] = str(resolved)
@@ -272,7 +297,7 @@ async def continue_agent(
     if ctx is not None:
         supervisor.bind(ctx.session)
     agent = registry.agent(agent_id)
-    run = agent.follow_up(message, verification)
+    run = agent.follow_up(message, verification, parent=_parent_context(ctx))
     await _wait_for(run, wait_seconds, ctx)
     return _result(run)
 

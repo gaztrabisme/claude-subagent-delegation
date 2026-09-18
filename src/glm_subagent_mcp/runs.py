@@ -1,0 +1,1176 @@
+"""Agent and run registry.
+
+One delegated subagent == one Claude Code session id == one worker thread
+holding a serial run queue. Each run is one ``claude -p`` subprocess. Continue
+re-enters the same session via ``--resume``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+import json
+import os
+import re
+import signal
+import subprocess
+import threading
+import time
+import uuid
+from collections import Counter, OrderedDict, deque
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .config import Settings, log
+from .guard import protect
+from .trace import Trace, open_trace
+from .verify import VerificationResult, run_verification
+
+WORKING = "working"
+COMPLETED = "completed"
+COMPLETED_UNVERIFIED = "completed_unverified"
+FAILED = "failed"
+CANCELLED = "cancelled"
+
+TERMINAL_STATES = frozenset({COMPLETED, COMPLETED_UNVERIFIED, FAILED, CANCELLED})
+
+PHASE_QUEUED = "queued"
+PHASE_RUNNING = "running"
+PHASE_VERIFYING = "verifying"
+PHASE_DISTILLING = "distilling"
+PHASE_DONE = "done"
+
+KILL_CANCEL = "cancel"
+KILL_TIMEOUT = "timeout"
+KILL_LOOP = "loop"
+KILL_BUDGET = "budget"
+KILL_STEPS = "steps"
+KILL_SHUTDOWN = "shutdown"
+KILL_IDLE = "idle"
+KILL_IS_FAILURE = frozenset({KILL_TIMEOUT, KILL_LOOP, KILL_BUDGET, KILL_STEPS})
+
+# The child's built-in tools. Bash, Read and Edit are what it had under --bare;
+# Write, Grep and Glob are file tools the guard already classifies.
+CHILD_TOOLS = "Bash,Read,Edit,Write,Grep,Glob"
+
+DISTIL_PROMPT = """\
+Stop working on the task. Summarize what you did, for a different engineer who \
+has none of your context and will not see this conversation.
+
+Write exactly these seven sections, each as a markdown heading:
+
+## Goal
+## Constraints & Preferences
+## Progress
+State Done, In-Progress and Blocked separately.
+## Key Decisions
+## Next Steps
+## Relevant Files
+## Critical Context
+
+Rules:
+- Preserve exact file paths, function names, error messages and command output. \
+Do not paraphrase an identifier or a path.
+- State what you changed in the repository, file by file.
+- Preserve any question you could not answer, verbatim.
+- Do not continue the task, propose new work, or take any tool call. Summarize only.
+- Stay under {limit} characters."""
+
+
+class RegistryError(RuntimeError):
+    """A caller-visible problem: unknown id, capacity, or a closed agent."""
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _truncate(text: str, cap: int) -> str:
+    marker = "\n\n[truncated; call glm_transcript(run_id, raw=True) for the full response]"
+    keep = max(0, cap - len(marker))
+    return text[:keep] + marker
+
+
+def _sleep(seconds: float) -> None:
+    """One sleep slice. Module-level indirection so tests can patch the clock."""
+    time.sleep(seconds)
+
+
+@dataclass
+class Usage:
+    input: int = 0
+    output: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    reasoning: int = 0
+    steps: int = 0  # tool calls
+    turns: int = 0  # model turns, as --max-turns counts them
+
+    @property
+    def total(self) -> int:
+        return self.input + self.cache_read + self.cache_write + self.output
+
+    def add(self, usage: dict[str, Any]) -> None:
+        self.input += int(usage.get("input_tokens") or usage.get("inputTokens") or 0)
+        self.output += int(usage.get("output_tokens") or usage.get("outputTokens") or 0)
+        self.cache_read += int(
+            usage.get("cache_read_input_tokens") or usage.get("cacheReadTokens") or 0
+        )
+        self.cache_write += int(
+            usage.get("cache_creation_input_tokens") or usage.get("cacheWriteTokens") or 0
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "input": self.input,
+            "output": self.output,
+            "cache_read": self.cache_read,
+            "cache_write": self.cache_write,
+            "reasoning": self.reasoning,
+            "total": self.total,
+            "steps": self.steps,
+            "turns": self.turns,
+        }
+
+    def merge(self, other: Usage) -> None:
+        self.input += other.input
+        self.output += other.output
+        self.cache_read += other.cache_read
+        self.cache_write += other.cache_write
+        self.reasoning += other.reasoning
+        self.steps += other.steps
+        self.turns += other.turns
+
+
+# --- claude exit classification -------------------------------------------
+# Claude Code 2.1.261 prints this harmless warning to stderr on every request
+# (the wrapper passes the raw GLM model name; the env maps only the aliases).
+# It is never the cause of a failure, so it is stripped from every message.
+MODEL_WARNING = "[claude-code:unrecognized_model]"
+
+# z.ai / Anthropic-compatible rate-limit wording. 429 = rate limit,
+# 529 = provider overloaded; "quota"/"Insufficient Balance" are z.ai billing
+# limits that behave the same way (transient, retryable).
+_RATE_LIMIT_WORDS = (
+    "rate_limit",
+    "rate limit",
+    "overloaded",
+    "insufficient balance",
+    "quota",
+)
+_AUTH_WORDS = ("invalid api key", "invalid_api_key", "unauthorized", "authentication")
+
+# z.ai puts its own code beside the HTTP status: "(429) · [1313][…]", or
+# `"code":"1308"` in a JSON body. The code decides whether waiting helps.
+_ZAI_CODE_RE = re.compile(r'\[(1[0-9]{3})\]|"code"\s*:\s*"?(1[0-9]{3})\b')
+_RESET_RE = re.compile(
+    r"reset(?:s)?\s+(?:at|on)\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}(?::[0-9]{2})?)",
+    re.IGNORECASE,
+)
+# Plan quota: the 5-hour (1308) or weekly/monthly (1310) allowance is spent.
+# It resets hours later, so a retry seconds from now only burns wall clock.
+ZAI_QUOTA_CODES = frozenset({"1308", "1310"})
+# Fair-use throttle: clears on the order of minutes, not seconds.
+ZAI_THROTTLE_CODE = "1313"
+
+
+def zai_code(text: str) -> str | None:
+    """The z.ai error code in `text`, if it carries one."""
+    match = _ZAI_CODE_RE.search(text or "")
+    if match is None:
+        return None
+    return match.group(1) or match.group(2)
+
+
+def zai_reset(text: str) -> str | None:
+    """The quota reset time z.ai quoted, if any."""
+    match = _RESET_RE.search(text or "")
+    return match.group(1) if match else None
+_HTTP_RATE_RE = re.compile(r"\b(?:429|529)\b")
+_HTTP_AUTH_RE = re.compile(r"\b(?:401|403)\b")
+
+
+def _strip_model_warning(stderr: str) -> str:
+    """Drop cosmetic unrecognized-model warning lines; keep the real cause."""
+    kept = [ln for ln in (stderr or "").splitlines() if MODEL_WARNING not in ln]
+    return "\n".join(kept).strip()
+
+
+def _rate_limit_line(text: str) -> str:
+    """The last line of `text` that actually mentions a rate limit, if any."""
+    for line in reversed(text.splitlines()):
+        low = line.lower()
+        if _HTTP_RATE_RE.search(line) or any(w in low for w in _RATE_LIMIT_WORDS):
+            return line.strip()
+    return ""
+
+
+def _event_error_text(event: dict | None) -> str:
+    """The text a result event itself reports as an error, or "".
+
+    Only fields the CLI fills when a turn actually failed: `error`, and
+    `result` when `is_error` is set (Claude Code puts the API error there --
+    status, message and retry info). Everything else in a result event --
+    `subtype`, usage, cost, durations, the model's answer -- is metadata or
+    payload, never a diagnostic, so it is not searched for failure keywords:
+    a `subtype: success` event whose answer text merely mentions 429/quota
+    does not make the run rate-limited.
+    """
+    if not isinstance(event, dict):
+        return ""
+    parts: list[str] = []
+    err = event.get("error")
+    if isinstance(err, str) and err.strip():
+        parts.append(err)
+    if event.get("is_error"):
+        res = event.get("result")
+        if isinstance(res, str) and res.strip():
+            parts.append(res)
+    return "\n".join(parts)
+
+
+def exit_event(code: int, stderr: str, last_result_event: dict | None) -> dict[str, Any]:
+    """The synthetic result event for a non-zero ``claude -p`` exit."""
+    kind, message = classify_exit(code, stderr, last_result_event)
+    event: dict[str, Any] = {
+        "type": "result",
+        "is_error": True,
+        "result": "",
+        "error": message,
+        # Honest kind so the run loop can decide to retry.
+        "error_kind": kind,
+    }
+    if kind == "rate_limited":
+        found = zai_code(_code_evidence(stderr, last_result_event))
+        if found:
+            event["zai_code"] = found
+    return event
+
+
+def _code_evidence(stderr: str, event: dict | None) -> str:
+    """Where a z.ai code may be read: stderr, the event's `error`, and its
+    `result` only when that is an API error the CLI reports, never model text.
+    A stray `[1308]` in an answer must not switch off a retry."""
+    parts = [stderr or ""]
+    if isinstance(event, dict):
+        if isinstance(event.get("error"), str):
+            parts.append(event["error"])
+        result = event.get("result")
+        if event.get("is_error") and isinstance(result, str) and result.lstrip().startswith(
+            "API Error"
+        ):
+            parts.append(result)
+    return "\n".join(parts)
+
+
+def classify_exit(code: int, stderr: str, last_result_event: dict | None) -> tuple[str, str]:
+    """Honest ``(kind, message)`` for a non-zero ``claude -p`` exit.
+
+    kind is one of:
+      - ``rate_limited``: transient upstream limit (429/529/quota/overloaded)
+        reported by stderr or by the last result event's own error fields;
+        the run loop retries these.
+      - ``auth``: credential failure (401/403/invalid key).
+      - ``cli_error``: anything else. Not retried.
+    """
+    if code in (0, None):
+        # Defensive: a clean exit is not an error; events() never classifies it.
+        return "cli_error", ""
+    cleaned = _strip_model_warning(stderr)
+    # Evidence is stderr plus only what the event reports as an error. The
+    # live trace's "rate_limited: success" runs were real z.ai 429s (code
+    # 1313, Fair Usage throttle): the CLI printed subtype "success" with
+    # is_error true and no `error` field, the class was right, and only the
+    # old `error or subtype` detail fallback mislabelled them. Scanning the
+    # whole event was a latent false positive (a successful answer merely
+    # mentioning 429 would have tripped the class), so it is gone.
+    event_error = _event_error_text(last_result_event)
+    haystack = f"{cleaned}\n{event_error}".lower()
+    if _HTTP_RATE_RE.search(haystack) or any(w in haystack for w in _RATE_LIMIT_WORDS):
+        # The actual limit text -- status, message or retry info, whichever
+        # stream carried it. Never the event's `subtype`: metadata like
+        # "success" is how "rate_limited: success" labels happened.
+        detail = _rate_limit_line(cleaned) or _rate_limit_line(event_error)
+        detail = detail or "no rate-limit detail in stderr or result event"
+        evidence = _code_evidence(cleaned, last_result_event)
+        found = zai_code(evidence)
+        if found in ZAI_QUOTA_CODES:
+            reset = zai_reset(evidence)
+            when = f", resets at {reset}" if reset else ", reset time not given"
+            return "rate_limited", (
+                f"rate_limited: z.ai plan quota exhausted ({found}{when}); "
+                f"not retried: {_clip(detail, 300)}"
+            )
+        if found == ZAI_THROTTLE_CODE:
+            return "rate_limited", (
+                "rate_limited: z.ai fair-use throttle (1313); run fewer children at "
+                f"once: {_clip(detail, 300)}"
+            )
+        return "rate_limited", f"rate_limited: {_clip(detail, 300)}"
+    tail = _clip(cleaned[-2000:], 800)
+    message = f"claude exited {code}: {tail}".strip()
+    if _HTTP_AUTH_RE.search(haystack) or any(w in haystack for w in _AUTH_WORDS):
+        return "auth", f"auth: {message}"
+    return "cli_error", f"cli_error: {message}"
+
+
+class ClaudeProcess:
+    """One ``claude -p`` subprocess. Tests replace `_spawn_claude` with a fake."""
+
+    def __init__(self, argv: list[str], env: dict[str, str], cwd: str):
+        self.argv = argv
+        self.env = env
+        self.cwd = cwd
+        self._proc: subprocess.Popen[str] | None = None
+
+    def events(self) -> Iterator[dict[str, Any]]:
+        self._proc = subprocess.Popen(
+            self.argv,
+            cwd=self.cwd,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        assert self._proc.stdout is not None
+        # Drain stderr on a side thread while iterating stdout. Claude Code
+        # writes a per-request model warning there; if we only read stdout the
+        # stderr pipe fills up and the child blocks forever (pipe deadlock).
+        # The full text is kept for classify_exit().
+        stderr_buf: list[str] = []
+        stderr_thread = threading.Thread(
+            target=self._drain_stderr, args=(self._proc, stderr_buf), daemon=True
+        )
+        stderr_thread.start()
+        try:
+            last_result: dict[str, Any] | None = None
+            for line in self._proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    log.debug("non-json claude line: %s", line[:200])
+                    continue
+                if isinstance(event, dict) and event.get("type") == "result":
+                    last_result = event
+                yield event
+            code = self._proc.wait()
+            stderr_thread.join(timeout=5)
+            if code not in (0, None):
+                yield exit_event(code, "".join(stderr_buf), last_result)
+        finally:
+            if self._proc.poll() is None:
+                self.kill()
+            stderr_thread.join(timeout=5)
+
+    @staticmethod
+    def _drain_stderr(proc: subprocess.Popen[str], buf: list[str]) -> None:
+        """Read all of the child's stderr into `buf`; runs beside stdout."""
+        if proc.stderr is None:
+            return
+        try:
+            buf.append(proc.stderr.read())
+        except (ValueError, OSError) as exc:  # pipe torn down by kill()
+            log.debug("stderr drain ended: %s", exc)
+
+    def kill(self) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+
+
+def _spawn_claude(argv: list[str], env: dict[str, str], cwd: str) -> ClaudeProcess:
+    return ClaudeProcess(argv, env, cwd)
+
+
+def _assistant_text(event: dict[str, Any]) -> str:
+    message = event.get("message") if isinstance(event.get("message"), dict) else event
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return ""
+    parts = [
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    return "".join(parts).strip()
+
+
+def _tool_uses(event: dict[str, Any]) -> list[tuple[str, Any]]:
+    message = event.get("message") if isinstance(event.get("message"), dict) else event
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    found = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            found.append((str(block.get("name") or "?"), block.get("input")))
+    return found
+
+
+def _tool_signature(name: str, args: Any) -> str:
+    try:
+        blob = json.dumps(args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        blob = repr(args)
+    return f"{name}:{hashlib.sha256(blob.encode()).hexdigest()[:16]}"
+
+
+def _hit_max_turns(event: dict[str, Any]) -> bool:
+    """Claude Code's own report that it stopped at --max-turns."""
+    return event.get("type") == "result" and (
+        event.get("subtype") == "error_max_turns" or event.get("terminal_reason") == "max_turns"
+    )
+
+
+class _Watch:
+    """Loop and token-budget trips for one attempt, decided as events arrive.
+
+    Starts from what the run has already ingested, so a trip is judged on the
+    whole run, not one attempt. Nothing here is written back to the run: a
+    rate-limited attempt that is discarded must not count twice.
+    """
+
+    def __init__(self, run: Run, settings: Settings, seen: Counter[str]):
+        self.settings = settings
+        # Counted across the agent's runs: a loop split over continues is
+        # still a loop.
+        self.signatures: Counter[str] = Counter(seen)
+        self.base_tokens = run.usage.total
+        self.messages: dict[str, int] = {}
+
+    def see(self, event: dict[str, Any]) -> tuple[str, str] | None:
+        if _hit_max_turns(event):
+            # Set during the attempt, so an exit that also reads as a rate
+            # limit is not retried.
+            return (
+                KILL_STEPS,
+                f"reached --max-turns of {self.settings.max_steps} (GSA_MAX_STEPS) "
+                "before finishing",
+            )
+        if event.get("type") != "assistant":
+            return None
+        for name, args in _tool_uses(event):
+            sig = _tool_signature(name, args)
+            self.signatures[sig] += 1
+            if self.signatures[sig] >= self.settings.loop_strikes:
+                return (KILL_LOOP, f"identical tool call repeated {self.signatures[sig]} times")
+        budget = self.settings.turn_token_budget
+        message = event.get("message")
+        if budget is None or not isinstance(message, dict):
+            return None
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            # One API response streams as several assistant events carrying the
+            # same message id and usage; count each response once.
+            spent = Usage()
+            spent.add(usage)
+            self.messages[str(message.get("id") or len(self.messages))] = spent.total
+        used = self.base_tokens + sum(self.messages.values())
+        if used > budget:
+            return (
+                KILL_BUDGET,
+                f"run used about {used} tokens, over GSA_TURN_TOKEN_BUDGET of {budget}",
+            )
+        return None
+
+
+@dataclass
+class Run:
+    run_id: str
+    agent_id: str
+    prompt: str
+    verification: str | None = None
+    # Where `verification` came from, when the caller did not pass it.
+    verification_note: str | None = None
+    state: str = WORKING
+    phase: str = PHASE_QUEUED
+    created_at: float = field(default_factory=_now)
+    started_at: float | None = None
+    finished_at: float | None = None
+    final_response: str = ""
+    result_text: str = ""
+    distilled: bool = False
+    truncated: bool = False
+    finish_reason: str | None = None
+    error: str | None = None
+    error_detail: str | None = None
+    event_count: int = 0
+    transcript: deque[str] = field(default_factory=lambda: deque(maxlen=400))
+    done: threading.Event = field(default_factory=threading.Event)
+    signatures: Counter[str] = field(default_factory=Counter)
+    usage: Usage = field(default_factory=Usage)
+    verification_result: VerificationResult | None = None
+    trip: tuple[str, str] | None = None
+    deadline: float | None = None
+    session_id: str | None = None
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "agent_id": self.agent_id,
+            "state": self.state,
+            "phase": self.phase,
+            "task": _clip(self.prompt, 120),
+            "finish_reason": self.finish_reason,
+            "elapsed_seconds": round(
+                (self.finished_at or _now()) - (self.started_at or self.created_at), 1
+            ),
+            "activity_count": self.event_count,
+            "usage": self.usage.as_dict(),
+            "last_activity": self.transcript[-1] if self.transcript else None,
+        }
+
+    def detail(self) -> dict[str, Any]:
+        out = self.summary()
+        out["result"] = self.result_text
+        if self.distilled:
+            out["distilled"] = True
+            out["raw_response_chars"] = len(self.final_response)
+        if self.truncated:
+            out["truncated"] = True
+        if self.verification_result is not None:
+            out["verification"] = self.verification_result.as_dict()
+        if self.verification_note:
+            out["verification_note"] = self.verification_note
+        if self.error:
+            out["error"] = self.error
+        if self.error_detail:
+            out["error_detail"] = self.error_detail
+        return out
+
+    def note(self, line: str) -> None:
+        self.event_count += 1
+        self.transcript.append(line)
+
+
+class Agent:
+    """One Claude Code session, driven by a serial task queue."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        name: str,
+        workspace: Path,
+        model: str,
+        settings: Settings,
+        trace: Trace | None = None,
+    ):
+        self.trace = trace
+        self.agent_id = agent_id
+        self.name = name
+        self.workspace = workspace
+        self.model = model
+        self.settings = settings
+        self.session_id: str | None = None
+        # The acceptance command the delegate was given; a continue that
+        # names none is judged against it.
+        self.delegate_verification: str | None = None
+        # Tool-call signatures across every run of this agent (loop detector).
+        self.signatures: Counter[str] = Counter()
+        self.created_at = _now()
+        self._runs: dict[str, Run] = {}
+        self._order: list[str] = []
+        self._queue: deque[Run] = deque()
+        self._wake = threading.Condition()
+        self._closing = False
+        self._closed = False
+        self._kill_kind: str | None = None
+        self.last_activity = _now()
+        self._ready = threading.Event()
+        self._start_error: str | None = None
+        self._current: ClaudeProcess | None = None
+        self._thread = threading.Thread(
+            target=self._worker, name=f"gsa-agent-{agent_id}", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def busy(self) -> bool:
+        return any(r.state == WORKING for r in self._runs.values())
+
+    def wait_ready(self, timeout: float = 60.0) -> str | None:
+        if not self._ready.wait(timeout):
+            return f"runtime did not start within {timeout:g}s"
+        return self._start_error
+
+    def submit(
+        self, prompt: str, verification: str | None = None, *, note: str | None = None
+    ) -> Run:
+        if self._closed or self._closing:
+            raise RegistryError(f"agent {self.agent_id} is closed")
+        run = Run(
+            run_id=f"run-{uuid.uuid4().hex[:12]}",
+            agent_id=self.agent_id,
+            prompt=prompt,
+            verification=verification,
+            verification_note=note,
+        )
+        run.transcript = deque(maxlen=self.settings.transcript_limit)
+        with self._wake:
+            self._runs[run.run_id] = run
+            self._order.append(run.run_id)
+            self._queue.append(run)
+            self._wake.notify()
+        return run
+
+    def delegate(self, prompt: str, verification: str) -> Run:
+        """The agent's first run. Its verification is kept for continues."""
+        self.delegate_verification = verification
+        return self.submit(prompt, verification=verification)
+
+    def follow_up(self, message: str, verification: str | None = None) -> Run:
+        """A continue. Omitting `verification` reuses the delegate's; "" skips it.
+
+        Wrap-up continues ("stop and report") were sent without one, so they
+        ended completed_unverified by design and said nothing about whether
+        the work was done. Judged against the original acceptance check, a
+        completed continue means the task passes.
+        """
+        if verification is None and self.delegate_verification:
+            return self.submit(
+                message,
+                verification=self.delegate_verification,
+                note=(
+                    "verification omitted: reused the glm_delegate command "
+                    f"`{_clip(self.delegate_verification, 200)}`. Pass "
+                    'verification="" to skip it.'
+                ),
+            )
+        if verification is not None and not verification.strip():
+            return self.submit(
+                message,
+                verification=None,
+                note='verification="" given: skipped, so this run reports completed_unverified',
+            )
+        return self.submit(message, verification=verification)
+
+    def get_run(self, run_id: str) -> Run | None:
+        return self._runs.get(run_id)
+
+    def runs(self) -> list[Run]:
+        return [self._runs[rid] for rid in self._order if rid in self._runs]
+
+    def usage(self) -> Usage:
+        total = Usage()
+        for run in self.runs():
+            total.merge(run.usage)
+        return total
+
+    def info(self) -> dict[str, Any]:
+        state = "closed" if self._closed else ("busy" if self.busy else "idle")
+        return {
+            "agent_id": self.agent_id,
+            "name": self.name,
+            "model": self.model,
+            "workspace": str(self.workspace),
+            "session_id": self.session_id,
+            "state": state,
+            "age_seconds": round(_now() - self.created_at, 1),
+            "usage": self.usage().as_dict(),
+            "runs": [r.summary() for r in self.runs()],
+        }
+
+    def close(self, reason: str = "cancelled by caller", kind: str = KILL_CANCEL) -> None:
+        with self._wake:
+            if self._closed:
+                return
+            self._closing = True
+            self._kill_kind = kind
+            self._wake.notify_all()
+        current = self._current
+        if current is not None:
+            current.kill()
+        for run in self.runs():
+            if run.state == WORKING:
+                run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
+                run.error = reason
+                run.phase = PHASE_DONE
+                run.finished_at = _now()
+                run.done.set()
+        self._thread.join(timeout=8)
+        self._closed = True
+
+    def _boot(self) -> None:
+        try:
+            self.settings.hooks_config(self.agent_id)
+            probe = subprocess.run(
+                [self.settings.claude_bin, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if probe.returncode != 0:
+                self._start_error = (
+                    probe.stderr.strip() or probe.stdout.strip()
+                    or f"{self.settings.claude_bin} --version exited {probe.returncode}"
+                )
+        except FileNotFoundError:
+            self._start_error = (
+                f"{self.settings.claude_bin!r} is not on PATH; install Claude Code"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._start_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._ready.set()
+
+    def _worker(self) -> None:
+        self._boot()
+        while True:
+            with self._wake:
+                while not self._queue and not self._closing:
+                    self._wake.wait(timeout=0.5)
+                if self._closing and not self._queue:
+                    break
+                run = self._queue.popleft() if self._queue else None
+            if run is None:
+                continue
+            try:
+                self._execute(run)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("run %s crashed", run.run_id, exc_info=True)
+                run.state = FAILED
+                run.error = f"{type(exc).__name__}: {exc}"
+                run.phase = PHASE_DONE
+                run.finished_at = _now()
+                run.done.set()
+
+    def _argv(self, prompt: str, resume: str | None) -> list[str]:
+        argv = [
+            self.settings.claude_bin,
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            # No --bare: it skips hooks, and the PreToolUse hook is the guard.
+            # The flags below restore the isolation --bare gave: built-in tools
+            # only, no MCP servers, and no settings but the file passed with
+            # --settings (a workspace .claude/settings.json could otherwise
+            # carry the child's own hooks). CLAUDE_CONFIG_DIR is per-agent.
+            "--tools",
+            CHILD_TOOLS,
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+            # Permission prompts are off; the PreToolUse hook is the gate.
+            "--dangerously-skip-permissions",
+            "--max-turns",
+            str(self.settings.max_steps),
+            "--model",
+            self.model,
+            "--settings",
+            str(self.settings.hooks_config(self.agent_id)),
+        ]
+        claude_md = self.workspace / "CLAUDE.md"
+        if claude_md.is_file():
+            argv.extend(["--append-system-prompt-file", str(claude_md)])
+        if resume:
+            argv.extend(["--resume", resume])
+        return argv
+
+    def _execute(self, run: Run) -> None:
+        run.started_at = _now()
+        run.deadline = run.started_at + self.settings.run_timeout
+        run.phase = PHASE_RUNNING
+        self.last_activity = _now()
+        token = self.settings.api_key or self.settings.child_env(self.agent_id).get(
+            "ANTHROPIC_AUTH_TOKEN"
+        )
+        if not token:
+            run.state = FAILED
+            run.error = (
+                "missing GLM API key: set GLM_API_KEY, ZAI_API_KEY, or ANTHROPIC_AUTH_TOKEN"
+            )
+            run.phase = PHASE_DONE
+            run.finished_at = _now()
+            run.done.set()
+            return
+
+        self._turn(run, run.prompt, resume=self.session_id)
+        if self._closing or run.trip or run.state in TERMINAL_STATES:
+            self._finish(run)
+            return
+
+        run.phase = PHASE_VERIFYING
+        remaining = (run.deadline - _now()) if run.deadline else None
+        run.verification_result = run_verification(
+            run.verification or "",
+            self.workspace,
+            self.settings,
+            budget=remaining,
+        )
+
+        if len(run.final_response) > self.settings.result_cap_chars:
+            run.phase = PHASE_DISTILLING
+            distilled = self._distill(run)
+            if distilled:
+                run.result_text = distilled
+                run.distilled = True
+            else:
+                run.result_text = _truncate(run.final_response, self.settings.result_cap_chars)
+                run.truncated = True
+        else:
+            run.result_text = run.final_response
+
+        if run.trip:
+            self._finish(run)
+            return
+        if run.verification_result.passed:
+            run.state = COMPLETED
+        else:
+            run.state = COMPLETED_UNVERIFIED
+        self._finish(run)
+
+    def _distill(self, run: Run) -> str:
+        prompt = DISTIL_PROMPT.format(limit=self.settings.result_cap_chars)
+        events = self._collect(run, prompt, resume=self.session_id)
+        text = ""
+        for event in events:
+            if event.get("type") == "result":
+                text = str(event.get("result") or "")
+        return text.strip()
+
+    def _turn(self, run: Run, prompt: str, resume: str | None) -> None:
+        for event in self._collect(run, prompt, resume=resume):
+            self._ingest(run, event)
+
+    def _backoff_sleep(self, run: Run, seconds: float) -> bool:
+        """Sleep before a rate-limit retry, in short slices so cancel/close
+        stay responsive. Returns False when the run was closed or tripped, or
+        when the wait would outlast the run's own deadline."""
+        deadline = _now() + seconds
+        if run.deadline is not None and deadline >= run.deadline:
+            log.warning("run %s rate-limit retry skipped: backoff outlasts the run deadline",
+                        run.run_id)
+            return False
+        while run.trip is None and not self._closing:
+            remaining = deadline - _now()
+            if remaining <= 0:
+                return True
+            _sleep(min(remaining, 0.25))
+        log.warning(
+            "run %s rate-limit retry aborted (closing=%s, trip=%s)",
+            run.run_id,
+            self._closing,
+            run.trip,
+        )
+        return False
+
+    def _collect(self, run: Run, prompt: str, resume: str | None) -> list[dict[str, Any]]:
+        """Run one whole ``claude -p`` turn and return its events.
+
+        A turn whose terminal event is an honest rate limit (z.ai 429/529) is
+        retried with exponential backoff, re-issuing the SAME prompt into the
+        same session so work already done is not lost. Failed attempts are
+        discarded: only the surviving attempt's events are ingested. Loop,
+        step and budget kills (run.trip) and every non-rate-limit exit are
+        final and never retried.
+        """
+        attempt = 0
+        while True:
+            argv = self._argv(prompt, resume)
+            env = self.settings.child_env(self.agent_id)
+            proc = _spawn_claude(argv, env, str(self.workspace))
+            self._current = proc
+            collected: list[dict[str, Any]] = []
+            watch = _Watch(run, self.settings, self.signatures)
+            try:
+                for event in proc.events():
+                    self.last_activity = _now()
+                    collected.append(event)
+                    # Trips are decided here, while the child still runs, so
+                    # the kill below lands; deciding them after the stream
+                    # ended could only relabel a run that had already finished.
+                    trip = watch.see(event)
+                    if trip is not None and run.trip is None:
+                        run.trip = trip
+                    if run.trip or self._closing:
+                        proc.kill()
+                        break
+            finally:
+                self._current = None
+
+            terminal = next(
+                (e for e in reversed(collected) if e.get("type") == "result"), None
+            )
+            succeeded = any(
+                e.get("type") == "result" and not e.get("is_error") for e in collected
+            )
+            code = terminal.get("zai_code") if isinstance(terminal, dict) else None
+            retryable = (
+                isinstance(terminal, dict)
+                and terminal.get("error_kind") == "rate_limited"
+                # A spent plan quota resets hours later; retrying burns wall clock.
+                and code not in ZAI_QUOTA_CODES
+                and not succeeded
+                and run.trip is None
+                and not self._closing
+                and attempt < self.settings.rate_limit_retries
+            )
+            if not retryable:
+                # Exhausted retries (or a non-retryable exit): hand the
+                # honest terminal event to _ingest, which fails the run.
+                return collected
+
+            # Retry resuming whatever session the failed attempt established.
+            session = next(
+                (
+                    e.get("session_id")
+                    for e in reversed(collected)
+                    if isinstance(e.get("session_id"), str) and e.get("session_id")
+                ),
+                None,
+            )
+            if code == ZAI_THROTTLE_CODE:
+                # Fair-use throttling does not clear in seconds.
+                delay = min(self.settings.throttle_backoff * (2 ** attempt), 900.0)
+            else:
+                delay = min(self.settings.rate_limit_backoff * (2 ** attempt), 300.0)
+            attempt += 1
+            log.warning(
+                "run %s rate-limited, retry %d/%d in %.1fs (%s)",
+                run.run_id,
+                attempt,
+                self.settings.rate_limit_retries,
+                delay,
+                terminal.get("error"),
+            )
+            if not self._backoff_sleep(run, delay):
+                return collected
+            resume = session or resume
+
+    def _ingest(self, run: Run, event: dict[str, Any]) -> None:
+        kind = event.get("type")
+        if kind == "stream_event":
+            return
+        session = event.get("session_id")
+        if isinstance(session, str) and session:
+            run.session_id = session
+            self.session_id = session
+        if kind == "system" and event.get("subtype") == "init":
+            run.note("system/init")
+            return
+        if kind == "assistant":
+            # Counting only. The loop and budget trips are decided by _Watch
+            # while the stream is read; tool calls are not a step limit, since
+            # GSA_MAX_STEPS is Claude Code's --max-turns.
+            for name, args in _tool_uses(event):
+                sig = _tool_signature(name, args)
+                run.signatures[sig] += 1
+                self.signatures[sig] += 1
+                run.usage.steps += 1
+                run.note(f"tool_use: {name}")
+            text = _assistant_text(event)
+            if text:
+                run.note(f"assistant: {_clip(text, 240)}")
+            return
+        if kind == "result":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                run.usage.add(usage)
+            if isinstance(event.get("num_turns"), int):
+                run.usage.turns += event["num_turns"]
+            if _hit_max_turns(event) and run.trip is None:
+                run.trip = (
+                    KILL_STEPS,
+                    f"reached --max-turns of {self.settings.max_steps} (GSA_MAX_STEPS) "
+                    "before finishing",
+                )
+            budget = self.settings.turn_token_budget
+            if budget is not None and run.usage.total > budget:
+                run.trip = (
+                    KILL_BUDGET,
+                    f"run used {run.usage.total} tokens, over GSA_TURN_TOKEN_BUDGET of {budget}",
+                )
+            text = str(event.get("result") or "")
+            run.final_response = text
+            if event.get("is_error"):
+                run.state = FAILED
+                reported = str(event.get("error") or text or "claude reported an error")
+                # Never surface the cosmetic model warning as the cause.
+                run.error = _strip_model_warning(reported) or reported
+                # Synthetic exit events carry an honest error_kind
+                # (rate_limited / auth / cli_error); CLI-reported errors keep
+                # the generic "error".
+                run.finish_reason = str(event.get("error_kind") or "error")
+            else:
+                run.finish_reason = "completed"
+            run.note("result")
+            return
+        if kind:
+            run.note(str(kind))
+
+    def _finish(self, run: Run) -> None:
+        if self._kill_kind:
+            kind = self._kill_kind
+            run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
+            run.error = run.error or kind
+            run.finish_reason = kind
+        elif run.trip:
+            kind, reason = run.trip
+            if kind == KILL_LOOP:
+                # The caller has been told; a continue starts the count again.
+                self.signatures.clear()
+            run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
+            run.error = reason
+            run.finish_reason = kind
+        run.phase = PHASE_DONE
+        run.finished_at = _now()
+        if self.trace is not None:
+            try:
+                self.trace.run(run, str(self.workspace), self.model)
+            except Exception:  # noqa: BLE001
+                log.warning("trace.write failed for %s", run.run_id, exc_info=True)
+        run.done.set()
+
+
+class Registry:
+    """Owns every live agent for the lifetime of the MCP server process."""
+
+    def __init__(self, settings: Settings, start_reaper: bool = True, trace: Trace | None = None):
+        self.settings = settings
+        self.trace = trace if trace is not None else open_trace(
+            settings.trace, settings.session_root
+        )
+        protect(settings.session_root)
+        self._agents: dict[str, Agent] = {}
+        self._archive: OrderedDict[str, Run] = OrderedDict()
+        self._lock = threading.Lock()
+        self._counter = itertools.count(1)
+        self._stop = threading.Event()
+        self._reaper: threading.Thread | None = None
+        if start_reaper:
+            interval = max(1.0, min(30.0, settings.idle_timeout / 4))
+            self._reaper = threading.Thread(
+                target=self._reap_loop, args=(interval,), name="gsa-reaper", daemon=True
+            )
+            self._reaper.start()
+
+    def reap_once(self) -> list[tuple[str, str]]:
+        now = _now()
+        acted: list[tuple[str, str]] = []
+        for agent in self.agents():
+            if agent.closed:
+                continue
+            active = [r for r in agent.runs() if r.state == WORKING and r.started_at]
+            tripped = next((r for r in active if r.trip), None)
+            overdue = next((r for r in active if r.deadline and now > r.deadline), None)
+            if tripped is not None and tripped.trip is not None:
+                kind, reason = tripped.trip
+                agent.close(reason, kind=kind)
+                acted.append((agent.agent_id, kind))
+            elif overdue is not None:
+                agent.close("run deadline exceeded", kind=KILL_TIMEOUT)
+                acted.append((agent.agent_id, KILL_TIMEOUT))
+            elif not active and not agent.busy:
+                if now - agent.last_activity > self.settings.idle_timeout:
+                    agent.close("idle", kind=KILL_IDLE)
+                    acted.append((agent.agent_id, KILL_IDLE))
+        self._evict_closed()
+        return acted
+
+    def _evict_closed(self) -> None:
+        with self._lock:
+            closed = [
+                a for a in self._agents.values()
+                if a.closed and all(r.state in TERMINAL_STATES for r in a.runs())
+            ]
+            for agent in closed:
+                for run in agent.runs():
+                    self._archive[run.run_id] = run
+                self._agents.pop(agent.agent_id, None)
+            while len(self._archive) > self.settings.run_archive:
+                self._archive.popitem(last=False)
+
+    def _reap_loop(self, interval: float) -> None:
+        while not self._stop.wait(interval):
+            try:
+                self.reap_once()
+            except Exception:  # noqa: BLE001
+                log.warning("reaper pass failed", exc_info=True)
+
+    def create_agent(self, name: str | None, workspace: Path, model: str) -> Agent:
+        refusal = self.settings.workspace_refusal(workspace)
+        if refusal is not None:
+            raise RegistryError(refusal)
+        with self._lock:
+            live = [a for a in self._agents.values() if not a.closed]
+            if len(live) >= self.settings.max_agents:
+                raise RegistryError(
+                    f"agent limit reached ({self.settings.max_agents} live). "
+                    "Cancel one with glm_cancel, or raise GSA_MAX_AGENTS."
+                )
+            agent_id = f"a{next(self._counter)}"
+            agent = Agent(
+                agent_id=agent_id,
+                name=name or f"subagent-{agent_id}",
+                workspace=workspace,
+                model=model,
+                settings=self.settings,
+                trace=self.trace,
+            )
+            self._agents[agent_id] = agent
+            return agent
+
+    def agent(self, agent_id: str) -> Agent:
+        with self._lock:
+            agent = self._agents.get(agent_id)
+        if agent is None:
+            raise RegistryError(f"unknown agent_id {agent_id!r}")
+        return agent
+
+    def find_agent(self, agent_id: str) -> Agent | None:
+        with self._lock:
+            return self._agents.get(agent_id)
+
+    def find_run(self, run_id: str) -> Run:
+        with self._lock:
+            agents = list(self._agents.values())
+            archived = self._archive.get(run_id)
+        for agent in agents:
+            run = agent.get_run(run_id)
+            if run is not None:
+                return run
+        if archived is not None:
+            return archived
+        raise RegistryError(f"unknown run_id {run_id!r}")
+
+    def agents(self) -> list[Agent]:
+        with self._lock:
+            return list(self._agents.values())
+
+    def archived_runs(self) -> list[Run]:
+        with self._lock:
+            return list(self._archive.values())
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        for agent in self.agents():
+            if not agent.closed:
+                agent.close("server shutting down", kind=KILL_SHUTDOWN)

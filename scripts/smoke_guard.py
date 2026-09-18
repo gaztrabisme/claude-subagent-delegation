@@ -72,7 +72,7 @@ def payload(result) -> dict:
 async def delegate(params: StdioServerParameters, workspace: Path, timeout: float) -> dict:
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
-        started = payload(await session.call_tool("glm_delegate", {
+        started = payload(await session.call_tool("delegate", {
             "task": TASK,
             "verification": "true",
             "workspace": str(workspace),
@@ -85,12 +85,12 @@ async def delegate(params: StdioServerParameters, workspace: Path, timeout: floa
         out = started
         while time.monotonic() < deadline:
             out = payload(await session.call_tool(
-                "glm_await", {"run_id": run_id, "wait_seconds": 30}
+                "await", {"run_id": run_id, "wait_seconds": 30}
             ))
             if out.get("state") in TERMINAL:
                 break
         if out.get("agent_id"):
-            await session.call_tool("glm_cancel", {"agent_id": out["agent_id"]})
+            await session.call_tool("cancel", {"agent_id": out["agent_id"]})
         return out
 
 
@@ -122,32 +122,32 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=420.0)
     args = parser.parse_args()
 
-    scratch = Path(tempfile.mkdtemp(prefix="gsa-smoke-")).resolve()
+    scratch = Path(tempfile.mkdtemp(prefix="sam-smoke-")).resolve()
     workspace = scratch / "ws"
     workspace.mkdir()
     sessions = scratch / "sessions"
     env = {
         k: v for k, v in os.environ.items()
-        if not k.startswith(("GSA_", "GLM_", "ZAI_", "ANTHROPIC_"))
+        if not k.startswith(("SAM_", "GLM_", "ZAI_", "ANTHROPIC_"))
     }
     env.update({
         "GLM_API_KEY": api_key(args.api_key_env),
-        "GSA_BASE_URL": args.base_url,
-        "GSA_MODEL": args.model,
-        "GSA_FLASH_MODEL": args.model,
-        "GSA_WORKSPACE": str(workspace),
-        "GSA_SESSION_ROOT": str(sessions),
+        "SAM_DEFAULT_LANE": "glm",
+        "SAM_GLM_BASE_URL": args.base_url,
+        "SAM_GLM_MODEL": args.model,
+        "SAM_WORKSPACE": str(workspace),
+        "SAM_SESSION_ROOT": str(sessions),
         # A unix socket path must stay under ~104 bytes on macOS.
-        "GSA_APPROVAL_SOCKET": f"/tmp/gsa-smoke-{os.getpid()}.sock",
+        "SAM_APPROVAL_SOCKET": f"/tmp/sam-smoke-{os.getpid()}.sock",
         # No sampling or elicitation from this client, so an escalation is a
         # deny; the call under test is a policy deny either way.
-        "GSA_SUPERVISOR": "auto",
-        "GSA_MAX_STEPS": "6",
-        "GSA_RATE_LIMIT_RETRIES": "1",
+        "SAM_SUPERVISOR": "auto",
+        "SAM_MAX_STEPS": "6",
+        "SAM_RATE_LIMIT_RETRIES": "1",
         "PYTHONPATH": str(ROOT / "src"),
     })
     params = StdioServerParameters(
-        command=sys.executable, args=["-m", "glm_subagent_mcp"], env=env, cwd=str(ROOT)
+        command=sys.executable, args=["-m", "subagent_mcp"], env=env, cwd=str(ROOT)
     )
     print(f"scratch: {scratch}")
     print(f"backend: {args.base_url} model={args.model}")

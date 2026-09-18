@@ -22,7 +22,7 @@ import os
 import socket
 import sys
 
-TIMEOUT_S = float(os.environ.get("GSA_HOOK_TIMEOUT", "150"))
+TIMEOUT_S = float(os.environ.get("SAM_HOOK_TIMEOUT", "150"))
 
 
 def agent_id() -> str:
@@ -58,9 +58,9 @@ def block(reason: str) -> None:
 
 
 def main() -> None:
-    socket_path = os.environ.get("GSA_APPROVAL_SOCKET")
+    socket_path = os.environ.get("SAM_APPROVAL_SOCKET")
     if not socket_path:
-        block("blocked: GSA_APPROVAL_SOCKET is not set, so no supervisor can be reached")
+        block("blocked: SAM_APPROVAL_SOCKET is not set, so no supervisor can be reached")
 
     try:
         payload = json.loads(sys.stdin.read() or "{}")

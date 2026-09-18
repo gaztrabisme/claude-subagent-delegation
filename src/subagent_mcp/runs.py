@@ -25,6 +25,7 @@ from typing import Any
 
 from .config import Settings, log
 from .guard import protect
+from .lanes import FALLBACK_MODES, Lane
 from .trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
 
@@ -93,7 +94,7 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _truncate(text: str, cap: int) -> str:
-    marker = "\n\n[truncated; call glm_transcript(run_id, raw=True) for the full response]"
+    marker = "\n\n[truncated; call transcript(run_id, raw=True) for the full response]"
     keep = max(0, cap - len(marker))
     return text[:keep] + marker
 
@@ -452,8 +453,11 @@ class _Watch:
     rate-limited attempt that is discarded must not count twice.
     """
 
-    def __init__(self, run: Run, settings: Settings, seen: Counter[str]):
+    def __init__(
+        self, run: Run, settings: Settings, seen: Counter[str], max_steps: int | None = None
+    ):
         self.settings = settings
+        self.max_steps = settings.max_steps if max_steps is None else max_steps
         # Counted across the agent's runs: a loop split over continues is
         # still a loop.
         self.signatures: Counter[str] = Counter(seen)
@@ -466,7 +470,7 @@ class _Watch:
             # limit is not retried.
             return (
                 KILL_STEPS,
-                f"reached --max-turns of {self.settings.max_steps} (GSA_MAX_STEPS) "
+                f"reached --max-turns of {self.max_steps} (SAM_MAX_STEPS) "
                 "before finishing",
             )
         if event.get("type") != "assistant":
@@ -491,7 +495,7 @@ class _Watch:
         if used > budget:
             return (
                 KILL_BUDGET,
-                f"run used about {used} tokens, over GSA_TURN_TOKEN_BUDGET of {budget}",
+                f"run used about {used} tokens, over SAM_TURN_TOKEN_BUDGET of {budget}",
             )
         return None
 
@@ -525,6 +529,8 @@ class Run:
     trip: tuple[str, str] | None = None
     deadline: float | None = None
     session_id: str | None = None
+    lane: str | None = None
+    fallback: str | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -532,6 +538,8 @@ class Run:
             "agent_id": self.agent_id,
             "state": self.state,
             "phase": self.phase,
+            "lane": self.lane,
+            "fallback": self.fallback,
             "task": _clip(self.prompt, 120),
             "finish_reason": self.finish_reason,
             "elapsed_seconds": round(
@@ -576,8 +584,14 @@ class Agent:
         model: str,
         settings: Settings,
         trace: Trace | None = None,
+        lane: Lane | None = None,
+        fallback: str = "full",
     ):
         self.trace = trace
+        # The lane this agent runs on. Routing between lanes comes later;
+        # today every run of the agent uses this one.
+        self.lane = lane or settings.lane()
+        self.fallback = fallback
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -602,7 +616,7 @@ class Agent:
         self._start_error: str | None = None
         self._current: ClaudeProcess | None = None
         self._thread = threading.Thread(
-            target=self._worker, name=f"gsa-agent-{agent_id}", daemon=True
+            target=self._worker, name=f"sam-agent-{agent_id}", daemon=True
         )
         self._thread.start()
 
@@ -630,6 +644,8 @@ class Agent:
             prompt=prompt,
             verification=verification,
             verification_note=note,
+            lane=self.lane.name,
+            fallback=self.fallback,
         )
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
@@ -657,7 +673,7 @@ class Agent:
                 message,
                 verification=self.delegate_verification,
                 note=(
-                    "verification omitted: reused the glm_delegate command "
+                    "verification omitted: reused the delegate command "
                     f"`{_clip(self.delegate_verification, 200)}`. Pass "
                     'verification="" to skip it.'
                 ),
@@ -688,6 +704,8 @@ class Agent:
             "agent_id": self.agent_id,
             "name": self.name,
             "model": self.model,
+            "lane": self.lane.name,
+            "fallback": self.fallback,
             "workspace": str(self.workspace),
             "session_id": self.session_id,
             "state": state,
@@ -718,7 +736,7 @@ class Agent:
 
     def _boot(self) -> None:
         try:
-            self.settings.hooks_config(self.agent_id)
+            self.settings.hooks_config(self.agent_id, self.lane, self.model)
             probe = subprocess.run(
                 [self.settings.claude_bin, "--version"],
                 capture_output=True,
@@ -781,11 +799,11 @@ class Agent:
             # Permission prompts are off; the PreToolUse hook is the gate.
             "--dangerously-skip-permissions",
             "--max-turns",
-            str(self.settings.max_steps),
+            str(self.lane.max_steps),
             "--model",
             self.model,
             "--settings",
-            str(self.settings.hooks_config(self.agent_id)),
+            str(self.settings.hooks_config(self.agent_id, self.lane, self.model)),
         ]
         claude_md = self.workspace / "CLAUDE.md"
         if claude_md.is_file():
@@ -796,17 +814,13 @@ class Agent:
 
     def _execute(self, run: Run) -> None:
         run.started_at = _now()
-        run.deadline = run.started_at + self.settings.run_timeout
+        run.deadline = run.started_at + self.lane.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
-        token = self.settings.api_key or self.settings.child_env(self.agent_id).get(
-            "ANTHROPIC_AUTH_TOKEN"
-        )
-        if not token:
+        if not self.lane.api_key():
             run.state = FAILED
-            run.error = (
-                "missing GLM API key: set GLM_API_KEY, ZAI_API_KEY, or ANTHROPIC_AUTH_TOKEN"
-            )
+            names = ", ".join(self.lane.api_key_envs) or "(none configured)"
+            run.error = f"missing API key for lane {self.lane.name!r}: set one of {names}"
             run.phase = PHASE_DONE
             run.finished_at = _now()
             run.done.set()
@@ -895,11 +909,11 @@ class Agent:
         attempt = 0
         while True:
             argv = self._argv(prompt, resume)
-            env = self.settings.child_env(self.agent_id)
+            env = self.settings.child_env(self.agent_id, self.lane, self.model)
             proc = _spawn_claude(argv, env, str(self.workspace))
             self._current = proc
             collected: list[dict[str, Any]] = []
-            watch = _Watch(run, self.settings, self.signatures)
+            watch = _Watch(run, self.settings, self.signatures, self.lane.max_steps)
             try:
                 for event in proc.events():
                     self.last_activity = _now()
@@ -979,7 +993,7 @@ class Agent:
         if kind == "assistant":
             # Counting only. The loop and budget trips are decided by _Watch
             # while the stream is read; tool calls are not a step limit, since
-            # GSA_MAX_STEPS is Claude Code's --max-turns.
+            # SAM_MAX_STEPS is Claude Code's --max-turns.
             for name, args in _tool_uses(event):
                 sig = _tool_signature(name, args)
                 run.signatures[sig] += 1
@@ -999,14 +1013,14 @@ class Agent:
             if _hit_max_turns(event) and run.trip is None:
                 run.trip = (
                     KILL_STEPS,
-                    f"reached --max-turns of {self.settings.max_steps} (GSA_MAX_STEPS) "
+                    f"reached --max-turns of {self.lane.max_steps} (SAM_MAX_STEPS) "
                     "before finishing",
                 )
             budget = self.settings.turn_token_budget
             if budget is not None and run.usage.total > budget:
                 run.trip = (
                     KILL_BUDGET,
-                    f"run used {run.usage.total} tokens, over GSA_TURN_TOKEN_BUDGET of {budget}",
+                    f"run used {run.usage.total} tokens, over SAM_TURN_TOKEN_BUDGET of {budget}",
                 )
             text = str(event.get("result") or "")
             run.final_response = text
@@ -1066,9 +1080,12 @@ class Registry:
         self._stop = threading.Event()
         self._reaper: threading.Thread | None = None
         if start_reaper:
-            interval = max(1.0, min(30.0, settings.idle_timeout / 4))
+            idle = min(
+                [lane.idle_timeout for lane in settings.lanes.values()] or [settings.idle_timeout]
+            )
+            interval = max(1.0, min(30.0, idle / 4))
             self._reaper = threading.Thread(
-                target=self._reap_loop, args=(interval,), name="gsa-reaper", daemon=True
+                target=self._reap_loop, args=(interval,), name="sam-reaper", daemon=True
             )
             self._reaper.start()
 
@@ -1089,7 +1106,7 @@ class Registry:
                 agent.close("run deadline exceeded", kind=KILL_TIMEOUT)
                 acted.append((agent.agent_id, KILL_TIMEOUT))
             elif not active and not agent.busy:
-                if now - agent.last_activity > self.settings.idle_timeout:
+                if now - agent.last_activity > agent.lane.idle_timeout:
                     agent.close("idle", kind=KILL_IDLE)
                     acted.append((agent.agent_id, KILL_IDLE))
         self._evict_closed()
@@ -1115,7 +1132,36 @@ class Registry:
             except Exception:  # noqa: BLE001
                 log.warning("reaper pass failed", exc_info=True)
 
-    def create_agent(self, name: str | None, workspace: Path, model: str) -> Agent:
+    def select_lane(self, lane: str | None, fallback: str | None = "full") -> Lane:
+        """The lane a new agent runs on, or RegistryError saying why not.
+
+        Checked before anything is spawned: an unknown lane, an unknown
+        fallback mode, or a lane this build cannot drive.
+        """
+        mode = fallback if fallback is not None else "full"
+        if mode not in FALLBACK_MODES:
+            raise RegistryError(
+                f"unknown fallback {fallback!r}; expected one of {', '.join(FALLBACK_MODES)}"
+            )
+        name = lane or self.settings.default_lane
+        chosen = self.settings.lanes.get(name)
+        if chosen is None:
+            known = ", ".join(self.settings.lanes) or "(none)"
+            raise RegistryError(f"unknown lane {name!r}; known lanes: {known}")
+        reason = chosen.unavailable()
+        if reason is not None:
+            raise RegistryError(reason)
+        return chosen
+
+    def create_agent(
+        self,
+        name: str | None,
+        workspace: Path,
+        model: str | None = None,
+        lane: str | None = None,
+        fallback: str = "full",
+    ) -> Agent:
+        chosen = self.select_lane(lane, fallback)
         refusal = self.settings.workspace_refusal(workspace)
         if refusal is not None:
             raise RegistryError(refusal)
@@ -1124,16 +1170,24 @@ class Registry:
             if len(live) >= self.settings.max_agents:
                 raise RegistryError(
                     f"agent limit reached ({self.settings.max_agents} live). "
-                    "Cancel one with glm_cancel, or raise GSA_MAX_AGENTS."
+                    "Cancel one with cancel, or raise SAM_MAX_AGENTS."
+                )
+            on_lane = [a for a in live if a.lane.name == chosen.name]
+            if len(on_lane) >= chosen.max_agents:
+                raise RegistryError(
+                    f"agent limit reached on lane {chosen.name!r} ({chosen.max_agents} live). "
+                    f"Cancel one with cancel, or raise SAM_{chosen.name.upper()}_MAX_AGENTS."
                 )
             agent_id = f"a{next(self._counter)}"
             agent = Agent(
                 agent_id=agent_id,
                 name=name or f"subagent-{agent_id}",
                 workspace=workspace,
-                model=model,
+                model=model or chosen.model or "",
                 settings=self.settings,
                 trace=self.trace,
+                lane=chosen,
+                fallback=fallback,
             )
             self._agents[agent_id] = agent
             return agent

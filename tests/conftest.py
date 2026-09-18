@@ -4,15 +4,28 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from glm_subagent_mcp.config import DEFAULT_BASE_URL, DEFAULT_FLASH_MODEL, DEFAULT_MODEL, Settings
+import pytest
+
+from subagent_mcp.config import Settings
+from subagent_mcp.lanes import load_lanes
+
+# Every lane's key variable. Tests never see the machine's real keys.
+KEY_ENVS = ("GLM_API_KEY", "ZAI_API_KEY", "DEEPSEEK_API_KEY", "SAM_BPPC_API_KEY",
+            "SAM_OMLX_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+@pytest.fixture(autouse=True)
+def _lane_keys(monkeypatch):
+    """The glm lane (the default) gets a fake key; every other key is unset."""
+    for name in KEY_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GLM_API_KEY", "test-key")
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:
+    """Settings for a test. Lanes resolve their knobs from these values, as
+    they would from the matching global SAM_ variables."""
     values = {
-        "api_key": "test-key",
-        "base_url": DEFAULT_BASE_URL,
-        "model": DEFAULT_MODEL,
-        "flash_model": DEFAULT_FLASH_MODEL,
         "workspace": tmp_path,
         "session_root": tmp_path / "sessions",
         "claude_bin": "claude",
@@ -39,6 +52,13 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         "throttle_backoff": 60.0,
     }
     values.update(overrides)
+    if "lanes" not in values:
+        # Only knobs a test overrode become globals, so the local lanes keep
+        # their own defaults, as they would with the SAM_ variables unset.
+        knobs = ("max_agents", "compact_window", "max_steps", "run_timeout", "idle_timeout")
+        values["lanes"] = load_lanes({
+            f"SAM_{knob.upper()}": str(overrides[knob]) for knob in knobs if knob in overrides
+        })
     settings = Settings(**values)
     settings.session_root.mkdir(parents=True, exist_ok=True)
     return settings

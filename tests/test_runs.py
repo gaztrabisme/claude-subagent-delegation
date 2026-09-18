@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from glm_subagent_mcp.runs import CANCELLED, COMPLETED, COMPLETED_UNVERIFIED, FAILED, Registry
+from subagent_mcp.runs import CANCELLED, COMPLETED, COMPLETED_UNVERIFIED, FAILED, Registry
 
 from .conftest import make_settings
 
@@ -59,7 +59,7 @@ def registry(tmp_path: Path, monkeypatch):
         captured.append(proc)
         return proc
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.captured = captured  # type: ignore[attr-defined]
     yield reg
@@ -91,7 +91,7 @@ def test_child_argv_runs_the_guard_hook(tmp_path: Path, monkeypatch):
         captured.append(FakeProcess(_result("done"), argv, env))
         return captured[-1]
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     registry = Registry(settings, start_reaper=False)
     registry.captured = captured  # type: ignore[attr-defined]
     agent = registry.create_agent("t", tmp_path, "glm-5.3[1m]")
@@ -126,7 +126,7 @@ def test_distills_when_over_cap(tmp_path: Path, monkeypatch):
         calls.append(proc)
         return proc
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     try:
         agent = reg.create_agent("t", tmp_path, "glm-5.3[1m]")
@@ -165,7 +165,7 @@ def test_loop_strikes_fail_the_run(tmp_path: Path, monkeypatch):
     def spawn(argv, env, cwd):
         return FakeProcess(events, argv, env)
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     try:
         agent = reg.create_agent("t", tmp_path, "glm-5.3[1m]")
@@ -183,7 +183,7 @@ def test_cancel_mid_run(tmp_path: Path, monkeypatch):
     def spawn(argv, env, cwd):
         return FakeProcess(_result("late"), argv, env, gate=gate)
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     try:
         agent = reg.create_agent("t", tmp_path, "glm-5.3[1m]")
@@ -216,7 +216,7 @@ def test_continue_passes_resume(tmp_path: Path, monkeypatch):
         calls.append(proc)
         return proc
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     try:
         agent = reg.create_agent("t", tmp_path, "glm-5.3[1m]")

@@ -1,4 +1,4 @@
-"""MCP server exposing Claude Code as a delegatable subagent."""
+"""MCP server exposing coding subagents on several backends (lanes)."""
 
 from __future__ import annotations
 
@@ -14,18 +14,21 @@ from mcp.server.mcpserver import Context
 
 from . import __version__
 from .config import Settings, configure_logging, log
+from .lanes import FALLBACK_MODES
 from .runs import TERMINAL_STATES, Registry, RegistryError, Run
 from .supervisor import Supervisor
 
 SERVER_INSTRUCTIONS = """\
-Delegate self-contained engineering work to a Claude Code agent running in
-its own process. The child reads and edits files and runs shell commands in the
-workspace you name, so give it a task with a clear definition of done.
+Delegate self-contained engineering work to a subagent running in its own
+process, on one of several backends ("lanes": codex, deepseek, glm, bppc,
+omlx). delegate takes `lane` (default glm) to pick one. The child reads and
+edits files and runs shell commands in the workspace you name, so give it a
+task with a clear definition of done.
 
-Typical loop: glm_delegate -> glm_await -> (glm_continue to iterate) ->
-glm_cancel when finished. Runs are asynchronous; glm_await polls.
+Typical loop: delegate -> await -> (continue to iterate) ->
+cancel when finished. Runs are asynchronous; await polls.
 
-ALWAYS call glm_await immediately after glm_delegate, with wait_seconds well
+ALWAYS call await immediately after delegate, with wait_seconds well
 above your client's blocking threshold (1800 or more). A run lives inside this
 server, not as a process on the machine, so nothing shows up in the caller's
 task list and nothing notifies anyone when it ends. An await that exceeds the
@@ -47,7 +50,7 @@ scratch directory rather than anything you cannot afford to have edited.
 
 
 def _instructions() -> str:
-    extra = (os.environ.get("GSA_INSTRUCTIONS") or "").strip()
+    extra = (os.environ.get("SAM_INSTRUCTIONS") or "").strip()
     if extra:
         return SERVER_INSTRUCTIONS + "\n" + extra + "\n"
     return SERVER_INSTRUCTIONS
@@ -70,7 +73,7 @@ async def _lifespan(_app):
 
 
 app = MCPServer(
-    "glm-subagent",
+    "subagent",
     version=__version__,
     instructions=_instructions(),
     lifespan=_lifespan,
@@ -114,25 +117,25 @@ def _result(run: Run) -> dict[str, Any]:
     out = run.detail()
     if run.state not in TERMINAL_STATES:
         out["hint"] = (
-            f"Still working. Call glm_await(run_id='{run.run_id}') to keep waiting, "
-            f"or glm_transcript(run_id='{run.run_id}') to see what it is doing."
+            f"Still working. Call await(run_id='{run.run_id}') to keep waiting, "
+            f"or transcript(run_id='{run.run_id}') to see what it is doing."
         )
     elif run.state == "completed":
         out["hint"] = (
-            f"Done and verified. Call glm_continue(agent_id='{run.agent_id}', ...) to "
-            "iterate in the same session, or glm_cancel to release the runtime."
+            f"Done and verified. Call continue(agent_id='{run.agent_id}', ...) to "
+            "iterate in the same session, or cancel to release the runtime."
         )
     elif run.state == "completed_unverified":
         out["hint"] = (
             "The child finished but the verification command did not pass. Read "
-            f"`verification.output_tail`, then glm_continue(agent_id='{run.agent_id}', ...) "
+            f"`verification.output_tail`, then continue(agent_id='{run.agent_id}', ...) "
             "with what to fix."
         )
     return out
 
 
-@app.tool()
-async def glm_delegate(
+@app.tool(name="delegate")
+async def delegate(
     task: str,
     verification: str,
     workspace: str | None = None,
@@ -140,13 +143,15 @@ async def glm_delegate(
     model: str | None = None,
     name: str | None = None,
     wait_seconds: float = 0,
+    lane: str | None = None,
+    fallback: str = "full",
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Start a new Claude Code subagent on a task.
+    """Start a new subagent on a task.
 
     Returns immediately with an agent_id and run_id unless wait_seconds is set.
     Each call creates a fresh agent with its own runtime process and session;
-    use glm_continue to give more work to an agent that already exists.
+    use continue to give more work to an agent that already exists.
 
     Args:
         task: What to do, with a clear definition of done. The child cannot ask
@@ -160,10 +165,27 @@ async def glm_delegate(
             against the server's configured workspace. Defaults to that workspace.
         instructions: Optional standing guidance prepended to the task, e.g.
             coding conventions or files to leave alone.
-        model: GLM model id. Defaults to the server's configured model.
-        name: Human label for this agent, shown in glm_list.
+        model: Model id on the chosen lane. Defaults to the lane's model.
+        name: Human label for this agent, shown in list.
         wait_seconds: Block up to this long for the run to finish. 0 returns at once.
+        lane: Backend to run on: codex, deepseek, glm, bppc or omlx. Defaults
+            to the server's default lane (SAM_DEFAULT_LANE, glm unless set).
+        fallback: Which other lanes may take the work if this one cannot:
+            "full", "local" or "none". Recorded but not acted on yet; the run
+            stays on the named lane.
     """
+    try:
+        chosen = registry.select_lane(lane, fallback)
+    except RegistryError as exc:
+        # Refused before anything is spawned.
+        return {
+            "state": "rejected",
+            "error": str(exc),
+            "lane": lane or settings.default_lane,
+            "fallback": fallback,
+            "known_lanes": list(settings.lanes),
+            "fallback_modes": list(FALLBACK_MODES),
+        }
     if ctx is not None:
         supervisor.bind(ctx.session)
     try:
@@ -178,7 +200,13 @@ async def glm_delegate(
             'or "true" if there is genuinely nothing to check.'
         )
 
-    agent = registry.create_agent(name=name, workspace=resolved, model=model or settings.model)
+    agent = registry.create_agent(
+        name=name,
+        workspace=resolved,
+        model=model or chosen.model,
+        lane=chosen.name,
+        fallback=fallback,
+    )
     start_error = await anyio.to_thread.run_sync(agent.wait_ready, 60.0)
     if start_error is not None:
         raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
@@ -188,11 +216,13 @@ async def glm_delegate(
     out = _result(run)
     out["workspace"] = str(resolved)
     out["model"] = agent.model
+    out["lane"] = agent.lane.name
+    out["fallback"] = agent.fallback
     return out
 
 
-@app.tool()
-async def glm_await(
+@app.tool(name="await")
+async def await_run(
     run_id: str,
     wait_seconds: float = 120,
     ctx: Context = None,  # type: ignore[assignment]
@@ -204,7 +234,7 @@ async def glm_await(
     agent has since been reaped are still readable — their results are archived.
 
     Args:
-        run_id: The run to wait on, from glm_delegate or glm_continue.
+        run_id: The run to wait on, from delegate or continue.
         wait_seconds: Maximum time to block. Use a longer value for big tasks.
     """
     run = registry.find_run(run_id)
@@ -212,8 +242,8 @@ async def glm_await(
     return _result(run)
 
 
-@app.tool()
-async def glm_continue(
+@app.tool(name="continue")
+async def continue_agent(
     agent_id: str,
     message: str,
     verification: str | None = None,
@@ -227,10 +257,10 @@ async def glm_continue(
     is mid-run, this message runs after it.
 
     Args:
-        agent_id: Agent to continue, from glm_delegate or glm_list.
+        agent_id: Agent to continue, from delegate or list.
         message: The follow-up instruction.
         verification: Command proving this follow-up is done. Omit it to reuse
-            the command this agent's glm_delegate was given (the result's
+            the command this agent's delegate was given (the result's
             `verification_note` says so). Pass "" to skip verification; the run
             then reports completed_unverified.
         wait_seconds: Block up to this long for the run to finish. 0 returns at once.
@@ -243,8 +273,8 @@ async def glm_continue(
     return _result(run)
 
 
-@app.tool()
-async def glm_list(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+@app.tool(name="list")
+async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
     """List every subagent this server owns, with its state, cost, and run history."""
     # Bind here too, so the reported supervisor tier is the real one on the
     # first call rather than a placeholder that reads like a resolved answer.
@@ -259,15 +289,16 @@ async def glm_list(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assig
         "agents": agents,
         "live": sum(1 for a in agents if a["state"] != "closed"),
         "limit": settings.max_agents,
-        "default_model": settings.model,
+        "default_lane": settings.default_lane,
+        "lanes": [lane.as_dict() for lane in settings.lanes.values()],
         "default_workspace": str(settings.workspace),
         "tokens_spent": spent,
         "archived_runs": len(registry.archived_runs()),
         "trace": str(registry.trace.path) if registry.trace.enabled else None,
         "limits": {
-            "run_timeout_seconds": settings.run_timeout,
-            "idle_timeout_seconds": settings.idle_timeout,
-            "max_steps": settings.max_steps,
+            "run_timeout_seconds": settings.lane().run_timeout,
+            "idle_timeout_seconds": settings.lane().idle_timeout,
+            "max_steps": settings.lane().max_steps,
             "turn_token_budget": settings.turn_token_budget,
             "result_cap_chars": settings.result_cap_chars,
         },
@@ -278,8 +309,8 @@ async def glm_list(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assig
     }
 
 
-@app.tool()
-async def glm_cancel(agent_id: str) -> dict[str, Any]:
+@app.tool(name="cancel")
+async def cancel(agent_id: str) -> dict[str, Any]:
     """Stop a subagent and release its runtime process.
 
     The harness protocol has no mid-turn cancel, so this kills the child
@@ -302,8 +333,8 @@ async def glm_cancel(agent_id: str) -> dict[str, Any]:
     }
 
 
-@app.tool()
-async def glm_transcript(run_id: str, limit: int = 60, raw: bool = False) -> dict[str, Any]:
+@app.tool(name="transcript")
+async def transcript(run_id: str, limit: int = 60, raw: bool = False) -> dict[str, Any]:
     """Show what a subagent actually did during a run.
 
     Returns the tail of its activity log — tool calls, assistant messages, turn
@@ -313,7 +344,7 @@ async def glm_transcript(run_id: str, limit: int = 60, raw: bool = False) -> dic
     Args:
         run_id: The run to inspect.
         limit: How many of the most recent activity lines to return.
-        raw: Also return the child's full uncapped response. glm_delegate
+        raw: Also return the child's full uncapped response. delegate
             returns a distilled version when the answer is large; this is where
             the original text lives.
     """
@@ -339,21 +370,25 @@ async def glm_transcript(run_id: str, limit: int = 60, raw: bool = False) -> dic
 def main() -> None:
     configure_logging(settings.log_level)
     log.info(
-        "starting: model=%s workspace=%s max_agents=%d supervisor=%s",
-        settings.model,
+        "starting: default_lane=%s workspace=%s max_agents=%d supervisor=%s",
+        settings.default_lane,
         settings.workspace,
         settings.max_agents,
         settings.supervisor,
     )
     if registry.trace.enabled:
         log.info("tracing decisions and runs to %s", registry.trace.path)
-    if not settings.api_key:
-        print(
-            "warning: GLM_API_KEY is not set in this server's environment; "
-            "child Claude Code processes will fail until one is provided "
-            "(GLM_API_KEY, ZAI_API_KEY, or ANTHROPIC_AUTH_TOKEN).",
-            file=sys.stderr,
-        )
+    for lane in settings.lanes.values():
+        reason = lane.unavailable()
+        if reason is not None:
+            log.info("lane %s: %s", lane.name, reason)
+        elif not lane.api_key():
+            # Names the variables only; key values are never logged.
+            print(
+                f"warning: lane {lane.name} has no API key in this server's environment; "
+                f"children on it will fail until one of {', '.join(lane.api_key_envs)} is set.",
+                file=sys.stderr,
+            )
     try:
         app.run()
     finally:

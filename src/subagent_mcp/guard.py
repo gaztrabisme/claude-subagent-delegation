@@ -86,7 +86,7 @@ GIT_BRANCH_READ = frozenset({
 # Paths a delegated coding agent has no business touching, relative to $HOME.
 SENSITIVE_HOME = (
     ".ssh", ".aws", ".gnupg", ".kube", ".docker/config.json", ".netrc",
-    ".config/gh", ".claude.json", ".claude", ".omlx", ".glm-subagent",
+    ".config/gh", ".claude.json", ".claude", ".omlx", ".glm-subagent", ".subagent-mcp",
     "Library/Keychains",
     # Shell and REPL history: commands typed with tokens in them.
     ".zsh_history", ".bash_history", ".history", ".python_history",
@@ -102,6 +102,7 @@ SENSITIVE_NAMES = frozenset({
 # to whatever the child writes next.
 SECRET_ENV = re.compile(
     r"\$\{?(ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|GLM_API_KEY|ZAI_API_KEY"
+    r"|DEEPSEEK_API_KEY|OPENAI_API_KEY|SAM_[A-Z0-9_]*API_KEY"
     r"|CLAUDE_CODE_OAUTH_TOKEN)\b"
 )
 

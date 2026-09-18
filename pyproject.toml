@@ -1,11 +1,11 @@
 [project]
-name = "glm-subagent-mcp"
+name = "subagent-mcp"
 version = "0.1.0"
-description = "Delegate work to a Claude Code subprocess billed against a GLM Coding Plan."
+description = "Delegate work to coding subagents across several backends (Codex, DeepSeek, GLM, local llama.cpp, oMLX)."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-keywords = ["mcp", "glm", "claude-code", "subagent", "z.ai"]
+keywords = ["mcp", "claude-code", "subagent", "codex", "deepseek", "glm", "omlx"]
 classifiers = [
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3.11",
@@ -17,10 +17,10 @@ dependencies = [
 ]
 
 [project.scripts]
-glm-subagent-mcp = "glm_subagent_mcp.server:main"
+subagent-mcp = "subagent_mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/gaztrabisme/glm-subagent-mcp"
+Homepage = "https://github.com/gaztrabisme/subagent-mcp"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]
@@ -30,7 +30,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/glm_subagent_mcp"]
+packages = ["src/subagent_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

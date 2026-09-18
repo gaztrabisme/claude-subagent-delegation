@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from glm_subagent_mcp.guard import ALLOW, DENY, ESCALATE, classify_verification
-from glm_subagent_mcp.verify import run_verification
+from subagent_mcp.guard import ALLOW, DENY, ESCALATE, classify_verification
+from subagent_mcp.verify import run_verification
 
 from .conftest import make_settings
 

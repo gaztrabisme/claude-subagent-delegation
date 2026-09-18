@@ -6,9 +6,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from glm_subagent_mcp import runs
-from glm_subagent_mcp.config import Settings
-from glm_subagent_mcp.runs import (
+from subagent_mcp import runs
+from subagent_mcp.config import Settings
+from subagent_mcp.runs import (
     COMPLETED,
     COMPLETED_UNVERIFIED,
     FAILED,
@@ -33,7 +33,7 @@ def _registry(tmp_path: Path, monkeypatch, script: list[list[dict[str, Any]]], *
         spawned.append(FakeProcess(events, argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("glm_subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg
@@ -61,11 +61,11 @@ def _success(text: str = "done", turns: int = 1) -> dict[str, Any]:
     }
 
 
-# --- item 6: GSA_MAX_STEPS counts turns ---------------------------------------
+# --- item 6: SAM_MAX_STEPS counts turns ---------------------------------------
 
 
 def test_a_child_that_finishes_under_the_turn_cap_is_not_relabelled(tmp_path, monkeypatch):
-    """Five parallel tool calls in two turns, with GSA_MAX_STEPS=2: completed."""
+    """Five parallel tool calls in two turns, with SAM_MAX_STEPS=2: completed."""
     events = [_init(), *[_tool(f"ls {i}") for i in range(5)], _success(turns=2)]
     reg = _registry(tmp_path, monkeypatch, [events], max_steps=2)
     try:
@@ -149,7 +149,7 @@ def test_continue_without_verification_reuses_the_delegates(tmp_path, monkeypatc
         run = _wait(agent.follow_up("wrap up"))
         assert run.verification == "test -d ."
         assert run.state == COMPLETED
-        assert "reused the glm_delegate command" in run.detail()["verification_note"]
+        assert "reused the delegate command" in run.detail()["verification_note"]
     finally:
         reg.shutdown()
 
@@ -247,7 +247,7 @@ def test_fair_use_throttle_backs_off_on_its_own_clock(tmp_path, monkeypatch):
         run = _wait(agent.submit("do", verification="true"))
         assert run.state == COMPLETED
         assert len(reg.spawned) == 3  # type: ignore[attr-defined]
-        # 0.02 then 0.04 from GSA_THROTTLE_BACKOFF, not 0.001 + 0.002.
+        # 0.02 then 0.04 from SAM_THROTTLE_BACKOFF, not 0.001 + 0.002.
         assert sum(slices) >= 0.05
     finally:
         reg.shutdown()
@@ -267,5 +267,5 @@ def test_fair_use_throttle_exhaustion_tells_the_caller_to_run_fewer(tmp_path, mo
 
 
 def test_throttle_backoff_default_is_a_minute(monkeypatch):
-    monkeypatch.delenv("GSA_THROTTLE_BACKOFF", raising=False)
+    monkeypatch.delenv("SAM_THROTTLE_BACKOFF", raising=False)
     assert Settings.from_env().throttle_backoff == 60.0

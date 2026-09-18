@@ -68,6 +68,8 @@ class Lane:
 
     def unavailable(self) -> str | None:
         """Why this build cannot run a child on this lane, or None."""
+        if self.driver == DRIVER_CODEX:
+            return None  # the Codex CLI owns its own connection
         if self.driver != DRIVER_CLAUDE:
             return f"lane {self.name!r} ({self.driver} driver) is not available in this build"
         if not self.base_url:

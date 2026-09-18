@@ -382,7 +382,7 @@ def main() -> None:
         reason = lane.unavailable()
         if reason is not None:
             log.info("lane %s: %s", lane.name, reason)
-        elif not lane.api_key():
+        elif lane.api_key_envs and not lane.api_key():
             # Names the variables only; key values are never logged.
             print(
                 f"warning: lane {lane.name} has no API key in this server's environment; "

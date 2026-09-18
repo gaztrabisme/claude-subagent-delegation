@@ -220,3 +220,49 @@ def fake_codex(tmp_path: Path, monkeypatch):
             return [json.loads(line) for line in record.read_text().splitlines()]
 
     return Fake()
+
+
+# --- telemetry probes and trace-record validation ----------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_telemetry_probes(monkeypatch):
+    """No test reaches oMLX, bppc (ssh, :8081) or sysctl/pmset through telemetry.
+
+    Tests that exercise the probe parsers patch these again with canned output.
+    """
+    from subagent_mcp import telemetry
+
+    def no_http(url, headers=None, timeout=telemetry.PROBE_TIMEOUT):
+        raise OSError("network probes are disabled in tests")
+
+    def no_run(argv, timeout=telemetry.PROBE_TIMEOUT):
+        raise OSError("subprocess probes are disabled in tests")
+
+    monkeypatch.setattr(telemetry, "_http_get", no_http)
+    monkeypatch.setattr(telemetry, "_run", no_run)
+
+
+@pytest.fixture(autouse=True)
+def trace_records(monkeypatch):
+    """Every record any Trace builds during a test, enabled or not, as written.
+
+    Checked against tests/test_trace_schema.py when the test ends, so every fake
+    run in the suite validates the schema of what it wrote.
+    """
+    from subagent_mcp import trace as trace_module
+
+    records: list[dict] = []
+    real_write = trace_module.Trace.write
+
+    def write(self, kind, **fields):
+        record = {"schema": trace_module.SCHEMA, "ts": 0.0, "kind": kind, **fields}
+        records.append(json.loads(json.dumps(record, default=str)))
+        real_write(self, kind, **fields)
+
+    monkeypatch.setattr(trace_module.Trace, "write", write)
+    yield records
+    from .test_trace_schema import problems
+
+    found = [p for record in list(records) for p in problems(record)]
+    assert not found, "trace records off schema:\n" + "\n".join(found[:20])

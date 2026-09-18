@@ -34,6 +34,10 @@ HOP_SKIPPED_CLOSED = "skipped_closed"
 HOP_HEALTH_FAILED = "health_failed"
 HOP_UNAVAILABLE = "unavailable"
 
+# Refusal code of a hop skipped by an enforced admission threshold. Not a lane
+# closure: the next dispatch probes the lane again.
+ADMISSION = "admission"
+
 _BALANCE_RE = re.compile(r"insufficient balance|\b402\b", re.IGNORECASE)
 _CODEX_LIMIT = "you've hit your usage limit"
 _CODEX_AT_RE = re.compile(
@@ -99,9 +103,14 @@ class Hop:
     # "sandbox+hook"), whether or not the hop ran.
     driver: str | None = None
     guard: str | None = None
+    # Local lanes: the telemetry snapshot taken at dispatch, and whether the
+    # admission thresholds would have refused it (telemetry.Admission).
+    admission: dict[str, Any] | None = None
+    would_refuse: bool | None = None
+    admit_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "hop": self.index,
             "lane": self.lane,
             "provider": self.provider,
@@ -114,6 +123,10 @@ class Hop:
             "reset_at": self.reset_at.isoformat() if self.reset_at else None,
             "closed_until": self.closed_until.isoformat() if self.closed_until else None,
         }
+        if self.would_refuse is not None:
+            out["would_refuse"] = self.would_refuse
+            out["admit_reason"] = self.admit_reason
+        return out
 
 
 def _local_now() -> datetime:

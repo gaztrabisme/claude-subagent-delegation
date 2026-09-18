@@ -310,3 +310,76 @@ def test_m8_omlx_cold_when_its_model_is_not_loaded(monkeypatch, mock_endpoint):
     # A server that does not list models falls back to the count.
     assert health.omlx_cold({"models_loaded": 0}, lane.model) is True
     assert health.omlx_cold({"models_loaded": 2}, lane.model) is False
+
+
+# --- L6: a health probe is bounded in wall-clock time ------------------------------
+
+
+def test_l6_slow_drip_health_is_cut_at_the_probe_timeout():
+    import socket
+    import threading
+    import time
+
+    from subagent_mcp import health
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    stop = threading.Event()
+
+    def drip():
+        conn, _ = server.accept()
+        conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 100\r\n\r\n")
+        while not stop.is_set():  # one byte per 0.3 s: never a socket timeout
+            try:
+                conn.sendall(b"x")
+            except OSError:
+                break
+            time.sleep(0.3)
+        conn.close()
+
+    threading.Thread(target=drip, daemon=True).start()
+    from .conftest import MOCK_PORTS
+
+    MOCK_PORTS.add(port)  # conftest's probe guard lets this port through
+    started = time.monotonic()
+    try:
+        assert health._http_get(f"http://127.0.0.1:{port}/health", timeout=1.0) is None
+        assert time.monotonic() - started < 2.5
+    finally:
+        MOCK_PORTS.discard(port)
+        stop.set()
+        server.close()
+
+
+# --- M4 (cheap parts): .codex/ is protected; a silent Codex hook is marked ----------
+
+
+def test_m4_workspace_codex_dir_is_protected(ws):
+    assert classify("Write", {"file_path": str(ws / ".codex" / "config.toml")}, ws).action == DENY
+    assert classify("Bash", {"command": "echo x > .codex/hooks.json"}, ws).action == DENY
+    assert classify("Write", {"file_path": str(ws / "codex" / "x")}, ws).action == ALLOW
+
+
+def test_m4_codex_run_with_steps_and_no_verdicts_is_hook_silent(tmp_path):
+    import json
+
+    from subagent_mcp.runs import Run
+    from subagent_mcp.trace import Trace
+
+    trace = Trace(tmp_path / "t.jsonl")
+    run = Run(run_id="r1", agent_id="a1-x", prompt="p", lane="codex", driver="codex",
+              guard="sandbox+hook")
+    run.usage.steps = 2
+    trace.run(run, str(tmp_path), "m")
+    record = json.loads((tmp_path / "t.jsonl").read_text().splitlines()[-1])
+    assert record["guard"] == "sandbox (hook silent)" and record["hook_silent"] is True
+    trace.verdict(agent_id="a1-y", tool="Bash", action="allow", tier="policy", reason="r",
+                  facts={}, latency_ms=1.0)
+    guarded = Run(run_id="r2", agent_id="a1-y", prompt="p", lane="codex", driver="codex",
+                  guard="sandbox+hook")
+    guarded.usage.steps = 1
+    trace.run(guarded, str(tmp_path), "m")
+    record = json.loads((tmp_path / "t.jsonl").read_text().splitlines()[-1])
+    assert record["guard"] == "sandbox+hook" and "hook_silent" not in record

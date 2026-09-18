@@ -222,7 +222,9 @@ def test_trace_marks_guard_per_driver(fake_codex, registry, tmp_path: Path, monk
     _run(claude_agent)
     records = [json.loads(line) for line in registry.trace_path.read_text().splitlines()]
     runs = {r["agent_id"]: r for r in records if r["kind"] == "run"}
-    assert runs[codex_agent.agent_id]["guard"] == "sandbox+hook"
+    # The fake codex never calls the hook: with command items and no verdict
+    # the run is marked hook-silent rather than sandbox+hook (M4).
+    assert runs[codex_agent.agent_id]["guard"] == "sandbox (hook silent)"
     assert runs[codex_agent.agent_id]["session_id"] == "01a0a0de-91f8-7441-a178-a154caba9282"
     assert runs[claude_agent.agent_id]["guard"] == "hook"
 

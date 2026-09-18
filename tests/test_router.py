@@ -628,8 +628,10 @@ def test_router_glm_refused_then_codex_runs_and_continue_resumes_thread(
     hops = [(r["lane"], r["driver"], r["guard"]) for r in records if r["kind"] == "hop"]
     assert hops == [("glm", "claude", "hook"), ("codex", "codex", "sandbox+hook")]
     runs_ = [r for r in records if r["kind"] == "run"]
+    # The fake codex runs a command without calling the hook, so the run
+    # record says the hook stayed silent (M4); the hop keeps the configured guard.
     assert [(r["lane"], r["driver"], r["guard"]) for r in runs_] == [
-        ("codex", "codex", "sandbox+hook")] * 2
+        ("codex", "codex", "sandbox (hook silent)")] * 2
     assert runs_[0]["session_id"] == CODEX_THREAD
 
 

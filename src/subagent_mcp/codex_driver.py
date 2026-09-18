@@ -25,13 +25,13 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import Settings, log
 from .lanes import DRIVER_CODEX, Lane
-from .router import Refusal
+from .router import Refusal, codex_reset
 from .runs import Agent, ClaudeProcess
 
 GUARD = "sandbox+hook"
@@ -47,26 +47,6 @@ STEP_ITEMS = frozenset({"command_execution", "file_change"})
 
 _USAGE_LIMIT_RE = re.compile(r"usage limit", re.IGNORECASE)
 _CONTEXT_RE = re.compile(r"context window", re.IGNORECASE)
-_RESET_RE = re.compile(
-    r"try again at\s+"
-    r"(?:(?P<month>[A-Z][a-z]{2,8})\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<year>\d{4})\s+)?"
-    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>[AaPp][Mm])",
-)
-_MONTHS = {
-    name: index
-    for index, names in enumerate(
-        (
-            ("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
-            ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
-            ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"),
-            ("dec", "december"),
-        ),
-        start=1,
-    )
-    for name in names
-}
-
-
 def codex_bin() -> str:
     """The Codex CLI to run: SAM_CODEX_BIN, else `codex` on PATH."""
     return os.environ.get("SAM_CODEX_BIN") or "codex"
@@ -82,30 +62,8 @@ def source_codex_home() -> Path:
 
 
 def parse_reset(message: str, now: datetime | None = None) -> datetime | None:
-    """The local time a usage-limit message says to try again at.
-
-    "try again at Sep 20th, 2026 1:29 PM" is that date. A bare "try again at
-    1:01 PM" is today, or tomorrow when that time has already passed.
-    Local time, returned timezone-aware.
-    """
-    match = _RESET_RE.search(message or "")
-    if match is None:
-        return None
-    hour = int(match["hour"]) % 12 + (12 if match["ampm"].lower() == "pm" else 0)
-    minute = int(match["minute"])
-    current = now or datetime.now()
-    if match["month"]:
-        month = _MONTHS.get(match["month"].lower())
-        if month is None:
-            return None
-        try:
-            return datetime(int(match["year"]), month, int(match["day"]), hour, minute).astimezone()
-        except ValueError:
-            return None
-    moment = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if moment <= current:
-        moment += timedelta(days=1)
-    return moment.astimezone()
+    """The local time a usage-limit message says to try again at (router.codex_reset)."""
+    return codex_reset(message, now)
 
 
 def _failure_messages(events: Iterable[dict[str, Any]]) -> list[str]:

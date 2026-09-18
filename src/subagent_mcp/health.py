@@ -62,10 +62,9 @@ class Health:
     cold_load: bool = False
 
 
-def _http_get(url: str, headers: dict[str, str] | None = None,
-              timeout: float = PROBE_TIMEOUT) -> tuple[int, bytes] | None:
-    """(status, body) for a GET, or None when nothing answered. No proxies."""
-    request = urllib.request.Request(url, headers=headers or {})
+def _http_get_once(url: str, headers: dict[str, str], timeout: float
+                   ) -> tuple[int, bytes] | None:
+    request = urllib.request.Request(url, headers=headers)
     try:
         with _OPENER.open(request, timeout=timeout) as response:
             return response.status, response.read(65536)
@@ -73,6 +72,24 @@ def _http_get(url: str, headers: dict[str, str] | None = None,
         return exc.code, b""
     except (OSError, ValueError):
         return None
+
+
+def _http_get(url: str, headers: dict[str, str] | None = None,
+              timeout: float = PROBE_TIMEOUT) -> tuple[int, bytes] | None:
+    """(status, body) for a GET, or None when nothing answered. No proxies.
+
+    `timeout` bounds the whole call, name lookup and a slow-drip body
+    included (urllib's own timeout is per socket operation). The request
+    runs on a daemon thread that is abandoned when the bound passes.
+    """
+    box: list[tuple[int, bytes] | None] = []
+    worker = threading.Thread(
+        target=lambda: box.append(_http_get_once(url, headers or {}, timeout)),
+        name="sam-health-probe", daemon=True,
+    )
+    worker.start()
+    worker.join(timeout)
+    return box[0] if box else None
 
 
 def _tailscale_status() -> dict[str, Any] | None:

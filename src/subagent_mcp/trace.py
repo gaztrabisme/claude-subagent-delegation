@@ -125,6 +125,19 @@ class Trace:
             None,
         )
         extra: dict[str, Any] = {}
+        verdicts = self.take_verdicts(run.agent_id)
+        guard = guard or getattr(run, "guard", None) or "hook"
+        if (
+            getattr(run, "driver", None) == "codex"
+            and "hook" in guard
+            and run.usage.steps > 0
+            and not any(verdicts.values())
+        ):
+            # Codex ran commands or patches and the hook was never asked: it
+            # did not fire, and only the sandbox stood between the child and
+            # the machine. A Claude child cannot get here: its hook must answer.
+            guard = "sandbox (hook silent)"
+            extra["hook_silent"] = True
         parent = getattr(run, "parent", None)
         if parent:
             extra["parent"] = parent
@@ -141,7 +154,7 @@ class Trace:
             provider=getattr(run, "provider", None),
             driver=getattr(run, "driver", None),
             workspace=workspace,
-            guard=guard or getattr(run, "guard", None) or "hook",
+            guard=guard,
             state=run.state,
             finish_reason=run.finish_reason,
             elapsed_seconds=round(finished - started, 2),
@@ -153,7 +166,7 @@ class Trace:
             continues=getattr(run, "continues", 0),
             end_state=run.state,
             verification_passed=verification.passed if verification else None,
-            guard_verdicts=self.take_verdicts(run.agent_id),
+            guard_verdicts=verdicts,
             refusal_code=refusal,
             usage=run.usage.as_dict(),
             # Lengths, not text: the trace is for measuring, not for archiving

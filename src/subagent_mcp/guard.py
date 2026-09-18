@@ -271,6 +271,11 @@ def protected(path: Path) -> str | None:
                     f"{candidate} is code git runs later (.git/hooks, .git/config), "
                     "including in the parent's own git calls"
                 )
+            if part == ".codex":
+                return (
+                    f"{candidate} is Codex project config (.codex/), read by the next "
+                    "Codex run in this directory, hooks included"
+                )
         for root in PROTECTED_ROOTS:
             if inside(candidate, root):
                 return f"{root} holds this server's per-agent settings and sessions"

@@ -25,7 +25,7 @@ from typing import Any
 
 from .config import Settings, log
 from .guard import protect
-from .lanes import FALLBACK_MODES, Lane
+from .lanes import DRIVER_CODEX, FALLBACK_MODES, Lane
 from .trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
 
@@ -127,6 +127,7 @@ class Usage:
         self.cache_write += int(
             usage.get("cache_creation_input_tokens") or usage.get("cacheWriteTokens") or 0
         )
+        self.reasoning += int(usage.get("reasoning_output_tokens") or 0)
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -576,6 +577,11 @@ class Run:
 class Agent:
     """One Claude Code session, driven by a serial task queue."""
 
+    # What stands between the child and the machine, for the trace.
+    guard = "hook"
+    # Whether a run needs the lane's API key in this server's environment.
+    needs_api_key = True
+
     def __init__(
         self,
         agent_id: str,
@@ -812,12 +818,18 @@ class Agent:
             argv.extend(["--resume", resume])
         return argv
 
+    def _spawn(self, prompt: str, resume: str | None) -> ClaudeProcess:
+        """One turn's child process. A driver subclass replaces this."""
+        argv = self._argv(prompt, resume)
+        env = self.settings.child_env(self.agent_id, self.lane, self.model)
+        return _spawn_claude(argv, env, str(self.workspace))
+
     def _execute(self, run: Run) -> None:
         run.started_at = _now()
         run.deadline = run.started_at + self.lane.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
-        if not self.lane.api_key():
+        if self.needs_api_key and not self.lane.api_key():
             run.state = FAILED
             names = ", ".join(self.lane.api_key_envs) or "(none configured)"
             run.error = f"missing API key for lane {self.lane.name!r}: set one of {names}"
@@ -908,9 +920,7 @@ class Agent:
         """
         attempt = 0
         while True:
-            argv = self._argv(prompt, resume)
-            env = self.settings.child_env(self.agent_id, self.lane, self.model)
-            proc = _spawn_claude(argv, env, str(self.workspace))
+            proc = self._spawn(prompt, resume)
             self._current = proc
             collected: list[dict[str, Any]] = []
             watch = _Watch(run, self.settings, self.signatures, self.lane.max_steps)
@@ -1058,7 +1068,7 @@ class Agent:
         run.finished_at = _now()
         if self.trace is not None:
             try:
-                self.trace.run(run, str(self.workspace), self.model)
+                self.trace.run(run, str(self.workspace), self.model, guard=self.guard)
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
         run.done.set()
@@ -1179,7 +1189,10 @@ class Registry:
                     f"Cancel one with cancel, or raise SAM_{chosen.name.upper()}_MAX_AGENTS."
                 )
             agent_id = f"a{next(self._counter)}"
-            agent = Agent(
+            agent_class = Agent
+            if chosen.driver == DRIVER_CODEX:
+                from .codex_driver import CodexAgent as agent_class
+            agent = agent_class(
                 agent_id=agent_id,
                 name=name or f"subagent-{agent_id}",
                 workspace=workspace,

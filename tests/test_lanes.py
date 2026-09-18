@@ -182,7 +182,6 @@ def _delegate(server, tmp_path: Path, **kwargs):
     [
         ({"lane": "nope"}, "unknown lane"),
         ({"fallback": "sideways"}, "unknown fallback"),
-        ({"lane": "codex"}, "not available in this build"),
         ({"lane": "bppc"}, "not available in this build"),
     ],
 )

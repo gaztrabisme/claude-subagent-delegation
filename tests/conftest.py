@@ -20,6 +20,9 @@ def _lane_keys(monkeypatch):
     for name in KEY_ENVS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GLM_API_KEY", "test-key")
+    # No test may reach the real Codex CLI or the user's Codex login.
+    monkeypatch.setenv("SAM_CODEX_BIN", "/nonexistent/codex-disabled-in-tests")
+    monkeypatch.setenv("CODEX_HOME", "/nonexistent/codex-home-disabled-in-tests")
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:

@@ -90,7 +90,7 @@ class Trace:
             latency_ms=round(latency_ms, 1),
         )
 
-    def run(self, run: Any, workspace: str, model: str) -> None:
+    def run(self, run: Any, workspace: str, model: str, guard: str = "hook") -> None:
         verification = run.verification_result
         distil: dict[str, Any] = {"distilled": run.distilled, "truncated": run.truncated}
         if run.distilled:
@@ -102,6 +102,7 @@ class Trace:
             session_id=run.session_id,
             model=model,
             workspace=workspace,
+            guard=guard,
             state=run.state,
             finish_reason=run.finish_reason,
             elapsed_seconds=round((run.finished_at or 0) - (run.started_at or 0), 2),

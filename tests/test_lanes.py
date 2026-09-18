@@ -57,7 +57,7 @@ def test_registry_lists_five_lanes_in_order(home):
     gpubox, omlx = lanes["gpubox"], lanes["omlx"]
     assert (gpubox.max_agents, gpubox.compact_window, gpubox.default_api_key) == (1, 40960, "local")
     assert gpubox.health_url is None
-    assert (omlx.max_agents, omlx.compact_window) == (4, 98304)
+    assert (omlx.max_agents, omlx.compact_window) == (1, 98304)
     assert omlx.health_url == "http://127.0.0.1:8000/api/status"
     # Cloud lanes take the Settings defaults.
     glm = lanes["glm"]

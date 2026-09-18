@@ -11,6 +11,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import adapter
 from .lanes import Lane, load_lanes
 
 log = logging.getLogger("sam")
@@ -210,7 +211,7 @@ class Settings:
             }
         payload = {
             "env": {
-                "ANTHROPIC_BASE_URL": lane.base_url or "",
+                "ANTHROPIC_BASE_URL": adapter.child_base_url(lane) or "",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
@@ -252,7 +253,7 @@ class Settings:
         key = lane.api_key() or ""
         env.update({
             "CLAUDE_CONFIG_DIR": str(self.agent_home(agent_id)),
-            "ANTHROPIC_BASE_URL": lane.base_url or "",
+            "ANTHROPIC_BASE_URL": adapter.child_base_url(lane) or "",
             "ANTHROPIC_AUTH_TOKEN": key,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model,

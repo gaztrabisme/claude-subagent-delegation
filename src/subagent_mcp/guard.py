@@ -88,6 +88,9 @@ SENSITIVE_HOME = (
     ".ssh", ".aws", ".gnupg", ".kube", ".docker/config.json", ".netrc",
     ".config/gh", ".claude.json", ".claude", ".omlx", ".glm-subagent", ".subagent-mcp",
     "Library/Keychains",
+    # Codex's login (auth.json: OpenAI OAuth and refresh tokens) and sessions;
+    # git's plain-text credential store.
+    ".codex", ".git-credentials",
     # Shell and REPL history: commands typed with tokens in them.
     ".zsh_history", ".bash_history", ".history", ".python_history",
     ".node_repl_history", ".psql_history", ".mysql_history", ".sqlite_history",
@@ -1248,8 +1251,49 @@ PATH_KEYS = ("path", "file_path", "filePath", "target", "filename", "file")
 COMMAND_KEYS = ("command", "cmd", "script", "input")
 
 
-def classify(tool_name: str, tool_input: dict, workspace: Path) -> Verdict:
-    """Classify one proposed tool call. Unknown shapes escalate, never allow."""
+def _working_dir(
+    raw: object, workspace: Path, base: Path | None = None
+) -> tuple[Path | None, Verdict | None]:
+    """The directory a call says it runs in (Codex `workdir`, the hook
+    payload's `cwd`), or the verdict refusing it.
+
+    Relative paths resolve against `base` (default the workspace). A directory outside the
+    workspace, or under a sensitive root, is refused: relative paths in the
+    command would resolve there, where the path checks cannot see them.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None, None
+    word = str(raw)
+    if _unresolvable(word):
+        return None, Verdict(DENY, f"refused: working directory `{word}` cannot be resolved",
+                             {"workdir": word})
+    path = _resolve(word, base or workspace)
+    why = is_sensitive(path)
+    if why:
+        return None, Verdict(DENY, f"refused: {why}", {"workdir": str(path),
+                                                      "sensitive_path": str(path)})
+    # Resolved inside the workspace; textually too unless the word has no
+    # `..` (an absolute cwd the OS reports may name the workspace through a
+    # symlink such as /var -> /private/var).
+    if not inside(path, workspace) or (
+        ".." in Path(word).parts and not _inside_logically(path, workspace)
+    ):
+        return None, Verdict(
+            DENY, f"refused: working directory {path} is outside the workspace",
+            {"workdir": str(path)},
+        )
+    return path, None
+
+
+def classify(
+    tool_name: str, tool_input: dict, workspace: Path, cwd: str | Path | None = None
+) -> Verdict:
+    """Classify one proposed tool call. Unknown shapes escalate, never allow.
+
+    `cwd` is the directory the calling agent reports it is in (the hook
+    payload's cwd). A shell call may name its own (`workdir`, `cwd`); either
+    must sit inside the workspace, and relative paths resolve against it.
+    """
     name = (tool_name or "").strip()
     if name.startswith("mcp__") or name in NESTED_TOOLS:
         return Verdict(
@@ -1259,10 +1303,14 @@ def classify(tool_name: str, tool_input: dict, workspace: Path) -> Verdict:
         )
     if name in NETWORK_TOOLS:
         return Verdict(ESCALATE, f"`{name}` reaches the network", {"tool": name})
+    base, refused = _working_dir(cwd, workspace)
+    if refused is not None:
+        return Verdict(refused.action, refused.reason, {"tool": name, **refused.facts})
+    base = base or workspace
     if name in READ_TOOLS:
         path = _first(tool_input, PATH_KEYS)
         if path is not None:
-            candidate = _resolve(str(path), workspace)
+            candidate = _resolve(str(path), base)
             why = is_sensitive(candidate)
             if why:
                 return Verdict(
@@ -1275,13 +1323,20 @@ def classify(tool_name: str, tool_input: dict, workspace: Path) -> Verdict:
         command = _first(tool_input, COMMAND_KEYS)
         if command is None:
             return Verdict(ESCALATE, "shell call with no readable command", {"tool": name})
-        verdict = classify_bash(str(command), workspace)
+        workdir = _first(tool_input, ("workdir", "cwd", "working_directory"))
+        if workdir is not None:
+            own, refused = _working_dir(workdir, workspace, base)
+            if refused is not None:
+                return Verdict(refused.action, refused.reason, {"tool": name, **refused.facts})
+            base = own or base
+        verdict = classify_bash(str(command), workspace, cwd=base)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
     if name in WRITE_TOOLS:
         path = _first(tool_input, PATH_KEYS)
         if path is None:
             return Verdict(ESCALATE, "write call with no readable path", {"tool": name})
-        verdict = classify_path_write(str(path), workspace)
+        target = str(path) if base == workspace else str(_resolve(str(path), base))
+        verdict = classify_path_write(target, workspace)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
     return Verdict(ESCALATE, f"unrecognized tool `{name}`", {"tool": name})
 

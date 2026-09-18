@@ -153,9 +153,10 @@ class Supervisor:
         tool_input: dict,
         workspace: Path,
         agent_id: str | None = None,
+        cwd: str | None = None,
     ) -> Verdict:
         started = time.monotonic()
-        verdict = classify(tool_name, tool_input, workspace)
+        verdict = classify(tool_name, tool_input, workspace, cwd)
         if verdict.action != ESCALATE:
             self._record(verdict, tier="policy", tool=tool_name, agent_id=agent_id,
                          started=started)
@@ -342,6 +343,7 @@ class Supervisor:
                     request.get("tool_input") or {},
                     workspace,
                     agent_id,
+                    request.get("cwd") or None,
                 )
                 reply = {"action": verdict.action, "reason": verdict.reason}
             except Exception as exc:  # noqa: BLE001 - a broken request denies

@@ -108,6 +108,9 @@ class Hop:
     admission: dict[str, Any] | None = None
     would_refuse: bool | None = None
     admit_reason: str | None = None
+    # The health gate found the lane's model not loaded (oMLX models_loaded 0,
+    # bppc backend stopped); the run's deadline was extended for the load.
+    cold_load: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         out = {
@@ -126,6 +129,8 @@ class Hop:
         if self.would_refuse is not None:
             out["would_refuse"] = self.would_refuse
             out["admit_reason"] = self.admit_reason
+        if self.cold_load:
+            out["cold_load"] = True
         return out
 
 

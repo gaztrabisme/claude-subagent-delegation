@@ -126,6 +126,34 @@ def test_health_bppc_base_url_override_skips_resolution(monkeypatch, mock_endpoi
     assert not health.check(lane).ok
 
 
+def test_health_bppc_backend_stopped_is_healthy_cold_load(mock_endpoint, bppc_lane):
+    """bppc's proxy answers /health with backend "stopped" while idle."""
+    mock_endpoint.routes["/health"] = (200, {"status": "ok", "backend": "stopped"})
+    env = {"SAM_BPPC_LAN_HOSTS": "127.0.0.1", "SAM_BPPC_PORT": str(mock_endpoint.port),
+           "SAM_BPPC_TAILSCALE_HOST": "127.0.0.1"}
+    gate = health.check_bppc(bppc_lane, env)
+    assert gate.ok and gate.cold_load
+    mock_endpoint.routes["/health"] = (200, {"status": "ok", "backend": "running"})
+    assert not health.check_bppc(bppc_lane, env).cold_load
+
+
+def test_health_bppc_cold_load_extends_deadline_and_marks_hop(
+        tmp_path: Path, lanes_on_mock, trace_records):  # noqa: F811
+    ep = lanes_on_mock
+    ep.routes["/bppc/health"] = (200, {"status": "ok", "backend": "stopped"})
+    reg = _registry(tmp_path, ep, bppc_cold_load_seconds=700.0, trace=str(tmp_path / "t.jsonl"))
+    try:
+        before = time.time()
+        _, run = _delegate(reg, tmp_path, "bppc", "none")
+        assert run.cold_load and run.hops[0]["cold_load"] is True
+        timeout = reg.settings.lanes["bppc"].run_timeout
+        assert run.deadline - before >= timeout + 700 - 1
+        hops = [r for r in trace_records if r["kind"] == "hop"]
+        assert hops and hops[-1]["cold_load"] is True
+    finally:
+        reg.shutdown()
+
+
 def _omlx(mock_endpoint, key="omlx-test"):
     lane = load_lanes({"SAM_OMLX_BASE_URL": mock_endpoint.url("omlx"),
                        "SAM_OMLX_API_KEY": key})["omlx"]
@@ -189,8 +217,10 @@ def test_health_cold_load_seconds_default(monkeypatch):
     from subagent_mcp.config import Settings
 
     for name in ("SAM_OMLX_COLD_LOAD_SECONDS", "SAM_BALANCE_CLOSE_HOURS",
-                 "SAM_THROTTLE_CLOSE_MINUTES"):
+                 "SAM_THROTTLE_CLOSE_MINUTES", "SAM_BPPC_COLD_LOAD_SECONDS"):
         monkeypatch.delenv(name, raising=False)
     s = Settings.from_env()
     assert (s.omlx_cold_load_seconds, s.balance_close_hours, s.throttle_close_minutes) == (
         120.0, 6.0, 15.0)
+    assert s.bppc_cold_load_seconds == 180.0
+    assert (s.cold_load_seconds("bppc"), s.cold_load_seconds("omlx")) == (180.0, 120.0)

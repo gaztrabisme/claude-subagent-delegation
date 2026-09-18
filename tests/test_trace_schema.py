@@ -36,7 +36,7 @@ REQUIRED: dict[str, set[str]] = {
     "hop": {
         "run_id", "agent_id", "hop", "lane", "provider", "driver", "guard", "model",
         "outcome", "code", "reset_at", "closed_until", "admission", "would_refuse",
-        "admit_reason",
+        "admit_reason", "cold_load",
     },
     "turn": {
         "run_id", "agent_id", "lane", "provider", "model", "turn", "attempt", "message_id",

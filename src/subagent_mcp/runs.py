@@ -1260,7 +1260,8 @@ class Agent:
             run.driver = hop.driver
             run.guard = hop.guard
             run.cold_load = gate.cold_load
-            extra = self.settings.omlx_cold_load_seconds if gate.cold_load else 0.0
+            hop.cold_load = gate.cold_load
+            extra = self.settings.cold_load_seconds(lane.name) if gate.cold_load else 0.0
             run.deadline = _now() + lane.run_timeout + extra
             run.worked = False
             events = self._collect(run, run.prompt, resume=None)

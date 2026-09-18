@@ -101,6 +101,12 @@ class Settings:
     throttle_close_minutes: float = 15.0
     # Extra time a run gets when oMLX reports no model loaded yet.
     omlx_cold_load_seconds: float = 120.0
+    # Extra time when bppc's proxy reports its backend stopped (container start).
+    bppc_cold_load_seconds: float = 180.0
+
+    def cold_load_seconds(self, lane: str) -> float:
+        """Deadline extension for a cold-load run on `lane`."""
+        return self.bppc_cold_load_seconds if lane == "bppc" else self.omlx_cold_load_seconds
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -151,6 +157,7 @@ class Settings:
             balance_close_hours=_float_env("SAM_BALANCE_CLOSE_HOURS", 6.0) or 6.0,
             throttle_close_minutes=_float_env("SAM_THROTTLE_CLOSE_MINUTES", 15.0) or 15.0,
             omlx_cold_load_seconds=_float_env("SAM_OMLX_COLD_LOAD_SECONDS", 120.0) or 120.0,
+            bppc_cold_load_seconds=_float_env("SAM_BPPC_COLD_LOAD_SECONDS", 180.0) or 180.0,
         )
 
     def lane(self, name: str | None = None) -> Lane:

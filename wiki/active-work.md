@@ -14,7 +14,7 @@ Reader: the next session that picks this server up. Read with `decisions.md` and
 | deepseek lane | DEFERRED: live 402 Insufficient Balance, correctly classified and closed |
 | codex lane | DEFERRED: quota closed until 2026-09-20 13:29; covered by a fake binary only |
 | Telemetry | Schema 3: run, hop, turn, verdict, calibration, run_summary in `trace.jsonl`; samples in `metrics.jsonl` |
-| Cost join | `scripts/cost_join.py` on 736 real runs, output in `data/cost-2026-09-18/`. Net saving (Opus 5 list price of child tokens − parent Claude spend − provider cost): glm $711.67 (1,103.89 − 312.22 − 80.00 plan), deepseek $172.82 (231.75 − 28.88 − 30.04 at peak rates), bppc $0.68. Verified-pass rate: glm 51%, deepseek 31%, bppc 50% |
+| Cost join | `scripts/cost_join.py` on 737 real runs, output in `data/cost-2026-09-18/`. Net saving (Opus 5 list price of child tokens − parent Claude spend − provider cost): glm $711.40 (1,104.22 − 312.82 − 80.00 plan), deepseek $172.82 (231.75 − 28.88 − 30.04 at peak rates), bppc $0.68. Verified-pass rate: glm 51%, deepseek 31%, bppc 50% |
 
 ## Next
 

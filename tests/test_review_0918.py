@@ -105,3 +105,39 @@ def test_h1_payload_cwd_outside_the_workspace_is_denied(ws):
 def test_h1_hook_forwards_workdir():
     pairs = HOOK.requests("exec_command", {"cmd": "ls", "workdir": "/w/sub"}, True)
     assert pairs == [("Bash", {"command": "ls", "workdir": "/w/sub"})]
+
+
+# --- H3: agent ids never repeat across server processes on one session root ---------
+
+
+def test_h3_two_registries_on_one_session_root_never_share_an_agent_home(tmp_path):
+    from dataclasses import replace
+
+    from subagent_mcp.runs import Registry
+
+    from .conftest import make_settings
+
+    base = make_settings(tmp_path, trace="off")
+    first = Registry(base, start_reaper=False)
+    second = Registry(replace(base), start_reaper=False)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    try:
+        a = first.create_agent("a", ws, lane="glm", fallback="none")
+        b = second.create_agent("b", ws, lane="glm", fallback="none")
+        assert a.agent_id != b.agent_id
+        glm, deepseek = base.lanes["glm"], base.lanes["deepseek"]
+        path_a = base.hooks_config(a.agent_id, glm)
+        path_b = base.hooks_config(b.agent_id, deepseek)
+        assert path_a != path_b
+        assert glm.base_url in path_a.read_text()
+        assert deepseek.base_url not in path_a.read_text()
+        # Ids claimed by one process are skipped by the other even with equal tags.
+        import itertools
+
+        second._tag, second._counter = first._tag, itertools.count(1)
+        c = second.create_agent("c", ws, lane="omlx", fallback="none")
+        assert c.agent_id not in (a.agent_id, b.agent_id)
+    finally:
+        first.shutdown()
+        second.shutdown()

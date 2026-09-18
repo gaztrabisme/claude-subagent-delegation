@@ -13,6 +13,7 @@ import itertools
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import threading
@@ -1597,6 +1598,11 @@ class Registry:
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
+        # Agent ids name directories under the shared session root
+        # (agents/<id>/claude-home, codex-home), so they must not repeat
+        # across server processes: a per-registry tag, and the directory is
+        # claimed with an exclusive mkdir before the id is used.
+        self._tag = secrets.token_hex(3)
         self._stop = threading.Event()
         self._reaper: threading.Thread | None = None
         if start_reaper:
@@ -1698,7 +1704,7 @@ class Registry:
                     f"agent limit reached on lane {chosen.name!r} ({chosen.max_agents} live). "
                     f"Cancel one with cancel, or raise SAM_{chosen.name.upper()}_MAX_AGENTS."
                 )
-            agent_id = f"a{next(self._counter)}"
+            agent_id = self._claim_agent_id()
             agent = Agent(
                 agent_id=agent_id,
                 name=name or f"subagent-{agent_id}",
@@ -1719,6 +1725,18 @@ class Registry:
             )
             self._agents[agent_id] = agent
             return agent
+
+    def _claim_agent_id(self) -> str:
+        """A fresh agent id whose session directory this process created."""
+        agents = self.settings.session_root / "agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        while True:
+            agent_id = f"a{next(self._counter)}-{self._tag}"
+            try:
+                (agents / agent_id).mkdir()
+            except FileExistsError:
+                continue
+            return agent_id
 
     def _lane_load(self, lane: str, asking: Agent) -> int:
         """Live agents other than `asking` currently on `lane`."""

@@ -110,8 +110,11 @@ def run_one(task, mode, n, out_dir, model, timeout):
         "output_tokens": usage.get("output_tokens", 0),
         "turns": claude.get("num_turns"),
         "wall_seconds": wall,
-        "worker_rounds": sum(1 for line in ends if not line.startswith("=== end: review")),
+        "worker_rounds": sum(1 for line in ends if not line.startswith(
+            ("=== end: review", "=== end: test review", "=== end: test writer"))),
         "reviews": sum(1 for line in ends if line.startswith("=== end: review")),
+        "test_reviews": sum(1 for line in ends if line.startswith("=== end: test review")),
+        "test_writer_runs": sum(1 for line in ends if line.startswith("=== end: test writer")),
         "worker_credits": round(sum(credits), 2) if credits else 0.0,
         "hidden_passed": counts.get("passed", 0),
         "hidden_total": counts.get("total", 0),

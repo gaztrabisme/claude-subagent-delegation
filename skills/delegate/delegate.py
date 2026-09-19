@@ -26,6 +26,7 @@ Subcommands (all print one JSON object to stdout):
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -41,8 +42,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import checkpoint  # noqa: E402
-from common import (DEPENDENCY_DIRS, STATE_DIR, git_prefix, hash_tree, load_config, matches,  # noqa: E402
-                    read_json, state_dir, tail, walk_files, write_json)
+from common import (DEPENDENCY_DIRS, STATE_DIR, changed_between, git_prefix, hash_tree, load_config,  # noqa: E402
+                    matches, read_json, state_dir, tail, walk_files, write_json)
 from detect import detect, run_tests  # noqa: E402
 from guard import TestGuard, protected_hash  # noqa: E402
 from livelog import END_MARKER, LiveLog, LogSink, follow, open_live_view, run_backend  # noqa: E402
@@ -461,6 +462,185 @@ def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sin
     return {k: v for k, v in result.items() if v is not None}
 
 
+# ---------------------------------------------------------------- test writer (outline mode)
+
+TEST_WRITER_PROMPT = """You are writing a TEST SUITE from an outline. The code under test does not exist yet; another
+agent will implement it later against your tests. Do NOT write or change implementation code: only the
+test files named in the outline.
+
+Read the outline in `{outline}` and the plan in `.delegate/review/plan.md` (and any spec it references).
+For every case in the outline, write one test that checks exactly the stated input and expected result.
+Use the project's test framework and conventions (test command: `{test_cmd}`). Put each test in the file
+named by the outline heading it is listed under. Keep tests plain and direct: no helpers that compute
+expected values, no skipped tests.
+
+The tests will fail until the code exists; that is expected. Only check that each test file is
+syntactically valid (for example `node --check file.js` or `python3 -m py_compile file.py`).
+{feedback}
+When you finish, write `.delegate/test_writer_result.json`:
+{{"status": "done" | "failed", "files": ["path", ...], "cases": <number of tests written>,
+  "notes": "anything the planner should know, e.g. where you deviated from the outline and why"}}
+"""
+
+
+def _outline_files(text):
+    """Test files declared by `## path/to/test_file` headings in an outline."""
+    files = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            token = line[3:].strip().split()[0].strip("`") if line[3:].strip() else ""
+            if "/" in token or "." in token:
+                files.append(token)
+    return files
+
+
+def _write_review_plan(root, plan_paths):
+    parts = []
+    for path in plan_paths:
+        try:
+            parts.append(f"<!-- {path} -->\n{Path(path).read_text()}")
+        except OSError:
+            continue
+    review_dir = state_dir(root) / "review"
+    review_dir.mkdir(exist_ok=True)
+    (review_dir / "plan.md").write_text("\n\n".join(parts) or "(no plan file; use the spec files in the repository)")
+
+
+def write_tests_from_outline(root, cfg, outline_path, plan_paths, issues=None):
+    """Turn Claude's test outline into test files with a separate Copilot session (test files only).
+
+    Skipped when the outline is unchanged and its files exist, unless `issues` (wrong tests found by the
+    test review) ask for a fix pass.
+    """
+    state = state_dir(root)
+    try:
+        outline = Path(outline_path).read_text()
+    except OSError as exc:
+        return {"status": "bad_outline", "error": f"cannot read the outline: {exc}"}
+    declared = _outline_files(outline)
+    if not declared:
+        return {"status": "bad_outline",
+                "error": "the outline needs one '## path/to/test_file' heading per test file, cases below it"}
+    outline_hash = hashlib.sha256(outline.encode()).hexdigest()
+    record = read_json(state / "test_writer.json") or {}
+    if not issues and record.get("outline_hash") == outline_hash and all((root / f).exists() for f in declared):
+        return {"status": "skipped", "note": "outline unchanged; tests already written"}
+
+    info = detect(root, cfg)
+    _write_review_plan(root, plan_paths)
+    feedback = ""
+    if issues:
+        listed = "\n".join(f"- {i.get('file', '?')}:{i.get('line', '?')}: {i.get('issue', '')}" for i in issues)
+        feedback = ("\n## Fix pass\nAn independent review found these wrong tests:\n" + listed +
+                    "\nFix them. Where the outline itself contradicts the plan or spec, follow the spec and "
+                    "explain each such deviation in `notes`.\n")
+    prompt = TEST_WRITER_PROMPT.format(outline=Path(outline_path).as_posix(),
+                                       test_cmd=info["test_cmd"] or "(use the project's test setup)",
+                                       feedback=feedback)
+    session_id = record.get("session_id") or str(uuid.uuid4())
+    model = cfg.get("test_writer_model") or "claude-sonnet-5"
+    cp = checkpoint.create(root, "before test writing")
+    before = hash_tree(root)
+    (state / "test_writer_result.json").unlink(missing_ok=True)
+    log = _new_log(root, "tests")
+    sink = LogSink(log)
+    sink.write(f"=== delegate test writer {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(declared)} files · model {model}"
+               + (" · fix pass" if issues else ""))
+    live = LiveLog(sink, log.with_suffix(".jsonl"), root)
+    env = {**os.environ, "DELEGATE_PROMPT": prompt, "DELEGATE_ROOT": str(root)}
+    exit_code, timed_out, used, _ = _run_worker(cfg, prompt, root, session_id, [model], live, env)
+
+    # Only test files may change: revert anything else the writer touched.
+    changed = changed_between(before, hash_tree(root))
+    allowed = info["test_globs"] + declared
+    reverted = [f for f in changed if not matches(f, allowed)]
+    for rel in reverted:
+        data = checkpoint.file_at(root, cp, rel)
+        if data is None:
+            (root / rel).unlink(missing_ok=True)
+        else:
+            (root / rel).write_bytes(data)
+    written = sorted(f for f in changed if f not in reverted and (root / f).exists())
+    report = read_json(state / "test_writer_result.json") or {}
+    if exit_code != 0 or timed_out:
+        status = "test_writer_error"
+    elif not written and not issues and not all((root / f).exists() for f in declared):
+        status = "no_tests_written"
+    else:
+        status = "done"
+    if status == "done":
+        files = sorted(set(record.get("files", [])) | set(written) | {f for f in declared if (root / f).exists()})
+        write_json(state / "test_writer.json", {"outline_hash": outline_hash, "session_id": session_id, "files": files})
+    result = {
+        "status": status,
+        "model": used,
+        "files": written or None,
+        "cases": report.get("cases"),
+        "outline_cases": sum(1 for line in outline.splitlines() if line.lstrip().startswith(("- ", "* "))),
+        "notes": report.get("notes") or None,
+        "reverted_files": reverted or None,
+        "worker_credits": round(live.credits, 2) if live.credits is not None else None,
+        "log_tail": tail(log.read_text(errors="ignore"), 30) if status == "test_writer_error" else None,
+    }
+    credits = f" · AI credits {live.credits:.2f}" if live.credits is not None else ""
+    sink.write(f"{END_MARKER}: test writer {status} · {len(written)} files{credits}")
+    live.close()
+    sink.close()
+    return {k: v for k, v in result.items() if v is not None}
+
+
+def _wrong_tests(review):
+    return [i for i in (review or {}).get("issues", [])
+            if i.get("severity") == "high" and i.get("kind", "wrong_test") == "wrong_test"]
+
+
+def _prepare_tests(root, cfg, args):
+    """Outline mode: write the tests; then review them. Returns (hand_back_result | None, extras)."""
+    plans = [args.plan] if args.plan else [t.get("plan") for t in (read_json(args.parallel) or {}).get("tasks", [])
+                                           if t.get("plan")]
+    extras = {"test_writer": None, "test_review": None, "credits": []}
+    writer = None
+    if args.test_outline:
+        writer = write_tests_from_outline(root, cfg, args.test_outline, plans)
+        extras["test_writer"] = writer
+        extras["credits"].append(writer.get("worker_credits"))
+        if writer["status"] not in ("done", "skipped"):
+            return {"status": writer["status"], "summary": writer.get("error") or "the test writer failed",
+                    "test_writer": writer}, extras
+    if not (cfg.get("review_tests") or args.test_outline):
+        return None, extras
+    review_plans = plans + ([args.test_outline] if args.test_outline else [])
+    review = do_test_review(root, cfg, args.tier, review_plans)
+    extras["credits"].append(review.get("worker_credits"))
+    wrong = _wrong_tests(review)
+    if wrong and writer and writer["status"] == "done":
+        # The generated tests may have transcription errors: one fix pass by the test writer.
+        fix = write_tests_from_outline(root, cfg, args.test_outline, plans, issues=wrong)
+        extras["credits"].append(fix.get("worker_credits"))
+        writer["fix_pass"] = fix["status"]
+        if fix.get("notes"):
+            writer["notes"] = fix["notes"]
+        if fix["status"] == "done":
+            # force: even if the fix pass changed nothing, the wrong tests must be checked again.
+            review = do_test_review(root, cfg, args.tier, review_plans, force=True)
+            extras["credits"].append(review.get("worker_credits"))
+            wrong = _wrong_tests(review)
+    extras["test_review"] = review
+    if wrong:
+        return {"status": "tests_questioned",
+                "summary": f"The test review found {len(wrong)} wrong test(s); no worker round was run.",
+                "test_review": _brief_test_review(review),
+                "test_writer": _brief_writer(writer)}, extras
+    return None, extras
+
+
+def _brief_writer(writer):
+    if not writer or writer.get("status") == "skipped":
+        return None
+    return {k: v for k, v in writer.items() if k in ("model", "files", "cases", "outline_cases", "notes",
+                                                     "reverted_files", "fix_pass")}
+
+
 # ---------------------------------------------------------------- autopilot
 
 # Statuses the autopilot cannot handle itself: they need Claude (test ownership) or a setup fix.
@@ -489,10 +669,21 @@ def _round_brief(number, result):
     return {k: v for k, v in brief.items() if v is not None}
 
 
+MAX_MISSING_TESTS_SHOWN = 3
+
+
 def _brief_test_review(review):
+    """Every wrong test, but only the top few missing tests: Claude reads this, so keep it short."""
+    issues = review.get("issues") or []
+    wrong = [i for i in issues if i.get("kind", "wrong_test") == "wrong_test"]
+    missing = sorted((i for i in issues if i.get("kind") == "missing_test"),
+                     key=lambda i: i.get("severity") != "high")
+    shown = wrong + missing[:MAX_MISSING_TESTS_SHOWN]
+    hidden = len(missing) - MAX_MISSING_TESTS_SHOWN
     return {k: v for k, v in {"verdict": review.get("verdict"), "model": review.get("model"),
-                              "issues": review.get("issues") or None, "note": review.get("note")}.items()
-            if v is not None}
+                              "issues": shown or None,
+                              "more_missing_tests": hidden if hidden > 0 else None,
+                              "note": review.get("note")}.items() if v is not None}
 
 
 def _review_feedback(issues):
@@ -509,22 +700,14 @@ def autopilot(root, cfg, args, run_id):
     """
     live_view_error = open_live_view(cfg, root, SCRIPT, ["--run", run_id, "--since", time.time()])
 
-    # Check Claude's tests against the plan before spending worker rounds on them.
-    test_review = None
-    if cfg.get("review_tests"):
-        plans = [args.plan] if args.plan else [t.get("plan") for t in (read_json(args.parallel) or {}).get("tasks", [])
-                                               if t.get("plan")]
-        test_review = do_test_review(root, cfg, args.tier, plans)
-        # Only wrong tests block (they would waste worker rounds); missing tests are reported only.
-        high = [i for i in test_review.get("issues", [])
-                if i.get("severity") == "high" and i.get("kind", "wrong_test") == "wrong_test"]
-        if high:
-            return {k: v for k, v in {
-                "status": "tests_questioned",
-                "summary": f"The test review found {len(high)} wrong test(s); no worker round was run.",
-                "test_review": _brief_test_review(test_review),
-                "worker_credits": test_review.get("worker_credits"),
-                "live_view_error": live_view_error}.items() if v is not None}
+    # Tests first: write them from the outline (outline mode), then check them against the plan/spec.
+    hand_back, extras = _prepare_tests(root, cfg, args)
+    test_review = extras["test_review"]
+    if hand_back:
+        credits = [c for c in extras["credits"] if c is not None]
+        hand_back.update({"worker_credits": round(sum(credits), 2) if credits else None,
+                          "live_view_error": live_view_error})
+        return {k: v for k, v in hand_back.items() if v is not None}
 
     first = run_parallel(root, cfg, args, live_view=False) if args.parallel else run_round(root, cfg, args, False)
     rounds, reviews = [first], []
@@ -583,8 +766,8 @@ def autopilot(root, cfg, args, run_id):
         final = "review_concerns"  # high issues remain and no rounds were left to fix them
     base = checkpoint.get(root, first.get("checkpoint")) if first.get("checkpoint") else None
     changed = [p for _, p in checkpoint.changes(root, base)] if base else last.get("changed_files")
-    credits = [r.get("worker_credits") for r in rounds + reviews + [test_review or {}]
-               if r.get("worker_credits") is not None]
+    credits = [r.get("worker_credits") for r in rounds + reviews if r.get("worker_credits") is not None]
+    credits += [c for c in extras["credits"] if c is not None]
     summary = last.get("summary") or "; ".join(f"{t['name']}: {t.get('summary', '')}" for t in last.get("tasks", []))
     result = {
         "status": final,
@@ -611,6 +794,8 @@ def autopilot(root, cfg, args, run_id):
                                              "code was not re-reviewed (auto_review_cycles or auto_max_rounds reached)"
     if test_review and not test_review.get("skipped"):
         result["test_review"] = _brief_test_review(test_review)
+    if _brief_writer(extras["test_writer"]):
+        result["test_writer"] = _brief_writer(extras["test_writer"])
     if args.parallel:
         result["parallel_tasks"] = [{k: v for k, v in t.items() if k in (
             "name", "status", "out_of_scope_files", "conflicts", "violations")} for t in first.get("tasks", [])]
@@ -644,6 +829,8 @@ def cmd_run(root, cfg, args):
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     state = state_dir(root)
 
+    if args.test_outline and not args.auto:
+        return {"status": "bad_arguments", "error": "--test-outline needs --auto"}, 2
     if args.background or args.wait is not None:
         out = state / "logs" / f"runner-{run_id}.out"
         with open(out, "w") as fh:
@@ -796,7 +983,7 @@ def _review_model(cfg, tier, explicit=None):
     return explicit or cfg.get("review_model") or (cfg.get("review_models") or {}).get(tier) or "gpt-5.6-sol"
 
 
-def _run_reviewer(root, cfg, reviewer, prompt, result_name, header):
+def _run_reviewer(root, cfg, reviewer, prompt, result_name, kind, detail):
     """Run a read-only reviewer; retry once without a verdict; undo any edits. Returns a result dict."""
     result_path = root / STATE_DIR / "review" / result_name
     result_path.unlink(missing_ok=True)
@@ -804,7 +991,7 @@ def _run_reviewer(root, cfg, reviewer, prompt, result_name, header):
     before = hash_tree(root)
     log = _new_log(root, "review")
     sink = LogSink(log)
-    sink.write(f"=== delegate {header} {time.strftime('%Y-%m-%d %H:%M:%S')} · model {reviewer}")
+    sink.write(f"=== delegate {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} · {detail} · model {reviewer}")
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
     review, credits, attempts, exit_code, timed_out, used = {}, 0.0, 0, None, False, reviewer
     for attempt in range(2):  # retry once if the reviewer produced no verdict
@@ -831,7 +1018,7 @@ def _run_reviewer(root, cfg, reviewer, prompt, result_name, header):
         "attempts": attempts if attempts > 1 else None,
     }
     tail_credits = f" · AI credits {credits:.2f}" if credits else ""
-    sink.write(f"{END_MARKER}: {header} {result['verdict']} · {len(result['issues'])} issues{tail_credits}")
+    sink.write(f"{END_MARKER}: {kind} {result['verdict']} · {len(result['issues'])} issues{tail_credits}")
     live.close()
     sink.close()
     return result
@@ -866,7 +1053,7 @@ def do_review(root, cfg, tier="normal", model=None, base_id=None):
     review_dir.mkdir(exist_ok=True)
     (review_dir / "diff.patch").write_text(patch[:limit] + ("\n... (truncated)\n" if truncated else ""))
     result = _run_reviewer(root, cfg, _review_model(cfg, tier, model), REVIEW_PROMPT, "result.json",
-                           f"review ({len(changes)} files)")
+                           "review", f"{len(changes)} files")
     result["reviewed_files"] = [p for _, p in changes]
     result["truncated_diff"] = truncated or None
     return {k: v for k, v in result.items() if v is not None}
@@ -887,18 +1074,10 @@ def do_test_review(root, cfg, tier, plan_paths, model=None, force=False):
     previous = read_json(state / "test_review.json") or {}
     if not force and previous.get("tests_hash") == tests_hash:
         return {"skipped": "tests unchanged since the last test review"}
-    plans = []
-    for path in plan_paths:
-        try:
-            plans.append(f"<!-- {path} -->\n{Path(path).read_text()}")
-        except OSError:
-            continue
-    review_dir = state / "review"
-    review_dir.mkdir(exist_ok=True)
-    (review_dir / "plan.md").write_text("\n\n".join(plans) or "(no plan file; use the spec files in the repository)")
-    (review_dir / "test_files.txt").write_text("\n".join(test_files) + "\n")
+    _write_review_plan(root, plan_paths)
+    (state / "review" / "test_files.txt").write_text("\n".join(test_files) + "\n")
     result = _run_reviewer(root, cfg, _review_model(cfg, tier, model), TEST_REVIEW_PROMPT, "tests_result.json",
-                           f"test review ({len(test_files)} files)")
+                           "test review", f"{len(test_files)} test files")
     result["test_files"] = test_files
     if result["verdict"] in ("ok", "concerns"):
         write_json(state / "test_review.json", {"tests_hash": tests_hash, "verdict": result["verdict"]})
@@ -978,6 +1157,8 @@ def main():
     run.add_argument("--tier", choices=["normal", "hard"], default="normal",
                      help="task complexity; picks the model from config \"models\"")
     run.add_argument("--model", help="explicit model, overrides --tier and config")
+    run.add_argument("--test-outline", metavar="FILE",
+                     help="autopilot: have a Copilot test writer turn this outline into test files first")
     run.add_argument("--auto", action="store_true",
                      help="autopilot: retry failing tests and fix high-severity review issues automatically")
     run.add_argument("--background", action="store_true", help="start the run and return immediately")

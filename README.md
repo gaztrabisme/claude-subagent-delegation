@@ -12,6 +12,22 @@ over 3 runs) with the same quality: every run passed all 42 hidden acceptance te
 the size check keeps the work with Claude, costing 4–9% more than not using the skill at all. See
 [Benchmark results](#benchmark-results).
 
+### What the Copilot reviewer does
+
+Because Claude never reads the code, a second Copilot model (`gpt-5.6-sol` by default, a different
+model family than the Claude workers) checks the work twice. It is read-only: it reports problems,
+and never edits files.
+
+| | 1. Test review | 2. Code review |
+|---|---|---|
+| **When** | before the first worker round | every time the tests pass |
+| **Reads** | Claude's tests, the plan and the spec | the implementation diff since the task started (tests excluded), plus any repo file for context |
+| **Looks for** | wrong tests (an expected value that contradicts the spec); missing tests | wrong behavior the tests miss, security problems, code that games the tests (not style) |
+| **What happens to findings** | wrong tests go back to Claude to fix (it owns the tests); missing tests are only reported | high severity goes back to the worker for another round; medium is listed in Claude's report |
+
+Details, the four-model comparison and costs: [Review](#review).
+
+- [What the Copilot reviewer does](#what-the-copilot-reviewer-does)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [When Claude delegates: size check](#when-claude-delegates-size-check)
@@ -386,7 +402,22 @@ Test counts are parsed from node:test, jest, vitest, mocha, pytest, unittest, go
 ## Review
 
 There are two reviews, both by a model of **another family** than the workers (set by
-`review_models`), both read-only:
+`review_models`), both read-only.
+
+What the **code review** checks, and what it doesn't:
+
+- It sees a diff of all implementation changes since the task started (tests excluded), and can
+  read any file in the repository for context or run commands to confirm a problem.
+- It reports only: clearly wrong behavior the tests miss (crashes on valid input, data loss, wrong
+  results), security problems (injection, path traversal, unsafe deserialization, secrets, missing
+  auth checks), and code that games the tests (hardcoded expected values, special-cased inputs).
+- It does not report style, naming or small improvements.
+- It must not edit files; if it does, the runner restores them and says so in `note`.
+- High-severity issues go back to the worker; medium ones are passed on in Claude's report.
+
+What the **test review** checks: it works out every expected value in Claude's tests from the plan
+and spec, checks the tests against each other, and lists requirements with no test. A wrong test
+stops the run before any worker round (`tests_questioned`); missing tests are only reported.
 
 | | Test review | Code review |
 |---|---|---|
@@ -412,11 +443,6 @@ Which reviewer? All four candidates reviewed **the same** ~1,000-line spreadshee
 | `gpt-6-astra` | 98.6 | the same bug, plus `ROUND(1.005, 2)` float rounding and row numbers above 2^53 colliding |
 
 For the most thorough reviews set `"review_models": {"hard": "gpt-6-astra"}`.
-
-- The reviewer sees a diff of all implementation changes since the task started (tests excluded).
-- It reports only security problems, clearly wrong behavior, and test-gaming, not style.
-- It must not edit files; if it does, the runner restores them and says so in `note`.
-- High-severity issues go back to the worker; medium ones are passed on in Claude's report.
 
 ## Watching Copilot live
 
@@ -644,7 +670,9 @@ claude-to-copilot-delegation/
   The test-count check still catches a passing suite that runs fewer tests.
 - **The worker runs with `--allow-all-tools`.** Checkpoints make every round undoable, but workers
   can still run arbitrary commands on your machine.
-- **Claude trusts the tests, not the code.** The cheap review catches obvious problems; for anything
-  important, read `git diff` yourself (it costs no Claude tokens).
+- **Claude trusts the tests and the reviews, not the code.** The reviews catch a lot (in the
+  comparison, `gpt-5.6-sol` found a real bug that passed all 42 hidden tests), but not everything:
+  `gpt-6-astra` found two more in the same code. For anything important, read `git diff` yourself
+  (it costs no Claude tokens).
 - **Copilot CLI's account may differ from `gh`'s.** Check model availability with
   `copilot -p "reply ok" --model <name>`, not the GitHub API.

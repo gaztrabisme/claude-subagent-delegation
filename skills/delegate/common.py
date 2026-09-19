@@ -32,7 +32,14 @@ DEFAULT_CONFIG = {
     "extra_protected": [],  # added on top of detected globs
     "count_tests": True,    # run the suite before/after each round and check the test count
     "live_view": None,      # "auto" opens a terminal following the live log; or argv with "{cmd}"
-    "review_model": "gpt-5-mini",  # cheap model for `review`
+    "review_models": {      # reviewer per tier: a different model family than the (Claude) workers.
+        "normal": "gpt-5.6-sol",  # gpt-5-mini was ~12x cheaper but missed a real bug in comparisons;
+        "hard": "gpt-5.6-sol",    # gpt-6-astra finds more but costs ~4.5x more
+    },
+    "review_model": None,   # pin one reviewer for every tier
+    "auto_max_rounds": 4,   # autopilot: worker rounds before handing back to Claude
+    "auto_review": True,    # autopilot: review when the tests pass, auto-fix high-severity issues
+    "auto_review_cycles": 2,
     "keep_checkpoints": 20,
 }
 TAIL_LINES = 60
@@ -57,9 +64,9 @@ def load_config(root):
     """Defaults, then ~/.config/delegate/config.json, then the project's .delegate/config.json."""
     cfg = dict(DEFAULT_CONFIG)
     for path in (GLOBAL_CONFIG, root / STATE_DIR / "config.json"):
-        user = read_json(path)
-        if user:
-            cfg.update(user)
+        for key, value in (read_json(path) or {}).items():
+            # Nested maps (models, review_models) merge, so one tier can be overridden alone.
+            cfg[key] = {**cfg[key], **value} if isinstance(value, dict) and isinstance(cfg.get(key), dict) else value
     return cfg
 
 

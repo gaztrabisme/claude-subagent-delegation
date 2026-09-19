@@ -137,7 +137,31 @@ What happened in the delegate runs:
   version) to $0.73, mostly because the skill now asks for concise tests and the runner re-runs the
   tests itself (no separate verification turn).
 
-### Earlier single-run results (before size check and the later runner features)
+## Autopilot (3 runs each, 2026-09-19)
+
+| Task | Mode | Claude cost | Claude turns | Copilot credits (worker rounds) | Hidden tests |
+|---|---|---|---|---|---|
+| spreadsheet | delegate, before autopilot | $0.73 ($0.66–$0.80) | 9 (8–10) | 140 | 126/126 |
+| spreadsheet | delegate, **autopilot** | $0.78 ($0.73–$0.85) | 8 (7–9) | 200 (126–342) | 126/126 |
+| cron | force, before autopilot | $0.43 ($0.41–$0.48) | 6 | 20 | 66/66 |
+| cron | force, **autopilot** | $0.50 ($0.44–$0.56) | 11 (9–13) | 78 (46–112) | 66/66 |
+
+- **Claude's cost stayed about the same** (within the run-to-run spread). In these tasks the first
+  round usually passed, so there were few retries to take off Claude's hands; Claude's cost is
+  dominated by writing the plan and the tests.
+- **What autopilot added was quality, paid in Copilot credits.** The cross-family review found real
+  problems that the hidden tests didn't cover. In one spreadsheet run it flagged a high-severity
+  issue and the worker fixed it in a second round, with no Claude turns. That fix round cost 214
+  credits (a resumed Opus session carries its whole context).
+- **Cron:** in 2 of 3 runs the worker correctly **disputed a wrong test Claude had written**
+  (`0 0 29 2 MON` can't fire in March). The runner handed the dispute back, Claude fixed its
+  test, and the rerun passed. That is where the extra Claude turns came from.
+- The credits above count worker rounds only: a bug (since fixed) dropped the review's usage
+  events for GPT models. A `gpt-5.6-sol` review of the spreadsheet costs ~22 credits.
+
+The runs are in `bench/results/20260919-160324` (spreadsheet) and `20260919-160329` (cron).
+
+## Earlier single-run results (before size check and the later runner features)
 
 | Task | Claude alone | Claude + delegate (always delegated) |
 |---|---|---|

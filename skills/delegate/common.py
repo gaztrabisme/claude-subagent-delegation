@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "auto_review": True,    # autopilot: review when the tests pass, auto-fix high-severity issues
     "auto_review_cycles": 2,
     "review_tests": True,   # autopilot: review Claude's tests against the plan before the first round
+    "test_writer_model": "claude-sonnet-5",  # writes test files from Claude's outline (--test-outline)
     "keep_checkpoints": 20,
 }
 TAIL_LINES = 60

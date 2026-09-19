@@ -6,7 +6,7 @@ import re
 import subprocess
 import time
 
-from common import read_json, tail
+from common import STATE_DIR, read_json, tail
 
 JS_TEST_GLOBS = [
     "**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/test/**", "**/tests/**",
@@ -108,6 +108,9 @@ def detect(root, cfg):
     if cfg.get("test_globs"):
         info["test_globs"] = list(cfg["test_globs"])
     info["test_globs"] = info["test_globs"] + list(cfg.get("extra_protected") or [])
+    # Files written by the test writer (test outline mode) are tests, wherever they live.
+    written = (read_json(root / STATE_DIR / "test_writer.json") or {}).get("files", [])
+    info["test_globs"] += [f for f in written if f not in info["test_globs"]]
     return info
 
 

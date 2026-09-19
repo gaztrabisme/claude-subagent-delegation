@@ -1,5 +1,7 @@
 # claude-to-copilot-delegation
 
+[![tests](https://github.com/khangzxrr/claude-to-copilot-delegation/actions/workflows/tests.yml/badge.svg)](https://github.com/khangzxrr/claude-to-copilot-delegation/actions/workflows/tests.yml)
+
 Cut Claude Code token usage by delegating implementation work to a cheaper coding agent
 (GitHub Copilot CLI by default).
 
@@ -33,6 +35,7 @@ Details, the four-model comparison and costs: [Review](#review).
 - [When Claude delegates: size check](#when-claude-delegates-size-check)
 - [Choosing the worker model: tiers](#choosing-the-worker-model-tiers)
 - [Autopilot](#autopilot)
+- [Test outlines](#test-outlines)
 - [Parallel workers](#parallel-workers)
 - [Background runs](#background-runs)
 - [Checkpoints and undo](#checkpoints-and-undo)
@@ -43,6 +46,7 @@ Details, the four-model comparison and costs: [Review](#review).
 - [Configuration](#configuration)
 - [Runner CLI reference](#runner-cli-reference)
 - [Benchmark results](#benchmark-results)
+- [Development](#development)
 - [Project layout](#project-layout)
 - [Limitations](#limitations)
 
@@ -85,7 +89,7 @@ What each side sees:
 | | Claude | Copilot |
 |---|---|---|
 | Reads | task, plan, tests, **one final JSON** | whole repo, plan, tests, feedback from the runner |
-| Writes | `.delegate/PLAN.md`, test files | implementation code |
+| Writes | `.delegate/PLAN.md`, a test outline (or the test files) | implementation code; test files from the outline (a separate session) |
 | Runs tests | no need: the runner runs them after each round | yes: while iterating |
 | May change tests | yes (it owns them) | **no**: only by asking Claude |
 
@@ -198,7 +202,8 @@ Every failed round or review finding used to come back to Claude, costing a turn
 whole conversation. With `--auto` (the skill's default) the runner handles the loop itself and
 hands back **one result**:
 
-0. Before any worker round, a model of another family **checks Claude's tests** against the plan
+0. Before any worker round: with a [test outline](#test-outlines), a Copilot test writer first turns
+   it into test files. Then a model of another family **checks the tests** against the plan
    and spec. **Wrong tests** (an expected value that contradicts the spec) go back to Claude
    (`tests_questioned`), which owns the tests; missing tests are only reported. This check repeats
    only when the tests change, so if Claude disagrees and reruns, the worker starts right away.
@@ -217,6 +222,7 @@ hands back **one result**:
 |---|---|
 | `done` | tests pass and the last review found no high-severity issue |
 | `tests_questioned` | the test review found wrong tests; no worker round ran |
+| `bad_outline`, `test_writer_error`, `no_tests_written` | the outline or the test writer failed; Claude fixes it |
 | `review_concerns` | tests pass but high-severity issues remain after the allowed rounds |
 | `tests_failed`, `violated_tests`, ... with `stopped_because` | stuck (e.g. `max_rounds`); Claude asks you what to do |
 | `needs_test_change` | the worker disputes a test; Claude decides and runs again |
@@ -286,6 +292,34 @@ left one medium issue:
 After a parallel round, failures in the merged result are fixed by single-worker rounds that get
 all the parts' plans combined. `review.unverified` says when the final fix wasn't re-reviewed
 because a limit was reached. Without `--auto`, each round returns on its own (manual mode).
+
+## Test outlines
+
+Tests are the largest thing Claude writes. So by default Claude writes a **test outline** instead of
+test code: one line per case, with the exact input and expected result, grouped by test file:
+
+```markdown
+# Test outline
+## test/sheet.test.js
+- empty cell: new Sheet().get("A1") -> null
+- formula: set A1="2", B1="=A1*3" -> get("B1") === 6
+- invalid address: get("A0") -> throws Error
+```
+
+With `--test-outline .delegate/TESTS.md`, the autopilot starts with a **test writer**: a separate
+Copilot session (`test_writer_model`, default `claude-sonnet-5`) that turns each line into a test.
+
+- It may only write test files. Anything else it touches is reverted (`reverted_files`), and the
+  files it writes are protected from the implementing worker like any other test, even if their
+  names don't look like tests.
+- The test review then checks the generated tests against the plan and spec. If it finds wrong
+  tests, the test writer gets **one fix pass** (it may deviate from the outline where the outline
+  contradicts the spec, and must say so in `notes`). Tests that are still wrong go back to Claude.
+- The test writer runs again only when the outline changes. Claude fixes a test by editing its
+  outline line.
+- The result has `test_writer`: `files`, `cases` vs `outline_cases`, `notes`, `fix_pass`.
+
+Claude still writes tests itself when a case needs setup too complex for one line.
 
 ## Parallel workers
 
@@ -538,6 +572,7 @@ Settings are read from `~/.config/delegate/config.json` (all projects), then fro
 | `auto_review` | `true` | autopilot: review when the tests pass and send high-severity issues back |
 | `auto_review_cycles` | `2` | autopilot: maximum code reviews per run |
 | `review_tests` | `true` | autopilot: review Claude's tests against the plan before the first round |
+| `test_writer_model` | `claude-sonnet-5` | writes test files from Claude's outline (`--test-outline`) |
 | `keep_checkpoints` | `20` | how many checkpoints to keep |
 | `live_view` | `null` | `"auto"` opens a terminal following each run's live log; or an argv containing `"{cmd}"` |
 
@@ -551,7 +586,7 @@ use `python3 ~/.claude/skills/delegate/delegate.py` instead (same arguments, any
 
 ```sh
 delegate detect                                             # test command, protected files, models, git
-delegate run --plan .delegate/PLAN.md --tier hard --auto --wait 540   # autopilot, result in one call
+delegate run --plan .delegate/PLAN.md --test-outline .delegate/TESTS.md --tier hard --auto --wait 540
 delegate run --parallel .delegate/parallel.json --auto --wait 540
 delegate wait --timeout 540                                          # if it was still running
 delegate run --plan .delegate/PLAN.md --continue --feedback-file .delegate/feedback.md   # manual round
@@ -571,6 +606,7 @@ delegate watch                                              # follow the live lo
 | `--continue` | resume the previous worker session(s) (keeps their context across retries) |
 | `--feedback-file PATH` / `--feedback TEXT` | feedback for a retry. Prefer a file (`-` reads stdin): test output full of quotes, `$` and backticks passes through untouched in any shell |
 | `--auto` | autopilot: retry failing tests, review, fix high-severity issues; return once done or stuck |
+| `--test-outline FILE` | autopilot: a Copilot test writer turns this outline into test files first |
 | `--wait S` | run in the background and wait up to S seconds in the same call (`running` after that) |
 | `--background` | return immediately; collect the result with `wait` |
 
@@ -640,7 +676,30 @@ xychart-beta
 - The credits above count worker rounds only: a bug (since fixed) dropped the review's usage
   events for GPT models. A `gpt-5.6-sol` review of the spreadsheet costs ~22 credits.
 
+### Test outlines (3 runs each)
+
+With Claude writing a test outline instead of test code, the spreadsheet delegation cost **$0.66**
+instead of $0.78 (-15%) and produced **76–95 tests instead of 13–15**. On cron, Claude's cost was
+flat ($0.49 vs $0.47) because it wrote more cases, which gave 61–95 tests instead of 10–19. All
+hidden tests passed. Copilot's credits rose about 45%, and runs took longer.
+
 Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](docs/benchmark.md).
+
+## Development
+
+The runner has a test suite that needs no network and no Copilot account: a fake `copilot`
+(`tests/fake_copilot.py`) plays worker, test writer and reviewer from small bash scenarios in
+`tests/scenarios/`. It covers the test guard, background runs, undo, parallel merges, both reviews,
+the autopilot loop, test outlines, Python/no-git/monorepo projects, and the documented commands in
+bash, zsh and fish (shells that aren't installed are skipped).
+
+```sh
+python3 -m unittest discover -s tests -v    # ~45 s; needs git, node/npm, python3
+```
+
+Each test runs in a temporary directory with its own `HOME`, so your own config and
+`~/.claude` are never touched. GitHub Actions runs the suite on Python 3.10 and 3.12
+(`.github/workflows/tests.yml`).
 
 ## Project layout
 
@@ -655,6 +714,8 @@ claude-to-copilot-delegation/
 │   ├── guard.py                # test protection
 │   ├── checkpoint.py           # checkpoints, undo, worktrees
 │   └── livelog.py              # live log, worker process runner, live-view terminals
+├── tests/                      # unittest suite with a fake copilot (tests/fake_copilot.py, tests/scenarios/)
+├── .github/workflows/tests.yml # CI: the suite on Python 3.10 and 3.12
 ├── bench/
 │   ├── run.py                  # benchmark harness: alone vs delegate
 │   ├── tasks/<name>/repo/      # starting project + TASK.md

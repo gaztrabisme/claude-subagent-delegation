@@ -178,6 +178,29 @@ The runs are in `bench/results/20260919-160324` (spreadsheet) and `20260919-1603
 
 Runs: `bench/results/20260919-211537` (v1), `20260919-213028` (v2).
 
+## Test outlines (3 runs each)
+
+Claude writes a one-line-per-case outline; a Copilot test writer (`claude-sonnet-5`) writes the tests.
+
+| Task | Tests written by | Claude cost | Claude output tokens | Tests in the suite | Copilot credits | Time |
+|---|---|---|---|---|---|---|
+| spreadsheet | Claude (autopilot) | $0.78 ($0.73–$0.85) | 12,406 | 13–15 | 200 | 555s |
+| spreadsheet | **outline + test writer** | **$0.66 ($0.60–$0.74)** | 10,182 | **76–95** | 293 | 760s |
+| cron (force) | Claude (test review v2) | $0.47 ($0.44–$0.49) | 6,183 | 10–19 | 63 | 304s |
+| cron (force) | **outline + test writer** | $0.49 ($0.48–$0.50) | 6,633 | **61–95** | 107 | 345s |
+
+- **Spreadsheet: -15% Claude cost.** Outlines are cheaper per test than test code.
+- **Cron: no saving**, because Claude wrote many more cases (39–60 outline lines instead of 10–19
+  tests). There the saving became coverage.
+- **Tests: 5-6x more** in both tasks, all hidden tests still passed (126/126, 66/66).
+- **The fix pass worked on a real mistake:** in one cron run Claude's outline again expected
+  `0 0 29 2 MON` on a Monday outside February. The test review flagged it, and the test writer
+  corrected it against the spec (Monday 2025-02-03) and explained why in `notes`, with no Claude turn.
+- **Copilot pays for it:** +45% credits on the spreadsheet (the test writer, and a worker that has
+  to pass 5-6x more tests) and runs took longer.
+
+Runs: `bench/results/20260919-235149` (spreadsheet), `20260919-235155` (cron).
+
 ## Earlier single-run results (before size check and the later runner features)
 
 | Task | Claude alone | Claude + delegate (always delegated) |

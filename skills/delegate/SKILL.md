@@ -50,19 +50,32 @@ Never put test output or other free text in a quoted command-line argument.
    ```
    Each part's plan must include the shared interfaces it uses. `files` are the globs that part may
    change; anything else it changes is discarded. `test_cmd` (optional) runs only that part's tests.
-3. **Tests**: write them yourself: the contract. Cover each requirement and edge case once; keep them
-   concise (tests are the biggest Claude-side cost). For parallel work, put each part's tests in its
-   own file(s) importing only that part, so each worker can run them in its copy (its `test_cmd`).
-   Run `DELEGATE detect` again and check your test files are under `protected_files` (else add
-   `extra_protected` to the config).
+3. **Tests**: they are the contract, and you own them. By default write a **test outline**, not test
+   code: a Copilot test writer turns it into test files, and a reviewer checks them against the spec.
+   Write `.delegate/TESTS.md`: one `## <test file path>` heading per file, one line per case with the
+   exact input and expected result:
+   ```markdown
+   # Test outline
+   ## test/sheet.test.js
+   - empty cell: new Sheet().get("A1") -> null
+   - formula: set A1="2", B1="=A1*3" -> get("B1") === 6
+   - invalid address: get("A0") -> throws Error
+   ```
+   Cover each requirement and edge case once. Mention the framework only if it isn't the project's
+   usual one. For parallel work, give each part its own test file(s) importing only that part.
+   Write the test code yourself only when cases need setup too complex for one line; then run
+   `DELEGATE detect` again and check your files are under `protected_files`.
 4. **Delegate on autopilot** (one command does all rounds, retries and the review):
-   - `DELEGATE run --plan .delegate/PLAN.md --tier <tier> --auto --wait 540`
-     (parallel: `DELEGATE run --parallel .delegate/parallel.json --tier <tier> --auto --wait 540`)
+   - `DELEGATE run --plan .delegate/PLAN.md --test-outline .delegate/TESTS.md --tier <tier> --auto --wait 540`
+     (parallel: `--parallel .delegate/parallel.json` instead of `--plan`; without an outline, omit
+     `--test-outline`)
      with the Bash tool timeout set to 600000.
    - If it returns `"status": "running"`, call `DELEGATE wait --timeout 540` (same Bash timeout) until
      it returns something else. Never start another run while one is running.
-   - Before the first round, a model of another family checks your tests against the plan/spec
-     (wrong expectations block the run; missing tests are only reported). Then the runner handles the loop itself:
+   - Before the first round, the test writer turns your outline into test files (test files only;
+     it gets one fix pass if the review finds transcription errors), and a model of another family
+     checks the tests against the plan/spec (wrong expectations block the run; missing tests are only
+     reported). Then the runner handles the loop itself:
      it re-runs the tests after each round, sends failing output
      back to the worker, moves to the hard tier after 2 failed rounds, and when the tests pass has a
      model of another family review the diff and sends high-severity issues back too (limits:
@@ -74,11 +87,14 @@ Never put test output or other free text in a quoted command-line argument.
    describe the end state):
    - `done`: tests pass and the review found no high-severity issue. Go to step 6.
    - `tests_questioned`: the test review found WRONG tests (expected values that contradict the
-     spec); no worker round ran. Check each `wrong_test` issue in `test_review.issues` against the spec. Fix the tests where the reviewer
-     is right; where it's wrong, leave them. Then run the same command again. The test review only
+     spec); no worker round ran. Check each `wrong_test` issue in `test_review.issues` against the spec.
+     Where the reviewer is right, fix the outline line (outline mode: the tests are rewritten from it)
+     or the test; where it's wrong, leave it. Then run the same command again. The test review only
      repeats if the tests changed, so a rerun after disagreeing goes straight to the worker.
-   - `needs_test_change`: read `test_change_request`. As the test owner, either edit the test
-     (feedback: "Approved: <change>. Continue.") or keep it (feedback: "Rejected: the test is correct
+   - `bad_outline` / `test_writer_error` / `no_tests_written`: fix the outline (headings, one case per
+     line) or the setup (`log_tail`), then run again.
+   - `needs_test_change`: read `test_change_request`. As the test owner, either edit the outline line
+     or the test (feedback: "Approved: <change>. Continue.") or keep it (feedback: "Rejected: the test is correct
      because <reason>."), then run again with `--auto --continue --feedback-file .delegate/feedback.md`.
    - `review_concerns`: high-severity review issues remain after the allowed rounds. Report them and
      ask the user whether to run another autopilot round (feedback file with the issues, `--continue`).
@@ -112,6 +128,7 @@ returns on its own and you retry with `--continue --feedback-file`, and run `DEL
 `models` ({"normal", "hard"}), `model` (pin one), `timeout` (s per worker run, default 1800),
 `test_cmd`, `test_globs`, `extra_protected`, `count_tests` (default true), `review_models`
 ({"normal": "gpt-5.6-sol", "hard": "gpt-5.6-sol"}; "gpt-6-astra" is more thorough, ~4.5x the credits), `review_model` (pin one), `auto_max_rounds` (4),
-`auto_review` (true), `auto_review_cycles` (2), `review_tests` (true), `live_view`, `builtin_mcps` (default false), `keep_checkpoints` (20),
+`auto_review` (true), `auto_review_cycles` (2), `review_tests` (true), `test_writer_model`
+(claude-sonnet-5), `live_view`, `builtin_mcps` (default false), `keep_checkpoints` (20),
 `extra_args`, and `"backend": "command"` with `"command": [...]` for another agent CLI (prompt in
 `$DELEGATE_PROMPT`; it must write `.delegate/result.json`).

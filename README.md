@@ -16,6 +16,7 @@ the size check keeps the work with Claude, costing 4–9% more than not using th
 - [Quick start](#quick-start)
 - [When Claude delegates: size check](#when-claude-delegates-size-check)
 - [Choosing the worker model: tiers](#choosing-the-worker-model-tiers)
+- [Autopilot](#autopilot)
 - [Parallel workers](#parallel-workers)
 - [Background runs](#background-runs)
 - [Checkpoints and undo](#checkpoints-and-undo)
@@ -39,66 +40,64 @@ flowchart TD
 
     subgraph CL["Claude Code: expensive, used sparingly"]
         C["1. Size check, tier,<br/>parallel or not"] --> P["2. Write plan(s)"] --> T["3. Write tests"]
-        V{"5. Read JSON status"}
-        RV["6. Review verdict"]
+        T --> RUN["4. One command:<br/>run --auto --wait 540"]
+        RES{"5. Final result"}
     end
 
-    subgraph R["delegate.py: runner"]
-        CP["Checkpoint<br/>(undo-able)"] --> G["Protect tests +<br/>test config"]
-        CHK["Restore anything touched,<br/>run the test suite itself"]
-        REV["Cheap-model review<br/>(gpt-5-mini)"]
+    subgraph R["delegate.py: autopilot (no Claude tokens)"]
+        CP["Checkpoint + protect<br/>tests and test config"]
+        CHK{"Runner runs<br/>the test suite"}
+        REV{"Review by another<br/>model family"}
     end
 
     subgraph W["Copilot CLI: worker(s)"]
-        I["4. Implement,<br/>run tests, iterate"]
+        I["Implement,<br/>run tests, iterate"]
     end
 
-    T --> CP
-    G --> I --> CHK
-    CHK -- "status + test results" --> V
-    V -- "tests fail: output as feedback" --> CP
-    V -- "tests pass" --> REV --> RV
-    RV --> D(["Done: summary, files, credits"])
+    RUN --> CP
+    CP --> I --> CHK
+    CHK -- "fail: output as feedback<br/>(hard tier after 2 fails)" --> CP
+    CHK -- pass --> REV
+    REV -- "high-severity issues<br/>as feedback" --> CP
+    REV -- "ok" --> RES
+    CHK -. "stuck, or a test is disputed" .-> RES
+    RES --> D(["Report: summary, files, rounds, review, credits"])
 ```
 
 What each side sees:
 
 | | Claude | Copilot |
 |---|---|---|
-| Reads | task, plan, tests, a JSON status, failing test output, review issues | whole repo, plan, tests |
+| Reads | task, plan, tests, **one final JSON** | whole repo, plan, tests, feedback from the runner |
 | Writes | `.delegate/PLAN.md`, test files | implementation code |
 | Runs tests | no need: the runner runs them after each round | yes: while iterating |
 | May change tests | yes (it owns them) | **no**: only by asking Claude |
 
-One delegation round in detail:
+One delegation in detail:
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Claude
     participant R as delegate.py
-    participant W as Copilot CLI
-    participant FS as Project files
+    participant W as Copilot worker
+    participant V as Copilot reviewer
 
-    C->>FS: write .delegate/PLAN.md + tests
-    C->>R: run --plan .delegate/PLAN.md --tier normal --background
-    R-->>C: {"status": "started"}
-    R->>FS: checkpoint, snapshot tests, make them read-only
-    R->>W: copilot -p "plan + rules" --model claude-sonnet-5
-    C->>R: wait (blocks up to 9 min, repeat while running)
-    loop until its tests pass or it gives up
-        W->>FS: edit implementation
-        W->>FS: run test command
+    C->>R: run --plan .delegate/PLAN.md --tier hard --auto --wait 540
+    loop until tests pass and the review is clean (max 4 rounds)
+        R->>R: checkpoint, lock tests
+        R->>W: plan + rules (+ feedback from the previous round)
+        W->>W: edit, run tests, iterate
+        R->>R: restore touched tests/config, run the test suite
+        alt tests fail
+            R->>R: feedback = failing output
+        else tests pass
+            R->>V: review the diff (gpt-5.6-sol by default)
+            V-->>R: {verdict, issues}
+            R->>R: feedback = high-severity issues (if any)
+        end
     end
-    W->>FS: write .delegate/result.json {status, summary}
-    R->>FS: restore touched tests/config, run the test suite
-    R-->>C: JSON {status, tests, changed_files, worker_credits, checkpoint}
-    alt tests fail
-        C->>R: run --continue --feedback-file .delegate/feedback.md
-    else tests pass
-        C->>R: review
-        R-->>C: {verdict, issues}
-    end
+    R-->>C: {status, rounds, tests, review, changed_files, worker_credits}
 ```
 
 ## Quick start
@@ -123,8 +122,8 @@ Then, in any project, start a new Claude Code session:
 
 Claude reports its decision first (for example
 `Size check: ~900 lines, 5 modules → delegating (tier: hard, 2 parallel workers)`), then plans,
-writes tests, delegates, verifies, gets a review and summarizes. Use `/delegate force ...` to skip
-the size check.
+writes tests, and hands everything else to the autopilot in one command: worker rounds, test runs,
+retries and a cross-family review. Use `/delegate force ...` to skip the size check.
 
 ## When Claude delegates: size check
 
@@ -166,11 +165,101 @@ touching the skill.
 | `normal` | `claude-sonnet-5` | most work; the default when unsure |
 | `hard` | `claude-opus-5` | complex algorithms, tricky state, perf/security, subtle specs |
 
-- **Escalation:** after two failed `normal` rounds in a row, Claude retries with `hard`.
+- **Escalation:** after two failed `normal` rounds in a row, the autopilot moves to `hard`.
 - **Fallback:** if the `hard` model's run exits with an error (e.g. the model is not on your plan),
   the runner retries once with the `normal` model and reports `model_fallback`.
-- Copilot bills per token in AI credits. On a trivial prompt Opus cost about 2.5x Sonnet, and
-  `gpt-5-mini` (used for reviews) about 1/30 of Sonnet.
+- Copilot bills per token in AI credits. On a trivial prompt Opus cost about 2.5x Sonnet. A
+  ~1,000-line implementation cost ~130 credits on Opus; reviewing it with gpt-5.6-sol ~22.
+
+## Autopilot
+
+Every failed round or review finding used to come back to Claude, costing a turn that re-reads the
+whole conversation. With `--auto` (the skill's default) the runner handles the loop itself and
+hands back **one result**:
+
+1. Run a worker round, then the test suite.
+2. Tests fail → send the failing output back to the worker (`--continue` in the same Copilot
+   session). After 2 failed rounds in a row, move to the `hard` tier.
+3. Tests pass → a model of **another family** reviews the diff since the task started
+   (`review_models`, default `gpt-5.6-sol`; the workers are Claude models, so reviewer and worker
+   don't share blind spots).
+4. High-severity issues → send them back to the worker, then test and review again.
+5. Stop and hand back when: done, `auto_max_rounds` (4) is reached, a test is disputed
+   (`needs_test_change`: Claude owns the tests), the worker touches tests twice, or a setup error.
+   If the reviewer returns no verdict (twice), the result says `review.unverified`.
+
+| Final status | Meaning |
+|---|---|
+| `done` | tests pass and the last review found no high-severity issue |
+| `review_concerns` | tests pass but high-severity issues remain after the allowed rounds |
+| `tests_failed`, `violated_tests`, ... with `stopped_because` | stuck (e.g. `max_rounds`); Claude asks you what to do |
+| `needs_test_change` | the worker disputes a test; Claude decides and runs again |
+
+A real result from the benchmark: the first round passed the tests, the review found a
+high-severity problem (huge ranges were expanded eagerly), round 2 fixed it, and the re-review
+left one medium issue:
+
+```json
+{
+  "status": "done",
+  "summary": "Fixed the eager range expansion: ranges are now stored as bounds and iterated lazily over only the non-empty cells inside them (via a row index), for dependency tracking, cycle detection and evaluation, so =SUM(A1:A1000000000) is instant. All 15 tests in test/sheet.test.js pass.",
+  "rounds": [
+    {
+      "round": 1,
+      "status": "done",
+      "tier": "hard",
+      "model": "claude-opus-5",
+      "tests": "15/15",
+      "credits": 128.76
+    },
+    {
+      "round": 2,
+      "status": "done",
+      "tier": "hard",
+      "model": "claude-opus-5",
+      "tests": "15/15",
+      "credits": 213.71
+    }
+  ],
+  "tests": {
+    "passed": true,
+    "cmd": "npm test",
+    "counts": {
+      "total": 15,
+      "passed": 15,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "changed_files": [
+    "src/evaluator.js",
+    "src/index.js",
+    "src/parser.js",
+    "src/references.js",
+    "src/sheet.js",
+    "src/tokenizer.js"
+  ],
+  "worker_credits": 342.47,
+  "first_checkpoint": "20260919-160504-5042",
+  "review": {
+    "verdict": "concerns",
+    "model": "gpt-5.6-sol",
+    "issues": [
+      {
+        "severity": "medium",
+        "file": "src/evaluator.js",
+        "line": 258,
+        "issue": "AND and OR skip empty cells in range arguments instead of coercing each empty value to FALSE, so formulas such as AND(TRUE,A1:A2) can return the wrong result."
+      }
+    ],
+    "cycles": 2
+  }
+}
+```
+
+After a parallel round, failures in the merged result are fixed by single-worker rounds that get
+all the parts' plans combined. `review.unverified` says when the final fix wasn't re-reviewed
+because a limit was reached. Without `--auto`, each round returns on its own (manual mode).
 
 ## Parallel workers
 
@@ -212,12 +301,13 @@ Claude writes one plan per part and a manifest:
 
 ## Background runs
 
-A worker round can take longer than Claude Code's 10-minute limit on a single command. So Claude
-starts rounds in the background and collects the result with `wait`:
+A delegation can take longer than Claude Code's 10-minute limit on a single command. So the run
+happens in a background process, and `--wait` waits for it within the same command:
 
 ```sh
-delegate run --plan .delegate/PLAN.md --background   # {"status": "started", "run_id": ...}
-delegate wait --timeout 540                          # the result, or {"status": "running"}
+delegate run --plan .delegate/PLAN.md --auto --wait 540   # the result, or {"status": "running"} after 9 min
+delegate wait --timeout 540                               # keep waiting if it was still running
+delegate run --plan .delegate/PLAN.md --background        # or: return at once with {"status": "started"}
 ```
 
 Only one run per project can be active; a second `run` returns `busy`. If the runner process dies,
@@ -285,24 +375,37 @@ Test counts are parsed from node:test, jest, vitest, mocha, pytest, unittest, go
 
 ## Review
 
-Since Claude never reads the code, weak tests could let bad code through. After the tests pass,
-Claude runs a **review by a cheap model** (`gpt-5-mini` by default, about 1 AI credit):
+Since Claude never reads the code, weak tests could let bad code through. In autopilot, every time
+the tests pass the runner has a model of **another family** review the diff (the reviewer per tier
+is set by `review_models`). You can also run it by hand:
 
 ```sh
-delegate review    # {"verdict": "ok" | "concerns", "issues": [{severity, file, line, issue}]}
+delegate review --tier hard   # {"verdict": "ok" | "concerns", "issues": [{severity, file, line, issue}]}
 ```
+
+Which reviewer? All four candidates reviewed **the same** ~1,000-line spreadsheet implementation
+(from a benchmark run that had passed all 42 hidden tests):
+
+| Reviewer | Credits | What it found |
+|---|---|---|
+| `gpt-5-mini` | 1.8 | a vague "large ranges could be slow" note; **missed the real bug** |
+| `gpt-5.5` | 32.6 | the real bug: formulas over ranges of 1M+ cells skip cycle detection (medium) |
+| **`gpt-5.6-sol`** (default) | 21.8 | the same bug, rated **high**, so the autopilot sends it back for a fix |
+| `gpt-6-astra` | 98.6 | the same bug, plus `ROUND(1.005, 2)` float rounding and row numbers above 2^53 colliding |
+
+For the most thorough reviews set `"review_models": {"hard": "gpt-6-astra"}`.
 
 - The reviewer sees a diff of all implementation changes since the task started (tests excluded).
 - It reports only security problems, clearly wrong behavior, and test-gaming, not style.
 - It must not edit files; if it does, the runner restores them and says so in `note`.
-- Claude sends `high` issues back to the worker as another round and includes `medium` ones in its
-  report.
+- High-severity issues go back to the worker; medium ones are passed on in Claude's report.
 
 ## Watching Copilot live
 
 The runner streams Copilot's JSON events and turns them into a readable log as they arrive, at
 `.delegate/logs/latest.log`. Claude only receives the final JSON, so watching costs no Claude tokens.
-Parallel workers are interleaved with a `[name]` prefix.
+Parallel workers are interleaved with a `[name]` prefix. An autopilot run opens one live-view
+window that follows all its rounds and reviews (`delegate watch --run <run_id>`).
 
 ```text
 === delegate run 2026-09-19 11:25:29 · tier normal · new session · checkpoint 20260919-112529-8e70
@@ -331,32 +434,20 @@ To suppress windows for one command, set `DELEGATE_LIVE_VIEW=off` in its environ
 
 ## Run statuses and retries
 
-```mermaid
-stateDiagram-v2
-    [*] --> Round
-    Round --> Review: done
-    Round --> Round: tests_failed / violated_tests / failed / timeout<br/>(retry with feedback)
-    Round --> Decide: needs_test_change
-    Decide --> Round: approve (Claude edits test) or reject
-    Round --> FixSetup: backend_error / runner_error / crashed
-    FixSetup --> Round
-    Review --> Round: high-severity issues
-    Review --> [*]: ok or medium issues (reported)
-    Round --> AskUser: 3 rounds without passing
-    AskUser --> [*]
-```
+In autopilot, Claude only sees the final status (see [Autopilot](#autopilot)). These are the
+statuses of a single round, which the autopilot acts on, and which Claude sees in manual mode:
 
-| Status | Meaning | Claude's next step |
+| Status | Meaning | Autopilot's next step |
 |---|---|---|
 | `done` | the runner's test run passed | review |
 | `tests_failed` | the runner's test run failed (`tests.output_tail`) | retry with the output as feedback |
-| `needs_test_change` | worker thinks a test is wrong (`test_change_request`) | approve and edit the test, or reject |
-| `violated_tests` | tests or test config touched (restored), or fewer tests ran | retry and name the violation |
-| `failed` / `no_report` / `timeout` | worker gave up, didn't report, or ran out of time | retry with `--continue` |
-| `backend_error` / `runner_error` / `crashed` | setup problem (`log_tail` / `error`) | fix the setup |
-| `started` / `running` / `busy` | background bookkeeping | keep calling `wait` |
+| `needs_test_change` | worker thinks a test is wrong (`test_change_request`) | hand back to Claude |
+| `violated_tests` | tests or test config touched (restored), or fewer tests ran | retry once, then hand back |
+| `failed` / `no_report` / `timeout` | worker gave up, didn't report, or ran out of time | retry |
+| `backend_error` / `runner_error` / `crashed` | setup problem (`log_tail` / `error`) | hand back |
+| `started` / `running` / `busy` | background bookkeeping | Claude keeps calling `wait` |
 
-Example (single round):
+A single round's JSON (manual mode) looks like:
 
 ```json
 {
@@ -369,7 +460,7 @@ Example (single round):
   "model": "claude-sonnet-5",
   "seconds": 29,
   "checkpoint": "20260919-112529-8e70",
-  "log": ".delegate/logs/run-20260919-112529.log",
+  "log": ".delegate/logs/run-20260919-112529-417.log",
   "worker_credits": 6.8,
   "run_id": "20260919-112529-1f3a"
 }
@@ -397,7 +488,11 @@ Settings are read from `~/.config/delegate/config.json` (all projects), then fro
 | `test_globs` | auto | override the detected protected test paths |
 | `extra_protected` | `[]` | extra protected paths on top of the detected ones |
 | `count_tests` | `true` | flag a passing suite that runs fewer tests than before |
-| `review_model` | `gpt-5-mini` | model for `review` |
+| `review_models` | `{"normal": "gpt-5.6-sol", "hard": "gpt-5.6-sol"}` | reviewer per tier (another model family than the worker) |
+| `review_model` | `null` | pin one reviewer for every tier |
+| `auto_max_rounds` | `4` | autopilot: worker rounds before handing back to Claude |
+| `auto_review` | `true` | autopilot: review when the tests pass and send high-severity issues back |
+| `auto_review_cycles` | `2` | autopilot: maximum reviews per run |
 | `keep_checkpoints` | `20` | how many checkpoints to keep |
 | `live_view` | `null` | `"auto"` opens a terminal following each run's live log; or an argv containing `"{cmd}"` |
 
@@ -411,27 +506,29 @@ use `python3 ~/.claude/skills/delegate/delegate.py` instead (same arguments, any
 
 ```sh
 delegate detect                                             # test command, protected files, models, git
-delegate run --plan .delegate/PLAN.md --tier hard --background
-delegate run --parallel .delegate/parallel.json --background
-delegate wait --timeout 540
-delegate run --plan .delegate/PLAN.md --continue --feedback-file .delegate/feedback.md
+delegate run --plan .delegate/PLAN.md --tier hard --auto --wait 540   # autopilot, result in one call
+delegate run --parallel .delegate/parallel.json --auto --wait 540
+delegate wait --timeout 540                                          # if it was still running
+delegate run --plan .delegate/PLAN.md --continue --feedback-file .delegate/feedback.md   # manual round
 delegate test                                               # run the suite: {passed, counts, output_tail}
-delegate review                                             # cheap-model review of the task's changes
+delegate review --tier hard                                 # cross-family review of the task's changes
 delegate checkpoints                                        # list checkpoints
 delegate undo                                               # restore the one before the last round
-delegate watch                                              # follow the live log
+delegate watch                                              # follow the live log (--run ID: one autopilot run)
 ```
 
 | `run` option | Meaning |
 |---|---|
 | `--plan FILE` / `--parallel MANIFEST` | one worker on a plan, or several on a manifest |
-| `--tier normal\|hard` | complexity tier, mapped to a model (default `normal`; per task in a manifest) |
+| `--tier normal\|hard` | complexity tier, mapped to a worker and a reviewer model (default `normal`; per task in a manifest) |
 | `--model NAME` | explicit model for this run, overrides tier and config |
 | `--continue` | resume the previous worker session(s) (keeps their context across retries) |
 | `--feedback-file PATH` / `--feedback TEXT` | feedback for a retry. Prefer a file (`-` reads stdin): test output full of quotes, `$` and backticks passes through untouched in any shell |
+| `--auto` | autopilot: retry failing tests, review, fix high-severity issues; return once done or stuck |
+| `--wait S` | run in the background and wait up to S seconds in the same call (`running` after that) |
 | `--background` | return immediately; collect the result with `wait` |
 
-Exit codes: `0` for `done`/`started`, `3` for `running` (from `wait`), otherwise non-zero.
+Exit codes: `0` for `done`/`started`, `3` for `running` (from `wait` or `--wait`), otherwise non-zero.
 
 **Shells.** The runner never goes through your interactive shell: workers, git, background runs and
 live-view terminals are started directly. The one exception is the test command, which always
@@ -474,6 +571,28 @@ xychart-beta
   about 20 Copilot credits, and it took 3.3 minutes instead of 1.
 - **Time:** about the same on the spreadsheet (504s vs 490s alone).
 - **Copilot credits** are listed separately: the dollar value of a credit depends on your plan.
+
+### Autopilot (3 runs each, 2026-09-19)
+
+| Task | Mode | Claude cost | Claude turns | Copilot credits (worker rounds) | Hidden tests |
+|---|---|---|---|---|---|
+| spreadsheet | delegate, before autopilot | $0.73 ($0.66–$0.80) | 9 (8–10) | 140 | 126/126 |
+| spreadsheet | delegate, **autopilot** | $0.78 ($0.73–$0.85) | 8 (7–9) | 200 (126–342) | 126/126 |
+| cron | force, before autopilot | $0.43 ($0.41–$0.48) | 6 | 20 | 66/66 |
+| cron | force, **autopilot** | $0.50 ($0.44–$0.56) | 11 (9–13) | 78 (46–112) | 66/66 |
+
+- **Claude's cost stayed about the same** (within the run-to-run spread). In these tasks the first
+  round usually passed, so there were few retries to take off Claude's hands; Claude's cost is
+  dominated by writing the plan and the tests.
+- **What autopilot added was quality, paid in Copilot credits.** The cross-family review found real
+  problems that the hidden tests didn't cover. In one spreadsheet run it flagged a high-severity
+  issue and the worker fixed it in a second round, with no Claude turns. That fix round cost 214
+  credits (a resumed Opus session carries its whole context).
+- **Cron:** in 2 of 3 runs the worker correctly **disputed a wrong test Claude had written**
+  (`0 0 29 2 MON` can't fire in March). The runner handed the dispute back, Claude fixed its
+  test, and the rerun passed. That is where the extra Claude turns came from.
+- The credits above count worker rounds only: a bug (since fixed) dropped the review's usage
+  events for GPT models. A `gpt-5.6-sol` review of the spreadsheet costs ~22 credits.
 
 Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](docs/benchmark.md).
 

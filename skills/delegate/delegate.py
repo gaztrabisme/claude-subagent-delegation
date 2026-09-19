@@ -12,18 +12,22 @@ Subcommands (all print one JSON object to stdout):
       [--tier normal|hard]           complexity tier -> model (config "models")
       [--background]                 return immediately; collect the result with `wait`
   run --parallel MANIFEST          several workers at once, each in its own git worktree
+      [--auto]                       autopilot: retry failing tests and fix high-severity review
+                                     issues automatically; return only when done or stuck
+      [--wait S]                     start in the background and wait up to S seconds in this call
   wait [--timeout S]               wait for the current run; {"status": "running"} if still going
   test                             run the test suite
-  review [--base ID]               cheap-model review of everything changed since the task started
+  review [--tier T] [--base ID]    review of everything changed since the task started
   undo [--to ID]                   restore the working tree to a checkpoint (default: before last round)
   checkpoints                      list checkpoints
-  watch [--log FILE] [--hold]      follow the live log (run it in another terminal)
+  watch [--log FILE | --run ID]    follow the live log (run it in another terminal)
 """
 
 import argparse
 import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +35,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -137,9 +142,14 @@ def _active_run(root):
     return current if _pid_alive(current["pid"]) else None
 
 
+def _stamp():
+    now = time.time()
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + f"-{int(now * 1000) % 1000:03d}"
+
+
 def _new_log(root, name):
     logs = state_dir(root) / "logs"
-    log = logs / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    log = logs / f"{name}-{_stamp()}.log"
     latest = logs / "latest.log"
     latest.unlink(missing_ok=True)
     latest.symlink_to(log.name)
@@ -224,15 +234,14 @@ def _status(violations, timed_out, exit_code, report, tests):
 
 # ---------------------------------------------------------------- run: one round
 
-def run_round(root, cfg, args):
+def run_round(root, cfg, args, live_view=True):
     state = state_dir(root)
     info = detect(root, cfg)
     plan = Path(args.plan).read_text()
     feedback = _feedback(args)
 
     session = _load_session(root) if args.continue_session else {}
-    if not session.get("session_id"):
-        session = {"session_id": str(uuid.uuid4())}
+    session.setdefault("session_id", str(uuid.uuid4()))
     cp = checkpoint.create(root, f"before round ({'retry' if args.continue_session else 'new task'})")
     session.setdefault("base_checkpoint", cp["id"])
 
@@ -243,7 +252,7 @@ def run_round(root, cfg, args):
     sink = LogSink(log)
     sink.write(f"=== delegate run {time.strftime('%Y-%m-%d %H:%M:%S')} · tier {args.tier} · "
                f"{'continue' if args.continue_session else 'new'} session · checkpoint {cp['id']}")
-    live_view_error = open_live_view(cfg, root, log, SCRIPT)
+    live_view_error = open_live_view(cfg, root, SCRIPT, ["--log", log]) if live_view else None
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
 
     guard = TestGuard(root, info["test_globs"])
@@ -306,7 +315,7 @@ def run_round(root, cfg, args):
 
 # ---------------------------------------------------------------- run: parallel round
 
-def run_parallel(root, cfg, args):
+def run_parallel(root, cfg, args, live_view=True):
     manifest = read_json(args.parallel)
     tasks = (manifest or {}).get("tasks") or []
     if len(tasks) < 2 or any(not t.get("name") or not t.get("plan") or not t.get("files") for t in tasks):
@@ -329,7 +338,7 @@ def run_parallel(root, cfg, args):
     sink = LogSink(log)
     sink.write(f"=== delegate parallel run {time.strftime('%Y-%m-%d %H:%M:%S')} · "
                f"{len(tasks)} workers · checkpoint {cp['id']}")
-    live_view_error = open_live_view(cfg, root, log, SCRIPT)
+    live_view_error = open_live_view(cfg, root, SCRIPT, ["--log", log]) if live_view else None
 
     workers = []
     try:
@@ -451,7 +460,154 @@ def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sin
     return {k: v for k, v in result.items() if v is not None}
 
 
+# ---------------------------------------------------------------- autopilot
+
+# Statuses the autopilot cannot handle itself: they need Claude (test ownership) or a setup fix.
+AUTO_HAND_BACK = {"needs_test_change", "backend_error", "runner_error", "unsupported", "bad_manifest"}
+
+
+def _combined_plan(root, manifest_path):
+    """One plan for follow-up rounds after a parallel round: all parts' plans together."""
+    manifest = read_json(manifest_path) or {}
+    parts = [f"## Part: {t['name']} (files: {', '.join(t['files'])})\n\n{Path(t['plan']).read_text()}"
+             for t in manifest.get("tasks", [])]
+    path = state_dir(root) / "auto_plan.md"
+    path.write_text("# Integration plan\n\nSeveral workers built these parts in parallel. The merged "
+                    "result now needs fixing; you may change any of these files.\n\n" + "\n\n".join(parts))
+    return str(path)
+
+
+def _round_brief(number, result):
+    counts = (result.get("tests") or {}).get("counts")
+    tests = f"{counts['passed']}/{counts['total']}" if counts else (
+        None if result.get("tests") is None else ("passed" if result["tests"]["passed"] else "failed"))
+    models = result.get("model") or ", ".join(sorted({t.get("model") for t in result.get("tasks", [])
+                                                      if t.get("model")})) or None
+    brief = {"round": number, "status": result["status"], "tier": result.get("tier"), "model": models,
+             "tests": tests, "credits": result.get("worker_credits"), "checkpoint": result.get("checkpoint")}
+    return {k: v for k, v in brief.items() if v is not None}
+
+
+def _review_feedback(issues):
+    lines = [f"- {i.get('file', '?')}:{i.get('line', '?')}: {i.get('issue', '')}" for i in issues]
+    return ("An independent code review found these high-severity problems. Fix them and keep the whole "
+            "test suite passing:\n" + "\n".join(lines))
+
+
+def autopilot(root, cfg, args, run_id):
+    """Run rounds until the tests pass and the review has no high-severity issues, or until stuck.
+
+    Failing tests and high-severity review issues go back to the worker automatically, so Claude only
+    sees the final result (or a problem only Claude can solve, like a disputed test).
+    """
+    live_view_error = open_live_view(cfg, root, SCRIPT, ["--run", run_id, "--since", time.time()])
+    first = run_parallel(root, cfg, args, live_view=False) if args.parallel else run_round(root, cfg, args, False)
+    rounds, reviews = [first], []
+    fix_plan = args.plan or (_combined_plan(root, args.parallel) if first["status"] not in AUTO_HAND_BACK else None)
+    tier, failed_in_row, escalated, stop, reviewed_round = args.tier, 0, False, None, 0
+    while True:
+        last = rounds[-1]
+        status = last["status"]
+        if status in AUTO_HAND_BACK:
+            stop = status
+            break
+        if status == "done":
+            failed_in_row = 0
+            if not cfg.get("auto_review") or len(reviews) >= cfg["auto_review_cycles"]:
+                stop = "done"
+                break
+            review = do_review(root, cfg, tier, model=None)
+            reviews.append(review)
+            reviewed_round = len(rounds)
+            if review.get("verdict") not in ("ok", "concerns"):
+                stop = "done"  # tests pass; the missing verdict is reported as unverified below
+                break
+            high = [i for i in review.get("issues", []) if i.get("severity") == "high"]
+            if not high:
+                stop = "done"
+                break
+            feedback = _review_feedback(high)
+        elif status == "violated_tests":
+            failed_in_row += 1
+            if sum(1 for r in rounds if r["status"] == "violated_tests") >= 2:
+                stop = "repeated_violations"
+                break
+            feedback = ("Your changes to tests or test configuration were reverted: "
+                        + json.dumps(last.get("violations")) + "\nDo not modify tests or test settings. "
+                        "If a test is wrong, use .delegate/test_change_request.md.")
+        else:  # tests_failed, failed, no_report, timeout, partial
+            failed_in_row += 1
+            output = (last.get("tests") or {}).get("output_tail")
+            feedback = (f"The test suite fails:\n{output}" if output else
+                        f"The previous round ended with status {status}: {last.get('summary') or 'no summary'}. "
+                        "Finish the task and make the tests pass.")
+        if len(rounds) >= cfg["auto_max_rounds"]:
+            stop = "max_rounds"
+            break
+        if tier == "normal" and failed_in_row >= 2 and not args.model:
+            tier, escalated = "hard", True
+        next_args = SimpleNamespace(plan=fix_plan, feedback=feedback, feedback_file=None, continue_session=True,
+                                    tier=tier, model=args.model)
+        rounds.append(run_round(root, cfg, next_args, live_view=False))
+
+    last = rounds[-1]
+    final = last["status"]
+    final_code_reviewed = bool(reviews) and reviewed_round == len(rounds)
+    if final == "done" and final_code_reviewed and any(
+            i.get("severity") == "high" for i in reviews[-1].get("issues", [])):
+        final = "review_concerns"  # high issues remain and no rounds were left to fix them
+    base = checkpoint.get(root, first.get("checkpoint")) if first.get("checkpoint") else None
+    changed = [p for _, p in checkpoint.changes(root, base)] if base else last.get("changed_files")
+    credits = [r.get("worker_credits") for r in rounds + reviews if r.get("worker_credits") is not None]
+    summary = last.get("summary") or "; ".join(f"{t['name']}: {t.get('summary', '')}" for t in last.get("tasks", []))
+    result = {
+        "status": final,
+        "stopped_because": None if stop == "done" else stop,
+        "summary": summary or None,
+        "rounds": [_round_brief(n, r) for n, r in enumerate(rounds, 1)],
+        "tests": last.get("tests"),
+        "changed_files": changed,
+        "worker_credits": round(sum(credits), 2) if credits else None,
+        "first_checkpoint": first.get("checkpoint"),
+        "escalated_to_hard": escalated or None,
+        "live_view_error": live_view_error,
+    }
+    if reviews:
+        latest_review = reviews[-1]
+        result["review"] = {k: v for k, v in {
+            "verdict": latest_review.get("verdict"), "model": latest_review.get("model"),
+            "issues": latest_review.get("issues") or None, "cycles": len(reviews),
+            "note": latest_review.get("note")}.items() if v is not None}
+        if latest_review.get("verdict") not in ("ok", "concerns"):
+            result["review"]["unverified"] = "the reviewer returned no verdict (twice); the final code was not reviewed"
+        elif not final_code_reviewed:
+            result["review"]["unverified"] = "the issues above were sent back to the worker, but the final " \
+                                             "code was not re-reviewed (auto_review_cycles or auto_max_rounds reached)"
+    if args.parallel:
+        result["parallel_tasks"] = [{k: v for k, v in t.items() if k in (
+            "name", "status", "out_of_scope_files", "conflicts", "violations")} for t in first.get("tasks", [])]
+    for key in ("test_change_request", "violations", "log_tail", "error", "model_fallback", "warning"):
+        if last.get(key):
+            result[key] = last[key]
+    return {k: v for k, v in result.items() if v is not None}
+
+
 # ---------------------------------------------------------------- commands
+
+def _child_argv(argv):
+    """The current command line minus the options that only matter to the launching process."""
+    out, skip = [], False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg == "--background":
+            continue
+        elif arg == "--wait":
+            skip = True
+        elif not arg.startswith("--wait="):
+            out.append(arg)
+    return out
+
 
 def cmd_run(root, cfg, args):
     active = _active_run(root)
@@ -460,22 +616,25 @@ def cmd_run(root, cfg, args):
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     state = state_dir(root)
 
-    if args.background:
-        argv = [a for a in sys.argv[1:] if a != "--background"]
+    if args.background or args.wait is not None:
         out = state / "logs" / f"runner-{run_id}.out"
         with open(out, "w") as fh:
-            proc = subprocess.Popen([sys.executable, str(SCRIPT), *argv, "--run-id", run_id], cwd=os.getcwd(),
-                                    stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen([sys.executable, str(SCRIPT), *_child_argv(sys.argv[1:]), "--run-id", run_id],
+                                    cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                                     start_new_session=True)
         write_json(state / "current.json", {"run_id": run_id, "pid": proc.pid, "started": time.time(),
                                              "runner_output": str(out.relative_to(root))})
-        return {"status": "started", "run_id": run_id,
-                "next": f"python3 {SCRIPT} wait --timeout 540"}, 0
+        if args.wait is not None:
+            return cmd_wait(root, cfg, SimpleNamespace(timeout=args.wait))
+        return {"status": "started", "run_id": run_id, "next": "wait --timeout 540"}, 0
 
     if not args.run_id:  # a background child's record was written by its parent
         write_json(state / "current.json", {"run_id": run_id, "pid": os.getpid(), "started": time.time()})
     try:
-        result = run_parallel(root, cfg, args) if args.parallel else run_round(root, cfg, args)
+        if args.auto:
+            result = autopilot(root, cfg, args, run_id)
+        else:
+            result = run_parallel(root, cfg, args) if args.parallel else run_round(root, cfg, args)
     except Exception as exc:  # the result file must always be written, or `wait` reports a crash
         result = {"status": "runner_error", "error": f"{type(exc).__name__}: {exc}"}
     result["run_id"] = run_id
@@ -504,7 +663,7 @@ def cmd_wait(root, cfg, args):
         if time.time() >= deadline:
             return {"status": "running", "run_id": current["run_id"],
                     "elapsed_seconds": round(time.time() - current["started"]),
-                    "next": "call wait again"}, 3
+                    "next": "wait --timeout 540"}, 3
         time.sleep(2)
 
 
@@ -528,7 +687,11 @@ def cmd_test(root, cfg, _args):
 def cmd_undo(root, cfg, args):
     if _active_run(root):
         return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
-    record = checkpoint.get(root, args.to)
+    if args.to:
+        record = checkpoint.get(root, args.to)
+    else:  # the last worker round, not a review's or an undo's own checkpoint
+        record = next((r for r in reversed(checkpoint.list_all(root))
+                       if r["label"].startswith(("before round", "before parallel"))), None)
     if not record:
         return {"status": "no_checkpoint", "error": "no matching checkpoint"}, 2
     safety = checkpoint.create(root, f"before undo to {record['id']}")
@@ -559,18 +722,39 @@ Use "ok" with an empty list when there is nothing that matters.
 """
 
 
-def cmd_review(root, cfg, args):
-    if _active_run(root):
-        return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
+REVIEW_RETRY = """
+Your previous attempt did not produce a verdict. Write the JSON to `.delegate/review/result.json` with
+your file tool; if you cannot, make your final message exactly that JSON object and nothing else.
+"""
+
+
+def _verdict_from_text(text):
+    """A review JSON object found in the reviewer's last message, or None."""
+    for match in re.finditer(r"\{.*\}", text or "", re.S):
+        try:
+            data = json.loads(match.group(0))
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("verdict") in ("ok", "concerns"):
+            return data
+    return None
+
+
+def _review_model(cfg, tier, explicit=None):
+    return explicit or cfg.get("review_model") or (cfg.get("review_models") or {}).get(tier) or "gpt-5.6-sol"
+
+
+def do_review(root, cfg, tier="normal", model=None, base_id=None):
+    """Review everything changed since the task started (tests excluded) with a model of another family."""
     state = state_dir(root)
     session = _load_session(root)
-    base = checkpoint.get(root, args.base or session.get("base_checkpoint"))
+    base = checkpoint.get(root, base_id or session.get("base_checkpoint"))
     if not base:
-        return {"status": "no_checkpoint", "error": "no base checkpoint; pass --base ID"}, 2
+        return {"verdict": "error", "issues": [], "error": "no base checkpoint; pass --base ID"}
     info = detect(root, cfg)
     changes = [(s, p) for s, p in checkpoint.changes(root, base) if not matches(p, info["test_globs"])]
     if not changes:
-        return {"verdict": "ok", "issues": [], "note": "no implementation changes since the base checkpoint"}, 0
+        return {"verdict": "ok", "issues": [], "note": "no implementation changes since the base checkpoint"}
 
     parts = []
     for status, rel in changes:
@@ -590,47 +774,88 @@ def cmd_review(root, cfg, args):
     (review_dir / "diff.patch").write_text(patch[:limit] + ("\n... (truncated)\n" if truncated else ""))
     (review_dir / "result.json").unlink(missing_ok=True)
 
+    reviewer = _review_model(cfg, tier, model)
     cp = checkpoint.create(root, "before review")
     before = hash_tree(root)
     log = _new_log(root, "review")
     sink = LogSink(log)
-    sink.write(f"=== delegate review {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(changes)} files · "
-               f"model {cfg.get('review_model')}")
+    sink.write(f"=== delegate review {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(changes)} files · model {reviewer}")
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
-    env = {**os.environ, "DELEGATE_PROMPT": REVIEW_PROMPT, "DELEGATE_ROOT": str(root)}
-    exit_code, timed_out, model, _ = _run_worker(cfg, REVIEW_PROMPT, root, str(uuid.uuid4()),
-                                                 [cfg.get("review_model")], live, env)
+    review, credits, attempts = {}, 0.0, 0
+    for attempt in range(2):  # retry once if the reviewer produced no verdict
+        attempts += 1
+        prompt = REVIEW_PROMPT if attempt == 0 else REVIEW_PROMPT + REVIEW_RETRY
+        env = {**os.environ, "DELEGATE_PROMPT": prompt, "DELEGATE_ROOT": str(root)}
+        live.credits, live.last_message = None, ""
+        exit_code, timed_out, used, _ = _run_worker(cfg, prompt, root, str(uuid.uuid4()), [reviewer], live, env)
+        credits += live.credits or 0.0
+        review = read_json(review_dir / "result.json") or _verdict_from_text(live.last_message) or {}
+        if review.get("verdict") in ("ok", "concerns") or exit_code != 0 or timed_out:
+            break
+        sink.write("=== reviewer returned no verdict; asking once more")
     note = None
     if hash_tree(root) != before:
         checkpoint.restore(root, cp)
         note = "the reviewer modified files; they were restored"
-    review = read_json(review_dir / "result.json") or {}
+    live.credits = credits or None
     result = {
         "verdict": review.get("verdict") or ("error" if exit_code != 0 or timed_out else "no_report"),
         "issues": review.get("issues") or [],
         "reviewed_files": [p for _, p in changes],
-        "model": model,
+        "model": used,
         "worker_credits": round(live.credits, 2) if live.credits is not None else None,
         "note": note,
+        "attempts": attempts if attempts > 1 else None,
         "truncated_diff": truncated or None,
     }
     credits = f" · AI credits {live.credits:.2f}" if live.credits is not None else ""
     sink.write(f"{END_MARKER}: review {result['verdict']} · {len(result['issues'])} issues{credits}")
     live.close()
     sink.close()
-    return {k: v for k, v in result.items() if v is not None}, 0 if result["verdict"] == "ok" else 1
+    return {k: v for k, v in result.items() if v is not None}
+
+
+def cmd_review(root, cfg, args):
+    if _active_run(root):
+        return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
+    result = do_review(root, cfg, args.tier, args.model, args.base)
+    return result, 0 if result["verdict"] == "ok" else 1
+
+
+def _hold(args):
+    if args.hold:
+        try:
+            input("\nRun finished. Press Enter to close.")
+        except EOFError:
+            pass
 
 
 def cmd_watch(root, cfg, args):
+    latest = root / STATE_DIR / "logs" / "latest.log"
     if args.log:
         follow(Path(args.log), stop_at_end=True)
-        if args.hold:
-            try:
-                input("\nRun finished. Press Enter to close.")
-            except EOFError:
-                pass
+        _hold(args)
         return None, 0
-    latest = root / STATE_DIR / "logs" / "latest.log"
+    if args.run:
+        # Follow every log of one (autopilot) run in order, round after round, until its result is written.
+        done = root / STATE_DIR / "runs" / f"{args.run}.json"
+        current = read_json(root / STATE_DIR / "current.json") or {}
+        since = args.since or (current.get("started", 0) if current.get("run_id") == args.run else 0)
+        seen = set()
+        while True:
+            fresh = sorted((p for p in latest.parent.glob("*.log")
+                            if p.name != "latest.log" and not p.name.startswith("test-")
+                            and p not in seen and p.stat().st_mtime >= since),
+                           key=lambda p: p.stem.split("-", 1)[1])
+            if fresh:
+                seen.add(fresh[0])
+                follow(fresh[0], stop_at_end=True, stop_when=done.exists)
+            elif done.exists():
+                break
+            else:
+                time.sleep(0.3)
+        _hold(args)
+        return None, 0
     if not latest.exists():
         print(f"Waiting for a delegate run in {root} ... (Ctrl-C to stop)", flush=True)
         while not latest.exists():
@@ -660,16 +885,25 @@ def main():
     run.add_argument("--tier", choices=["normal", "hard"], default="normal",
                      help="task complexity; picks the model from config \"models\"")
     run.add_argument("--model", help="explicit model, overrides --tier and config")
+    run.add_argument("--auto", action="store_true",
+                     help="autopilot: retry failing tests and fix high-severity review issues automatically")
     run.add_argument("--background", action="store_true", help="start the run and return immediately")
+    run.add_argument("--wait", type=int, metavar="S",
+                     help="start in the background and wait up to S seconds for the result in this call")
     run.add_argument("--run-id", help=argparse.SUPPRESS)
     wait = sub.add_parser("wait")
     wait.add_argument("--timeout", type=int, default=540, help="seconds to wait before returning 'running'")
     review = sub.add_parser("review")
     review.add_argument("--base", help="checkpoint to diff against (default: start of the current task)")
+    review.add_argument("--tier", choices=["normal", "hard"], default="normal",
+                        help="picks the reviewer from config \"review_models\"")
+    review.add_argument("--model", help="explicit reviewer model")
     undo = sub.add_parser("undo")
-    undo.add_argument("--to", help="checkpoint id or prefix (default: the latest, i.e. before the last round)")
+    undo.add_argument("--to", help="checkpoint id or prefix (default: the one before the last worker round)")
     watch = sub.add_parser("watch", help="follow the worker's live log")
     watch.add_argument("--log", help="follow this log file until its run ends (default: latest, forever)")
+    watch.add_argument("--run", help="follow all logs of this run (autopilot) until it finishes")
+    watch.add_argument("--since", type=float, help=argparse.SUPPRESS)
     watch.add_argument("--hold", action="store_true", help="wait for Enter after the run ends")
     args = parser.parse_args()
 

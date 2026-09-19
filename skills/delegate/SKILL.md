@@ -55,42 +55,43 @@ Never put test output or other free text in a quoted command-line argument.
    own file(s) importing only that part, so each worker can run them in its copy (its `test_cmd`).
    Run `DELEGATE detect` again and check your test files are under `protected_files` (else add
    `extra_protected` to the config).
-4. **Delegate** in the background, then wait:
-   - `DELEGATE run --plan .delegate/PLAN.md --tier <tier> --background`
-     (parallel: `DELEGATE run --parallel .delegate/parallel.json --background`)
-   - `DELEGATE wait --timeout 540` with the Bash tool timeout set to 600000. While it returns
-     `"status": "running"`, call `wait` again. Never start another run while one is running.
+4. **Delegate on autopilot** (one command does all rounds, retries and the review):
+   - `DELEGATE run --plan .delegate/PLAN.md --tier <tier> --auto --wait 540`
+     (parallel: `DELEGATE run --parallel .delegate/parallel.json --tier <tier> --auto --wait 540`)
+     with the Bash tool timeout set to 600000.
+   - If it returns `"status": "running"`, call `DELEGATE wait --timeout 540` (same Bash timeout) until
+     it returns something else. Never start another run while one is running.
+   - The runner handles the loop itself: it re-runs the tests after each round, sends failing output
+     back to the worker, moves to the hard tier after 2 failed rounds, and when the tests pass has a
+     model of another family review the diff and sends high-severity issues back too (limits:
+     `auto_max_rounds`, `auto_review_cycles`). You only get the final result.
    - On the first delegation, tell the user once that they can watch live with
      `python3 <skill base directory>/delegate.py watch` in another terminal (or
      `"live_view": "auto"` in `~/.config/delegate/config.json`). Mention `live_view_error` once if present.
-5. **Act on `status`**. The runner re-runs the tests itself after each round; `tests` in the JSON is
-   the source of truth (`passed`, `counts`, `output_tail`).
-   - `done`: tests pass, go to step 6.
-   Every retry below is `run ... --continue --feedback-file .delegate/feedback.md` after writing the
-   feedback file (see "Shell-safe commands").
-   - `tests_failed`: feedback = `tests.output_tail` verbatim.
-   - `needs_test_change`: read `test_change_request`; as the test owner either edit the test
-     (feedback: "Approved: <change>. Continue.") or keep it (feedback: "Rejected: the test is
-     correct because <reason>.").
-   - `violated_tests`: the worker touched tests or test config, or the suite passed with fewer tests
-     than before; files were already restored. Retry with feedback naming the violation.
-   - `failed` / `no_report` / `timeout`: retry with feedback from `summary`.
+5. **Act on the final `status`** (`rounds` lists each round; `tests`, `review` and `changed_files`
+   describe the end state):
+   - `done`: tests pass and the review found no high-severity issue. Go to step 6.
+   - `needs_test_change`: read `test_change_request`. As the test owner, either edit the test
+     (feedback: "Approved: <change>. Continue.") or keep it (feedback: "Rejected: the test is correct
+     because <reason>."), then run again with `--auto --continue --feedback-file .delegate/feedback.md`.
+   - `review_concerns`: high-severity review issues remain after the allowed rounds. Report them and
+     ask the user whether to run another autopilot round (feedback file with the issues, `--continue`).
+   - `tests_failed` / `violated_tests` / `failed` / `timeout` (with `stopped_because`, e.g.
+     `max_rounds`): the autopilot is stuck. Tell the user briefly what fails (from `tests.output_tail`)
+     and ask whether to improve the plan and run again, or have you fix it directly. Don't loop.
    - `backend_error` / `runner_error` / `crashed`: read `log_tail` / `error`, fix the setup, retry.
-   - Parallel results have per-part entries in `tasks`: `out_of_scope_files` were discarded (if a part
-     needed them, e.g. a dependency in package.json, make that change yourself or give it to one
-     worker); `conflicts` mean two parts changed the same file. If the merged suite fails, fix it with a
-     single-worker round (`run --plan` with a short integration plan) rather than another parallel round.
-   - **Escalation**: after two failed `normal` rounds in a row, use `--tier hard` and tell the user.
-   - **Undo**: if a round made things worse (e.g. fewer tests passing than the previous round),
-     `DELEGATE undo` restores the tree to before that round (`checkpoints` lists all); then retry
-     with feedback. Every round's JSON has its `checkpoint` id.
-6. **Review** (cheap model, costs Copilot credits, not Claude tokens): `DELEGATE review` once the tests
-   pass. `high` severity issues: send them back as one more round (feedback file, `--continue`).
-   `medium`: include them in your report. Don't read the code yourself to double-check.
-7. **Report**: status, summary, changed files, review verdict, and `worker_credits` summed over all
-   rounds (Copilot AI credits). Mention `DELEGATE undo --to <first checkpoint>` if they want it all back.
-8. **Stop after 3 rounds** without passing tests: tell the user what fails and ask whether to try
-   again, change the plan, or have you fix it directly.
+   - Parallel runs add `parallel_tasks`: `out_of_scope_files` were discarded (if a part needed them,
+     e.g. a dependency in package.json, make that change yourself); `conflicts` mean two parts changed
+     the same file. Failures after the merge are fixed by the autopilot with a combined plan.
+   - **Undo**: `DELEGATE undo` restores the tree to before the last worker round; `first_checkpoint`
+     restores everything (`DELEGATE undo --to <id>`).
+6. **Report**: status, summary, changed files, number of rounds, review verdict (mention medium
+   issues and `review.unverified` if present), and `worker_credits` (Copilot AI credits, including
+   reviews).
+
+Manual mode (only if the user asks to drive rounds themselves): omit `--auto`; each round then
+returns on its own and you retry with `--continue --feedback-file`, and run `DELEGATE review
+--tier <tier>` yourself once the tests pass.
 
 ## Token discipline
 
@@ -103,7 +104,8 @@ Never put test output or other free text in a quoted command-line argument.
 ## Configuration (`.delegate/config.json` per project, `~/.config/delegate/config.json` global)
 
 `models` ({"normal", "hard"}), `model` (pin one), `timeout` (s per worker run, default 1800),
-`test_cmd`, `test_globs`, `extra_protected`, `count_tests` (default true), `review_model`
-(default gpt-5-mini), `live_view`, `builtin_mcps` (default false), `keep_checkpoints` (20),
+`test_cmd`, `test_globs`, `extra_protected`, `count_tests` (default true), `review_models`
+({"normal": "gpt-5.6-sol", "hard": "gpt-5.6-sol"}; "gpt-6-astra" is more thorough, ~4.5x the credits), `review_model` (pin one), `auto_max_rounds` (4),
+`auto_review` (true), `auto_review_cycles` (2), `live_view`, `builtin_mcps` (default false), `keep_checkpoints` (20),
 `extra_args`, and `"backend": "command"` with `"command": [...]` for another agent CLI (prompt in
 `$DELEGATE_PROMPT`; it must write `.delegate/result.json`).

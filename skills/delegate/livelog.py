@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -41,6 +42,7 @@ class LiveLog:
         self.tools = {}     # toolCallId -> tool name
         self.partial = {}   # toolCallId -> partial output lines shown
         self.credits = None
+        self.last_message = ""  # the worker's last chat message (fallback when it forgets to write a file)
 
     def write(self, text):
         self.sink.write(self.prefix + text)
@@ -60,6 +62,13 @@ class LiveLog:
             return datetime.now().strftime("%H:%M:%S")
 
     def feed(self, line):
+        """Never raises: one malformed event must not stop the stream (usage and completion come last)."""
+        try:
+            self._feed(line)
+        except Exception as exc:  # noqa: BLE001
+            self.write(f"(could not format an event: {type(exc).__name__}: {exc})")
+
+    def _feed(self, line):
         line = line.rstrip("\n")
         try:
             event = json.loads(line)
@@ -74,14 +83,19 @@ class LiveLog:
         if kind == "assistant.turn_start":
             self.write(f"{ts} ── turn {int(data.get('turnId', 0)) + 1}")
         elif kind == "assistant.message":
+            if (data.get("content") or "").strip():
+                self.last_message = data["content"].strip()
             for text_line in (data.get("content") or "").strip().splitlines():
                 self.write(f"{ts} 💬 {text_line}")
         elif kind == "tool.execution_start":
             name = data.get("toolName", "?")
             self.tools[data.get("toolCallId")] = name
             args = data.get("arguments") or {}
-            detail = args.get("command") or args.get("path") or next(
-                (v for v in args.values() if isinstance(v, str)), "")
+            if isinstance(args, dict):
+                detail = args.get("command") or args.get("path") or next(
+                    (v for v in args.values() if isinstance(v, str)), "")
+            else:  # e.g. GPT models' apply_patch passes the patch text as a plain string
+                detail = str(args).strip().splitlines()[0] if str(args).strip() else ""
             self.write(f"{ts} ▸ {name} {self._short(detail)}")
         elif kind == "tool.execution_partial_result":
             # partialOutput is cumulative: print only the complete lines not shown yet.
@@ -114,8 +128,11 @@ class LiveLog:
 def run_backend(argv, cwd, env, timeout, live):
     """Run the worker, feeding its output to the live log line by line. Returns (exit_code, timed_out)."""
     try:
+        # Own session/process group: the worker (and anything it spawns) can't signal the runner, and a
+        # timeout can stop the whole group, not just the CLI process.
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, text=True, bufsize=1, errors="replace")
+                                stdin=subprocess.DEVNULL, text=True, bufsize=1, errors="replace",
+                                start_new_session=True)
     except FileNotFoundError as exc:
         live.write(f"backend not found: {exc}")
         return 127, False
@@ -124,11 +141,22 @@ def run_backend(argv, cwd, env, timeout, live):
     try:
         code, timed_out = proc.wait(timeout=timeout), False
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        _kill_group(proc)
         code, timed_out = None, True
-    reader.join(timeout=5)
+    reader.join(timeout=30)  # let the reader drain the last events (usage, completion)
     return code, timed_out
+
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
 
 
 TERMINALS = [
@@ -143,12 +171,12 @@ TERMINALS = [
 ]
 
 
-def open_live_view(cfg, root, log, script):
-    """Open a terminal that follows this run's live log (config "live_view"). Returns an error or None."""
+def open_live_view(cfg, root, script, watch_args):
+    """Open a terminal running `watch <watch_args> --hold` (config "live_view"). Returns an error or None."""
     setting = cfg.get("live_view")
     if not setting or setting == "off" or os.environ.get("DELEGATE_LIVE_VIEW") == "off":
         return None
-    watch = [sys.executable, str(script), "--root", str(root), "watch", "--log", str(log), "--hold"]
+    watch = [sys.executable, str(script), "--root", str(root), "watch", *[str(a) for a in watch_args], "--hold"]
     if isinstance(setting, list):
         argv = [arg for part in setting for arg in (watch if part == "{cmd}" else [part])]
     elif os.environ.get("TMUX") and shutil.which("tmux"):
@@ -171,8 +199,12 @@ def open_live_view(cfg, root, log, script):
     return None
 
 
-def follow(path, stop_at_end, latest=None):
-    """Print a log file as it grows. Returns when the end marker is seen (stop_at_end) or latest moves."""
+def follow(path, stop_at_end, latest=None, stop_when=None):
+    """Print a log file as it grows.
+
+    Returns when the end marker is seen (stop_at_end), when `latest` points to a newer log, or when
+    everything has been printed and stop_when() is true.
+    """
     with open(path, errors="replace") as fh:
         while True:
             line = fh.readline()
@@ -182,5 +214,7 @@ def follow(path, stop_at_end, latest=None):
                     return
                 continue
             if latest is not None and latest.exists() and latest.resolve() != Path(path).resolve():
+                return
+            if stop_when is not None and stop_when():
                 return
             time.sleep(0.2)

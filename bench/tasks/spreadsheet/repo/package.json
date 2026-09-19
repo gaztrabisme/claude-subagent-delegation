@@ -1,0 +1,1 @@
+{"name":"spreadsheet","type":"module","scripts":{"test":"node --test"}}

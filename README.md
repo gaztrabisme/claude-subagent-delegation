@@ -627,15 +627,23 @@ that neither side saw. Values are means over the 3 runs (2026-09-19).
 config:
   themeVariables:
     xyChart:
-      plotColorPalette: "#2a78d6, #898781"
+      plotColorPalette: "#2a78d6"
 ---
-xychart-beta
-    title "Claude cost with /delegate, as % of Claude alone (100 = break-even)"
-    x-axis ["coupons ~60 lines", "expr ~200", "cron ~200 (Python)", "sheet ~1000"]
-    y-axis "% of Claude-alone cost" 0 --> 120
-    bar [104, 108, 109, 31]
-    line [100, 100, 100, 100]
+xychart-beta horizontal
+    title "Claude cost per run in USD (lower is better)"
+    x-axis ["spreadsheet: alone", "spreadsheet: /delegate", "cron: alone", "cron: /delegate *", "expr: alone", "expr: /delegate *", "coupons: alone", "coupons: /delegate *"]
+    y-axis "USD per run (mean of 3)" 0 --> 2.5
+    bar [2.36, 0.73, 0.39, 0.43, 0.34, 0.37, 0.30, 0.32]
 ```
+
+How to read it: each pair of bars is the same task, done by Claude alone and with `/delegate`.
+
+- **spreadsheet (~1,000 lines):** the task was delegated to Copilot, and Claude's cost fell from
+  $2.36 to $0.73 (-69%). With [test outlines](#test-outlines) it fell further, to $0.66.
+- **\* the three small tasks (~60-200 lines):** the [size check](#when-claude-delegates-size-check)
+  decided they were too small to delegate, so Claude did them itself. The few extra cents (+4-9%)
+  are the cost of loading the skill and making that decision, not a loss from delegating.
+
 
 | Task | Size | What `/delegate` did | Claude alone | Claude + `/delegate` | Change | Copilot credits | Hidden tests |
 |---|---|---|---|---|---|---|---|

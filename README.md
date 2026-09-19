@@ -84,6 +84,11 @@ sequenceDiagram
     participant V as Copilot reviewer
 
     C->>R: run --plan .delegate/PLAN.md --tier hard --auto --wait 540
+    R->>V: review Claude's tests against the plan and spec
+    V-->>R: {verdict, issues}
+    alt high-severity test issues
+        R-->>C: tests_questioned (Claude fixes its tests, runs again)
+    end
     loop until tests pass and the review is clean (max 4 rounds)
         R->>R: checkpoint, lock tests
         R->>W: plan + rules (+ feedback from the previous round)
@@ -177,6 +182,10 @@ Every failed round or review finding used to come back to Claude, costing a turn
 whole conversation. With `--auto` (the skill's default) the runner handles the loop itself and
 hands back **one result**:
 
+0. Before any worker round, a model of another family **checks Claude's tests** against the plan
+   and spec. **Wrong tests** (an expected value that contradicts the spec) go back to Claude
+   (`tests_questioned`), which owns the tests; missing tests are only reported. This check repeats
+   only when the tests change, so if Claude disagrees and reruns, the worker starts right away.
 1. Run a worker round, then the test suite.
 2. Tests fail → send the failing output back to the worker (`--continue` in the same Copilot
    session). After 2 failed rounds in a row, move to the `hard` tier.
@@ -191,6 +200,7 @@ hands back **one result**:
 | Final status | Meaning |
 |---|---|
 | `done` | tests pass and the last review found no high-severity issue |
+| `tests_questioned` | the test review found wrong tests; no worker round ran |
 | `review_concerns` | tests pass but high-severity issues remain after the allowed rounds |
 | `tests_failed`, `violated_tests`, ... with `stopped_because` | stuck (e.g. `max_rounds`); Claude asks you what to do |
 | `needs_test_change` | the worker disputes a test; Claude decides and runs again |
@@ -375,13 +385,21 @@ Test counts are parsed from node:test, jest, vitest, mocha, pytest, unittest, go
 
 ## Review
 
-Since Claude never reads the code, weak tests could let bad code through. In autopilot, every time
-the tests pass the runner has a model of **another family** review the diff (the reviewer per tier
-is set by `review_models`). You can also run it by hand:
+There are two reviews, both by a model of **another family** than the workers (set by
+`review_models`), both read-only:
 
-```sh
-delegate review --tier hard   # {"verdict": "ok" | "concerns", "issues": [{severity, file, line, issue}]}
-```
+| | Test review | Code review |
+|---|---|---|
+| When | once before the first worker round (again only if the tests change) | every time the tests pass |
+| Checks | Claude's tests against the plan and spec: the reviewer works out each expected value itself and checks the tests against each other; also lists missing tests | the implementation diff since the task started: wrong behavior, security, test-gaming |
+| Blocking findings | wrong tests, back to Claude (`tests_questioned`); missing tests are only reported | high severity, back to the worker (another round) |
+| By hand | `delegate review --tests` | `delegate review --tier hard` |
+
+Why review the tests at all: Claude never reads the code, so the tests are the whole contract. In
+the benchmark Claude wrote the same kind of wrong test in 3 of 6 cron runs: it expected
+`0 0 29 2 MON` to fire on a Monday outside February. Each time that cost worker rounds before the
+worker disputed it. Given those original test files, the test review (`gpt-5.6-sol`, 23–34 credits)
+flagged the wrong test with the correct expected value in 5 of 6 attempts, with no false alarms.
 
 Which reviewer? All four candidates reviewed **the same** ~1,000-line spreadsheet implementation
 (from a benchmark run that had passed all 42 hidden tests):
@@ -492,7 +510,8 @@ Settings are read from `~/.config/delegate/config.json` (all projects), then fro
 | `review_model` | `null` | pin one reviewer for every tier |
 | `auto_max_rounds` | `4` | autopilot: worker rounds before handing back to Claude |
 | `auto_review` | `true` | autopilot: review when the tests pass and send high-severity issues back |
-| `auto_review_cycles` | `2` | autopilot: maximum reviews per run |
+| `auto_review_cycles` | `2` | autopilot: maximum code reviews per run |
+| `review_tests` | `true` | autopilot: review Claude's tests against the plan before the first round |
 | `keep_checkpoints` | `20` | how many checkpoints to keep |
 | `live_view` | `null` | `"auto"` opens a terminal following each run's live log; or an argv containing `"{cmd}"` |
 
@@ -512,6 +531,7 @@ delegate wait --timeout 540                                          # if it was
 delegate run --plan .delegate/PLAN.md --continue --feedback-file .delegate/feedback.md   # manual round
 delegate test                                               # run the suite: {passed, counts, output_tail}
 delegate review --tier hard                                 # cross-family review of the task's changes
+delegate review --tests                                     # review the tests against .delegate/PLAN.md
 delegate checkpoints                                        # list checkpoints
 delegate undo                                               # restore the one before the last round
 delegate watch                                              # follow the live log (--run ID: one autopilot run)

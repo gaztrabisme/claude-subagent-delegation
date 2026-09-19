@@ -61,7 +61,9 @@ Never put test output or other free text in a quoted command-line argument.
      with the Bash tool timeout set to 600000.
    - If it returns `"status": "running"`, call `DELEGATE wait --timeout 540` (same Bash timeout) until
      it returns something else. Never start another run while one is running.
-   - The runner handles the loop itself: it re-runs the tests after each round, sends failing output
+   - Before the first round, a model of another family checks your tests against the plan/spec
+     (wrong expectations block the run; missing tests are only reported). Then the runner handles the loop itself:
+     it re-runs the tests after each round, sends failing output
      back to the worker, moves to the hard tier after 2 failed rounds, and when the tests pass has a
      model of another family review the diff and sends high-severity issues back too (limits:
      `auto_max_rounds`, `auto_review_cycles`). You only get the final result.
@@ -71,6 +73,10 @@ Never put test output or other free text in a quoted command-line argument.
 5. **Act on the final `status`** (`rounds` lists each round; `tests`, `review` and `changed_files`
    describe the end state):
    - `done`: tests pass and the review found no high-severity issue. Go to step 6.
+   - `tests_questioned`: the test review found WRONG tests (expected values that contradict the
+     spec); no worker round ran. Check each `wrong_test` issue in `test_review.issues` against the spec. Fix the tests where the reviewer
+     is right; where it's wrong, leave them. Then run the same command again. The test review only
+     repeats if the tests changed, so a rerun after disagreeing goes straight to the worker.
    - `needs_test_change`: read `test_change_request`. As the test owner, either edit the test
      (feedback: "Approved: <change>. Continue.") or keep it (feedback: "Rejected: the test is correct
      because <reason>."), then run again with `--auto --continue --feedback-file .delegate/feedback.md`.
@@ -86,8 +92,8 @@ Never put test output or other free text in a quoted command-line argument.
    - **Undo**: `DELEGATE undo` restores the tree to before the last worker round; `first_checkpoint`
      restores everything (`DELEGATE undo --to <id>`).
 6. **Report**: status, summary, changed files, number of rounds, review verdict (mention medium
-   issues and `review.unverified` if present), and `worker_credits` (Copilot AI credits, including
-   reviews).
+   issues and `review.unverified` if present), medium `test_review` issues (e.g. missing tests), and
+   `worker_credits` (Copilot AI credits, including reviews).
 
 Manual mode (only if the user asks to drive rounds themselves): omit `--auto`; each round then
 returns on its own and you retry with `--continue --feedback-file`, and run `DELEGATE review
@@ -106,6 +112,6 @@ returns on its own and you retry with `--continue --feedback-file`, and run `DEL
 `models` ({"normal", "hard"}), `model` (pin one), `timeout` (s per worker run, default 1800),
 `test_cmd`, `test_globs`, `extra_protected`, `count_tests` (default true), `review_models`
 ({"normal": "gpt-5.6-sol", "hard": "gpt-5.6-sol"}; "gpt-6-astra" is more thorough, ~4.5x the credits), `review_model` (pin one), `auto_max_rounds` (4),
-`auto_review` (true), `auto_review_cycles` (2), `live_view`, `builtin_mcps` (default false), `keep_checkpoints` (20),
+`auto_review` (true), `auto_review_cycles` (2), `review_tests` (true), `live_view`, `builtin_mcps` (default false), `keep_checkpoints` (20),
 `extra_args`, and `"backend": "command"` with `"command": [...]` for another agent CLI (prompt in
 `$DELEGATE_PROMPT`; it must write `.delegate/result.json`).

@@ -161,6 +161,23 @@ What happened in the delegate runs:
 
 The runs are in `bench/results/20260919-160324` (spreadsheet) and `20260919-160329` (cron).
 
+## Test review (cron, forced delegation, 3 runs each)
+
+| Version | Claude cost | Turns | Copilot credits | Rounds per run |
+|---|---|---|---|---|
+| autopilot, no test review | $0.50 ($0.44–$0.56) | 11 | 78 | 1–2, plus 2 test disputes |
+| test review v1 (missing tests could block) | $0.60 ($0.52–$0.73) | 13 | 135 | 1–5 |
+| **test review v2** (only wrong tests block; sharper prompt) | **$0.47 ($0.44–$0.49)** | **8** | **63** | **1** |
+
+- v1 missed Claude's wrong test (`0 0 29 2 1` expected on a Monday in January) and blocked another
+  run over a missing test that didn't matter.
+- v2 was checked directly on the three original test files with that mistake: it flagged the wrong
+  test with the correct expected value in 5 of 6 attempts (23–34 credits each), with no false alarms.
+- In the v2 benchmark batch Claude didn't happen to write that test, so no run was blocked; each run
+  needed one worker round.
+
+Runs: `bench/results/20260919-211537` (v1), `20260919-213028` (v2).
+
 ## Earlier single-run results (before size check and the later runner features)
 
 | Task | Claude alone | Claude + delegate (always delegated) |

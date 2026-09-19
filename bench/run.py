@@ -4,33 +4,63 @@
 Each task is bench/tasks/<name>/ with:
   repo/     starting project (copied fresh for every run; contains TASK.md)
   hidden/   acceptance tests never shown to the agents; copied in after the run
+            (*.test.js run with `node --test`, *.py run with `python3 -m unittest`)
 
 For every (task, mode, run) it records Claude's cost/tokens (from `claude -p --output-format json`),
-wall time, how many worker runs were delegated, and the hidden test pass rate.
+Copilot's AI credits (from the delegate logs), wall time, and the hidden test pass rate.
 
   python3 bench/run.py                         # all tasks, both modes, 1 run each
-  python3 bench/run.py --tasks expr-eval --runs 3 --jobs 2 --model sonnet
+  python3 bench/run.py --tasks cron --runs 3 --jobs 2 --model sonnet
 """
 
 import argparse
 import concurrent.futures as cf
 import json
+import os
 import re
 import shutil
+import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 BENCH = Path(__file__).resolve().parent
+sys.path.insert(0, str(BENCH.parent / "skills" / "delegate"))
+from detect import parse_test_counts  # noqa: E402
+
 PROMPTS = {
     "alone": "Implement the task described in TASK.md in this repository. Verify your work before finishing.",
     "delegate": "/delegate Implement the task described in TASK.md in this repository.",
+    "force": "/delegate force Implement the task described in TASK.md in this repository.",
 }
+DEFAULT_MODES = ["alone", "delegate"]
 ALLOWED_TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Skill"]
 
 
 def sh(cmd, cwd, **kw):
-    return subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
+    return subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, **kw)
+
+
+def run_hidden_tests(task, work):
+    """Copy the hidden tests in (only now, after the agent finished) and run them."""
+    hidden = BENCH / "tasks" / task / "hidden"
+    if any(hidden.glob("*.py")):
+        target = work / "_hidden_tests"
+        shutil.copytree(hidden, target)
+        (target / "__init__.py").touch()
+        cmd = ["python3", "-m", "unittest", "discover", "-s", "_hidden_tests", "-t", "."]
+    else:
+        target = work / ".hidden"
+        shutil.copytree(hidden, target)
+        cmd = ["node", "--test", *sorted(str(p.relative_to(work)) for p in target.glob("*.test.js"))]
+    try:
+        output = sh(cmd, work, timeout=300).stdout
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + "\nTIMEOUT"
+    counts = parse_test_counts(output) or {"total": 0, "passed": 0}
+    return counts, output
 
 
 def run_one(task, mode, n, out_dir, model, timeout):
@@ -46,29 +76,30 @@ def run_one(task, mode, n, out_dir, model, timeout):
         argv += ["--model", model]
     started = time.time()
     try:
-        proc = sh(argv, work, timeout=timeout)
+        # No live-view windows during benchmark runs.
+        proc = sh(argv, work, timeout=timeout, env={**os.environ, "DELEGATE_LIVE_VIEW": "off"})
         raw = proc.stdout
     except subprocess.TimeoutExpired as exc:
         raw = exc.stdout or ""
     wall = round(time.time() - started)
-    (work.parent / f"{work.name}.claude.json").write_text(raw if isinstance(raw, str) else raw.decode())
-
+    raw = raw if isinstance(raw, str) else raw.decode()
+    (work.parent / f"{work.name}.claude.json").write_text(raw)
+    # The JSON result is the last line starting with "{" (the CLI may print warnings before it).
+    json_line = next((line for line in reversed(raw.splitlines()) if line.startswith("{")), "")
     try:
-        claude = json.loads(raw)
-    except (ValueError, TypeError):
-        claude = {"is_error": True, "result": str(raw)[-2000:]}
+        claude = json.loads(json_line)
+    except ValueError:
+        claude = {"is_error": True, "result": raw[-2000:]}
     usage = claude.get("usage") or {}
 
-    # Hidden acceptance tests, copied in only now.
-    hidden_dir = work / ".hidden"
-    shutil.copytree(BENCH / "tasks" / task / "hidden", hidden_dir)
-    files = sorted(str(p.relative_to(work)) for p in hidden_dir.glob("*.test.js"))
-    tap = sh(["node", "--test", *files], work, timeout=120).stdout
-    passed = int((re.search(r"^# pass (\d+)", tap, re.M) or [0, 0])[1])
-    failed = int((re.search(r"^# fail (\d+)", tap, re.M) or [0, 0])[1])
-    (work.parent / f"{work.name}.hidden.tap").write_text(tap)
+    counts, output = run_hidden_tests(task, work)
+    (work.parent / f"{work.name}.hidden.txt").write_text(output)
 
     logs = work / ".delegate" / "logs"
+    ends = [line for f in (sorted(logs.glob("*.log")) if logs.exists() else [])
+            if f.name != "latest.log" and not f.name.startswith("test-")
+            for line in f.read_text(errors="ignore").splitlines() if line.startswith("=== end:")]
+    credits = [float(m[1]) for line in ends if (m := re.search(r"AI credits ([\d.]+)", line))]
     return {
         "task": task, "mode": mode, "run": n,
         "ok": not claude.get("is_error", False),
@@ -79,43 +110,60 @@ def run_one(task, mode, n, out_dir, model, timeout):
         "output_tokens": usage.get("output_tokens", 0),
         "turns": claude.get("num_turns"),
         "wall_seconds": wall,
-        "worker_runs": len(list(logs.glob("run-*.log"))) if logs.exists() else 0,
-        "hidden_passed": passed,
-        "hidden_total": passed + failed,
+        "worker_rounds": sum(1 for line in ends if not line.startswith("=== end: review")),
+        "reviews": sum(1 for line in ends if line.startswith("=== end: review")),
+        "worker_credits": round(sum(credits), 2) if credits else 0.0,
+        "hidden_passed": counts.get("passed", 0),
+        "hidden_total": counts.get("total", 0),
         "permission_denials": len(claude.get("permission_denials") or []),
         "models": sorted((claude.get("modelUsage") or {}).keys()),
     }
 
 
+def _stat(values, fmt):
+    values = [v for v in values if v is not None]
+    if not values:
+        return "n/a"
+    mean = fmt.format(statistics.mean(values))
+    return mean if len(values) == 1 else f"{mean} ({fmt.format(min(values))}–{fmt.format(max(values))})"
+
+
 def summarize(results):
     lines = [
-        "| task | mode | hidden tests | Claude cost | input (uncached+cache write) | cache read | output | turns | wall | Copilot runs |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| task | mode | runs | hidden tests | Claude cost | Copilot AI credits | Claude output tokens | turns | wall |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
+    groups, expected = {}, {}
+    for r in results:
+        groups.setdefault((r["task"], r["mode"]), []).append(r)
+        # A solution that fails to import reports 1 failing test; use the full count as denominator.
+        expected[r["task"]] = max(expected.get(r["task"], 0), r["hidden_total"])
+    for (task, mode), rs in sorted(groups.items()):
+        passed = sum(r["hidden_passed"] for r in rs)
+        total = expected[task] * len(rs)
+        errors = sum(1 for r in rs if not r["ok"])
+        lines.append(
+            f"| {task} | {mode} | {len(rs)}{f' ({errors} errored)' if errors else ''} | {passed}/{total} "
+            f"| {_stat([r['cost_usd'] for r in rs], '${:.2f}')} "
+            f"| {_stat([r['worker_credits'] for r in rs], '{:.1f}')} "
+            f"| {_stat([r['output_tokens'] for r in rs], '{:,.0f}')} "
+            f"| {_stat([r['turns'] for r in rs], '{:.0f}')} | {_stat([r['wall_seconds'] for r in rs], '{:.0f}s')} |")
+    lines += ["", "Values are means, with (min–max) over the runs.", "", "Per run:", "",
+              "| task | mode | run | hidden | Claude cost | credits | rounds | reviews | turns | wall |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in sorted(results, key=lambda r: (r["task"], r["mode"], r["run"])):
         cost = f"${r['cost_usd']:.3f}" if r["cost_usd"] is not None else "n/a"
-        lines.append(
-            f"| {r['task']} | {r['mode']}{'' if r['ok'] else ' (error)'} | {r['hidden_passed']}/{r['hidden_total']} | {cost} "
-            f"| {r['input_tokens'] + r['cache_write_tokens']:,} | {r['cache_read_tokens']:,} | {r['output_tokens']:,} "
-            f"| {r['turns']} | {r['wall_seconds']}s | {r['worker_runs']} |"
-        )
-    lines += ["", "Averages per mode:", ""]
-    for mode in PROMPTS:
-        rs = [r for r in results if r["mode"] == mode and r["cost_usd"] is not None]
-        if not rs:
-            continue
-        avg = lambda k: sum(r[k] for r in rs) / len(rs)
-        passed = sum(r["hidden_passed"] for r in rs)
-        total = sum(r["hidden_total"] for r in rs)
-        lines.append(f"- **{mode}**: ${avg('cost_usd'):.3f}/run, {avg('output_tokens'):,.0f} output tokens, "
-                     f"{avg('wall_seconds'):.0f}s, hidden tests {passed}/{total}")
+        lines.append(f"| {r['task']} | {r['mode']}{'' if r['ok'] else ' (error)'} | {r['run']} "
+                     f"| {r['hidden_passed']}/{expected[r['task']]} | {cost} | {r['worker_credits']} "
+                     f"| {r['worker_rounds']} | {r['reviews']} | {r['turns']} | {r['wall_seconds']}s |")
     return "\n".join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tasks", nargs="*", help="task names (default: all)")
-    parser.add_argument("--modes", nargs="*", default=list(PROMPTS), choices=list(PROMPTS))
+    parser.add_argument("--modes", nargs="*", default=DEFAULT_MODES, choices=list(PROMPTS),
+                        help="alone, delegate (size check decides), force (always delegate)")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--jobs", type=int, default=1, help="parallel runs")
     parser.add_argument("--model", help="Claude model for both modes (default: your Claude Code default)")
@@ -135,7 +183,7 @@ def main():
             r = fut.result()
             results.append(r)
             print(f"done {r['task']}/{r['mode']}#{r['run']}: hidden {r['hidden_passed']}/{r['hidden_total']}, "
-                  f"cost {r['cost_usd']}, {r['wall_seconds']}s", flush=True)
+                  f"cost {r['cost_usd']}, credits {r['worker_credits']}, {r['wall_seconds']}s", flush=True)
             (out_dir / "results.json").write_text(json.dumps(results, indent=2))
 
     summary = summarize(results)

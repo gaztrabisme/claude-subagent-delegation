@@ -1,199 +1,51 @@
 #!/usr/bin/env python3
 """Delegate implementation work to a cheaper coding agent (Copilot CLI by default).
 
-Claude writes the plan + tests; the worker implements; the worker may run tests but
-may NOT change them. Test files are snapshotted before each run and any change is
-reverted and reported as a violation.
+Claude writes the plan + tests; the worker implements; the worker may run tests but may NOT change
+them. Every round is checkpointed (undo-able), test files and test config are guarded, and the runner
+re-runs the test suite itself after the worker finishes.
 
 Subcommands (all print one JSON object to stdout):
-  detect                          show detected test command / protected test globs
-  run --plan FILE [--feedback T]  delegate the plan to the worker, return its status
-      [--continue]                  reuse the previous worker session (for retries)
-      [--tier normal|hard]          complexity tier -> model (config "models")
-  test                            run the test command, return pass/fail + output tail
+  detect                           detected test command, protected files, models
+  run --plan FILE                  one worker round on a plan
+      [--continue] [--feedback T]    reuse the worker session for a retry
+      [--tier normal|hard]           complexity tier -> model (config "models")
+      [--background]                 return immediately; collect the result with `wait`
+  run --parallel MANIFEST          several workers at once, each in its own git worktree
+  wait [--timeout S]               wait for the current run; {"status": "running"} if still going
+  test                             run the test suite
+  review [--base ID]               cheap-model review of everything changed since the task started
+  undo [--to ID]                   restore the working tree to a checkpoint (default: before last round)
+  checkpoints                      list checkpoints
+  watch [--log FILE] [--hold]      follow the live log (run it in another terminal)
 """
 
 import argparse
-import fnmatch
-import hashlib
+import difflib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
 
-STATE_DIR = ".delegate"
-SKIP_DIRS = {
-    ".git", ".hg", ".svn", STATE_DIR, "node_modules", ".venv", "venv", "env",
-    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
-    "dist", "build", "target", ".next", ".nuxt", "coverage", ".turbo",
-}
-DEFAULT_CONFIG = {
-    "backend": "copilot",
-    "models": {             # model per complexity tier; Claude picks the tier with --tier
-        "normal": "claude-sonnet-5",
-        "hard": "claude-opus-5",
-    },
-    "model": None,          # pin one model for every tier (disables tier selection)
-    "timeout": 1800,        # seconds per worker run
-    "extra_args": [],       # extra CLI args for the backend
-    "command": None,        # argv for the "command" backend; prompt in $DELEGATE_PROMPT
-    "test_cmd": None,       # override detection, e.g. "npm run test:unit"
-    "test_globs": None,     # override detection, e.g. ["tests/**"]
-    "extra_protected": [],  # added on top of detected globs
-}
-TAIL_LINES = 60
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import checkpoint  # noqa: E402
+from common import (DEPENDENCY_DIRS, STATE_DIR, git_prefix, hash_tree, load_config, matches,  # noqa: E402
+                    read_json, state_dir, tail, walk_files, write_json)
+from detect import detect, run_tests  # noqa: E402
+from guard import TestGuard, protected_hash  # noqa: E402
+from livelog import END_MARKER, LiveLog, LogSink, follow, open_live_view, run_backend  # noqa: E402
+
+SCRIPT = Path(__file__).resolve()
+STATUS_EXIT = {"done": 0, "running": 3, "started": 0}
 
 
-# ---------------------------------------------------------------- detection
-
-def _read_json(path):
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def _detect_js(root):
-    pkg = _read_json(root / "package.json")
-    if not pkg:
-        return None
-    script = (pkg.get("scripts") or {}).get("test", "")
-    if not script or "no test specified" in script:
-        return None
-    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
-    framework = next((f for f in ("vitest", "jest", "mocha", "ava") if f in deps), None)
-    if framework is None:
-        framework = "node:test" if "node --test" in script else "npm-script"
-    if (root / "pnpm-lock.yaml").exists():
-        pm = "pnpm"
-    elif (root / "yarn.lock").exists():
-        pm = "yarn"
-    elif (root / "bun.lockb").exists() or (root / "bun.lock").exists():
-        pm = "bun"
-    else:
-        pm = "npm"
-    return {
-        "framework": framework,
-        "test_cmd": f"{pm} test",
-        "test_globs": [
-            "**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/test/**", "**/tests/**",
-            "**/jest.config.*", "**/jest.setup.*", "**/vitest.config.*", "**/vitest.setup.*",
-            "**/.mocharc*",
-        ],
-    }
-
-
-def _detect_python(root):
-    pyproject = root / "pyproject.toml"
-    setup_cfg = root / "setup.cfg"
-    signals = [
-        pyproject.exists() and "pytest" in pyproject.read_text(errors="ignore"),
-        (root / "pytest.ini").exists(),
-        (root / "conftest.py").exists(),
-        setup_cfg.exists() and "tool:pytest" in setup_cfg.read_text(errors="ignore"),
-        any(root.glob("test_*.py")),
-        any(root.glob("tests/**/test_*.py")) or any(root.glob("tests/**/*_test.py")),
-    ]
-    if not any(signals):
-        return None
-    if (root / "uv.lock").exists():
-        runner = "uv run pytest"
-    elif (root / "poetry.lock").exists():
-        runner = "poetry run pytest"
-    elif (root / ".venv/bin/pytest").exists():
-        runner = ".venv/bin/pytest"
-    else:
-        runner = "python3 -m pytest"
-    return {
-        "framework": "pytest",
-        "test_cmd": f"{runner} -q",
-        "test_globs": ["**/test_*.py", "**/*_test.py", "**/conftest.py", "**/tests/**", "pytest.ini"],
-    }
-
-
-def _detect_go(root):
-    if not (root / "go.mod").exists():
-        return None
-    return {"framework": "go test", "test_cmd": "go test ./...",
-            "test_globs": ["**/*_test.go", "**/testdata/**"]}
-
-
-def _detect_rust(root):
-    if not (root / "Cargo.toml").exists():
-        return None
-    # Inline #[cfg(test)] modules live in src/ and cannot be protected by path.
-    return {"framework": "cargo test", "test_cmd": "cargo test", "test_globs": ["**/tests/**"]}
-
-
-def _detect_make(root):
-    makefile = root / "Makefile"
-    if makefile.exists() and any(l.startswith("test:") for l in makefile.read_text(errors="ignore").splitlines()):
-        return {"framework": "make", "test_cmd": "make test", "test_globs": ["**/tests/**", "**/test/**"]}
-    return None
-
-
-DETECTORS = [_detect_js, _detect_python, _detect_go, _detect_rust, _detect_make]
-
-
-def load_config(root):
-    cfg = dict(DEFAULT_CONFIG)
-    user = _read_json(root / STATE_DIR / "config.json")
-    if user:
-        cfg.update(user)
-    return cfg
-
-
-def detect(root, cfg):
-    info = {"framework": None, "test_cmd": None, "test_globs": []}
-    for detector in DETECTORS:
-        found = detector(root)
-        if found:
-            info = found
-            break
-    if cfg.get("test_cmd"):
-        info["test_cmd"] = cfg["test_cmd"]
-        info["framework"] = info["framework"] or "custom"
-    if cfg.get("test_globs"):
-        info["test_globs"] = list(cfg["test_globs"])
-    info["test_globs"] = info["test_globs"] + list(cfg.get("extra_protected") or [])
-    return info
-
-
-# ---------------------------------------------------------------- file tracking
-
-def walk_files(root):
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for name in filenames:
-            path = Path(dirpath) / name
-            if path.is_file() and not path.is_symlink():
-                yield path.relative_to(root).as_posix()
-
-
-def matches(rel, globs):
-    for pattern in globs:
-        if fnmatch.fnmatch(rel, pattern):
-            return True
-        if pattern.startswith("**/") and fnmatch.fnmatch(rel, pattern[3:]):
-            return True
-    return False
-
-
-def file_hash(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def hash_tree(root):
-    return {rel: file_hash(root / rel) for rel in walk_files(root)}
-
-
-# ---------------------------------------------------------------- backends
+# ---------------------------------------------------------------- backends and prompts
 
 def resolve_models(cfg, tier, explicit):
     """Models to try in order: the chosen one, then the normal-tier model as fallback for "hard"."""
@@ -208,11 +60,13 @@ def resolve_models(cfg, tier, explicit):
     return list(dict.fromkeys(candidates)) or [None]
 
 
-def backend_argv(cfg, prompt, root, session_id, model):
+def backend_argv(cfg, prompt, cwd, session_id, model):
     backend = cfg["backend"]
     if backend == "copilot":
-        argv = ["copilot", "-p", prompt, "--allow-all-tools", "-s", "-C", str(root),
+        argv = ["copilot", "-p", prompt, "--allow-all-tools", "--output-format", "json", "-C", str(cwd),
                 "--session-id", session_id]
+        if not cfg.get("builtin_mcps"):
+            argv.append("--disable-builtin-mcps")
         if model:
             argv += ["--model", model]
         return argv + list(cfg.get("extra_args") or [])
@@ -223,16 +77,29 @@ def backend_argv(cfg, prompt, root, session_id, model):
     raise SystemExit(f"unknown backend: {backend}")
 
 
-def build_prompt(plan, feedback, info, protected_files):
+def build_prompt(plan, feedback, info, protected_files, parallel=None):
     shown = protected_files[:50]
     more = f"\n  ... and {len(protected_files) - 50} more" if len(protected_files) > 50 else ""
     feedback_block = f"\n## Feedback from the reviewer on your previous attempt\n{feedback}\n" if feedback else ""
     test_cmd = info["test_cmd"] or "(none detected - verify by reasoning and any checks you can run)"
+    parallel_block = ""
+    if parallel:
+        others = "\n".join(f"   - {t['name']}: {', '.join(t['files'])}" for t in parallel["others"]) or "   (none)"
+        own_tests = parallel.get("test_cmd") or f"`{test_cmd}` (other parts may still fail in your copy)"
+        parallel_block = f"""
+## Parallel work
+You are worker "{parallel['name']}", one of several workers running at the same time, each in its own
+copy of the repository. Only create or modify files matching: {', '.join(parallel['files'])}
+Changes to any other file are discarded. Other workers are building:
+{others}
+Their code is not in your copy. Code against the interfaces described in the plan. Test your part with:
+{own_tests}
+"""
     return f"""You are implementing a task in this repository. Work autonomously; nobody will answer questions during this run.
 
 ## Task plan
 {plan}
-{feedback_block}
+{feedback_block}{parallel_block}
 ## Rules
 1. Implement the plan. The test command is: `{test_cmd}`
    Run it yourself and keep iterating until it passes.
@@ -247,15 +114,398 @@ def build_prompt(plan, feedback, info, protected_files):
 4. Do not game the tests (no hardcoding expected outputs, no special-casing test inputs).
 5. When you finish, write `.delegate/result.json` containing exactly:
    {{"status": "done" | "failed" | "needs_test_change", "summary": "<one or two sentences>"}}
-   Use "done" only if the test command passes.
+   Use "done" only if the tests for your work pass.
 """
+
+
+# ---------------------------------------------------------------- run bookkeeping
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _active_run(root):
+    current = read_json(root / STATE_DIR / "current.json")
+    if not current or (root / STATE_DIR / "runs" / f"{current['run_id']}.json").exists():
+        return None
+    return current if _pid_alive(current["pid"]) else None
+
+
+def _new_log(root, name):
+    logs = state_dir(root) / "logs"
+    log = logs / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    latest = logs / "latest.log"
+    latest.unlink(missing_ok=True)
+    latest.symlink_to(log.name)
+    return log
+
+
+def _feedback(args):
+    """--feedback text plus --feedback-file contents ("-" reads stdin). Files avoid shell quoting issues."""
+    text = args.feedback or ""
+    if args.feedback_file:
+        source = sys.stdin.read() if args.feedback_file == "-" else Path(args.feedback_file).read_text(encoding="utf-8")
+        text = f"{text}\n{source}" if text else source
+    return text
+
+
+def _load_session(root):
+    return read_json(root / STATE_DIR / "session.json") or {}
+
+
+def _save_session(root, session):
+    write_json(root / STATE_DIR / "session.json", session)
+
+
+def _check_test_counts(session, tests_hash, tests):
+    """Flag a passing suite that runs fewer tests (or skips more) than seen before for the same tests."""
+    if session.get("tests_hash") != tests_hash:
+        session["tests_hash"], session["best_counts"] = tests_hash, None
+    counts = (tests or {}).get("counts")
+    if not tests or not counts or counts.get("total") is None:
+        return None
+    best = session.get("best_counts")
+    problem = None
+    if tests["passed"] and best:
+        if counts["total"] < best["total"]:
+            problem = f"the suite passed but ran {counts['total']} tests, fewer than the {best['total']} seen before"
+        elif counts["skipped"] > best["skipped"]:
+            problem = f"the suite passed but skipped {counts['skipped']} tests, more than the {best['skipped']} before"
+    if not best or counts["total"] > best["total"] or (
+            counts["total"] == best["total"] and counts["skipped"] < best["skipped"]):
+        session["best_counts"] = {"total": counts["total"], "skipped": counts["skipped"]}
+    return problem
+
+
+def _tests_summary(tests):
+    if not tests:
+        return None
+    out = {"passed": tests["passed"], "cmd": tests["cmd"]}
+    if tests.get("counts"):
+        out["counts"] = tests["counts"]
+    if not tests["passed"]:
+        out["output_tail"] = tests.get("output_tail")
+    return out
+
+
+def _run_worker(cfg, prompt, cwd, session_id, candidates, live, env):
+    """Run the worker with model fallback. Returns (exit_code, timed_out, model, fallback_note)."""
+    fallback_note, exit_code, timed_out, model = None, None, False, None
+    for attempt, model in enumerate(candidates):
+        live.write(f"=== model: {model or 'default'}")
+        exit_code, timed_out = run_backend(backend_argv(cfg, prompt, cwd, session_id, model), cwd, env,
+                                           cfg["timeout"], live)
+        if timed_out or exit_code == 0 or attempt == len(candidates) - 1:
+            break
+        fallback_note = f"{model} failed (exit {exit_code}); retried with {candidates[attempt + 1]}"
+        live.write(f"=== {fallback_note}")
+    return exit_code, timed_out, model, fallback_note
+
+
+def _status(violations, timed_out, exit_code, report, tests):
+    if violations:
+        return "violated_tests"
+    if timed_out:
+        return "timeout"
+    if exit_code != 0:
+        return "backend_error"
+    if report.get("status") == "needs_test_change":
+        return "needs_test_change"
+    if tests is not None:
+        return "done" if tests["passed"] else "tests_failed"
+    return report.get("status") if report.get("status") in ("done", "failed") else "no_report"
+
+
+# ---------------------------------------------------------------- run: one round
+
+def run_round(root, cfg, args):
+    state = state_dir(root)
+    info = detect(root, cfg)
+    plan = Path(args.plan).read_text()
+    feedback = _feedback(args)
+
+    session = _load_session(root) if args.continue_session else {}
+    if not session.get("session_id"):
+        session = {"session_id": str(uuid.uuid4())}
+    cp = checkpoint.create(root, f"before round ({'retry' if args.continue_session else 'new task'})")
+    session.setdefault("base_checkpoint", cp["id"])
+
+    for leftover in ("result.json", "test_change_request.md"):
+        (state / leftover).unlink(missing_ok=True)
+
+    log = _new_log(root, "run")
+    sink = LogSink(log)
+    sink.write(f"=== delegate run {time.strftime('%Y-%m-%d %H:%M:%S')} · tier {args.tier} · "
+               f"{'continue' if args.continue_session else 'new'} session · checkpoint {cp['id']}")
+    live_view_error = open_live_view(cfg, root, log, SCRIPT)
+    live = LiveLog(sink, log.with_suffix(".jsonl"), root)
+
+    guard = TestGuard(root, info["test_globs"])
+    guard.lock()
+    prompt = build_prompt(plan, feedback, info, guard.protected)
+    env = {**os.environ, "DELEGATE_PROMPT": prompt, "DELEGATE_ROOT": str(root)}
+    started = time.time()
+    try:
+        exit_code, timed_out, model, fallback_note = _run_worker(
+            cfg, prompt, root, session["session_id"], resolve_models(cfg, args.tier, args.model), live, env)
+    finally:
+        violations, changed = guard.release()
+
+    tests = None
+    if info["test_cmd"] and not timed_out and exit_code == 0:
+        sink.write("=== runner: running the test suite")
+        tests = run_tests(root, info["test_cmd"], state / "logs", "test")
+    count_problem = _check_test_counts(session, guard.protected_hash(), tests) if cfg.get("count_tests") else None
+    if count_problem:
+        violations.append({"file": "(test run)", "change": count_problem})
+
+    report = read_json(state / "result.json") or {}
+    status = _status(violations, timed_out, exit_code, report, tests)
+    result = {
+        "status": status,
+        "summary": report.get("summary"),
+        "worker_reported": report.get("status"),
+        "changed_files": changed,
+        "tests": _tests_summary(tests),
+        "tier": args.tier,
+        "model": model,
+        "seconds": round(time.time() - started),
+        "checkpoint": cp["id"],
+        "log": str(log.relative_to(root)),
+    }
+    if live.credits is not None:
+        result["worker_credits"] = round(live.credits, 2)
+    if live_view_error:
+        result["live_view_error"] = live_view_error
+    if fallback_note:
+        result["model_fallback"] = fallback_note
+    if violations:
+        result["violations"] = violations
+    request = state / "test_change_request.md"
+    if request.exists():
+        result["test_change_request"] = request.read_text()[:4000]
+    if status == "backend_error":
+        result["log_tail"] = tail(log.read_text(errors="ignore"), 30)
+    if not changed and status == "done":
+        result["warning"] = "tests pass but the worker changed no files"
+
+    credits = f" · AI credits {live.credits:.2f}" if live.credits is not None else ""
+    sink.write(f"{END_MARKER}: {status} · {result['seconds']}s · {len(changed)} files changed{credits}")
+    live.close()
+    sink.close()
+    _save_session(root, session)
+    checkpoint.prune(root, cfg.get("keep_checkpoints") or 0)
+    return {k: v for k, v in result.items() if v is not None}
+
+
+# ---------------------------------------------------------------- run: parallel round
+
+def run_parallel(root, cfg, args):
+    manifest = read_json(args.parallel)
+    tasks = (manifest or {}).get("tasks") or []
+    if len(tasks) < 2 or any(not t.get("name") or not t.get("plan") or not t.get("files") for t in tasks):
+        return {"status": "bad_manifest",
+                "error": 'manifest needs 2+ tasks, each with "name", "plan" (file) and "files" (globs)'}
+    if len({t["name"] for t in tasks}) != len(tasks):
+        return {"status": "bad_manifest", "error": "task names must be unique"}
+    if git_prefix(root) is None:
+        return {"status": "unsupported", "error": "parallel rounds need a git repository; run the tasks one by one"}
+
+    state_dir(root)
+    info = detect(root, cfg)
+    feedback = _feedback(args)
+    session = _load_session(root) if args.continue_session else {}
+    session.setdefault("parallel", {})
+    cp = checkpoint.create(root, f"before parallel round ({', '.join(t['name'] for t in tasks)})")
+    session.setdefault("base_checkpoint", cp["id"])
+
+    log = _new_log(root, "parallel")
+    sink = LogSink(log)
+    sink.write(f"=== delegate parallel run {time.strftime('%Y-%m-%d %H:%M:%S')} · "
+               f"{len(tasks)} workers · checkpoint {cp['id']}")
+    live_view_error = open_live_view(cfg, root, log, SCRIPT)
+
+    workers = []
+    try:
+        return _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sink, live_view_error,
+                              workers)
+    except BaseException:
+        for w in workers:
+            if not w.get("released"):
+                w["guard"].release()
+            checkpoint.worktree_remove(root, w["worktree"])
+        sink.close()
+        raise
+
+
+def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sink, live_view_error, workers):
+    state = root / STATE_DIR
+    for task in tasks:
+        worktree, proj = checkpoint.worktree_add(root, cp)
+        for dep in DEPENDENCY_DIRS:
+            if (root / dep).exists() and not (proj / dep).exists():
+                (proj / dep).symlink_to(root / dep)
+        guard = TestGuard(proj, info["test_globs"])
+        guard.lock()
+        session_id = session["parallel"].get(task["name"]) if args.continue_session else None
+        session["parallel"][task["name"]] = session_id or str(uuid.uuid4())
+        others = [{"name": t["name"], "files": t["files"]} for t in tasks if t is not task]
+        prompt = build_prompt(Path(task["plan"]).read_text(), task.get("feedback") or feedback, info,
+                              guard.protected, {"name": task["name"], "files": task["files"],
+                                                "others": others, "test_cmd": task.get("test_cmd")})
+        workers.append({"task": task, "worktree": worktree, "proj": proj, "guard": guard, "prompt": prompt,
+                        "session_id": session["parallel"][task["name"]],
+                        "live": LiveLog(sink, log.with_name(f"{log.stem}-{task['name']}.jsonl"), proj, task["name"])})
+
+    def work(w):
+        env = {**os.environ, "DELEGATE_PROMPT": w["prompt"], "DELEGATE_ROOT": str(w["proj"])}
+        tier = w["task"].get("tier", args.tier)
+        w["outcome"] = _run_worker(cfg, w["prompt"], w["proj"], w["session_id"],
+                                   resolve_models(cfg, tier, args.model), w["live"], env)
+
+    started = time.time()
+    threads = [threading.Thread(target=work, args=(w,)) for w in workers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    applied, results, all_violations = {}, [], []
+    for w in workers:
+        task, proj = w["task"], w["proj"]
+        violations, changed = w["guard"].release()
+        w["released"] = True
+        exit_code, timed_out, model, fallback_note = w["outcome"]
+        owned = [f for f in changed if matches(f, task["files"])]
+        out_of_scope = [f for f in changed if f not in owned]
+        conflicts = [f for f in owned if f in applied]
+        for rel in owned:
+            if rel in conflicts:
+                continue
+            src, dst = proj / rel, root / rel
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            else:
+                dst.unlink(missing_ok=True)
+            applied[rel] = task["name"]
+        report = read_json(proj / STATE_DIR / "result.json") or {}
+        request = proj / STATE_DIR / "test_change_request.md"
+        entry = {
+            "name": task["name"],
+            "status": _status(violations, timed_out, exit_code, report, None),
+            "summary": report.get("summary"),
+            "model": model,
+            "applied_files": [f for f in owned if f not in conflicts],
+            "out_of_scope_files": out_of_scope or None,
+            "conflicts": [f"{f} (already changed by {applied[f]})" for f in conflicts] or None,
+            "violations": violations or None,
+            "model_fallback": fallback_note,
+            "worker_credits": round(w["live"].credits, 2) if w["live"].credits is not None else None,
+            "test_change_request": request.read_text()[:4000] if request.exists() else None,
+        }
+        results.append({k: v for k, v in entry.items() if v is not None})
+        all_violations += violations
+        w["live"].close()
+        checkpoint.worktree_remove(root, w["worktree"])
+
+    tests = None
+    if info["test_cmd"]:
+        sink.write("=== runner: running the full test suite on the merged result")
+        tests = run_tests(root, info["test_cmd"], state / "logs", "test")
+    count_problem = (_check_test_counts(session, protected_hash(root, info["test_globs"]), tests)
+                     if cfg.get("count_tests") else None)
+
+    statuses = {r["status"] for r in results}
+    if all_violations or count_problem:
+        status = "violated_tests"
+    elif "needs_test_change" in statuses:
+        status = "needs_test_change"
+    elif tests is not None:
+        status = "done" if tests["passed"] else "tests_failed"
+    else:
+        status = "done" if statuses == {"done"} else "partial"
+    credits = [r["worker_credits"] for r in results if "worker_credits" in r]
+    result = {
+        "status": status,
+        "tasks": results,
+        "tests": _tests_summary(tests),
+        "seconds": round(time.time() - started),
+        "checkpoint": cp["id"],
+        "log": str(log.relative_to(root)),
+        "worker_credits": round(sum(credits), 2) if credits else None,
+        "violations": ([{"file": "(test run)", "change": count_problem}] if count_problem else None),
+        "live_view_error": live_view_error,
+    }
+    total = f" · AI credits {sum(credits):.2f}" if credits else ""
+    sink.write(f"{END_MARKER}: {status} · {result['seconds']}s · {len(applied)} files applied{total}")
+    sink.close()
+    _save_session(root, session)
+    checkpoint.prune(root, cfg.get("keep_checkpoints") or 0)
+    return {k: v for k, v in result.items() if v is not None}
 
 
 # ---------------------------------------------------------------- commands
 
-def tail(text, n=TAIL_LINES):
-    lines = text.rstrip().splitlines()
-    return "\n".join(lines[-n:])
+def cmd_run(root, cfg, args):
+    active = _active_run(root)
+    if active and active["run_id"] != args.run_id:
+        return {"status": "busy", "error": f"run {active['run_id']} is still in progress; use `wait`"}, 2
+    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
+    state = state_dir(root)
+
+    if args.background:
+        argv = [a for a in sys.argv[1:] if a != "--background"]
+        out = state / "logs" / f"runner-{run_id}.out"
+        with open(out, "w") as fh:
+            proc = subprocess.Popen([sys.executable, str(SCRIPT), *argv, "--run-id", run_id], cwd=os.getcwd(),
+                                    stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        write_json(state / "current.json", {"run_id": run_id, "pid": proc.pid, "started": time.time(),
+                                             "runner_output": str(out.relative_to(root))})
+        return {"status": "started", "run_id": run_id,
+                "next": f"python3 {SCRIPT} wait --timeout 540"}, 0
+
+    if not args.run_id:  # a background child's record was written by its parent
+        write_json(state / "current.json", {"run_id": run_id, "pid": os.getpid(), "started": time.time()})
+    try:
+        result = run_parallel(root, cfg, args) if args.parallel else run_round(root, cfg, args)
+    except Exception as exc:  # the result file must always be written, or `wait` reports a crash
+        result = {"status": "runner_error", "error": f"{type(exc).__name__}: {exc}"}
+    result["run_id"] = run_id
+    write_json(state / "runs" / f"{run_id}.json", result)
+    return result, STATUS_EXIT.get(result["status"], 2)
+
+
+def cmd_wait(root, cfg, args):
+    current = read_json(root / STATE_DIR / "current.json")
+    if not current:
+        return {"status": "no_run", "error": "no run has been started in this project"}, 2
+    result_path = root / STATE_DIR / "runs" / f"{current['run_id']}.json"
+    deadline = time.time() + args.timeout
+    while True:
+        result = read_json(result_path)
+        if result:
+            return result, STATUS_EXIT.get(result["status"], 2)
+        if not _pid_alive(current["pid"]):
+            time.sleep(1)
+            result = read_json(result_path)
+            if result:
+                return result, STATUS_EXIT.get(result["status"], 2)
+            out = root / current.get("runner_output", "")
+            return {"status": "crashed", "run_id": current["run_id"],
+                    "log_tail": tail(out.read_text(errors="ignore"), 30) if out.is_file() else None}, 2
+        if time.time() >= deadline:
+            return {"status": "running", "run_id": current["run_id"],
+                    "elapsed_seconds": round(time.time() - current["started"]),
+                    "next": "call wait again"}, 3
+        time.sleep(2)
 
 
 def cmd_detect(root, cfg, _args):
@@ -263,6 +513,7 @@ def cmd_detect(root, cfg, _args):
     info["protected_files"] = sorted(f for f in walk_files(root) if matches(f, info["test_globs"]))
     info["backend"] = cfg["backend"]
     info["models"] = {"pinned": cfg["model"]} if cfg.get("model") else cfg.get("models")
+    info["git"] = git_prefix(root) is not None
     return info, 0
 
 
@@ -270,140 +521,125 @@ def cmd_test(root, cfg, _args):
     info = detect(root, cfg)
     if not info["test_cmd"]:
         return {"passed": False, "error": "no test command detected; set test_cmd in .delegate/config.json"}, 2
-    logs = root / STATE_DIR / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "CI": "1"}  # keeps vitest/jest out of watch mode
-    proc = subprocess.run(info["test_cmd"], shell=True, cwd=root, env=env,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    log = logs / f"test-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    log.write_text(proc.stdout)
-    result = {"passed": proc.returncode == 0, "exit_code": proc.returncode,
-              "cmd": info["test_cmd"], "log": str(log.relative_to(root))}
-    if proc.returncode != 0:
-        result["output_tail"] = tail(proc.stdout)
-    return result, 0 if proc.returncode == 0 else 1
+    result = run_tests(root, info["test_cmd"], state_dir(root) / "logs", "test")
+    return result, 0 if result["passed"] else 1
 
 
-def cmd_run(root, cfg, args):
-    state = root / STATE_DIR
-    logs = state / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    (state / ".gitignore").write_text("*\n")
+def cmd_undo(root, cfg, args):
+    if _active_run(root):
+        return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
+    record = checkpoint.get(root, args.to)
+    if not record:
+        return {"status": "no_checkpoint", "error": "no matching checkpoint"}, 2
+    safety = checkpoint.create(root, f"before undo to {record['id']}")
+    undone = checkpoint.restore(root, record)
+    return {"status": "undone", "restored_to": record, "changes_undone": [f"{s} {p}" for s, p in undone],
+            "redo_checkpoint": safety["id"]}, 0
 
-    plan = Path(args.plan).read_text()
-    feedback = args.feedback or ""
-    if args.feedback_file:
-        feedback += Path(args.feedback_file).read_text()
 
+def cmd_checkpoints(root, cfg, _args):
+    return {"checkpoints": checkpoint.list_all(root)}, 0
+
+
+REVIEW_PROMPT = """You are a code reviewer. Do NOT modify any file except `.delegate/review/result.json`.
+
+The patch in `.delegate/review/diff.patch` contains all implementation changes made by another agent for
+this task (tests excluded; the tests pass). You may read other files in the repository for context.
+
+Report only issues that matter:
+- security problems (injection, path traversal, unsafe deserialization, secrets, missing auth checks)
+- clearly wrong behavior the tests might not catch (crashes on valid input, data loss, wrong results)
+- code that games tests (hardcoded expected values, special-casing test inputs)
+Do not report style, naming, or minor improvements.
+
+Write `.delegate/review/result.json` exactly as:
+{"verdict": "ok" | "concerns",
+ "issues": [{"severity": "high" | "medium", "file": "path", "line": 123, "issue": "one sentence"}]}
+Use "ok" with an empty list when there is nothing that matters.
+"""
+
+
+def cmd_review(root, cfg, args):
+    if _active_run(root):
+        return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
+    state = state_dir(root)
+    session = _load_session(root)
+    base = checkpoint.get(root, args.base or session.get("base_checkpoint"))
+    if not base:
+        return {"status": "no_checkpoint", "error": "no base checkpoint; pass --base ID"}, 2
     info = detect(root, cfg)
+    changes = [(s, p) for s, p in checkpoint.changes(root, base) if not matches(p, info["test_globs"])]
+    if not changes:
+        return {"verdict": "ok", "issues": [], "note": "no implementation changes since the base checkpoint"}, 0
+
+    parts = []
+    for status, rel in changes:
+        old = checkpoint.file_at(root, base, rel) if status != "A" else b""
+        new = (root / rel).read_bytes() if status != "D" else b""
+        if b"\0" in old[:8000] or b"\0" in new[:8000]:
+            parts.append(f"Binary file {rel} ({status})\n")
+            continue
+        parts.extend(difflib.unified_diff(old.decode(errors="replace").splitlines(keepends=True),
+                                          new.decode(errors="replace").splitlines(keepends=True),
+                                          f"a/{rel}", f"b/{rel}"))
+    patch = "".join(parts)
+    limit = 150_000
+    truncated = len(patch) > limit
+    review_dir = state / "review"
+    review_dir.mkdir(exist_ok=True)
+    (review_dir / "diff.patch").write_text(patch[:limit] + ("\n... (truncated)\n" if truncated else ""))
+    (review_dir / "result.json").unlink(missing_ok=True)
+
+    cp = checkpoint.create(root, "before review")
     before = hash_tree(root)
-    protected = sorted(f for f in before if matches(f, info["test_globs"]))
-
-    # Snapshot protected files (outside the project, so test runners don't collect the
-    # copies) so they can be restored, then make them read-only.
-    snapshot = Path(tempfile.mkdtemp(prefix="delegate-snapshot-"))
-    modes = {}
-    for rel in protected:
-        dst = snapshot / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(root / rel, dst)
-        modes[rel] = (root / rel).stat().st_mode
-        os.chmod(root / rel, modes[rel] & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-
-    for leftover in ("result.json", "test_change_request.md"):
-        (state / leftover).unlink(missing_ok=True)
-
-    session_file = state / "session.json"
-    session = _read_json(session_file) if args.continue_session else None
-    session_id = (session or {}).get("session_id") or str(uuid.uuid4())
-    session_file.write_text(json.dumps({"session_id": session_id}))
-
-    prompt = build_prompt(plan, feedback, info, protected)
-    candidates = resolve_models(cfg, args.tier, args.model)
-    log = logs / f"run-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    env = {**os.environ, "DELEGATE_PROMPT": prompt, "DELEGATE_ROOT": str(root)}
-    started = time.time()
-    timed_out = False
-    fallback_note = None
-    try:
-        for attempt, model in enumerate(candidates):
-            argv = backend_argv(cfg, prompt, root, session_id, model)
-            try:
-                with open(log, "a") as fh:
-                    fh.write(f"=== model: {model or 'default'}\n")
-                    fh.flush()
-                    proc = subprocess.run(argv, cwd=root, env=env, stdout=fh, stderr=subprocess.STDOUT,
-                                          stdin=subprocess.DEVNULL, timeout=cfg["timeout"])
-                exit_code = proc.returncode
-            except subprocess.TimeoutExpired:
-                timed_out, exit_code = True, None
-            except FileNotFoundError as exc:
-                exit_code = 127
-                with open(log, "a") as fh:
-                    fh.write(f"backend not found: {exc}\n")
-            if timed_out or exit_code == 0 or attempt == len(candidates) - 1:
-                break
-            fallback_note = f"{model} failed (exit {exit_code}); retried with {candidates[attempt + 1]}"
-    finally:
-        # Guard: revert any change to protected files, delete newly added ones.
-        violations = []
-        for rel in protected:
-            path = root / rel
-            if not path.exists() or file_hash(path) != before[rel]:
-                violations.append({"file": rel, "change": "deleted" if not path.exists() else "modified"})
-                if path.exists():
-                    os.chmod(path, stat.S_IWUSR | stat.S_IRUSR)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(snapshot / rel, path)
-            os.chmod(path, modes[rel])
-        after = hash_tree(root)
-        for rel in sorted(set(after) - set(before)):
-            if matches(rel, info["test_globs"]):
-                violations.append({"file": rel, "change": "added"})
-                (root / rel).unlink()
-                after.pop(rel)
-        shutil.rmtree(snapshot, ignore_errors=True)
-
-    changed = sorted(
-        [f for f in after if before.get(f) != after[f]] + [f for f in before if f not in after]
-    )
-    report = _read_json(state / "result.json") or {}
-    request_path = state / "test_change_request.md"
-
-    if violations:
-        status = "violated_tests"
-    elif timed_out:
-        status = "timeout"
-    elif exit_code != 0:
-        status = "backend_error"
-    elif report.get("status") in ("done", "failed", "needs_test_change"):
-        status = report["status"]
-    else:
-        status = "no_report"
-
+    log = _new_log(root, "review")
+    sink = LogSink(log)
+    sink.write(f"=== delegate review {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(changes)} files · "
+               f"model {cfg.get('review_model')}")
+    live = LiveLog(sink, log.with_suffix(".jsonl"), root)
+    env = {**os.environ, "DELEGATE_PROMPT": REVIEW_PROMPT, "DELEGATE_ROOT": str(root)}
+    exit_code, timed_out, model, _ = _run_worker(cfg, REVIEW_PROMPT, root, str(uuid.uuid4()),
+                                                 [cfg.get("review_model")], live, env)
+    note = None
+    if hash_tree(root) != before:
+        checkpoint.restore(root, cp)
+        note = "the reviewer modified files; they were restored"
+    review = read_json(review_dir / "result.json") or {}
     result = {
-        "status": status,
-        "summary": report.get("summary"),
-        "worker_reported": report.get("status"),
-        "changed_files": changed,
-        "test_cmd": info["test_cmd"],
-        "backend": cfg["backend"],
-        "tier": args.tier,
+        "verdict": review.get("verdict") or ("error" if exit_code != 0 or timed_out else "no_report"),
+        "issues": review.get("issues") or [],
+        "reviewed_files": [p for _, p in changes],
         "model": model,
-        "seconds": round(time.time() - started),
-        "log": str(log.relative_to(root)),
+        "worker_credits": round(live.credits, 2) if live.credits is not None else None,
+        "note": note,
+        "truncated_diff": truncated or None,
     }
-    if fallback_note:
-        result["model_fallback"] = fallback_note
-    if violations:
-        result["violations"] = violations
-    if request_path.exists():
-        result["test_change_request"] = request_path.read_text()[:4000]
-    if status == "backend_error":
-        result["log_tail"] = tail(log.read_text(errors="ignore"), 30)
-    if status == "done" and not changed:
-        result["warning"] = "worker reported done but changed no files"
-    return result, 0 if status == "done" else 2
+    credits = f" · AI credits {live.credits:.2f}" if live.credits is not None else ""
+    sink.write(f"{END_MARKER}: review {result['verdict']} · {len(result['issues'])} issues{credits}")
+    live.close()
+    sink.close()
+    return {k: v for k, v in result.items() if v is not None}, 0 if result["verdict"] == "ok" else 1
+
+
+def cmd_watch(root, cfg, args):
+    if args.log:
+        follow(Path(args.log), stop_at_end=True)
+        if args.hold:
+            try:
+                input("\nRun finished. Press Enter to close.")
+            except EOFError:
+                pass
+        return None, 0
+    latest = root / STATE_DIR / "logs" / "latest.log"
+    if not latest.exists():
+        print(f"Waiting for a delegate run in {root} ... (Ctrl-C to stop)", flush=True)
+        while not latest.exists():
+            time.sleep(0.5)
+    try:
+        while True:
+            follow(latest.resolve(), stop_at_end=False, latest=latest)
+    except KeyboardInterrupt:
+        return None, 0
 
 
 def main():
@@ -412,22 +648,38 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("detect")
     sub.add_parser("test")
+    sub.add_parser("checkpoints")
     run = sub.add_parser("run")
-    run.add_argument("--plan", required=True, help="path to the plan markdown file")
+    what = run.add_mutually_exclusive_group(required=True)
+    what.add_argument("--plan", help="path to the plan markdown file")
+    what.add_argument("--parallel", help="path to a manifest of parallel tasks (see SKILL.md)")
     run.add_argument("--feedback", help="feedback text for a retry (failing tests, decisions)")
-    run.add_argument("--feedback-file", help="read feedback from a file")
+    run.add_argument("--feedback-file", help="read feedback from a file (\"-\" = stdin); safest for test output")
     run.add_argument("--continue", dest="continue_session", action="store_true",
-                     help="continue the previous worker session instead of starting fresh")
+                     help="continue the previous worker session(s) instead of starting fresh")
     run.add_argument("--tier", choices=["normal", "hard"], default="normal",
                      help="task complexity; picks the model from config \"models\"")
     run.add_argument("--model", help="explicit model, overrides --tier and config")
+    run.add_argument("--background", action="store_true", help="start the run and return immediately")
+    run.add_argument("--run-id", help=argparse.SUPPRESS)
+    wait = sub.add_parser("wait")
+    wait.add_argument("--timeout", type=int, default=540, help="seconds to wait before returning 'running'")
+    review = sub.add_parser("review")
+    review.add_argument("--base", help="checkpoint to diff against (default: start of the current task)")
+    undo = sub.add_parser("undo")
+    undo.add_argument("--to", help="checkpoint id or prefix (default: the latest, i.e. before the last round)")
+    watch = sub.add_parser("watch", help="follow the worker's live log")
+    watch.add_argument("--log", help="follow this log file until its run ends (default: latest, forever)")
+    watch.add_argument("--hold", action="store_true", help="wait for Enter after the run ends")
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
     cfg = load_config(root)
-    handler = {"detect": cmd_detect, "test": cmd_test, "run": cmd_run}[args.command]
+    handler = {"detect": cmd_detect, "test": cmd_test, "run": cmd_run, "wait": cmd_wait, "review": cmd_review,
+               "undo": cmd_undo, "checkpoints": cmd_checkpoints, "watch": cmd_watch}[args.command]
     result, code = handler(root, cfg, args)
-    print(json.dumps(result, indent=2))
+    if result is not None:
+        print(json.dumps(result, indent=2))
     sys.exit(code)
 
 

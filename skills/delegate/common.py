@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
     "auto_max_rounds": 4,   # autopilot: worker rounds before handing back to Claude
     "auto_review": True,    # autopilot: review when the tests pass, auto-fix high-severity issues
     "auto_review_cycles": 2,
+    "review_tests": True,   # autopilot: review Claude's tests against the plan before the first round
     "keep_checkpoints": 20,
 }
 TAIL_LINES = 60

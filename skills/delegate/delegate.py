@@ -18,6 +18,7 @@ Subcommands (all print one JSON object to stdout):
   wait [--timeout S]               wait for the current run; {"status": "running"} if still going
   test                             run the test suite
   review [--tier T] [--base ID]    review of everything changed since the task started
+  review --tests [--plan FILE]     review Claude's tests against the plan/spec (autopilot does this first)
   undo [--to ID]                   restore the working tree to a checkpoint (default: before last round)
   checkpoints                      list checkpoints
   watch [--log FILE | --run ID]    follow the live log (run it in another terminal)
@@ -488,6 +489,12 @@ def _round_brief(number, result):
     return {k: v for k, v in brief.items() if v is not None}
 
 
+def _brief_test_review(review):
+    return {k: v for k, v in {"verdict": review.get("verdict"), "model": review.get("model"),
+                              "issues": review.get("issues") or None, "note": review.get("note")}.items()
+            if v is not None}
+
+
 def _review_feedback(issues):
     lines = [f"- {i.get('file', '?')}:{i.get('line', '?')}: {i.get('issue', '')}" for i in issues]
     return ("An independent code review found these high-severity problems. Fix them and keep the whole "
@@ -501,6 +508,24 @@ def autopilot(root, cfg, args, run_id):
     sees the final result (or a problem only Claude can solve, like a disputed test).
     """
     live_view_error = open_live_view(cfg, root, SCRIPT, ["--run", run_id, "--since", time.time()])
+
+    # Check Claude's tests against the plan before spending worker rounds on them.
+    test_review = None
+    if cfg.get("review_tests"):
+        plans = [args.plan] if args.plan else [t.get("plan") for t in (read_json(args.parallel) or {}).get("tasks", [])
+                                               if t.get("plan")]
+        test_review = do_test_review(root, cfg, args.tier, plans)
+        # Only wrong tests block (they would waste worker rounds); missing tests are reported only.
+        high = [i for i in test_review.get("issues", [])
+                if i.get("severity") == "high" and i.get("kind", "wrong_test") == "wrong_test"]
+        if high:
+            return {k: v for k, v in {
+                "status": "tests_questioned",
+                "summary": f"The test review found {len(high)} wrong test(s); no worker round was run.",
+                "test_review": _brief_test_review(test_review),
+                "worker_credits": test_review.get("worker_credits"),
+                "live_view_error": live_view_error}.items() if v is not None}
+
     first = run_parallel(root, cfg, args, live_view=False) if args.parallel else run_round(root, cfg, args, False)
     rounds, reviews = [first], []
     fix_plan = args.plan or (_combined_plan(root, args.parallel) if first["status"] not in AUTO_HAND_BACK else None)
@@ -558,7 +583,8 @@ def autopilot(root, cfg, args, run_id):
         final = "review_concerns"  # high issues remain and no rounds were left to fix them
     base = checkpoint.get(root, first.get("checkpoint")) if first.get("checkpoint") else None
     changed = [p for _, p in checkpoint.changes(root, base)] if base else last.get("changed_files")
-    credits = [r.get("worker_credits") for r in rounds + reviews if r.get("worker_credits") is not None]
+    credits = [r.get("worker_credits") for r in rounds + reviews + [test_review or {}]
+               if r.get("worker_credits") is not None]
     summary = last.get("summary") or "; ".join(f"{t['name']}: {t.get('summary', '')}" for t in last.get("tasks", []))
     result = {
         "status": final,
@@ -583,6 +609,8 @@ def autopilot(root, cfg, args, run_id):
         elif not final_code_reviewed:
             result["review"]["unverified"] = "the issues above were sent back to the worker, but the final " \
                                              "code was not re-reviewed (auto_review_cycles or auto_max_rounds reached)"
+    if test_review and not test_review.get("skipped"):
+        result["test_review"] = _brief_test_review(test_review)
     if args.parallel:
         result["parallel_tasks"] = [{k: v for k, v in t.items() if k in (
             "name", "status", "out_of_scope_files", "conflicts", "violations")} for t in first.get("tasks", [])]
@@ -721,11 +749,35 @@ Write `.delegate/review/result.json` exactly as:
 Use "ok" with an empty list when there is nothing that matters.
 """
 
+TEST_REVIEW_PROMPT = """You are checking a TEST SUITE before the code under test is written. Do NOT modify any
+file except `.delegate/review/tests_result.json`.
 
-REVIEW_RETRY = """
-Your previous attempt did not produce a verdict. Write the JSON to `.delegate/review/result.json` with
-your file tool; if you cannot, make your final message exactly that JSON object and nothing else.
+The tests were written from the plan in `.delegate/review/plan.md`. Read it, and any spec file it
+references (for example TASK.md). The test files are listed in `.delegate/review/test_files.txt`. The
+code under test may not exist yet: do not run the tests.
+
+Your main job is to find WRONG tests: assertions whose expected value, error type or input contradicts
+the plan or spec. Go through the assertions one by one and work out each expected value yourself from
+the spec (compute dates, weekdays, numbers, strings step by step). Also check the tests against each
+other: two assertions that imply different rules for the same situation mean one of them is wrong.
+Where the spec is silent, the standard behavior of the domain applies (e.g. how cron, HTTP, SQL work).
+Report each wrong test with severity "high" and the correct expectation.
+
+Secondary: requirements of the plan or spec with no test at all ("missing_test"), always severity
+"medium", and only for behavior users would rely on. Do not report style or test organization.
+Check each claim before reporting it: a false alarm costs a round.
+
+Write `.delegate/review/tests_result.json` exactly as:
+{"verdict": "ok" | "concerns",
+ "issues": [{"severity": "high" | "medium", "kind": "wrong_test" | "missing_test", "file": "path",
+             "line": 12, "issue": "one sentence, including the correct expectation"}]}
+Use "ok" with an empty list when every assertion is right.
 """
+
+
+def _retry_prompt(result_file):
+    return (f"\nYour previous attempt did not produce a verdict. Write the JSON to `{result_file}` with your "
+            "file tool; if you cannot, make your final message exactly that JSON object and nothing else.\n")
 
 
 def _verdict_from_text(text):
@@ -742,6 +794,47 @@ def _verdict_from_text(text):
 
 def _review_model(cfg, tier, explicit=None):
     return explicit or cfg.get("review_model") or (cfg.get("review_models") or {}).get(tier) or "gpt-5.6-sol"
+
+
+def _run_reviewer(root, cfg, reviewer, prompt, result_name, header):
+    """Run a read-only reviewer; retry once without a verdict; undo any edits. Returns a result dict."""
+    result_path = root / STATE_DIR / "review" / result_name
+    result_path.unlink(missing_ok=True)
+    cp = checkpoint.create(root, "before review")
+    before = hash_tree(root)
+    log = _new_log(root, "review")
+    sink = LogSink(log)
+    sink.write(f"=== delegate {header} {time.strftime('%Y-%m-%d %H:%M:%S')} · model {reviewer}")
+    live = LiveLog(sink, log.with_suffix(".jsonl"), root)
+    review, credits, attempts, exit_code, timed_out, used = {}, 0.0, 0, None, False, reviewer
+    for attempt in range(2):  # retry once if the reviewer produced no verdict
+        attempts += 1
+        text = prompt if attempt == 0 else prompt + _retry_prompt(f".delegate/review/{result_name}")
+        env = {**os.environ, "DELEGATE_PROMPT": text, "DELEGATE_ROOT": str(root)}
+        live.credits, live.last_message = None, ""
+        exit_code, timed_out, used, _ = _run_worker(cfg, text, root, str(uuid.uuid4()), [reviewer], live, env)
+        credits += live.credits or 0.0
+        review = read_json(result_path) or _verdict_from_text(live.last_message) or {}
+        if review.get("verdict") in ("ok", "concerns") or exit_code != 0 or timed_out:
+            break
+        sink.write("=== reviewer returned no verdict; asking once more")
+    note = None
+    if hash_tree(root) != before:
+        checkpoint.restore(root, cp)
+        note = "the reviewer modified files; they were restored"
+    result = {
+        "verdict": review.get("verdict") or ("error" if exit_code != 0 or timed_out else "no_report"),
+        "issues": review.get("issues") or [],
+        "model": used,
+        "worker_credits": round(credits, 2) if credits else None,
+        "note": note,
+        "attempts": attempts if attempts > 1 else None,
+    }
+    tail_credits = f" · AI credits {credits:.2f}" if credits else ""
+    sink.write(f"{END_MARKER}: {header} {result['verdict']} · {len(result['issues'])} issues{tail_credits}")
+    live.close()
+    sink.close()
+    return result
 
 
 def do_review(root, cfg, tier="normal", model=None, base_id=None):
@@ -772,54 +865,54 @@ def do_review(root, cfg, tier="normal", model=None, base_id=None):
     review_dir = state / "review"
     review_dir.mkdir(exist_ok=True)
     (review_dir / "diff.patch").write_text(patch[:limit] + ("\n... (truncated)\n" if truncated else ""))
-    (review_dir / "result.json").unlink(missing_ok=True)
+    result = _run_reviewer(root, cfg, _review_model(cfg, tier, model), REVIEW_PROMPT, "result.json",
+                           f"review ({len(changes)} files)")
+    result["reviewed_files"] = [p for _, p in changes]
+    result["truncated_diff"] = truncated or None
+    return {k: v for k, v in result.items() if v is not None}
 
-    reviewer = _review_model(cfg, tier, model)
-    cp = checkpoint.create(root, "before review")
-    before = hash_tree(root)
-    log = _new_log(root, "review")
-    sink = LogSink(log)
-    sink.write(f"=== delegate review {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(changes)} files · model {reviewer}")
-    live = LiveLog(sink, log.with_suffix(".jsonl"), root)
-    review, credits, attempts = {}, 0.0, 0
-    for attempt in range(2):  # retry once if the reviewer produced no verdict
-        attempts += 1
-        prompt = REVIEW_PROMPT if attempt == 0 else REVIEW_PROMPT + REVIEW_RETRY
-        env = {**os.environ, "DELEGATE_PROMPT": prompt, "DELEGATE_ROOT": str(root)}
-        live.credits, live.last_message = None, ""
-        exit_code, timed_out, used, _ = _run_worker(cfg, prompt, root, str(uuid.uuid4()), [reviewer], live, env)
-        credits += live.credits or 0.0
-        review = read_json(review_dir / "result.json") or _verdict_from_text(live.last_message) or {}
-        if review.get("verdict") in ("ok", "concerns") or exit_code != 0 or timed_out:
-            break
-        sink.write("=== reviewer returned no verdict; asking once more")
-    note = None
-    if hash_tree(root) != before:
-        checkpoint.restore(root, cp)
-        note = "the reviewer modified files; they were restored"
-    live.credits = credits or None
-    result = {
-        "verdict": review.get("verdict") or ("error" if exit_code != 0 or timed_out else "no_report"),
-        "issues": review.get("issues") or [],
-        "reviewed_files": [p for _, p in changes],
-        "model": used,
-        "worker_credits": round(live.credits, 2) if live.credits is not None else None,
-        "note": note,
-        "attempts": attempts if attempts > 1 else None,
-        "truncated_diff": truncated or None,
-    }
-    credits = f" · AI credits {live.credits:.2f}" if live.credits is not None else ""
-    sink.write(f"{END_MARKER}: review {result['verdict']} · {len(result['issues'])} issues{credits}")
-    live.close()
-    sink.close()
+
+def do_test_review(root, cfg, tier, plan_paths, model=None, force=False):
+    """Check Claude's tests against the plan/spec before any worker round.
+
+    Skipped (returns {"skipped": ...}) when the tests are unchanged since the last test review, so a
+    rerun after Claude disagreed with the reviewer doesn't ask again.
+    """
+    state = state_dir(root)
+    info = detect(root, cfg)
+    test_files = sorted(f for f in walk_files(root) if matches(f, info["test_globs"]))
+    if not test_files:
+        return {"skipped": "no test files"}
+    tests_hash = protected_hash(root, info["test_globs"])
+    previous = read_json(state / "test_review.json") or {}
+    if not force and previous.get("tests_hash") == tests_hash:
+        return {"skipped": "tests unchanged since the last test review"}
+    plans = []
+    for path in plan_paths:
+        try:
+            plans.append(f"<!-- {path} -->\n{Path(path).read_text()}")
+        except OSError:
+            continue
+    review_dir = state / "review"
+    review_dir.mkdir(exist_ok=True)
+    (review_dir / "plan.md").write_text("\n\n".join(plans) or "(no plan file; use the spec files in the repository)")
+    (review_dir / "test_files.txt").write_text("\n".join(test_files) + "\n")
+    result = _run_reviewer(root, cfg, _review_model(cfg, tier, model), TEST_REVIEW_PROMPT, "tests_result.json",
+                           f"test review ({len(test_files)} files)")
+    result["test_files"] = test_files
+    if result["verdict"] in ("ok", "concerns"):
+        write_json(state / "test_review.json", {"tests_hash": tests_hash, "verdict": result["verdict"]})
     return {k: v for k, v in result.items() if v is not None}
 
 
 def cmd_review(root, cfg, args):
     if _active_run(root):
         return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
-    result = do_review(root, cfg, args.tier, args.model, args.base)
-    return result, 0 if result["verdict"] == "ok" else 1
+    if args.tests:
+        result = do_test_review(root, cfg, args.tier, [args.plan], args.model, force=True)
+    else:
+        result = do_review(root, cfg, args.tier, args.model, args.base)
+    return result, 0 if result.get("verdict") == "ok" else 1
 
 
 def _hold(args):
@@ -898,6 +991,9 @@ def main():
     review.add_argument("--tier", choices=["normal", "hard"], default="normal",
                         help="picks the reviewer from config \"review_models\"")
     review.add_argument("--model", help="explicit reviewer model")
+    review.add_argument("--tests", action="store_true",
+                        help="review the test files against the plan instead of the code")
+    review.add_argument("--plan", default=".delegate/PLAN.md", help="plan for --tests (default .delegate/PLAN.md)")
     undo = sub.add_parser("undo")
     undo.add_argument("--to", help="checkpoint id or prefix (default: the one before the last worker round)")
     watch = sub.add_parser("watch", help="follow the worker's live log")

@@ -1,0 +1,1 @@
+{"name":"expr-eval","type":"module","scripts":{"test":"node --test"}}

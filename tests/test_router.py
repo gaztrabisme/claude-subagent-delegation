@@ -146,8 +146,8 @@ def test_router_classify_not_a_refusal():
 def test_router_classify_grok_balance_402():
     """A grok child that answered an HTTP 402 refusal did no work (P1a addendum)."""
     events = [json.loads(line) for line in
-              (Path(__file__).parent.parent / "wiki" / "briefs"
-               / "grok-402-fixture.jsonl").read_text().splitlines() if line.strip()]
+              (Path(__file__).parent / "fixtures" / "grok"
+               / "402.jsonl").read_text().splitlines() if line.strip()]
     found = router.classify_refusal("grok", events)
     assert found is not None and found.code == "grok_balance"
     assert router.did_work(events) is False

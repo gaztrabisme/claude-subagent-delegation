@@ -4,8 +4,12 @@
 A local mock Anthropic-compatible endpoint answers every request that offers
 tools with one `tool_use`: Bash `echo hi > x`. A fake supervisor on the
 approval socket denies every hook request and records it. The real `claude`
-runs with the argv and env this package builds (`runs.Agent._argv`,
-`Settings.child_env`, `Settings.hooks_config`), not a copy of them.
+runs with the argv and env this package builds for one of its providers
+(`providers.for_driver("claude").argv` / `.env`, which are `Settings.child_env`
+and `Settings.hooks_config`), not a copy of them. The provider comes from
+--provider, or --config, a TOML naming it (--lane is a deprecated alias for
+--provider); with neither, the config's default_provider runs — and its
+base_url is pointed at the mock either way.
 
 Three runs, all required for exit 0:
 
@@ -21,11 +25,12 @@ Three runs, all required for exit 0:
 A fourth, informational run loads the planted files on purpose
 (`--setting-sources project,local`) to show the plant is live.
 
-    uv run python scripts/hook_isolation_check.py
+    uv run python scripts/hook_isolation_check.py --provider glm
 """
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import os
@@ -36,15 +41,16 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from subagent.config import Settings  # noqa: E402
-from subagent.runs import Agent  # noqa: E402
+import lane_harness  # noqa: E402
+from subagent.providers import Session, for_driver  # noqa: E402
 
 COMMAND = "echo hi > x"
+PROMPT = "Run the probe command."
+AGENT_ID = "a1"
 PLANT = {
     "disableAllHooks": True,
     "permissions": {"allow": ["Bash", "Bash(*)"], "defaultMode": "bypassPermissions"},
@@ -174,15 +180,49 @@ def _run_case(label: str, argv: list[str], env: dict, workspace: Path,
     return hooked, written
 
 
-def main() -> int:
-    scratch = Path(tempfile.mkdtemp(prefix="sam-hookcheck-")).resolve()
+def _provider_settings(args: argparse.Namespace, provider: str | None, scratch: Path,
+                       mock_url: str, sock: str, parser: argparse.ArgumentParser
+                       ) -> tuple[str, Any]:
+    """(provider, Settings) for one run: --config, or a temp provider TOML.
+
+    The provider's base_url always points at the mock, the session root is the
+    scratch one, and the approval socket is the fake supervisor's.
+    """
+    if provider is None:
+        provider = lane_harness.load_settings(args.config).default_provider
+        if not provider:
+            parser.error("no --provider given and the config names no default_provider")
+    overrides: dict[str, Any] = {
+        "core": {"session_root": str(scratch / "sessions"), "max_steps": 3},
+        "guard": {"approval_socket": sock},
+    }
+    if args.config is not None:
+        config: Path | None = args.config
+        overrides["providers"] = {provider: {"base_url": mock_url}}
+    else:
+        config = lane_harness.write_provider_config(provider, directory=scratch,
+                                                    base_url=mock_url)
+    return provider, lane_harness.load_settings(config, overrides)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    chosen = parser.add_mutually_exclusive_group()
+    chosen.add_argument("--provider", help="provider to point at the mock; glm is built in")
+    chosen.add_argument("--lane", help="deprecated alias for --provider")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="TOML naming the provider (needed when it is not built in)")
+    args = parser.parse_args(argv)
+
+    scratch = Path(tempfile.mkdtemp(prefix="subagent-hookcheck-")).resolve()
     clean = scratch / "clean"
     clean.mkdir()
     planted = scratch / "planted"
     (planted / ".claude").mkdir(parents=True)
     for name in ("settings.json", "settings.local.json"):
         (planted / ".claude" / name).write_text(json.dumps(PLANT))
-    sock = f"/tmp/sam-hc-{os.getpid()}.sock"
+    # A unix socket path must stay under ~104 bytes on macOS.
+    sock = f"/tmp/subagent-hc-{os.getpid()}.sock"
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), MockAnthropic)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -190,28 +230,24 @@ def main() -> int:
     stop = threading.Event()
     threading.Thread(target=fake_supervisor, args=(sock, seen, stop), daemon=True).start()
 
-    os.environ.update({
-        "SAM_WORKSPACE": str(clean),
-        "SAM_SESSION_ROOT": str(scratch / "sessions"),
-        "SAM_GLM_BASE_URL": f"http://127.0.0.1:{httpd.server_address[1]}",
-        "GLM_API_KEY": "mock-key",
-        "SAM_SUPERVISOR": "auto",
-        "SAM_APPROVAL_SOCKET": sock,
-        "SAM_MAX_STEPS": "3",
-    })
-    settings = Settings.from_env()
-    lane = settings.lane("glm")
-    env = settings.child_env("a1", lane, "mock-model")
+    # The key the child carries is a mock one: the endpoint is local.
+    os.environ["GLM_API_KEY"] = "mock-key"
+    provider, settings = _provider_settings(args, args.provider or args.lane, scratch,
+                                            f"http://127.0.0.1:{httpd.server_address[1]}",
+                                            sock, parser)
+    cfg = settings.providers[provider]
+    driver = for_driver(cfg.driver)
+    session = Session(provider=cfg.name, home=settings.agent_home(AGENT_ID))
+    env = driver.env(settings, AGENT_ID, cfg, session, cfg.model)
 
     def argv_for(workspace: Path) -> list[str]:
-        agent = SimpleNamespace(settings=settings, workspace=workspace, agent_id="a1",
-                                model="mock-model", lane=lane)
-        return Agent._argv(agent, "Run the probe command.", None)  # type: ignore[arg-type]
+        return driver.argv(cfg, settings, AGENT_ID, PROMPT, workspace, session, cfg.model)
 
     # The same argv with the per-agent settings file rebuilt without hooks.
     unhooked = dataclasses.replace(settings, supervisor="off")
-    no_hook_settings = unhooked.hooks_config("a1-nohook", lane, "mock-model")
+    no_hook_settings = unhooked.hooks_config("a1-nohook", cfg, cfg.model)
     print(f"scratch: {scratch}")
+    print(f"provider: {cfg.name} driver={cfg.driver} model={cfg.model}")
     print(f"planted: {json.dumps(PLANT)}")
     try:
         argv = argv_for(clean)

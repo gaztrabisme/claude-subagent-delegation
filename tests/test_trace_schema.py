@@ -12,10 +12,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from subagent_mcp.lanes import load_lanes
-from subagent_mcp.runs import COMPLETED, Registry
-from subagent_mcp.telemetry import Telemetry
-from subagent_mcp.trace import KINDS, SCHEMA, Trace
+from subagent.lanes import load_lanes
+from subagent.runs import COMPLETED, Registry
+from subagent.telemetry.sampler import Telemetry
+from subagent.telemetry.trace import KINDS, SCHEMA, Trace
 
 from .conftest import make_settings
 from .test_runs import FakeProcess, _wait
@@ -134,7 +134,7 @@ def test_records_from_a_local_lane_run_satisfy_the_schema(tmp_path: Path, monkey
     def spawn(argv, env, cwd):
         return FakeProcess(_events(), argv, env, gate=gate)
 
-    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
     trace = Trace(tmp_path / "trace.jsonl")
     telemetry = Telemetry(
         Trace(tmp_path / "metrics.jsonl"),

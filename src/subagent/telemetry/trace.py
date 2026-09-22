@@ -31,7 +31,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .config import log
+from ..config import log
 
 # 2: run records carry the Claude Code session_id (2026-09-18)
 # 3: one "hop" record per lane the router tried; run and hop records carry

@@ -4,14 +4,18 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-TESTS = Path(__file__).resolve().parent
+TESTS = Path(__file__).resolve().parents[1]
 REPO = TESTS.parent
-DELEGATE = REPO / "skills" / "delegate" / "delegate.py"
-SCENARIOS = TESTS / "scenarios"
+FAKES = TESTS / "fakes"
+SCENARIOS = FAKES / "scenarios"
+# The runner is a module now, not a script. `uv run` installs the package
+# editable, so `-m subagent.cli` resolves; PYTHONPATH covers a bare checkout.
+RUNNER = [sys.executable, "-m", "subagent.cli"]
 
 ADD_TEST = """import { test } from 'node:test'; import assert from 'node:assert/strict'; import { add } from '../src/add.js';
 test('adds', () => assert.equal(add(2, 3), 5));
@@ -32,22 +36,25 @@ class Sandbox(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
-        (bin_dir / "copilot").symlink_to(TESTS / "fake_copilot.py")
+        (bin_dir / "copilot").symlink_to(FAKES / "fake_copilot.py")
         home = self.tmp / "home"
         home.mkdir()
+        src = str(REPO / "src")
+        pythonpath = os.pathsep.join([src, os.environ["PYTHONPATH"]]) if os.environ.get("PYTHONPATH") else src
         self.env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(home),
                     "XDG_CONFIG_HOME": str(home / ".config"), "DELEGATE_LIVE_VIEW": "off",
+                    "PYTHONPATH": pythonpath,
                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
                     "GIT_COMMITTER_EMAIL": "t@t"}
 
     # ------------------------------------------------------------ running the CLI
 
     def delegate(self, *args, cwd, scenario=None, env=None, stdin=None, timeout=120):
-        """Run delegate.py; returns (exit_code, parsed JSON or raw stdout)."""
+        """Run the delegate loop; returns (exit_code, parsed JSON or raw stdout)."""
         run_env = {**self.env, **(env or {})}
         if scenario:
             run_env["FAKE_SCRIPT"] = str(SCENARIOS / f"{scenario}.sh")
-        proc = subprocess.run(["python3", str(DELEGATE), *args], cwd=cwd, env=run_env, input=stdin,
+        proc = subprocess.run([*RUNNER, *args], cwd=cwd, env=run_env, input=stdin,
                               capture_output=True, text=True, timeout=timeout)
         try:
             return proc.returncode, json.loads(proc.stdout)

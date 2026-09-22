@@ -171,12 +171,12 @@ TERMINALS = [
 ]
 
 
-def open_live_view(cfg, root, script, watch_args):
+def open_live_view(cfg, root, runner, watch_args):
     """Open a terminal running `watch <watch_args> --hold` (config "live_view"). Returns an error or None."""
     setting = cfg.get("live_view")
     if not setting or setting == "off" or os.environ.get("DELEGATE_LIVE_VIEW") == "off":
         return None
-    watch = [sys.executable, str(script), "--root", str(root), "watch", *[str(a) for a in watch_args], "--hold"]
+    watch = [*runner, "--root", str(root), "watch", *[str(a) for a in watch_args], "--hold"]
     if isinstance(setting, list):
         argv = [arg for part in setting for arg in (watch if part == "{cmd}" else [part])]
     elif os.environ.get("TMUX") and shutil.which("tmux"):

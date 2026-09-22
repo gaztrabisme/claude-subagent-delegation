@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent_mcp" / "runtime" / "approval_hook.py"
+HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent" / "guard" / "approval_hook.py"
 
 
 def _run_hook(env: dict, stdin: str, extra_args: list[str] | None = None) -> subprocess.CompletedProcess:

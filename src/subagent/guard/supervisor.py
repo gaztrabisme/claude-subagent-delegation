@@ -44,8 +44,8 @@ from typing import Any
 import anyio
 from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapability
 
-from .config import Settings, log
-from .guard import ALLOW, DENY, ESCALATE, Verdict, classify
+from ..config import Settings, log
+from .classify import ALLOW, DENY, ESCALATE, Verdict, classify
 
 TIER_UNRESOLVED = "unresolved"
 TIER_AGENT = "agent"

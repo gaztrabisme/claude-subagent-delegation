@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from subagent_mcp.runs import Run
-from subagent_mcp.trace import SCHEMA, Trace
+from subagent.runs import Run
+from subagent.telemetry.trace import SCHEMA, Trace
 
 
 def test_run_record_carries_session_id_and_current_schema(tmp_path: Path):

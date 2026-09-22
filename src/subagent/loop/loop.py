@@ -39,16 +39,15 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import checkpoint  # noqa: E402
-from common import (DEPENDENCY_DIRS, STATE_DIR, changed_between, git_prefix, hash_tree, load_config,  # noqa: E402
+from . import checkpoint
+from .common import (DEPENDENCY_DIRS, STATE_DIR, changed_between, git_prefix, hash_tree, load_config,
                     matches, read_json, state_dir, tail, walk_files, write_json)
-from detect import detect, run_tests  # noqa: E402
-from guard import TestGuard, protected_hash  # noqa: E402
-from livelog import END_MARKER, LiveLog, LogSink, follow, open_live_view, run_backend  # noqa: E402
+from .detect import detect, run_tests
+from .testguard import TestGuard, protected_hash
+from .events import END_MARKER, LiveLog, LogSink, follow, open_live_view, run_backend
 
-SCRIPT = Path(__file__).resolve()
+# How to re-run this runner: as a module, so its relative imports resolve.
+RUNNER = [sys.executable, "-m", "subagent.cli"]
 STATUS_EXIT = {"done": 0, "running": 3, "started": 0}
 
 
@@ -254,7 +253,7 @@ def run_round(root, cfg, args, live_view=True):
     sink = LogSink(log)
     sink.write(f"=== delegate run {time.strftime('%Y-%m-%d %H:%M:%S')} · tier {args.tier} · "
                f"{'continue' if args.continue_session else 'new'} session · checkpoint {cp['id']}")
-    live_view_error = open_live_view(cfg, root, SCRIPT, ["--log", log]) if live_view else None
+    live_view_error = open_live_view(cfg, root, RUNNER, ["--log", log]) if live_view else None
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
 
     guard = TestGuard(root, info["test_globs"])
@@ -340,7 +339,7 @@ def run_parallel(root, cfg, args, live_view=True):
     sink = LogSink(log)
     sink.write(f"=== delegate parallel run {time.strftime('%Y-%m-%d %H:%M:%S')} · "
                f"{len(tasks)} workers · checkpoint {cp['id']}")
-    live_view_error = open_live_view(cfg, root, SCRIPT, ["--log", log]) if live_view else None
+    live_view_error = open_live_view(cfg, root, RUNNER, ["--log", log]) if live_view else None
 
     workers = []
     try:
@@ -698,7 +697,7 @@ def autopilot(root, cfg, args, run_id):
     Failing tests and high-severity review issues go back to the worker automatically, so Claude only
     sees the final result (or a problem only Claude can solve, like a disputed test).
     """
-    live_view_error = open_live_view(cfg, root, SCRIPT, ["--run", run_id, "--since", time.time()])
+    live_view_error = open_live_view(cfg, root, RUNNER, ["--run", run_id, "--since", time.time()])
 
     # Tests first: write them from the outline (outline mode), then check them against the plan/spec.
     hand_back, extras = _prepare_tests(root, cfg, args)
@@ -834,7 +833,7 @@ def cmd_run(root, cfg, args):
     if args.background or args.wait is not None:
         out = state / "logs" / f"runner-{run_id}.out"
         with open(out, "w") as fh:
-            proc = subprocess.Popen([sys.executable, str(SCRIPT), *_child_argv(sys.argv[1:]), "--run-id", run_id],
+            proc = subprocess.Popen([*RUNNER, *_child_argv(sys.argv[1:]), "--run-id", run_id],
                                     cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                                     start_new_session=True)
         write_json(state / "current.json", {"run_id": run_id, "pid": proc.pid, "started": time.time(),

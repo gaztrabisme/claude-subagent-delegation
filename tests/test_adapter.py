@@ -10,8 +10,8 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from subagent_mcp import adapter, health
-from subagent_mcp.lanes import load_lanes
+from subagent import adapter, health
+from subagent.lanes import load_lanes
 
 from .conftest import make_settings
 

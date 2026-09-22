@@ -147,7 +147,7 @@ def main() -> int:
         "PYTHONPATH": str(ROOT / "src"),
     })
     params = StdioServerParameters(
-        command=sys.executable, args=["-m", "subagent_mcp"], env=env, cwd=str(ROOT)
+        command=sys.executable, args=["-m", "subagent"], env=env, cwd=str(ROOT)
     )
     print(f"scratch: {scratch}")
     print(f"backend: {args.base_url} model={args.model}")

@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from helpers import Sandbox, need
+from .helpers import Sandbox, need
 
 
 @need("git", "node", "npm")

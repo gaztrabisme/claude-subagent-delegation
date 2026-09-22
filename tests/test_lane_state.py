@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from subagent_mcp.config import log
-from subagent_mcp.lane_state import LaneState
+from subagent.config import log
+from subagent.lane_state import LaneState
 
 
 @pytest.fixture

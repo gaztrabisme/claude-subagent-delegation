@@ -220,9 +220,9 @@ class InProcessServer:
         os.environ.setdefault("SAM_SUPERVISOR", "auto")
         for key, value in (env or {}).items():
             os.environ[key] = value
-        from subagent_mcp.config import Settings, configure_logging
-        from subagent_mcp.runs import Registry
-        from subagent_mcp.supervisor import Supervisor
+        from subagent.config import Settings, configure_logging
+        from subagent.guard.supervisor import Supervisor
+        from subagent.runs import Registry
 
         self.settings = Settings.from_env()
         configure_logging(os.environ.get("SAM_LOG_LEVEL") or "warning")

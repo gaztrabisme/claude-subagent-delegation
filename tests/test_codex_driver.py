@@ -19,19 +19,19 @@ from pathlib import Path
 
 import pytest
 
-from subagent_mcp import codex_driver
-from subagent_mcp.codex_driver import (
+from subagent.providers import codex as codex_driver
+from subagent.providers.codex import (
     REFUSAL_USAGE_LIMIT,
     codex_refusal,
     parse_reset,
 )
-from subagent_mcp.runs import COMPLETED, FAILED, Registry
-from subagent_mcp.trace import Trace
+from subagent.runs import COMPLETED, FAILED, Registry
+from subagent.telemetry.trace import Trace
 
 from .conftest import make_settings
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
-HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent_mcp" / "runtime" / "approval_hook.py"
+HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent" / "guard" / "approval_hook.py"
 
 def _load(name: str) -> list[dict]:
     return [json.loads(line) for line in (FIXTURES / name).read_text().splitlines() if line.strip()]
@@ -202,7 +202,7 @@ def test_codex_home_is_per_agent_and_isolated(fake_codex, registry, tmp_path: Pa
 
 def test_lane_model_skips_user_model(fake_codex, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SAM_CODEX_MODEL", "gpt-5.6-luna")
-    from subagent_mcp.lanes import load_lanes
+    from subagent.lanes import load_lanes
 
     settings = make_settings(tmp_path, lanes=load_lanes(os.environ))
     home = codex_driver.prepare_home(settings, "a9", settings.lanes["codex"])
@@ -214,7 +214,7 @@ def test_trace_marks_guard_per_driver(fake_codex, registry, tmp_path: Path, monk
     from .test_runs import FakeProcess, _result
 
     monkeypatch.setattr(
-        "subagent_mcp.runs._spawn_claude", lambda argv, env, cwd: FakeProcess(_result("ok"), argv, env)
+        "subagent.runs._spawn_claude", lambda argv, env, cwd: FakeProcess(_result("ok"), argv, env)
     )
     codex_agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
     _run(codex_agent)

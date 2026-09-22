@@ -1,12 +1,13 @@
-"""Tests for scripts/cost_join.py against synthetic fixtures in tests/fixtures/cost/."""
+"""Tests for subagent.telemetry.cost against synthetic fixtures in tests/fixtures/cost/."""
 
 from __future__ import annotations
 
 import csv
-import importlib.util
 from pathlib import Path
 
 import pytest
+
+from subagent.telemetry import cost as cost_join
 
 pd = pytest.importorskip("pandas")
 pytest.importorskip("pyarrow")
@@ -17,15 +18,6 @@ FIX = ROOT / "tests" / "fixtures" / "cost"
 # unknown-cost handling do not break when the real file gains provider prices.
 PRICING_UNKNOWN = FIX / "pricing_unknown.toml"
 
-
-def _load_module():
-    spec = importlib.util.spec_from_file_location("cost_join", ROOT / "scripts" / "cost_join.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-cost_join = _load_module()
 
 
 @pytest.fixture(scope="module")

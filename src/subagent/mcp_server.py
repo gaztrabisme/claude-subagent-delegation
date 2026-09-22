@@ -14,9 +14,9 @@ from mcp.server.mcpserver import Context
 
 from . import __version__
 from .config import Settings, configure_logging, log
+from .guard.supervisor import Supervisor
 from .lanes import FALLBACK_MODES
 from .runs import TERMINAL_STATES, Registry, RegistryError, Run
-from .supervisor import Supervisor
 
 SERVER_INSTRUCTIONS = """\
 Delegate self-contained engineering work to a subagent running in its own

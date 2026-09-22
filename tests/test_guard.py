@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from subagent_mcp.guard import ALLOW, DENY, ESCALATE, classify, classify_bash
+from subagent.guard.classify import ALLOW, DENY, ESCALATE, classify, classify_bash
 
 DESTRUCTIVE = "rm" + " -" + "rf"  # kept out of source text; see wiki/active-work.md
 
@@ -446,7 +446,7 @@ def test_a_cd_inside_an_and_chain_moves_where_paths_resolve(home_ws):
 
 
 def test_a_nonexistent_user_home_does_not_crash_the_classifier(ws):
-    from subagent_mcp.guard import _describe_path
+    from subagent.guard.classify import _describe_path
 
     # Unresolvable in a shell word (review G1); literal in a file tool's path.
     assert _describe_path("~nosuchuser/x", ws) == {"path": "~nosuchuser/x", "resolved": False}

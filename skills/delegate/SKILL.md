@@ -8,7 +8,8 @@ description: Delegate implementation work to a cheaper coding agent (GitHub Copi
 Your job is to be the **planner and verifier**, not the implementer. Every token you spend reading
 implementation code defeats the purpose of this skill.
 
-`DELEGATE` below means `python3 <skill base directory>/delegate.py`, run from the project root.
+`DELEGATE` below means `subagent` (or `python3 -m subagent.cli` when the console script is not
+on PATH), run from the project root.
 Every command prints one JSON object.
 
 **Shell-safe commands** (the user's shell may be bash, zsh or fish): run each `DELEGATE` command as
@@ -81,7 +82,7 @@ Never put test output or other free text in a quoted command-line argument.
      model of another family review the diff and sends high-severity issues back too (limits:
      `auto_max_rounds`, `auto_review_cycles`). You only get the final result.
    - On the first delegation, tell the user once that they can watch live with
-     `python3 <skill base directory>/delegate.py watch` in another terminal (or
+     `subagent watch` in another terminal (or
      `"live_view": "auto"` in `~/.config/delegate/config.json`). Mention `live_view_error` once if present.
 5. **Act on the final `status`** (`rounds` lists each round; `tests`, `review` and `changed_files`
    describe the end state):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from subagent_mcp.config import Settings
+from subagent.config import Settings
 
 from .conftest import make_settings
 

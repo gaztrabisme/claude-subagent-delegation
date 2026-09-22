@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
-from common import STATE_DIR, file_hash, git, git_prefix, read_json, walk_files, write_json
+from .common import STATE_DIR, file_hash, git, git_prefix, read_json, walk_files, write_json
 
 INDEX_FILE = "checkpoints.json"
 

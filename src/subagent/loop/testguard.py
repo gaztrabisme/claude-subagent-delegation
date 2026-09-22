@@ -7,8 +7,8 @@ import stat
 import tempfile
 from pathlib import Path
 
-from common import changed_between, file_hash, hash_tree, matches, walk_files
-from detect import restore_config_fragment, test_config_fragments
+from .common import changed_between, file_hash, hash_tree, matches, walk_files
+from .detect import restore_config_fragment, test_config_fragments
 
 
 class TestGuard:

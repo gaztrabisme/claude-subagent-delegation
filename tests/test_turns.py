@@ -43,7 +43,7 @@ def _registry(tmp_path: Path, monkeypatch, script, **overrides) -> Registry:
         spawned.append(proc)
         return proc
 
-    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.providers.claude._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg
@@ -232,7 +232,7 @@ def test_codex_turn_gets_the_turn_completed_usage(fake_codex, tmp_path: Path, tr
     try:
         ws = tmp_path / "ws"
         ws.mkdir()
-        agent = reg.create_agent("t", ws, lane="codex", fallback="none")
+        agent = reg.create_agent("t", ws, provider="codex", fallback="none")
         assert agent.wait_ready(5) is None
         run = agent.submit("do it", verification="true")
         assert run.done.wait(10)

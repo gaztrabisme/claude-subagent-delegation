@@ -1,8 +1,8 @@
-"""Router: the lane chain, refusal classification, and rerouting a delegate.
+"""Router: the provider chain, refusal classification, and rerouting a delegate.
 
-Children are fakes that make one real HTTP request to their lane's
+Children are fakes that make one real HTTP request to their provider's
 ANTHROPIC_BASE_URL, which points at the local mock endpoint, and turn the
-answer into the events `claude -p` would print. So a lane that was skipped
+answer into the events `claude -p` would print. So a provider that was skipped
 shows up as zero hits on its mock path.
 """
 
@@ -13,7 +13,6 @@ import subprocess
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
-from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,16 +21,28 @@ import pytest
 
 from subagent import router
 from subagent.lane_state import LaneState
-from subagent.lanes import load_lanes
-from subagent.runs import COMPLETED, FAILED, Registry, exit_event
+from subagent.providers.claude import exit_event
+from subagent.runs import COMPLETED, FAILED, Registry
 from subagent.telemetry.trace import SCHEMA
 
-from .conftest import make_settings
+from .conftest import default_providers, make_settings
 from .test_runs import _result, _wait
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
 SRC = Path(__file__).parent.parent / "src"
 LANES = ("codex", "deepseek", "glm", "bppc", "omlx")
+# The configured [fallback].chain the default provider set carries.
+CONFIGURED = ("codex", "deepseek", "glm", "bppc", "omlx")
+
+
+class _Local:
+    """Stand-in for a provider the chain looks `local` up on."""
+
+    def __init__(self, local: bool):
+        self.local = local
+
+
+PROVIDERS = {n: _Local(n in ("bppc", "omlx")) for n in CONFIGURED}
 
 
 def _later(hours: float = 5) -> str:
@@ -43,25 +54,29 @@ def _later(hours: float = 5) -> str:
 
 @pytest.mark.parametrize("primary", LANES)
 def test_router_chain_full(primary):
-    expected = [primary] + [n for n in ("codex", "deepseek", "glm", "bppc", "omlx")
-                            if n != primary]
-    assert router.chain(primary, "full") == expected
+    expected = [primary] + [n for n in CONFIGURED if n != primary]
+    assert router.chain(primary, "full", CONFIGURED, PROVIDERS) == expected
 
 
 @pytest.mark.parametrize("primary", LANES)
 def test_router_chain_local(primary):
     expected = [primary] + [n for n in ("bppc", "omlx") if n != primary]
-    assert router.chain(primary, "local") == expected
+    assert router.chain(primary, "local", CONFIGURED, PROVIDERS) == expected
 
 
 @pytest.mark.parametrize("primary", LANES)
 def test_router_chain_none(primary):
-    assert router.chain(primary, "none") == [primary]
+    assert router.chain(primary, "none", CONFIGURED, PROVIDERS) == [primary]
+
+
+def test_router_chain_without_a_configured_chain_is_the_primary_alone():
+    assert router.chain("glm", "full", (), {}) == ["glm"]
+    assert router.chain("glm", "local", (), {}) == ["glm"]
 
 
 def test_router_chain_unknown_mode():
     with pytest.raises(ValueError):
-        router.chain("glm", "sideways")
+        router.chain("glm", "sideways", CONFIGURED, PROVIDERS)
 
 
 # --- classify_refusal() ----------------------------------------------------------
@@ -76,7 +91,7 @@ def _cli_error(text: str) -> list[dict[str, Any]]:
 
 def test_router_classify_zai_1308_with_reset():
     reset = _later()
-    found = router.classify_refusal("glm", _cli_error(
+    found = router.classify_refusal("zai", _cli_error(
         f"API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. "
         f"Your limit will reset at {reset}]"))
     assert found is not None and found.code == "zai_1308"
@@ -85,10 +100,10 @@ def test_router_classify_zai_1308_with_reset():
 
 def test_router_classify_zai_1310_and_1313():
     quota = router.classify_refusal(
-        "glm", _cli_error("API Error: Request rejected (429) · [1310][Weekly Limit Exhausted.]"))
+        "zai", _cli_error("API Error: Request rejected (429) · [1310][Weekly Limit Exhausted.]"))
     assert quota is not None and quota.code == "zai_1310" and quota.reset_at is None
     throttle = router.classify_refusal(
-        "glm", _cli_error("API Error: Request rejected (429) · [1313][Fair Usage]"))
+        "zai", _cli_error("API Error: Request rejected (429) · [1313][Fair Usage]"))
     assert throttle is not None and throttle.code == "zai_1313_exhausted"
 
 
@@ -120,12 +135,23 @@ def test_router_codex_reset_clock_time_today_or_tomorrow():
 
 
 def test_router_classify_not_a_refusal():
-    assert router.classify_refusal("glm", _cli_error("API Error: 429 Too Many Requests")) is None
-    assert router.classify_refusal("glm", _result("I saw [1308] and Insufficient Balance")) is None
+    assert router.classify_refusal("zai", _cli_error("API Error: 429 Too Many Requests")) is None
+    assert router.classify_refusal("zai", _result("I saw [1308] and Insufficient Balance")) is None
     context = [json.loads(line) for line in
                (FIXTURES / "context_full.jsonl").read_text().splitlines()]
     assert router.classify_refusal("codex", context) is None
-    assert router.classify_refusal("glm", "") is None
+    assert router.classify_refusal("zai", "") is None
+
+
+def test_router_classify_grok_balance_402():
+    """A grok child that answered an HTTP 402 refusal did no work (P1a addendum)."""
+    events = [json.loads(line) for line in
+              (Path(__file__).parent.parent / "wiki" / "briefs"
+               / "grok-402-fixture.jsonl").read_text().splitlines() if line.strip()]
+    found = router.classify_refusal("grok", events)
+    assert found is not None and found.code == "grok_balance"
+    assert router.did_work(events) is False
+    assert router.classify_refusal("zai", events) is None
 
 
 def test_router_did_work():
@@ -203,16 +229,15 @@ class FakeClaude:
 
 @pytest.fixture
 def lanes_on_mock(tmp_path: Path, monkeypatch, mock_endpoint):
-    """Every claude lane pointed at the mock; every route answers healthy/ok."""
+    """Every claude provider pointed at the mock; every route answers healthy/ok."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-test")
-    monkeypatch.setenv("SAM_OMLX_API_KEY", "omlx-test")
-    env = {f"SAM_{n.upper()}_BASE_URL": mock_endpoint.url(n)
-           for n in ("deepseek", "glm", "bppc", "omlx")}
-    lanes = load_lanes(env)
-    lanes["omlx"] = replace(lanes["omlx"], health_url=f"{mock_endpoint.url('omlx')}/api/status")
+    monkeypatch.setenv("OMLX_API_KEY", "omlx-test")
+    providers = default_providers()
     for name in ("deepseek", "glm", "bppc", "omlx"):
+        providers[name]["base_url"] = mock_endpoint.url(name)
         mock_endpoint.routes[f"/{name}/v1/messages"] = (200, {"mode": "ok"})
+    providers["omlx"]["health"]["url"] = f"{mock_endpoint.url('omlx')}/api/status"
     mock_endpoint.routes["/bppc/health"] = (200, {"status": "ok"})
     mock_endpoint.routes["/omlx/api/status"] = (200, {"status": "ok", "models_loaded": 1})
     spawned: list[FakeClaude] = []
@@ -221,21 +246,21 @@ def lanes_on_mock(tmp_path: Path, monkeypatch, mock_endpoint):
         spawned.append(FakeClaude(argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
-    mock_endpoint.lanes = lanes  # type: ignore[attr-defined]
+    monkeypatch.setattr("subagent.providers.claude._spawn_claude", spawn)
+    mock_endpoint.providers = providers  # type: ignore[attr-defined]
     mock_endpoint.spawned = spawned  # type: ignore[attr-defined]
     return mock_endpoint
 
 
 def _registry(tmp_path: Path, ep, **overrides) -> Registry:
     settings = make_settings(
-        tmp_path, lanes=ep.lanes, rate_limit_retries=1, rate_limit_backoff=0.001,
+        tmp_path, providers=ep.providers, rate_limit_retries=1, rate_limit_backoff=0.001,
         throttle_backoff=0.001, **overrides)
     return Registry(settings, start_reaper=False)
 
 
 def _delegate(reg: Registry, tmp_path: Path, lane: str = "glm", fallback: str = "full"):
-    agent = reg.create_agent("t", tmp_path, lane=lane, fallback=fallback)
+    agent = reg.create_agent("t", tmp_path, provider=lane, fallback=fallback)
     return agent, _wait(agent.delegate("do it", "true"))
 
 
@@ -309,7 +334,7 @@ def test_router_refusal_reroutes_to_next_lane(tmp_path, lanes_on_mock, code):
             ("codex", "unavailable", None),
             ("deepseek", "ran", None),
         ]
-        assert run.lane == agent.lane.name == "deepseek"
+        assert run.lane == agent.cfg.name == "deepseek"
         assert run.provider == "deepseek"
         assert _msgs(ep, "deepseek") == 1
         assert ep.spawned[-1].env["ANTHROPIC_BASE_URL"] == ep.url("deepseek")
@@ -432,7 +457,7 @@ def test_router_all_lanes_refused_fails_with_hops(tmp_path, lanes_on_mock):
             ("bppc", "health_failed", "health_failed"),
             ("omlx", "health_failed", "health_failed"),
         ]
-        assert "no lane took the run" in run.error
+        assert "no provider took the run" in run.error
         assert "Insufficient Balance" in (run.error_detail or "")
         assert run.detail()["hops"] == run.hops
     finally:
@@ -480,7 +505,7 @@ def test_router_continue_stays_on_the_lane_that_ran(tmp_path, lanes_on_mock):
 
 
 def test_router_codex_without_cli_is_unavailable(tmp_path, lanes_on_mock):
-    # conftest points SAM_CODEX_BIN at a path that does not exist.
+    # conftest points the codex provider's binary at a path that does not exist.
     ep = lanes_on_mock
     ep.routes["/glm/v1/messages"] = (429, {"error": "[1310][Weekly Limit Exhausted.]"})
     reg = _registry(tmp_path, ep)
@@ -549,9 +574,9 @@ def frozen_now(monkeypatch):
 
 
 def _mixed(tmp_path: Path, ep, names: tuple[str, ...], **overrides) -> Registry:
-    """A registry whose only lanes are `names`, so the chain is exactly them."""
+    """A registry whose only providers are `names`, so the chain is exactly them."""
     settings = make_settings(
-        tmp_path, lanes={n: ep.lanes[n] for n in names}, rate_limit_retries=1,
+        tmp_path, providers={n: ep.providers[n] for n in names}, rate_limit_retries=1,
         rate_limit_backoff=0.001, throttle_backoff=0.001, **overrides)
     return Registry(settings, start_reaper=False)
 
@@ -579,7 +604,7 @@ def test_router_codex_usage_limit_then_glm_and_continue_stays(
         assert len(fake_codex.calls()) == 1
         assert _msgs(ep, "glm") == 1
         assert (run.lane, run.driver, run.guard) == ("glm", "claude", "hook")
-        assert agent.lane.name == "glm" and agent.driver.name == "claude"
+        assert agent.cfg.name == "glm" and agent.driver.name == "claude"
         glm_session = agent.session_id
         assert glm_session == f"sess-{ep.url('glm')[-4:]}"
 
@@ -651,6 +676,34 @@ def test_router_codex_closed_second_delegate_spawns_no_codex(
                                      ("glm", "ran", None)]
         assert second.hops[0]["closed_until"] == CODEX_RESET.isoformat()
         assert len(fake_codex.calls()) == 1  # zero codex spawns while closed
+    finally:
+        reg.shutdown()
+
+
+def test_router_codex_message_then_usage_limit_is_a_refusal_that_closes_codex(
+    tmp_path, lanes_on_mock, fake_codex, frozen_now
+):
+    """A child that only answered the refusal did no work (P1a addendum).
+
+    Live on 2026-09-22 this was classified usage_limit_after_work and codex
+    stayed open, because an agent_message item counted as work.
+    """
+    ep = lanes_on_mock
+    fake_codex.use("usage_limit_after_message.jsonl")
+    reg = _mixed(tmp_path, ep, ("codex",))
+    try:
+        _, run = _delegate(reg, tmp_path, "codex", "none")
+        assert run.state == FAILED
+        assert run.finish_reason == "refused"
+        assert run.usage.steps == 0 and run.usage.output == 0
+        assert _outcomes(run) == [("codex", "refused", "codex_usage_limit")]
+        reset = datetime(2026, 9, 27, 17, 18).astimezone()
+        assert run.hops[0]["reset_at"] == reset.isoformat()
+        entry = LaneState(reg.settings.session_root).closed("codex")
+        assert entry is not None and entry["code"] == "codex_usage_limit"
+        # The quoted reset is 9 days out, and no refusal closes a provider for
+        # longer than router.MAX_CLOSE.
+        assert entry["closed_until"] == frozen_now + router.MAX_CLOSE
     finally:
         reg.shutdown()
 

@@ -1,4 +1,4 @@
-"""The per-lane request adapter (U-B1) and the bppc wake-up (U-B2)."""
+"""The per-provider request adapter (U-B1) and the local wake-up (U-B2)."""
 
 from __future__ import annotations
 
@@ -11,9 +11,8 @@ from urllib.parse import urlsplit
 import pytest
 
 from subagent import adapter, health
-from subagent.lanes import load_lanes
 
-from .conftest import make_settings
+from .conftest import make_settings, provider_cfg
 
 # The shape Claude Code 2.1.276 sends, cut down: a system entry after the
 # first user message, as the last message.
@@ -97,21 +96,23 @@ def test_adapter_proxy_rewrites_and_forwards_headers(mock_endpoint):
     assert adapter.proxy_url("fold_system", mock_endpoint.url("bppc") + "/") == url
 
 
-def test_adapter_bppc_lane_defaults_to_fold_system_and_can_be_turned_off():
-    assert load_lanes({})["bppc"].adapter == "fold_system"
-    assert load_lanes({"SAM_BPPC_ADAPTER": "none"})["bppc"].adapter is None
-    assert all(lane.adapter is None for name, lane in load_lanes({}).items() if name != "bppc")
+def test_adapter_bppc_provider_defaults_to_fold_system_and_can_be_turned_off(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    assert settings.provider("bppc").adapter == "fold_system"
+    assert provider_cfg("bppc", adapter="none").adapter is None
+    assert all(cfg.adapter is None for name, cfg in settings.providers.items()
+               if name != "bppc")
 
 
 def test_adapter_child_gets_the_proxy_url_while_the_lane_keeps_the_backend(tmp_path: Path):
     settings = make_settings(tmp_path)
-    lane = replace(settings.lanes["bppc"], base_url="http://192.0.2.10:8080")
+    lane = replace(settings.provider("bppc"), base_url="http://192.0.2.10:8080")
     env = settings.child_env("a1", lane)
     assert env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
     written = json.loads(settings.hooks_config("a1", lane).read_text())
     assert written["env"]["ANTHROPIC_BASE_URL"] == env["ANTHROPIC_BASE_URL"]
     assert lane.base_url == "http://192.0.2.10:8080"  # health and telemetry still see bppc
-    glm = settings.lanes["glm"]
+    glm = settings.provider("glm")
     assert settings.child_env("a2", glm)["ANTHROPIC_BASE_URL"] == glm.base_url
 
 
@@ -120,7 +121,7 @@ def test_adapter_warm_bppc_wakes_through_the_proxy(mock_endpoint):
     mock_endpoint.routes["/bppc/health"] = (200, {"status": "ok", "backend": "stopped"})
     mock_endpoint.on_hit["/bppc/v1/models"] = lambda: mock_endpoint.routes.__setitem__(
         "/bppc/health", (200, {"status": "ok", "backend": "running"}))
-    gate = health.warm_bppc(base, 10.0, "local", poll=0.05)
+    gate = health.warm(provider_cfg("bppc"), base, 10.0, poll=0.05)
     assert gate.ok and gate.base_url == base
     assert mock_endpoint.hits["/bppc/v1/models"] == 1
 
@@ -128,5 +129,5 @@ def test_adapter_warm_bppc_wakes_through_the_proxy(mock_endpoint):
 def test_adapter_warm_bppc_is_bounded(mock_endpoint):
     base = mock_endpoint.url("bppc")
     mock_endpoint.routes["/bppc/health"] = (200, {"status": "ok", "backend": "stopped"})
-    gate = health.warm_bppc(base, 0.3, poll=0.05)
+    gate = health.warm(provider_cfg("bppc"), base, 0.3, poll=0.05)
     assert not gate.ok and "not running" in gate.message

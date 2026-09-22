@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a0b1c2-5d6e-7f80-9123-456789abcdef"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I can't continue: the account has hit its usage limit."}}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 27th, 2026 5:18 PM."}}

@@ -3,70 +3,231 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from subagent import config
 from subagent.config import Settings
-from subagent.lanes import load_lanes
 
-# Every lane's key variable. Tests never see the machine's real keys.
-KEY_ENVS = ("GLM_API_KEY", "ZAI_API_KEY", "DEEPSEEK_API_KEY", "SAM_BPPC_API_KEY",
-            "SAM_OMLX_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# Every provider's key variable. Tests never see the machine's real keys.
+KEY_ENVS = ("GLM_API_KEY", "ZAI_API_KEY", "DEEPSEEK_API_KEY", "BPPC_API_KEY",
+            "OMLX_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+# The fake `codex` binary a test installs; the default provider table reads it
+# so no test can reach the real Codex CLI.
+CODEX_BIN_ENV = "SUBAGENT_TEST_CODEX_BIN"
+NO_CODEX = "/nonexistent/codex-disabled-in-tests"
+# Stands in for that binary in a provider table, resolved when the config is
+# written: a fixture that installs a fake `codex` may run after the table was
+# built.
+CODEX_BIN_TOKEN = "@codex-bin@"
+
+# The bppc probe, as the old lane hardcoded it.
+GPU_CMD = [
+    "ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", "bppc@{host}", "nvidia-smi",
+    "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu",
+    "--format=csv,noheader,nounits",
+]
 
 
 @pytest.fixture(autouse=True)
-def _lane_keys(monkeypatch):
-    """The glm lane (the default) gets a fake key; every other key is unset."""
+def _provider_keys(monkeypatch, tmp_path_factory):
+    """The glm provider (the default) gets a fake key; every other is unset.
+
+    The machine's own config files are out of reach too: XDG_CONFIG_HOME
+    points at an empty directory and SUBAGENT_CONFIG is unset, so `config.load`
+    sees only what a test writes.
+    """
     for name in KEY_ENVS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GLM_API_KEY", "test-key")
-    # No test may reach the real Codex CLI or the user's Codex login.
-    monkeypatch.setenv("SAM_CODEX_BIN", "/nonexistent/codex-disabled-in-tests")
+    monkeypatch.setenv(CODEX_BIN_ENV, NO_CODEX)
     monkeypatch.setenv("CODEX_HOME", "/nonexistent/codex-home-disabled-in-tests")
+    empty = tmp_path_factory.mktemp("xdg-config")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(empty))
+    monkeypatch.delenv(config.CONFIG_ENV, raising=False)
 
 
-def make_settings(tmp_path: Path, **overrides) -> Settings:
-    """Settings for a test. Lanes resolve their knobs from these values, as
-    they would from the matching global SAM_ variables."""
-    values = {
-        "workspace": tmp_path,
-        "session_root": tmp_path / "sessions",
-        "claude_bin": "claude",
-        "max_agents": 4,
-        "transcript_limit": 400,
-        "summary_tokens": 2000,
-        "idle_timeout": 900.0,
-        "run_timeout": 1800.0,
-        "turn_token_budget": None,
+def default_providers() -> dict[str, dict[str, Any]]:
+    """The five backends this project ran on before the config file landed.
+
+    Same drivers, models, keys, adapters and limits the old lane registry
+    hardcoded, so a test that does not care about providers keeps its old
+    behaviour by saying nothing.
+    """
+    return {
+        "codex": {
+            "driver": "codex",
+            "binary": CODEX_BIN_TOKEN,
+        },
+        "deepseek": {
+            "driver": "claude",
+            "base_url": "https://api.deepseek.com/anthropic",
+            "model": "deepseek-v4-pro",
+            "api_key_env": "DEEPSEEK_API_KEY",
+            # Stated, not derived: these tests point base_url at a local mock.
+            "vendor": "deepseek",
+        },
+        "glm": {
+            "driver": "claude",
+            "base_url": "https://api.z.ai/api/anthropic",
+            "model": "glm-5.3-flash[1m]",
+            "api_key_env": ["GLM_API_KEY", "ZAI_API_KEY"],
+            "vendor": "zai",
+        },
+        "bppc": {
+            "driver": "claude",
+            "model": "qwen3.8-27b",
+            "api_key_env": "BPPC_API_KEY",
+            "api_key": "local",
+            "local": True,
+            "max_agents": 1,
+            "compact_window": 40960,
+            # llama.cpp's Qwen3.8 template refuses a system message after the
+            # first user turn, which Claude Code sends.
+            "adapter": "fold_system",
+            "health": {
+                "kind": "llamacpp",
+                "candidates": ["http://192.168.1.17:8080", "http://100.106.185.34:8080"],
+                "warm": True,
+                "cold_load_seconds": 180.0,
+            },
+            "probe": {
+                "gpu_cmd": GPU_CMD,
+                "slots_url": "http://{host}:8081/slots",
+                "metrics_url": "http://{host}:8081/metrics",
+            },
+        },
+        "omlx": {
+            "driver": "claude",
+            "base_url": "http://127.0.0.1:8000",
+            "model": "Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B",
+            "api_key_env": "OMLX_API_KEY",
+            "local": True,
+            "send_sampling": False,
+            # Measured on this Mac: aggregate output tok/s 20.1 at 1 child,
+            # 18.3 at 2, 7.6 at 4; p90 TTFT 3.9 s -> 181 s at 4.
+            "max_agents": 1,
+            "compact_window": 98304,
+            "health": {
+                "kind": "omlx",
+                "url": "http://127.0.0.1:8000/api/status",
+                "cold_load_seconds": 120.0,
+            },
+            "probe": {"host_parser": "mac"},
+        },
+    }
+
+
+# Overrides make_settings routes to a table other than [core].
+GUARD_KEYS = ("supervisor", "supervisor_cmd", "supervisor_timeout", "approval_socket",
+              "allow_unguarded")
+TELEMETRY_KEYS = ("sample_seconds",)
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    return json.dumps(str(value))
+
+
+def _toml_table(name: str, table: dict[str, Any]) -> str:
+    """One table and its sub-tables, deepest last. Values only, no comments."""
+    scalars = {k: v for k, v in table.items() if not isinstance(v, dict)}
+    lines = [f"[{name}]"]
+    lines += [f"{k} = {_toml_value(v)}" for k, v in scalars.items()]
+    out = ["\n".join(lines)]
+    for key, value in table.items():
+        if isinstance(value, dict):
+            out.append(_toml_table(f"{name}.{key}", value))
+    return "\n\n".join(out)
+
+
+def _resolve(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace(CODEX_BIN_TOKEN, os.environ.get(CODEX_BIN_ENV, NO_CODEX))
+    if isinstance(value, dict):
+        return {k: _resolve(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve(v) for v in value]
+    return value
+
+
+def write_config(path: Path, tables: dict[str, Any]) -> Path:
+    """Write `tables` as TOML and return the path."""
+    tables = _resolve(tables)
+    path.write_text("\n\n".join(
+        _toml_table(name, table) for name, table in tables.items() if table
+    ) + "\n")
+    return path
+
+
+def make_settings(tmp_path: Path, providers: dict[str, Any] | None = None,
+                  **overrides) -> Settings:
+    """Settings for a test, written as a config file and loaded back.
+
+    `providers` is the `[providers]` table; None declares the five backends
+    this project used to hardcode. Any other keyword goes to [core], [guard]
+    or [telemetry], whichever owns it.
+    """
+    tables = default_providers() if providers is None else providers
+    core: dict[str, Any] = {
+        "workspace": str(tmp_path),
+        "session_root": str(tmp_path / "sessions"),
+        "default_provider": "glm" if "glm" in tables else next(iter(tables), ""),
         "loop_strikes": 3,
+        "trace": "off",
+    }
+    guard: dict[str, Any] = {
         "supervisor": "off",
         "supervisor_cmd": "claude -p --model sonnet",
-        "supervisor_timeout": 120.0,
         "approval_socket": str(tmp_path / "approval.sock"),
-        "log_level": "info",
-        "max_steps": 40,
-        "verify_timeout": 300.0,
-        "chars_per_token": 3.5,
-        "run_archive": 200,
-        "trace": "off",
-        "compact_window": 1_000_000,
-        "rate_limit_retries": 3,
-        "rate_limit_backoff": 5.0,
-        "throttle_backoff": 60.0,
     }
-    values.update(overrides)
-    if "lanes" not in values:
-        # Only knobs a test overrode become globals, so the local lanes keep
-        # their own defaults, as they would with the SAM_ variables unset.
-        knobs = ("max_agents", "compact_window", "max_steps", "run_timeout", "idle_timeout")
-        values["lanes"] = load_lanes({
-            f"SAM_{knob.upper()}": str(overrides[knob]) for knob in knobs if knob in overrides
-        })
-    settings = Settings(**values)
+    telemetry: dict[str, Any] = {}
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        if key in GUARD_KEYS:
+            guard[key] = value
+        elif key in TELEMETRY_KEYS:
+            telemetry[key] = value
+        else:
+            core[key] = value
+    chain = [n for n in ("codex", "deepseek", "glm", "bppc", "omlx") if n in tables]
+    path = write_config(tmp_path / "subagent.toml", {
+        "core": core,
+        "guard": guard,
+        "telemetry": telemetry,
+        "fallback": {"chain": chain},
+        "providers": tables,
+    })
+    settings = config.load(extra=path)
     settings.session_root.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def provider_cfg(name: str, **patch):
+    """One default provider as a ProviderConfig, with `patch` merged in."""
+    table = default_providers()[name]
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(table.get(key), dict):
+            table[key] = {**table[key], **value}
+        else:
+            table[key] = value
+    from subagent.config import _provider
+
+    table = _resolve(table)
+    defaults = {"max_agents": 4, "compact_window": 1_000_000, "max_steps": 40,
+                "run_timeout": 1800.0, "idle_timeout": 900.0}
+    return _provider(name, table, defaults)
 
 
 # Ports of the mock HTTP servers tests start. Health probes to anything else
@@ -89,7 +250,9 @@ def _no_network_health(monkeypatch):
         return None
 
     monkeypatch.setattr(health, "_http_get", guarded)
-    monkeypatch.setattr(health, "_tailscale_status", lambda: None)
+    # No resolve command runs either: an unresolved provider has no candidates
+    # beyond the ones its config names.
+    monkeypatch.setattr(health, "_run", lambda argv, timeout=health.RESOLVE_TIMEOUT: "")
 
 
 class MockEndpoint:
@@ -174,7 +337,8 @@ record = {
     "argv": argv,
     "stdin": stdin,
     "env": {k: os.environ.get(k) for k in (
-        "CODEX_HOME", "SAM_APPROVAL_SOCKET", "GLM_API_KEY", "ANTHROPIC_AUTH_TOKEN")},
+        "CODEX_HOME", "SUBAGENT_APPROVAL_SOCKET", "GLM_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN")},
     "cwd": os.getcwd(),
 }
 with open(os.environ["FAKE_CODEX_RECORD"], "a") as fh:
@@ -208,7 +372,7 @@ def fake_codex(tmp_path: Path, monkeypatch):
     )
     (user_home / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
         {"hooks": [{"type": "command", "command": "/bin/sh /user/own-hook.sh"}]}]}}))
-    monkeypatch.setenv("SAM_CODEX_BIN", str(binary))
+    monkeypatch.setenv(CODEX_BIN_ENV, str(binary))
     monkeypatch.setenv("CODEX_HOME", str(user_home))
     monkeypatch.setenv("FAKE_CODEX_RECORD", str(record))
     monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(CODEX_FIXTURES / "success.jsonl"))

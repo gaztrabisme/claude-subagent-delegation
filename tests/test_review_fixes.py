@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from subagent import runs
-from subagent.config import APPROVAL_HOOK, Settings
+from subagent.config import APPROVAL_HOOK
 from subagent.guard.classify import (
     ALLOW,
     DENY,
@@ -185,11 +185,14 @@ def test_n8_git_hooks_and_config_are_protected(ws):
     assert classify("Write", {"file_path": ".github/config"}, ws).action == ALLOW
 
 
-def test_i0a_session_root_is_outside_the_workspace_and_protected(ws, monkeypatch):
-    monkeypatch.delenv("SAM_SESSION_ROOT", raising=False)
-    monkeypatch.setenv("SAM_WORKSPACE", str(ws))
-    settings = Settings.from_env()
-    assert settings.session_root == (Path.home() / ".subagent-mcp" / "sessions").resolve()
+def test_i0a_session_root_is_outside_the_workspace_and_protected(ws, tmp_path):
+    from subagent import config
+
+    from .conftest import write_config
+
+    path = write_config(tmp_path / "c.toml", {"core": {"workspace": str(ws)}})
+    settings = config.load(extra=path)
+    assert settings.session_root == (Path.home() / ".subagent" / "sessions").resolve()
     # Wherever it is configured, writes under it are refused.
     sessions = ws / "sessions"
     protect(sessions)
@@ -403,7 +406,7 @@ def _registry(tmp_path, monkeypatch, script: list[list[dict[str, Any]]], **overr
         spawned.append(FakeProcess(events, argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.providers.claude._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg
@@ -448,9 +451,8 @@ def test_r2_backoff_never_outlasts_the_run_deadline(tmp_path, monkeypatch):
         reg.shutdown()
 
 
-def test_r2_zero_retries_is_accepted(monkeypatch):
-    monkeypatch.setenv("SAM_RATE_LIMIT_RETRIES", "0")
-    assert Settings.from_env().rate_limit_retries == 0
+def test_r2_zero_retries_is_accepted(tmp_path):
+    assert make_settings(tmp_path, rate_limit_retries=0).rate_limit_retries == 0
 
 
 # --- R3: codes are read from errors, not model text --------------------------------

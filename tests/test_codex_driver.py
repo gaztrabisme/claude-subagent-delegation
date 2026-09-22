@@ -1,7 +1,7 @@
 """The codex driver, against a fake `codex` binary that replays real fixtures.
 
 The fake (the `fake_codex` fixture in conftest) is a small Python script
-selected by SAM_CODEX_BIN. It prints the fixture named by FAKE_CODEX_FIXTURE
+named as the codex provider's `binary`. It prints the fixture named by FAKE_CODEX_FIXTURE
 and records its argv, stdin and environment to FAKE_CODEX_RECORD (one JSON
 line per call).
 """
@@ -28,7 +28,7 @@ from subagent.providers.codex import (
 from subagent.runs import COMPLETED, FAILED, Registry
 from subagent.telemetry.trace import Trace
 
-from .conftest import make_settings
+from .conftest import default_providers, make_settings
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
 HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent" / "guard" / "approval_hook.py"
@@ -61,7 +61,7 @@ def _run(agent, prompt="do it", verification="true"):
 
 
 def test_success_maps_usage_text_and_thread(fake_codex, registry, tmp_path: Path):
-    agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     run = _run(agent, prompt="the task")
     assert run.state == COMPLETED, run.error
     assert run.session_id == agent.session_id == "01a0a0de-91f8-7441-a178-a154caba9282"
@@ -83,7 +83,7 @@ def test_success_maps_usage_text_and_thread(fake_codex, registry, tmp_path: Path
 
 def test_argv_is_sandboxed_and_never_bypasses(fake_codex, registry, tmp_path: Path):
     ws = _workspace(tmp_path)
-    agent = registry.create_agent("c", ws, lane="codex", model="gpt-5.3-codex-spark")
+    agent = registry.create_agent("c", ws, provider="codex", model="gpt-5.3-codex-spark")
     _run(agent)
     argv = fake_codex.calls()[0]["argv"]
     assert argv[:2] == ["exec", "--json"]
@@ -97,13 +97,13 @@ def test_argv_is_sandboxed_and_never_bypasses(fake_codex, registry, tmp_path: Pa
 
 
 def test_no_model_means_no_m_flag(fake_codex, registry, tmp_path: Path):
-    agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     _run(agent)
     assert "-m" not in fake_codex.calls()[0]["argv"]
 
 
 def test_resume_passes_thread_id(fake_codex, registry, tmp_path: Path):
-    agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     _run(agent)
     second = agent.follow_up("keep going")
     assert second.done.wait(10)
@@ -120,7 +120,7 @@ def test_resume_passes_thread_id(fake_codex, registry, tmp_path: Path):
 
 def test_usage_limit_is_a_refusal_with_reset(fake_codex, registry, tmp_path: Path):
     fake_codex.use("usage_limit.jsonl")
-    agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     run = _run(agent)
     assert run.state == FAILED
     assert run.finish_reason == REFUSAL_USAGE_LIMIT
@@ -142,7 +142,7 @@ def test_context_full_is_failed_not_refused(fake_codex, registry, tmp_path: Path
     events = _load("context_full.jsonl")
     assert codex_refusal(events) is None
     fake_codex.use("context_full.jsonl")
-    agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     run = _run(agent)
     assert run.state == FAILED
     assert run.finish_reason == "context_full"
@@ -178,7 +178,7 @@ def test_bare_time_reset_is_today_or_tomorrow():
 
 
 def test_codex_home_is_per_agent_and_isolated(fake_codex, registry, tmp_path: Path):
-    agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     _run(agent)
     home = Path(fake_codex.calls()[0]["env"]["CODEX_HOME"])
     assert home == registry.settings.session_root / "agents" / agent.agent_id / "codex-home"
@@ -196,16 +196,15 @@ def test_codex_home_is_per_agent_and_isolated(fake_codex, registry, tmp_path: Pa
     assert commands == [registry.settings.guard_hook_command(agent.agent_id, "--dialect", "codex")]
     assert str(HOOK) in commands[0] and "own-hook.sh" not in json.dumps(hooks)
     env = fake_codex.calls()[0]["env"]
-    assert env["SAM_APPROVAL_SOCKET"] == registry.settings.approval_socket
+    assert env["SUBAGENT_APPROVAL_SOCKET"] == registry.settings.approval_socket
     assert env["GLM_API_KEY"] is None and env["ANTHROPIC_AUTH_TOKEN"] is None
 
 
-def test_lane_model_skips_user_model(fake_codex, tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("SAM_CODEX_MODEL", "gpt-5.6-luna")
-    from subagent.lanes import load_lanes
-
-    settings = make_settings(tmp_path, lanes=load_lanes(os.environ))
-    home = codex_driver.prepare_home(settings, "a9", settings.lanes["codex"])
+def test_provider_model_skips_user_model(fake_codex, tmp_path: Path):
+    providers = default_providers()
+    providers["codex"]["model"] = "gpt-5.6-luna"
+    settings = make_settings(tmp_path, providers=providers)
+    home = codex_driver.prepare_home(settings, "a9", settings.provider("codex"))
     config = (home / "config.toml").read_text()
     assert "gpt-6-astra" not in config and "xhigh" not in config
 
@@ -214,11 +213,11 @@ def test_trace_marks_guard_per_driver(fake_codex, registry, tmp_path: Path, monk
     from .test_runs import FakeProcess, _result
 
     monkeypatch.setattr(
-        "subagent.runs._spawn_claude", lambda argv, env, cwd: FakeProcess(_result("ok"), argv, env)
+        "subagent.providers.claude._spawn_claude", lambda argv, env, cwd: FakeProcess(_result("ok"), argv, env)
     )
-    codex_agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    codex_agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     _run(codex_agent)
-    claude_agent = registry.create_agent("g", _workspace(tmp_path), "glm-5.3", lane="glm")
+    claude_agent = registry.create_agent("g", _workspace(tmp_path), "glm-5.3", provider="glm")
     _run(claude_agent)
     records = [json.loads(line) for line in registry.trace_path.read_text().splitlines()]
     runs = {r["agent_id"]: r for r in records if r["kind"] == "run"}
@@ -230,7 +229,7 @@ def test_trace_marks_guard_per_driver(fake_codex, registry, tmp_path: Path, monk
 
 
 def test_missing_binary_is_a_start_error(tmp_path: Path, registry):
-    agent = registry.create_agent("c", _workspace(tmp_path), lane="codex")
+    agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     assert "not on PATH" in (agent.wait_ready(5) or "")
 
 
@@ -279,7 +278,7 @@ def supervisor_socket(tmp_path: Path):
 
 
 def _hook(sock, payload: dict, *extra: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "SAM_APPROVAL_SOCKET": str(sock.path)}
+    env = {**os.environ, "SUBAGENT_APPROVAL_SOCKET": str(sock.path)}
     return subprocess.run(
         [sys.executable, str(HOOK), "--agent", "a1", *extra],
         input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=10,

@@ -29,7 +29,7 @@ def _decision(stdout: str) -> dict:
 
 def test_missing_socket_denies_with_json(monkeypatch, tmp_path: Path):
     env = {**os.environ}
-    env.pop("SAM_APPROVAL_SOCKET", None)
+    env.pop("SUBAGENT_APPROVAL_SOCKET", None)
     result = _run_hook(env, json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
     assert result.returncode == 2
     out = _decision(result.stdout)
@@ -64,7 +64,7 @@ def test_allow_and_deny_from_unix_socket(tmp_path: Path):
         if sock_path.exists():
             break
         __import__("time").sleep(0.02)
-    env = {**__import__("os").environ, "SAM_APPROVAL_SOCKET": str(sock_path)}
+    env = {**__import__("os").environ, "SUBAGENT_APPROVAL_SOCKET": str(sock_path)}
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
     allowed = _run_hook(env, payload, ["--agent", "a1"])
     denied = _run_hook(env, payload, ["--agent", "a1"])
@@ -77,7 +77,7 @@ def test_allow_and_deny_from_unix_socket(tmp_path: Path):
 
 
 def test_unreachable_socket_denies(tmp_path: Path):
-    env = {**__import__("os").environ, "SAM_APPROVAL_SOCKET": str(tmp_path / "missing.sock")}
+    env = {**__import__("os").environ, "SUBAGENT_APPROVAL_SOCKET": str(tmp_path / "missing.sock")}
     result = _run_hook(env, "{}")
     assert result.returncode == 2
     assert _decision(result.stdout)["permissionDecision"] == "deny"

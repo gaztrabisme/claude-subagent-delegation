@@ -1,9 +1,19 @@
 # benchmark output: per-run working copies (with their own .git), raw Claude JSON, logs
 bench/results/
-
 # runner state when trying the skill inside this repo
 .delegate/
-
 __pycache__/
 *.pyc
 node_modules/
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.gsa-sessions/
+.dsh-sessions/
+.DS_Store
+.ref/
+.mcp.json
+.subagent/

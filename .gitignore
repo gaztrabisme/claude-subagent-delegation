@@ -17,3 +17,5 @@ build/
 .ref/
 .mcp.json
 .subagent/
+.capture-home/
+.capture-tmp/

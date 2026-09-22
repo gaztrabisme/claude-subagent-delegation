@@ -31,6 +31,9 @@ class Shells(Sandbox):
         home = self.env["HOME"]
         self.env["PATH"] = f"{home}/.local/bin:{self.env['PATH']}"
         self.env["FAKE_SCRIPT"] = str(SCENARIOS / "capture.sh")
+        # The CLI is exercised straight from the checkout (PYTHONPATH); skip
+        # install.sh's slow, network-touching `uv tool install` step.
+        self.env["SUBAGENT_SKIP_INSTALL"] = "1"
         for shell in shells:
             with self.subTest(shell):
                 root = self.node_project(name=f"p-{shell}")

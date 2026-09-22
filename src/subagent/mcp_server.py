@@ -50,11 +50,23 @@ scratch directory rather than anything you cannot afford to have edited.
 """
 
 
+def _provider_instructions(settings) -> str:
+    """The configured providers, named with their driver and local flag."""
+    lines = ["Configured providers (`delegate` picks one by `provider`):"]
+    for cfg in settings.providers.values():
+        local = ", local" if cfg.local else ""
+        lines.append(f"- {cfg.name} (driver {cfg.driver}{local})")
+    if not settings.providers:
+        lines.append("- (none configured)")
+    return "\n".join(lines)
+
+
 def _instructions() -> str:
+    parts = [SERVER_INSTRUCTIONS, _provider_instructions(settings)]
     extra = (settings.instructions or "").strip()
     if extra:
-        return SERVER_INSTRUCTIONS + "\n" + extra + "\n"
-    return SERVER_INSTRUCTIONS
+        parts.append(extra)
+    return "\n\n".join(parts) + "\n"
 
 
 settings = config.load(Path.cwd())
@@ -84,6 +96,8 @@ app = MCPServer(
 
 # How often a wait reports progress back to the client while it blocks.
 PROGRESS_INTERVAL = 3.0
+
+LANE_DEPRECATED = "`lane` is deprecated; use `provider`"
 
 
 def _parent_context(ctx: Context | None) -> dict[str, Any] | None:
@@ -209,11 +223,12 @@ async def delegate(
             continue always stays on that provider.
     """
     wanted = provider or lane
+    deprecated = provider is None and lane is not None
     try:
         chosen = registry.select_provider(wanted, fallback)
     except RegistryError as exc:
         # Refused before anything is spawned.
-        return {
+        result = {
             "state": "rejected",
             "error": str(exc),
             "lane": wanted or settings.default_provider,
@@ -222,6 +237,9 @@ async def delegate(
             "known_providers": list(settings.providers),
             "fallback_modes": list(FALLBACK_MODES),
         }
+        if deprecated:
+            result["warning"] = LANE_DEPRECATED
+        return result
     if ctx is not None:
         supervisor.bind(ctx.session)
     try:
@@ -254,6 +272,8 @@ async def delegate(
     out["model"] = agent.model
     out["lane"] = run.lane or agent.cfg.name
     out["fallback"] = agent.fallback
+    if deprecated:
+        out["warning"] = LANE_DEPRECATED
     return out
 
 

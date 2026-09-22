@@ -1,0 +1,4 @@
+[
+  {"start_s": 0.0, "end_s": 3.0, "speaker": "Minh", "text": "Chào mọi người.", "confidence": 0.98},
+  {"start_s": 3.0, "end_s": 7.0, "speaker": "Lan", "text": "@minh gửi báo cáo đến thứ sáu.", "confidence": 0.97}
+]

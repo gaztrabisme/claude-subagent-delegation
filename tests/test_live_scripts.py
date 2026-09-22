@@ -18,12 +18,16 @@ from subagent.runs import Run
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+BENCH = ROOT / "bench"  # bench_concurrency lives here since the bench matrix landed
 
 
-def _load(name: str):
-    if str(SCRIPTS) not in sys.path:
-        sys.path.insert(0, str(SCRIPTS))
-    spec = importlib.util.spec_from_file_location(f"sam_script_{name}", SCRIPTS / f"{name}.py")
+def _load(name: str, path: Path | None = None):
+    path = path or (BENCH / f"{name}.py")
+    if not path.exists():
+        path = SCRIPTS / f"{name}.py"
+    if str(path.parent) not in sys.path:
+        sys.path.insert(0, str(path.parent))
+    spec = importlib.util.spec_from_file_location(f"sam_script_{name}", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod  # dataclasses look their module up there
     spec.loader.exec_module(mod)
@@ -32,7 +36,7 @@ def _load(name: str):
 
 smoke = _load("smoke_lanes")
 harness = _load("lane_harness")
-bench = _load("bench_concurrency")
+bench = _load("bench_concurrency", BENCH / "concurrency.py")
 
 SSH = "/Users/someone/.ssh/config"
 
@@ -359,7 +363,7 @@ def test_bench_main_writes_one_row_per_level(tmp_path, monkeypatch):
             pass
 
     monkeypatch.setattr(bench.lane_harness, "InProcessServer", FakeServer)
-    assert bench.main(["--levels", "1,2,4,8", "--out", str(tmp_path)]) == 0
+    assert bench.main(["--provider", "omlx", "--levels", "1,2,4,8", "--out", str(tmp_path)]) == 0
     with open(tmp_path / "bench.csv") as handle:
         rows = list(csv.DictReader(handle))
     assert [r["level"] for r in rows] == ["1", "2", "4", "8"]

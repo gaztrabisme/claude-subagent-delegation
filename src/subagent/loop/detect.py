@@ -6,7 +6,7 @@ import re
 import subprocess
 import time
 
-from common import STATE_DIR, read_json, tail
+from .common import STATE_DIR, read_json, tail
 
 JS_TEST_GLOBS = [
     "**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/test/**", "**/tests/**",

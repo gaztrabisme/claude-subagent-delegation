@@ -13,12 +13,12 @@ from typing import Any
 
 import pytest
 
-from subagent_mcp import telemetry
-from subagent_mcp.lane_state import LaneState
-from subagent_mcp.lanes import load_lanes
-from subagent_mcp.runs import COMPLETED, FAILED, Registry
-from subagent_mcp.telemetry import Telemetry, Thresholds, breaches, p10, summarize
-from subagent_mcp.trace import Trace
+from subagent.lane_state import LaneState
+from subagent.lanes import load_lanes
+from subagent.runs import COMPLETED, FAILED, Registry
+from subagent.telemetry import sampler as telemetry
+from subagent.telemetry.sampler import Telemetry, Thresholds, breaches, p10, summarize
+from subagent.telemetry.trace import Trace
 
 from .conftest import make_settings
 from .test_runs import FakeProcess, _result, _wait
@@ -287,7 +287,7 @@ def _omlx_registry(tmp_path: Path, monkeypatch, mock_endpoint, env: dict[str, st
         spawned.append(FakeProcess(_result("done"), argv, env_))
         return spawned[-1]
 
-    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
     hub = Telemetry(
         None,
         probes={"omlx": lambda lane: {"mac": {"swap_used_mb": 5000.0, "pressure_level": 1},
@@ -368,7 +368,7 @@ def test_local_run_writes_a_run_summary(tmp_path, monkeypatch, mock_endpoint, tr
 
 def test_cloud_run_has_no_run_summary(tmp_path, monkeypatch, trace_records):
     settings = make_settings(tmp_path)
-    monkeypatch.setattr("subagent_mcp.runs._spawn_claude",
+    monkeypatch.setattr("subagent.runs._spawn_claude",
                         lambda argv, env, cwd: FakeProcess(_result("done"), argv, env))
     reg = Registry(settings, start_reaper=False)
     try:

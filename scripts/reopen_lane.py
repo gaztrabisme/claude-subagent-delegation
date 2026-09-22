@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from subagent_mcp.lane_state import LaneState  # noqa: E402
+from subagent.lane_state import LaneState  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:

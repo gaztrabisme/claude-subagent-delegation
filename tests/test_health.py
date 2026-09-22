@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from subagent_mcp import health
-from subagent_mcp.lanes import load_lanes
+from subagent import health
+from subagent.lanes import load_lanes
 
 from .test_router import _delegate, _registry, lanes_on_mock  # noqa: F401 - fixture
 
@@ -219,7 +219,7 @@ def test_health_omlx_cold_load_extends_the_run_deadline(tmp_path: Path, lanes_on
 
 
 def test_health_cold_load_seconds_default(monkeypatch):
-    from subagent_mcp.config import Settings
+    from subagent.config import Settings
 
     for name in ("SAM_OMLX_COLD_LOAD_SECONDS", "SAM_BALANCE_CLOSE_HOURS",
                  "SAM_THROTTLE_CLOSE_MINUTES", "SAM_BPPC_COLD_LOAD_SECONDS"):

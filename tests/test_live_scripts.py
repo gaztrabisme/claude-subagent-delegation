@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from subagent_mcp.runs import Run
+from subagent.runs import Run
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"

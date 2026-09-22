@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from subagent_mcp.config import APPROVAL_HOOK
-from subagent_mcp.guard import ALLOW, DENY, classify
+from subagent.config import APPROVAL_HOOK
+from subagent.guard.classify import ALLOW, DENY, classify
 
 HOME = Path.home()
 
@@ -113,7 +113,7 @@ def test_h1_hook_forwards_workdir():
 def test_h3_two_registries_on_one_session_root_never_share_an_agent_home(tmp_path):
     from dataclasses import replace
 
-    from subagent_mcp.runs import Registry
+    from subagent.runs import Registry
 
     from .conftest import make_settings
 
@@ -147,7 +147,7 @@ def test_h3_two_registries_on_one_session_root_never_share_an_agent_home(tmp_pat
 
 
 def _cli(text: str) -> list[dict]:
-    from subagent_mcp.runs import exit_event
+    from subagent.runs import exit_event
 
     cli = {"type": "result", "subtype": "success", "is_error": True, "result": text,
            "session_id": "s"}
@@ -155,7 +155,7 @@ def _cli(text: str) -> list[dict]:
 
 
 def test_m1_omlx_timeout_402_seconds_is_not_a_balance_refusal():
-    from subagent_mcp import router
+    from subagent import router
 
     text = "API Error: 500 upstream request timed out after 402 s"
     assert router.classify_refusal("omlx", _cli(text)) is None
@@ -164,7 +164,7 @@ def test_m1_omlx_timeout_402_seconds_is_not_a_balance_refusal():
 
 
 def test_m1_bppc_402_payment_required_does_not_close_bppc():
-    from subagent_mcp import router
+    from subagent import router
 
     assert router.classify_refusal("bppc", _cli("402 Payment Required from proxy")) is None
     found = router.classify_refusal("deepseek", _cli("402 Payment Required from proxy"))
@@ -174,7 +174,7 @@ def test_m1_bppc_402_payment_required_does_not_close_bppc():
 
 
 def test_m1_zai_codes_only_on_glm_and_codex_limit_only_on_codex():
-    from subagent_mcp import router
+    from subagent import router
 
     zai = "API Error: Request rejected (429) · [1308][Usage limit reached. reset at 2099-01-01 00:00:00]"
     assert router.classify_refusal("deepseek", _cli(zai)) is None
@@ -188,7 +188,7 @@ def test_m1_zai_codes_only_on_glm_and_codex_limit_only_on_codex():
 def test_m1_glm_reset_2099_closes_at_most_seven_days():
     from datetime import datetime, timedelta
 
-    from subagent_mcp import router
+    from subagent import router
 
     zai = "API Error: Request rejected (429) · [1308][Usage limit reached. reset at 2099-01-01 00:00:00]"
     refusal = router.classify_refusal("glm", _cli(zai))
@@ -202,7 +202,7 @@ def test_m1_lane_state_caps_old_entries_and_reopens(tmp_path):
     import json
     from datetime import datetime, timedelta
 
-    from subagent_mcp.lane_state import LaneState
+    from subagent.lane_state import LaneState
 
     state = LaneState(tmp_path)
     state.close("glm", datetime(2099, 1, 1).astimezone(), "zai_1308", "m")
@@ -226,7 +226,7 @@ def test_m1_reopen_cli(tmp_path, capsys):
     import sys
     from datetime import datetime, timedelta
 
-    from subagent_mcp.lane_state import LaneState
+    from subagent.lane_state import LaneState
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import reopen_lane
@@ -246,7 +246,8 @@ def test_m1_reopen_cli(tmp_path, capsys):
 def test_l4_codex_reset_without_a_year():
     from datetime import datetime
 
-    from subagent_mcp import codex_driver, router
+    from subagent import router
+    from subagent.providers import codex as codex_driver
 
     now = datetime(2026, 9, 18, 12, 0).astimezone()
     text = "try again at Sep 20th 1:29 PM"
@@ -263,7 +264,7 @@ def test_l4_codex_reset_without_a_year():
 
 
 def test_m3_crafted_peer_named_bppc_is_ignored():
-    from subagent_mcp import health
+    from subagent import health
 
     status = {"Peer": {
         "nodekey:evil": {"HostName": "bppc-evil", "TailscaleIPs": ["100.64.0.9"],
@@ -277,7 +278,7 @@ def test_m3_crafted_peer_named_bppc_is_ignored():
 
 
 def test_m3_public_endpoint_is_never_used():
-    from subagent_mcp import health
+    from subagent import health
 
     status = {"Peer": {"nodekey:real": {
         "HostName": "bppc", "TailscaleIPs": ["100.106.185.34"],
@@ -295,8 +296,8 @@ def test_m3_public_endpoint_is_never_used():
 def test_m8_omlx_cold_when_its_model_is_not_loaded(monkeypatch, mock_endpoint):
     from dataclasses import replace
 
-    from subagent_mcp import health
-    from subagent_mcp.lanes import load_lanes
+    from subagent import health
+    from subagent.lanes import load_lanes
 
     monkeypatch.setenv("SAM_OMLX_API_KEY", "k")
     lane = load_lanes({"SAM_OMLX_BASE_URL": mock_endpoint.url("omlx")})["omlx"]
@@ -320,7 +321,7 @@ def test_l6_slow_drip_health_is_cut_at_the_probe_timeout():
     import threading
     import time
 
-    from subagent_mcp import health
+    from subagent import health
 
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
@@ -365,8 +366,8 @@ def test_m4_workspace_codex_dir_is_protected(ws):
 def test_m4_codex_run_with_steps_and_no_verdicts_is_hook_silent(tmp_path):
     import json
 
-    from subagent_mcp.runs import Run
-    from subagent_mcp.trace import Trace
+    from subagent.runs import Run
+    from subagent.telemetry.trace import Trace
 
     trace = Trace(tmp_path / "t.jsonl")
     run = Run(run_id="r1", agent_id="a1-x", prompt="p", lane="codex", driver="codex",

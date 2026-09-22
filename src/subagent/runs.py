@@ -27,11 +27,11 @@ from typing import Any
 
 from . import adapter, health, router
 from .config import Settings, log
-from .guard import protect
+from .guard.classify import protect
 from .lane_state import LaneState
 from .lanes import DRIVER_CLAUDE, DRIVER_CODEX, FALLBACK_MODES, Lane
-from .telemetry import Telemetry, open_metrics, summarize
-from .trace import Trace, open_trace
+from .telemetry.sampler import Telemetry, open_metrics, summarize
+from .telemetry.trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
 
 WORKING = "working"
@@ -838,9 +838,9 @@ CLAUDE_DRIVER = ClaudeDriver()
 
 
 def driver_for(lane: Lane) -> Any:
-    """The driver object for a lane (ClaudeDriver or codex_driver.CodexDriver)."""
+    """The driver object for a lane (ClaudeDriver or providers.codex.CodexDriver)."""
     if lane.driver == DRIVER_CODEX:
-        from .codex_driver import CODEX_DRIVER  # codex_driver imports this module
+        from .providers.codex import CODEX_DRIVER  # the codex driver imports this module
 
         return CODEX_DRIVER
     return CLAUDE_DRIVER

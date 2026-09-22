@@ -16,7 +16,7 @@ from .lanes import Lane, load_lanes
 
 log = logging.getLogger("sam")
 
-APPROVAL_HOOK = Path(__file__).parent / "runtime" / "approval_hook.py"
+APPROVAL_HOOK = Path(__file__).parent / "guard" / "approval_hook.py"
 DEFAULT_LANE = "glm"
 
 

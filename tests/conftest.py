@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from subagent_mcp.config import Settings
-from subagent_mcp.lanes import load_lanes
+from subagent.config import Settings
+from subagent.lanes import load_lanes
 
 # Every lane's key variable. Tests never see the machine's real keys.
 KEY_ENVS = ("GLM_API_KEY", "ZAI_API_KEY", "DEEPSEEK_API_KEY", "SAM_BPPC_API_KEY",
@@ -78,7 +78,7 @@ MOCK_PORTS: set[int] = set()
 def _no_network_health(monkeypatch):
     from urllib.parse import urlsplit
 
-    from subagent_mcp import health
+    from subagent import health
 
     real_get = health._http_get
 
@@ -236,7 +236,7 @@ def _no_telemetry_probes(monkeypatch):
 
     Tests that exercise the probe parsers patch these again with canned output.
     """
-    from subagent_mcp import telemetry
+    from subagent.telemetry import sampler as telemetry
 
     def no_http(url, headers=None, timeout=telemetry.PROBE_TIMEOUT):
         raise OSError("network probes are disabled in tests")
@@ -255,7 +255,7 @@ def trace_records(monkeypatch):
     Checked against tests/test_trace_schema.py when the test ends, so every fake
     run in the suite validates the schema of what it wrote.
     """
-    from subagent_mcp import trace as trace_module
+    from subagent.telemetry import trace as trace_module
 
     records: list[dict] = []
     real_write = trace_module.Trace.write

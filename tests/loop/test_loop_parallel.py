@@ -4,7 +4,7 @@ import json
 import subprocess
 import unittest
 
-from helpers import Sandbox, need
+from .helpers import Sandbox, need
 
 AB_TEST = """import { test } from 'node:test'; import assert from 'node:assert/strict';
 import { a } from '../src/a.js'; import { b } from '../src/b.js';

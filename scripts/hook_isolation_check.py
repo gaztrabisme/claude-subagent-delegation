@@ -41,8 +41,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from subagent_mcp.config import Settings  # noqa: E402
-from subagent_mcp.runs import Agent  # noqa: E402
+from subagent.config import Settings  # noqa: E402
+from subagent.runs import Agent  # noqa: E402
 
 COMMAND = "echo hi > x"
 PLANT = {

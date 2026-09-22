@@ -6,9 +6,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from subagent_mcp import runs
-from subagent_mcp.config import Settings
-from subagent_mcp.runs import (
+from subagent import runs
+from subagent.config import Settings
+from subagent.runs import (
     COMPLETED,
     COMPLETED_UNVERIFIED,
     FAILED,
@@ -33,7 +33,7 @@ def _registry(tmp_path: Path, monkeypatch, script: list[list[dict[str, Any]]], *
         spawned.append(FakeProcess(events, argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg

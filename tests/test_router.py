@@ -20,11 +20,11 @@ from typing import Any
 
 import pytest
 
-from subagent_mcp import router
-from subagent_mcp.lane_state import LaneState
-from subagent_mcp.lanes import load_lanes
-from subagent_mcp.runs import COMPLETED, FAILED, Registry, exit_event
-from subagent_mcp.trace import SCHEMA
+from subagent import router
+from subagent.lane_state import LaneState
+from subagent.lanes import load_lanes
+from subagent.runs import COMPLETED, FAILED, Registry, exit_event
+from subagent.telemetry.trace import SCHEMA
 
 from .conftest import make_settings
 from .test_runs import _result, _wait
@@ -221,7 +221,7 @@ def lanes_on_mock(tmp_path: Path, monkeypatch, mock_endpoint):
         spawned.append(FakeClaude(argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
     mock_endpoint.lanes = lanes  # type: ignore[attr-defined]
     mock_endpoint.spawned = spawned  # type: ignore[attr-defined]
     return mock_endpoint
@@ -540,7 +540,7 @@ CODEX_THREAD = "01a0a0de-91f8-7441-a178-a154caba9282"  # success.jsonl
 def frozen_now(monkeypatch):
     """Local time fixed before the fixture's 2026-09-20 13:29 reset, so the
     closure is live whatever day the suite runs."""
-    from subagent_mcp import lane_state
+    from subagent import lane_state
 
     now = datetime(2026, 9, 18, 12, 0).astimezone()
     monkeypatch.setattr(router, "_local_now", lambda: now)

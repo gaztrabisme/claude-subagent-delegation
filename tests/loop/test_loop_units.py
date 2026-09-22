@@ -1,20 +1,14 @@
 """Unit tests for pure functions: test-count parsing, the live log, config, result shaping."""
 
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import REPO
-
-sys.path.insert(0, str(REPO / "skills" / "delegate"))
-sys.argv = ["delegate.py"]  # delegate.py parses argv only in main()
-
-import delegate  # noqa: E402
-import detect  # noqa: E402
-from common import load_config  # noqa: E402
-from livelog import LiveLog, LogSink  # noqa: E402
+from subagent.loop import detect
+from subagent.loop import loop as delegate
+from subagent.loop.common import load_config
+from subagent.loop.events import LiveLog, LogSink
 
 
 class ParseTestCounts(unittest.TestCase):

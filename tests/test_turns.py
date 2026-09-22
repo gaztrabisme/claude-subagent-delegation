@@ -14,8 +14,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from subagent_mcp.runs import CANCELLED, COMPLETED, FAILED, Registry, _Meter, exit_event
-from subagent_mcp.trace import Trace
+from subagent.runs import CANCELLED, COMPLETED, FAILED, Registry, _Meter, exit_event
+from subagent.telemetry.trace import Trace
 
 from .conftest import make_settings
 from .test_runs import FakeProcess, _result, _wait
@@ -43,7 +43,7 @@ def _registry(tmp_path: Path, monkeypatch, script, **overrides) -> Registry:
         spawned.append(proc)
         return proc
 
-    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg

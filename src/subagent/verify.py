@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings, log
-from .guard import ALLOW, classify_verification
+from .guard.classify import ALLOW, classify_verification
 
 OUTPUT_TAIL_CHARS = 2000
 

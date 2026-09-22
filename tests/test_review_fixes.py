@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 
-from subagent_mcp import runs
-from subagent_mcp.config import APPROVAL_HOOK, Settings
-from subagent_mcp.guard import (
+from subagent import runs
+from subagent.config import APPROVAL_HOOK, Settings
+from subagent.guard.classify import (
     ALLOW,
     DENY,
     ESCALATE,
@@ -22,7 +22,7 @@ from subagent_mcp.guard import (
     classify_path_write,
     protect,
 )
-from subagent_mcp.runs import (
+from subagent.runs import (
     COMPLETED,
     FAILED,
     Registry,
@@ -403,7 +403,7 @@ def _registry(tmp_path, monkeypatch, script: list[list[dict[str, Any]]], **overr
         spawned.append(FakeProcess(events, argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("subagent_mcp.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg

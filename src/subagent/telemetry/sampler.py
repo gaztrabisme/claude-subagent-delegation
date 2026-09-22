@@ -52,8 +52,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from .config import log
-from .lanes import Lane
+from ..config import log
+from ..lanes import Lane
 from .trace import Trace
 
 PROBE_TIMEOUT = 3.0

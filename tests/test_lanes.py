@@ -9,9 +9,9 @@ from pathlib import Path
 import anyio
 import pytest
 
-from subagent_mcp import health, runs
-from subagent_mcp.lanes import load_lanes, omlx_settings_key
-from subagent_mcp.runs import COMPLETED, Registry
+from subagent import health, runs
+from subagent.lanes import load_lanes, omlx_settings_key
+from subagent.runs import COMPLETED, Registry
 
 from .conftest import make_settings
 from .test_runs import FakeProcess, _result
@@ -125,7 +125,7 @@ def test_lane_key_order_and_default(home):
 
 
 def test_default_lane_from_env(monkeypatch, home):
-    from subagent_mcp.config import Settings
+    from subagent.config import Settings
 
     monkeypatch.delenv("SAM_DEFAULT_LANE", raising=False)
     assert Settings.from_env().default_lane == "glm"
@@ -141,7 +141,7 @@ def server(tmp_path: Path, monkeypatch, home):
     """The server module, pointed at a registry whose spawns are recorded."""
     monkeypatch.setenv("SAM_SESSION_ROOT", str(tmp_path / "server-sessions"))
     monkeypatch.setenv("SAM_WORKSPACE", str(tmp_path))
-    module = importlib.import_module("subagent_mcp.server")
+    module = importlib.import_module("subagent.mcp_server")
     settings = make_settings(tmp_path)
     registry = Registry(settings, start_reaper=False)
     spawned: list[FakeProcess] = []

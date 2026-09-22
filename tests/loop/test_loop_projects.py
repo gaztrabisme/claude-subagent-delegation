@@ -2,7 +2,7 @@
 
 import unittest
 
-from helpers import Sandbox, need
+from .helpers import Sandbox, need
 
 CALC_TEST = """import unittest
 from calc import add

@@ -3,7 +3,7 @@
 import subprocess
 import unittest
 
-from helpers import DELEGATE, Sandbox, need
+from .helpers import RUNNER, Sandbox, need
 
 
 @need("git", "node", "npm")
@@ -59,7 +59,7 @@ class Autopilot(Sandbox):
         (root / ".delegate" / "config.json").write_text('{"review_tests": false}')
         code, started = self.delegate("run", "--plan", ".delegate/PLAN.md", "--auto", "--background", cwd=root,
                                       scenario="auto", env={"AUTO_SCENARIO": "fixloop"})
-        out = subprocess.run(["python3", str(DELEGATE), "watch", "--run", started["run_id"]], cwd=root,
+        out = subprocess.run([*RUNNER, "watch", "--run", started["run_id"]], cwd=root,
                              env=self.env, capture_output=True, text=True, timeout=60).stdout
         ends = [line.split(":", 1)[1].split("·")[0].strip() for line in out.splitlines() if line.startswith("=== end")]
         self.assertEqual(ends, ["tests_failed", "done", "review concerns", "done", "review ok"])

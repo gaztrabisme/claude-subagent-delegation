@@ -1,0 +1,32 @@
+# Oh My Pi (`omp`) running a local model behind a llama.cpp server on this
+# machine. The worker is `omp -p --mode json --no-session`: one-shot JSON per
+# turn, model picked from omp's own config (~/.omp/agent/models.yml) unless
+# `model` says otherwise.
+
+[core]
+default_provider = "local"
+
+[providers.local]
+driver = "omp"
+model = "local/qwen3.6-35b-a3b"
+local = true
+max_agents = 1
+
+[providers.local.health]
+# The llama.cpp server is not always up: its candidate base URLs are probed
+# before dispatch, and a cold load (model weights from disk) can take a while.
+kind = "llamacpp"
+candidates = ["http://127.0.0.1:8080"]
+warm = true
+cold_load_seconds = 600
+
+[providers.local.pricing]
+# Local compute: free per token, the wall clock is the cost.
+kind = "local"
+usd = 0
+
+[guard]
+# omp has no PreToolUse hook the guard can attach to, so a child on this
+# provider runs unguarded. The gate in boot() refuses it for a plain MCP
+# delegation unless this is set; the delegate loop lifts it itself.
+allow_unguarded = true

@@ -7,9 +7,11 @@ from typing import Any
 from .base import (
     DRIVER_CLAUDE,
     DRIVER_CODEX,
+    DRIVER_COPILOT,
+    DRIVER_GEMINI,
+    DRIVER_GROK,
     DRIVERS,
     HealthSpec,
-    NotPorted,
     PricingSpec,
     ProbeSpec,
     Process,
@@ -34,8 +36,12 @@ def for_driver(name: str) -> Any:
         from .claude import CLAUDE_PROVIDER as provider
     elif name == DRIVER_CODEX:
         from .codex import CODEX_PROVIDER as provider
-    elif name in DRIVERS:
-        provider = NotPorted(name)
+    elif name == DRIVER_COPILOT:
+        from .copilot import COPILOT_PROVIDER as provider
+    elif name == DRIVER_GEMINI:
+        from .gemini import GEMINI_PROVIDER as provider
+    elif name == DRIVER_GROK:
+        from .grok import GROK_PROVIDER as provider
     else:
         raise KeyError(f"unknown driver {name!r}; expected one of {', '.join(DRIVERS)}")
     _CACHE[name] = provider

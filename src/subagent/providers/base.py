@@ -137,6 +137,10 @@ class ProviderConfig:
     health: HealthSpec = field(default_factory=HealthSpec)
     probe: ProbeSpec = field(default_factory=ProbeSpec)
     pricing: PricingSpec = field(default_factory=PricingSpec)
+    # Every key in the provider's config table this module does not recognise.
+    # Drivers read their own extras from it: copilot's builtin_mcps, loop and
+    # extra_args, grok's hooks.
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         """The first set key in `api_key_envs`, else `api_key_default`."""
@@ -149,13 +153,10 @@ class ProviderConfig:
 
     def unavailable(self) -> str | None:
         """Why this build cannot run a child on this provider, or None."""
-        if self.driver == DRIVER_CODEX:
-            return None  # the Codex CLI owns its own connection
         if self.driver != DRIVER_CLAUDE:
-            return (
-                f"provider {self.name!r} ({self.driver} driver) is not "
-                f"available in this build: {NOT_PORTED}"
-            )
+            # codex, copilot, grok and gemini CLIs own their own connection;
+            # their drivers check the binary at boot.
+            return None
         if not self.base_url and not self.health.candidates and not self.health.resolve_cmd:
             return f"provider {self.name!r} has no base URL and is not available in this build"
         return None

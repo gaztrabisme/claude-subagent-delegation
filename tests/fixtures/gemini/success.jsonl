@@ -1,0 +1,6 @@
+{"type": "init", "session_id": "gemini-sess-1", "model": "gemini-2.5-flash"}
+{"type": "message", "role": "assistant", "content": "I'll run the tests."}
+{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "uv run pytest -q"}}
+{"type": "tool_result", "tool_use_id": "t1", "content": "2 passed"}
+{"type": "message", "role": "assistant", "content": "the tests pass"}
+{"type": "result", "response": "the tests pass", "stats": {"models": {"gemini-2.5-flash": {"tokens": {"prompt": 120, "candidates": 30, "total": 150, "cached": 20, "thoughts": 10, "tool": 5}}}}}

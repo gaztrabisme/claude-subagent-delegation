@@ -1,0 +1,2 @@
+Hand-written, NOT captured from a live `gemini` run: the Gemini CLI is not installed on this machine. The event names (`init`, `message`, `tool_use`, `tool_result`, `result`) and the `stats.models[*].tokens` shape are from the documented `--output-format stream-json` / headless JSON output.
+- success.jsonl: one turn, with per-model token counters so the translator's usage math (`prompt - cached` → input, `cached` → cache_read, `candidates + thoughts` → output) is exercised.

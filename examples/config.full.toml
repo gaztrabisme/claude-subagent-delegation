@@ -1,0 +1,173 @@
+# Every provider this project can run on, in one file: the two cloud plans
+# (glm, deepseek), the two CLIs that own their own connection (codex, copilot),
+# and three local servers (llama.cpp, oMLX, vLLM). Loadable as-is; the key
+# values themselves live in the environment, never here.
+
+[core]
+default_provider = "glm"
+session_root = "~/.subagent/sessions"
+max_agents = 4
+run_timeout = 1800
+max_steps = 40
+trace = "on"
+
+[guard]
+supervisor = "auto"
+# For supervisor = "agent", uncomment and point it at your reviewer model:
+# supervisor = "agent"
+# supervisor_cmd = "claude -p --model sonnet"
+allow_unguarded = false
+
+[fallback]
+# The order a delegation walks when one provider refuses before doing work.
+chain = ["codex", "deepseek", "glm"]
+
+[pricing]
+# The model a run's tokens are priced at to answer "what would this have cost
+# on Claude".
+counterfactual = "claude-opus-5"
+
+[pricing.cache_multipliers]
+# Relative to the model's input rate.
+cache_write_5m = 1.25
+cache_write_1h = 2.0
+cache_read = 0.1
+
+[pricing.models."claude-opus-5"]
+input = 5.00
+output = 25.00
+
+[pricing.models."claude-sonnet-5"]
+input = 2.00
+output = 10.00
+
+[pricing.models."claude-haiku-4-5"]
+input = 1.00
+output = 5.00
+
+[providers.glm]
+driver = "claude"
+base_url = "https://api.z.ai/api/anthropic"
+model = "glm-5.3-flash[1m]"
+api_key_env = ["GLM_API_KEY", "ZAI_API_KEY"]
+vendor = "zai"
+
+[providers.glm.pricing]
+kind = "flat_plan"
+monthly_usd = 80
+
+[providers.deepseek]
+driver = "claude"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+vendor = "deepseek"
+
+[providers.deepseek.pricing]
+# Peak rates, USD per 1M tokens; off-peak is half.
+kind = "per_token"
+input = 1.32
+output = 3.96
+cache_read = 0.044
+
+[providers.codex]
+driver = "codex"
+
+[providers.codex.pricing]
+kind = "flat_plan"
+# monthly_usd = 0   # the plan price is unknown, so it is left absent
+
+[providers.copilot]
+driver = "copilot"
+model = "claude-sonnet-5"
+
+[providers.copilot.pricing]
+kind = "credits"
+usd_per_credit = 0.01
+
+[providers.llamacpp]
+driver = "claude"
+model = "qwen3.8-27b"
+api_key_env = "LOCAL_API_KEY"
+api_key = "local"
+local = true
+max_agents = 1
+adapter = "fold_system"
+
+[providers.llamacpp.health]
+kind = "llamacpp"
+candidates = ["http://192.168.1.17:8080", "http://100.106.185.34:8080"]
+# resolve_cmd = ["sh", "-c", "tailscale ip -4 llama-box"]
+warm = true
+cold_load_seconds = 180
+
+[providers.llamacpp.probe]
+gpu_cmd = ["ssh", "user@{host}", "nvidia-smi",
+           "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu",
+           "--format=csv,noheader,nounits"]
+metrics_url = "http://{host}:8081/metrics"
+slots_url = "http://{host}:8081/slots"
+
+[providers.llamacpp.probe.admit]
+min_vram_free_mb = 2048
+
+[providers.llamacpp.pricing]
+kind = "local"
+usd = 0
+
+[providers.omlx]
+driver = "claude"
+base_url = "http://127.0.0.1:8000/v1"
+model = "Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B"
+api_key_env = "OMLX_API_KEY"
+vendor = "omlx"
+local = true
+send_sampling = false
+max_agents = 1
+
+[providers.omlx.health]
+kind = "omlx"
+url = "http://127.0.0.1:8000/api/status"
+cold_load_seconds = 120
+
+[providers.omlx.probe]
+host_cmd = "mac"
+
+[providers.omlx.pricing]
+kind = "local"
+usd = 0
+
+[providers.vllm]
+driver = "claude"
+base_url = "http://192.168.1.20:8000/v1"
+model = "Qwen3-32B"
+api_key_env = "LOCAL_API_KEY"
+api_key = "local"
+local = true
+max_agents = 1
+
+[providers.vllm.health]
+kind = "http"
+url = "http://192.168.1.20:8000/health"
+
+[providers.vllm.pricing]
+kind = "local"
+usd = 0
+
+[loop]
+fallback = "none"
+auto_max_rounds = 4
+auto_review = true
+
+[loop.tiers.normal]
+provider = "glm"
+
+[loop.tiers.hard]
+provider = "codex"
+model = "gpt-5.6-sol"
+
+[loop.review]
+provider = "codex"
+
+[loop.test_writer]
+provider = "glm"

@@ -1,0 +1,20 @@
+# DeepSeek, run through Claude Code against DeepSeek's Anthropic-compatible
+# endpoint. The key goes in the environment; this file names only the variable.
+
+[core]
+default_provider = "deepseek"
+
+[providers.deepseek]
+driver = "claude"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+vendor = "deepseek"
+
+[providers.deepseek.pricing]
+# Peak rates, USD per 1M tokens. Off-peak is half; peak is used here so the
+# saving is never overstated.
+kind = "per_token"
+input = 1.32
+output = 3.96
+cache_read = 0.044

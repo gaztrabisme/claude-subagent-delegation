@@ -1,0 +1,33 @@
+# oMLX on this Mac, run through Claude Code against oMLX's Anthropic-compatible
+# endpoint on localhost.
+
+[core]
+default_provider = "omlx"
+
+[providers.omlx]
+driver = "claude"
+base_url = "http://127.0.0.1:8000/v1"
+model = "Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B"
+api_key_env = "OMLX_API_KEY"
+# Stated, not derived: a localhost base_url would otherwise derive vendor
+# "none", and the guard's provider-home protection keys on this label.
+vendor = "omlx"
+local = true
+# oMLX already reports the sampling fields it can honour; sending them does
+# not change how it samples.
+send_sampling = false
+# Measured on this Mac: aggregate throughput is best at one child.
+max_agents = 1
+
+[providers.omlx.health]
+kind = "omlx"
+url = "http://127.0.0.1:8000/api/status"
+cold_load_seconds = 120
+
+[providers.omlx.probe]
+# Capacity is read from this Mac directly, not from a GPU host over ssh.
+host_cmd = "mac"
+
+[providers.omlx.pricing]
+kind = "local"
+usd = 0

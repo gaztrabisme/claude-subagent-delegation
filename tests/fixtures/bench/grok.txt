@@ -1,0 +1,1 @@
+{"sessionId":"grok-77c1","model":"grok-5","is_error":false,"usage":{"input_tokens":4000,"output_tokens":350,"cached_input_tokens":1500},"total_cost_usd":0.07}

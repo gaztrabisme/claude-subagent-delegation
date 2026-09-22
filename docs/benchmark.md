@@ -1,53 +1,79 @@
-# Benchmark: Claude alone vs Claude + delegate
+# Benchmark: orchestrator × config × task
 
-`bench/run.py` runs the same tasks in several modes and compares Claude's cost, tokens, time,
-Copilot credits and quality.
-
-| Mode | Prompt given to `claude -p` |
-|---|---|
-| `alone` | `Implement the task described in TASK.md in this repository. Verify your work before finishing.` |
-| `delegate` | `/delegate Implement the task described in TASK.md in this repository.` (the size check decides) |
-| `force` | `/delegate force Implement the task described in TASK.md in this repository.` (always delegates) |
-
-All modes use the same Claude model (your Claude Code default unless `--model` is given), the same
-tools (`Bash Read Edit Write Glob Grep Skill`) and `--permission-mode acceptEdits`. Live-view windows
-are turned off (`DELEGATE_LIVE_VIEW=off`).
-
-## How one run works
-
-```mermaid
-flowchart TD
-    A["Copy tasks/&lt;task&gt;/repo<br/>into results/&lt;ts&gt;/&lt;task&gt;-&lt;mode&gt;-&lt;n&gt;/"] --> B["git init + commit"]
-    B --> C["claude -p &lt;prompt&gt; --output-format json"]
-    C --> D["Save Claude's JSON:<br/>cost, tokens, turns"]
-    D --> E["Copy hidden/ tests in<br/>(only after Claude finished)"]
-    E --> F["node --test (JS) or<br/>python3 -m unittest (Python)"]
-    F --> G["Record pass/total, worker rounds,<br/>reviews and Copilot credits from .delegate/logs"]
-    G --> H["results.json + summary.md"]
-```
-
-The hidden tests are copied in only after the agent is done, so no mode can see them or tailor the
-code to them. They measure whether the result actually meets the spec in `TASK.md`.
-
-## Running it
+`bench/run.py` runs a matrix of benchmark cells: every combination of an
+orchestrator harness (the CLI you delegate from), a subagent config (the
+worker backend), a task, a mode and a run. For each cell it records the
+orchestrator's cost and tokens, the workers' tokens and credits, and whether
+the result passes hidden tests the agents never saw.
 
 ```sh
-python3 bench/run.py                                   # all tasks, alone + delegate, 1 run each
-python3 bench/run.py --runs 3 --jobs 4                 # what produced the results below
-python3 bench/run.py --tasks cron --modes force --runs 3
-python3 bench/run.py --model sonnet                    # a different Claude model for all modes
+python3 bench/run.py --harness claude --config examples/config.glm.toml \
+    --tasks cron --modes alone --runs 1 --dry-run     # print the cells, run nothing
+python3 bench/run.py --harness claude --tasks cron --modes alone --runs 1
+python3 bench/run.py --harness claude codex --tasks cron spreadsheet --runs 3 --jobs 2
+python3 bench/run.py --harness claude --config examples/config.glm.toml examples/config.ds.toml
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
+| `--harness` | `claude` | orchestrator CLIs, any of `claude codex gemini grok copilot` (only `claude`, `codex` and `grok` are installed here) |
+| `--config` | `examples/config.glm.toml` | subagent config TOMLs; the worker backend each cell delegates through |
 | `--tasks` | all | task names under `bench/tasks/` |
-| `--modes` | `alone delegate` | any of `alone`, `delegate`, `force` |
-| `--runs` | `1` | runs per task and mode |
-| `--jobs` | `1` | parallel runs (timing gets noisier with more) |
-| `--model` | Claude Code default | Claude model for all modes |
-| `--timeout` | `2400` | seconds per Claude run |
+| `--modes` | `alone delegate` | `alone`, `delegate` (the size check decides), `force` (always delegate) |
+| `--runs` | `1` | runs per harness × config × task × mode |
+| `--jobs` | `1` | parallel cells (timing gets noisier with more) |
+| `--model` | each CLI's own default | model for the orchestrator |
+| `--timeout` | `2400` | seconds per cell |
+| `--out` | `bench/results/<ts>` | output directory |
+| `--dry-run` | off | print the cells and their command lines, run nothing |
 
-Every run uses Claude usage, and every run that delegates also uses Copilot credits.
+## Modes and prompts
+
+Each mode is a prompt given to the orchestrator, per harness:
+
+| Mode | claude | codex, gemini, grok, copilot |
+|---|---|---|
+| `alone` | Implement the task described in TASK.md … Verify your work before finishing. | the same |
+| `delegate` | `/delegate Implement the task …` (the size check decides) | Implement the task … Delegate the implementation with the delegate skill: run `subagent run …` per skills/delegate/SKILL.md |
+| `force` | `/delegate force Implement the task …` (always delegates) | the same instruction, plus *you must delegate* |
+
+The prompts live in `bench/harness.py` (`DELEGATE_PROMPTS`), next to one
+`Orchestrator` per harness, which knows how to build each CLI's command line
+(`argv`) and how to read its output (`parse`): claude's
+`--output-format json` result (`total_cost_usd`, `usage`, `modelUsage`,
+`num_turns`, `session_id`), codex's `exec --json` JSONL (usage on the last
+`turn.completed`, `input_tokens` including the cached part; no USD), gemini's
+`stats.models.<m>.tokens`, grok's `sessionId` (usage and cost read
+defensively), copilot's JSONL with `session.usage_checkpoint.totalNanoAiu`.
+
+## How one cell works
+
+```mermaid
+flowchart TD
+    A["Copy tasks/&lt;task&gt;/repo<br/>into results/&lt;ts&gt;/&lt;cell&gt;/"] --> B["git init + commit"]
+    B --> C["Write the cell's config:<br/>[core].session_root = &lt;cell&gt;/sessions"]
+    C --> D["Run the orchestrator CLI with<br/>SUBAGENT_BENCH_RUN_ID, SUBAGENT_CONFIG,<br/>SUBAGENT_ORCHESTRATOR in the environment"]
+    D --> E["Read the CLI's output:<br/>cost, tokens, turns (bench/harness.py)"]
+    E --> F["Copy hidden/ tests in<br/>(only after the agent finished)"]
+    F --> G["node --test (JS) or<br/>python3 -m unittest (Python)"]
+    G --> H["Read the cell's delegation<br/>trace records: workers, credits"]
+    H --> I["results.csv (+ parquet),<br/>dashboard.html"]
+```
+
+Each cell is isolated:
+
+- its own working copy (fresh `git init`, so `git diff` shows what the agent
+  did), named `<harness>-<config>-<task>-<mode>-<run>`;
+- its own session root, written as a copy of the chosen config with
+  `[core].session_root` pointed inside the cell — delegation traces can never
+  interleave between cells;
+- `SUBAGENT_BENCH_RUN_ID=<cell id>` in the environment, so every trace record
+  the cell produces carries the cell's id, and `SUBAGENT_ORCHESTRATOR` names
+  the harness for the delegation records.
+
+The hidden tests are copied in only after the agent is done, so no mode can
+see them or tailor the code to them. They measure whether the result actually
+meets the spec in `TASK.md`.
 
 ## Output
 
@@ -55,25 +81,57 @@ Every run uses Claude usage, and every run that delegates also uses Copilot cred
 
 | File | Content |
 |---|---|
-| `summary.md` | per task and mode: means with (min–max), then a per-run table |
-| `results.json` | one record per run (fields below) |
-| `<task>-<mode>-<n>/` | the run's working copy: inspect with `git diff`, `.delegate/logs/` |
-| `<task>-<mode>-<n>.claude.json` | Claude's raw `--output-format json` result |
-| `<task>-<mode>-<n>.hidden.txt` | hidden test output |
+| `results.csv` | one row per cell, the columns below |
+| `results.parquet` | the same rows, when pandas is importable |
+| `results.json` | the same rows, as they finished |
+| `summary.md` | means with (min–max) per group, then a per-cell table |
+| `dashboard.html` | `subagent report` over the cells' traces (skipped, with a log line, if the report fails) |
+| `<cell>/` | the cell's working copy: inspect with `git diff`, `sessions/` for traces |
+| `<cell>.<harness>.out` | the orchestrator's raw output |
+| `<cell>.hidden.txt` | hidden test output |
 
-| Field | Source |
+`results.csv` columns:
+
+| Column | Source |
 |---|---|
-| `cost_usd` | `total_cost_usd` from Claude (API-equivalent cost) |
-| `input_tokens`, `cache_write_tokens`, `cache_read_tokens`, `output_tokens` | Claude's `usage` |
-| `turns` | `num_turns` |
-| `wall_seconds` | measured by the harness (includes waiting for Copilot) |
-| `worker_rounds`, `reviews` | `=== end` lines in `.delegate/logs/*.log` |
-| `worker_credits` | Copilot AI credits, summed from those `=== end` lines (rounds and reviews) |
+| `cell` | `<harness>-<config>-<task>-<mode>-<run>` |
+| `harness`, `config`, `task`, `mode`, `run` | the matrix factors |
 | `hidden_passed`, `hidden_total` | parsed from the hidden test output |
-| `permission_denials` | tool calls Claude was not allowed to make |
+| `orch_cost_usd` | the orchestrator's own cost figure (`total_cost_usd` for claude and grok; codex and copilot report none) |
+| `orch_tokens_in`, `orch_tokens_out`, `orch_tokens_cache` | the orchestrator's usage; cache is read + write. Claude's sums come from `modelUsage`, which includes subagent tokens; codex's input is reported uncached so cache reads are not counted twice |
+| `orch_turns` | the orchestrator's turn count (`num_turns` for claude) |
+| `worker_provider` | the provider of the worker round that ran last, from the cell's `delegation` trace records |
+| `worker_tokens_in/out/cache` | the delegation records' `usage_total`, summed |
+| `worker_credits` | the delegation records' `credits_total` (Copilot AI credits) |
+| `worker_usd` | the delegation records' `cost_total.provider_usd` |
+| `counterfactual_usd` | `cost_total.counterfactual_usd`: what the same worker tokens would have cost on the orchestrator's own provider |
+| `rounds`, `reviews` | worker rounds and reviews, from the delegation records |
+| `verified_pass` | the delegation record's verdict on the worker's own tests |
+| `wall_s` | wall seconds for the orchestrator run, measured by the bench |
 
-A solution that fails to import reports a single failing test, so the summary uses the task's full
-hidden test count as the denominator.
+A record missing a field (an older trace, a changed schema) becomes an empty
+column, never a failed run.
+
+**API-equivalent** means: a USD figure for tokens that were not billed as API
+calls. Claude's `total_cost_usd` is API-equivalent when Claude Code runs on a
+subscription, and the delegation records' `counterfactual_usd` is
+API-equivalent for the workers, whose real cost was credits or a local GPU.
+Comparing `orch_cost_usd + counterfactual_usd` against `orch_cost_usd` alone
+is the business case for delegating.
+
+## The concurrency bench
+
+`bench/concurrency.py` (moved from `scripts/bench_concurrency.py`) answers a
+different question: how many children one local provider can serve at once.
+It starts 1, 2, 4, 8 children (`--levels`) on one provider (`--provider`,
+default: the config's default provider) and writes `bench.csv` (one row per
+level: aggregate tok/s, TTFT median/p90, peak memory and swap, failures) and
+`bench_children.csv` (per child: TTFT, wall, decode tok/s, verified), plus
+the `max_agents` recommendation with the rule that decided it:
+
+```sh
+uv run python bench/concurrency.py --provider omlx --levels 1,2,4,8 --out /tmp/bench
+```
 
 ## Tasks
 
@@ -82,13 +140,39 @@ hidden test count as the denominator.
 | `cart-coupons` | JS | add a feature to an existing small codebase | ~60 lines | 9 |
 | `expr-eval` | JS | new module: arithmetic expression evaluator | ~200 lines | 13 |
 | `cron` | Python | new package: cron expression parser and scheduler | ~200 lines | 22 |
+| `meeting-scribe` | Python | new package: transcription post-processor from a ~250-line spec | ~400 lines | 41 |
 | `spreadsheet` | JS | new multi-module engine: parser, evaluator, dependency graph, cycles, row insertion, change events | ~1,000 lines | 42 |
 
 Every task's hidden tests were validated against a reference implementation kept out of the repo.
 The cron tests were also cross-checked against a second, minute-by-minute brute-force implementation
 on 400 random expressions.
 
-## Results (2026-09-19, Opus 5, 3 runs per task and mode)
+## Adding a task
+
+```text
+bench/tasks/<name>/
+├── repo/            # starting project; must contain TASK.md (and package.json for JS tasks)
+│   └── TASK.md      # the spec every mode receives
+└── hidden/          # acceptance tests: *.test.js (node --test) or test_*.py (unittest)
+```
+
+1. Write `repo/TASK.md` precisely enough that the hidden tests have exactly one correct answer.
+2. Write the hidden tests. JS tests run from the project root with `node --test`, so import from
+   `../src/...`. Python tests are copied into a `_hidden_tests/` package and run with
+   `python3 -m unittest discover -s _hidden_tests -t .`, so import the project's modules directly.
+3. Validate them against a reference solution in a temporary copy (not in `repo/`).
+4. Run `python3 bench/run.py --harness claude --tasks <name>`.
+
+---
+
+## Results before the fusion (2026-09-19)
+
+Everything below was measured with the pre-fusion tool: Claude Code as the
+only orchestrator, `/delegate` as the only way in, Copilot as the only worker
+pool. The matrix above replaced the runner, not the tasks; treat these as the
+baseline the first matrix runs are compared against.
+
+### Claude alone vs Claude + delegate (Opus 5, 3 runs per task and mode)
 
 ```mermaid
 ---
@@ -126,7 +210,7 @@ What happened in the delegate runs:
   Claude did not choose parallel workers: the modules depend closely on each other.
 - **cron force:** one `normal` worker (claude-sonnet-5), one round, plus a review, each run.
 
-### Takeaways
+#### Takeaways
 
 - **Large tasks: -69% Claude cost**, the same quality, about the same time. Claude's turns drop from
   ~32 to ~9, and cache-read tokens from 1.24M to 273k per run.
@@ -137,7 +221,7 @@ What happened in the delegate runs:
   version) to $0.73, mostly because the skill now asks for concise tests and the runner re-runs the
   tests itself (no separate verification turn).
 
-## Autopilot (3 runs each, 2026-09-19)
+### Autopilot (3 runs each, 2026-09-19)
 
 | Task | Mode | Claude cost | Claude turns | Copilot credits (worker rounds) | Hidden tests |
 |---|---|---|---|---|---|
@@ -161,7 +245,7 @@ What happened in the delegate runs:
 
 The runs are in `bench/results/20260919-160324` (spreadsheet) and `20260919-160329` (cron).
 
-## Test review (cron, forced delegation, 3 runs each)
+### Test review (cron, forced delegation, 3 runs each)
 
 | Version | Claude cost | Turns | Copilot credits | Rounds per run |
 |---|---|---|---|---|
@@ -178,7 +262,7 @@ The runs are in `bench/results/20260919-160324` (spreadsheet) and `20260919-1603
 
 Runs: `bench/results/20260919-211537` (v1), `20260919-213028` (v2).
 
-## Test outlines (3 runs each)
+### Test outlines (3 runs each)
 
 Claude writes a one-line-per-case outline; a Copilot test writer (`claude-sonnet-5`) writes the tests.
 
@@ -201,26 +285,10 @@ Claude writes a one-line-per-case outline; a Copilot test writer (`claude-sonnet
 
 Runs: `bench/results/20260919-235149` (spreadsheet), `20260919-235155` (cron).
 
-## Earlier single-run results (before size check and the later runner features)
+### Earlier single-run results (before size check and the later runner features)
 
 | Task | Claude alone | Claude + delegate (always delegated) |
 |---|---|---|
 | cart-coupons | $0.277 | $0.392 (+41%) |
 | expr-eval | $0.400 | $0.397 (-1%) |
 | spreadsheet | $2.670 | $0.895 (-66%) |
-
-## Adding a task
-
-```text
-bench/tasks/<name>/
-├── repo/            # starting project; must contain TASK.md (and package.json for JS tasks)
-│   └── TASK.md      # the spec every mode receives
-└── hidden/          # acceptance tests: *.test.js (node --test) or test_*.py (unittest)
-```
-
-1. Write `repo/TASK.md` precisely enough that the hidden tests have exactly one correct answer.
-2. Write the hidden tests. JS tests run from the project root with `node --test`, so import from
-   `../src/...`. Python tests are copied into a `_hidden_tests/` package and run with
-   `python3 -m unittest discover -s _hidden_tests -t .`, so import the project's modules directly.
-3. Validate them against a reference solution in a temporary copy (not in `repo/`).
-4. Run `python3 bench/run.py --tasks <name>`.

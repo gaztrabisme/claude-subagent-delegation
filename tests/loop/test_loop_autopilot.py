@@ -52,6 +52,13 @@ class Autopilot(Sandbox):
         self.assertEqual((code, r["status"]), (0, "done"))
         self.assertEqual(self.read(root, ".subagent/models_seen.txt").split()[-1], "gpt-5.6-sol")
 
+    def test_auto_wait_returns_done(self):
+        # The acceptance invocation: run --plan PLAN --auto --wait 60 -> status done.
+        root = self.node_project()
+        code, r = self.delegate("run", "--plan", ".subagent/PLAN.md", "--auto", "--wait", "60",
+                                cwd=root, scenario="auto", env={"AUTO_SCENARIO": "fixloop"})
+        self.assertEqual((code, r["status"]), (0, "done"))
+
     def test_watch_run_follows_every_round_and_review(self):
         root = self.node_project()
         self.write_config(review_tests=False)

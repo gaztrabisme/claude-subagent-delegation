@@ -32,8 +32,13 @@ class VerificationResult:
     passed: bool
     reason: str
     exit_code: int | None = None
-    output_tail: str = ""
+    output: str = ""
+    counts: dict[str, int] | None = None
     duration_seconds: float = 0.0
+
+    @property
+    def output_tail(self) -> str:
+        return self.output[-OUTPUT_TAIL_CHARS:] if len(self.output) > OUTPUT_TAIL_CHARS else self.output
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -44,6 +49,8 @@ class VerificationResult:
         }
         if self.exit_code is not None:
             out["exit_code"] = self.exit_code
+        if self.counts is not None:
+            out["counts"] = self.counts
         if self.output_tail:
             out["output_tail"] = self.output_tail
         return out
@@ -107,16 +114,19 @@ def run_verification(
 
     duration = time.time() - started
     output = ((completed.stdout or "") + (completed.stderr or "")).strip()
-    tail = output[-OUTPUT_TAIL_CHARS:] if len(output) > OUTPUT_TAIL_CHARS else output
+    from .loop.detect import parse_test_counts
+
+    counts = parse_test_counts(output)
     if completed.returncode == 0:
         return VerificationResult(
-            command, True, "exit 0", 0, tail, duration
+            command, True, "exit 0", 0, output, counts, duration
         )
     return VerificationResult(
         command,
         False,
         f"exited {completed.returncode}",
         completed.returncode,
-        tail,
+        output,
+        counts,
         duration,
     )

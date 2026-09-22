@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Delegate implementation work to a cheaper coding agent (Copilot CLI by default).
+"""The plan-build-test-review loop and its CLI commands.
 
 Claude writes the plan + tests; the worker implements; the worker may run tests but may NOT change
 them. Every round is checkpointed (undo-able), test files and test config are guarded, and the runner
-re-runs the test suite itself after the worker finishes.
+re-runs the test suite itself (server-side, through `verify.run_verification`) after the worker
+finishes. Workers run on whatever providers the config declares, through the provider `Registry`.
 
 Subcommands (all print one JSON object to stdout):
-  detect                           detected test command, protected files, models
+  detect                           detected test command, protected files
   run --plan FILE                  one worker round on a plan
       [--continue] [--feedback T]    reuse the worker session for a retry
-      [--tier normal|hard]           complexity tier -> model (config "models")
+      [--tier normal|hard]           complexity tier -> provider/model ([loop.tiers])
       [--background]                 return immediately; collect the result with `wait`
   run --parallel MANIFEST          several workers at once, each in its own git worktree
       [--auto]                       autopilot: retry failing tests and fix high-severity review
@@ -24,7 +25,6 @@ Subcommands (all print one JSON object to stdout):
   watch [--log FILE | --run ID]    follow the live log (run it in another terminal)
 """
 
-import argparse
 import difflib
 import hashlib
 import json
@@ -39,48 +39,40 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import checkpoint
-from .common import (DEPENDENCY_DIRS, STATE_DIR, changed_between, git_prefix, hash_tree, load_config,
+from ..verify import run_verification
+from . import checkpoint, session
+from .common import (DEPENDENCY_DIRS, STATE_DIR, changed_between, git_prefix, hash_tree,
                     matches, read_json, state_dir, tail, walk_files, write_json)
-from .detect import detect, run_tests
+from .detect import detect
+from .events import END_MARKER, LiveLog, LogSink, follow, open_live_view
 from .testguard import TestGuard, protected_hash
-from .events import END_MARKER, LiveLog, LogSink, follow, open_live_view, run_backend
 
 # How to re-run this runner: as a module, so its relative imports resolve.
 RUNNER = [sys.executable, "-m", "subagent.cli"]
 STATUS_EXIT = {"done": 0, "running": 3, "started": 0}
 
-
-# ---------------------------------------------------------------- backends and prompts
-
-def resolve_models(cfg, tier, explicit):
-    """Models to try in order: the chosen one, then the normal-tier model as fallback for "hard"."""
-    if explicit:
-        return [explicit]
-    if cfg.get("model"):
-        return [cfg["model"]]
-    models = cfg.get("models") or {}
-    chosen = models.get(tier)
-    fallback = models.get("normal")
-    candidates = [m for m in (chosen, fallback if tier == "hard" else None) if m]
-    return list(dict.fromkeys(candidates)) or [None]
+# A failed run with no work done walks to the next candidate on these endings.
+FALLBACK_REASONS = {"no_lane", "refused", "auth", "cli_error"}
 
 
-def backend_argv(cfg, prompt, cwd, session_id, model):
-    backend = cfg["backend"]
-    if backend == "copilot":
-        argv = ["copilot", "-p", prompt, "--allow-all-tools", "--output-format", "json", "-C", str(cwd),
-                "--session-id", session_id]
-        if not cfg.get("builtin_mcps"):
-            argv.append("--disable-builtin-mcps")
-        if model:
-            argv += ["--model", model]
-        return argv + list(cfg.get("extra_args") or [])
-    if backend == "command":
-        if not cfg.get("command"):
-            raise SystemExit('backend "command" needs "command": [argv...] in config')
-        return list(cfg["command"])
-    raise SystemExit(f"unknown backend: {backend}")
+# ---------------------------------------------------------------- tiers and prompts
+
+def resolve_tier(settings, tier, explicit_provider=None, explicit_model=None):
+    """(provider, model) candidates in order; the hard tier falls back to normal."""
+    if explicit_provider is not None or explicit_model is not None:
+        provider = explicit_provider
+        if provider is None:
+            target = settings.loop.tiers.get(tier)
+            provider = target.provider if target is not None else None
+        return [(provider, explicit_model)]
+    chosen = settings.loop.tiers.get(tier)
+    candidates = []
+    for target in ([chosen, settings.loop.tiers.get("normal")] if tier == "hard" else [chosen]):
+        if target is None or (target.provider is None and target.model is None):
+            continue
+        candidates.append((target.provider, target.model))
+    candidates = list(dict.fromkeys(candidates))
+    return candidates or [(None, None)]
 
 
 def build_prompt(plan, feedback, info, protected_files, parallel=None):
@@ -113,15 +105,101 @@ Their code is not in your copy. Code against the interfaces described in the pla
    or add test files or test configuration. Protected globs: {", ".join(info["test_globs"]) or "(none)"}
    Protected files:
   {chr(10).join("  " + f for f in shown) or "  (none yet)"}{more}
-   Any change to them is automatically reverted and your run is marked as a violation.
+   Any change to them is automatically reverted and your run is marked as a violation. Protected files
+   are also denied by the guard hook: writes to them fail before they run.
 3. If you believe a test is wrong (contradicts the plan, or has a bug), do NOT work around it.
-   Write `.delegate/test_change_request.md` with: the test file and test name, why it is wrong,
+   Write `.subagent/test_change_request.md` with: the test file and test name, why it is wrong,
    and the exact change you propose. Then finish with status "needs_test_change".
 4. Do not game the tests (no hardcoding expected outputs, no special-casing test inputs).
-5. When you finish, write `.delegate/result.json` containing exactly:
+5. When you finish, write `.subagent/result.json` containing exactly:
    {{"status": "done" | "failed" | "needs_test_change", "summary": "<one or two sentences>"}}
    Use "done" only if the tests for your work pass.
 """
+
+
+# ---------------------------------------------------------------- worker
+
+class Worker:
+    """One worker turn through the provider Registry: candidates, guard, verification."""
+
+    def __init__(self, server, root, test_cmd, guard=None, live=None):
+        self.server = server
+        self.registry = server.registry
+        self.settings = server.settings
+        self.root = root
+        self.test_cmd = test_cmd or ""
+        self.guard = guard
+        self.live = live
+        self.agent = None
+        self.run = None
+        self.model = None
+        self.fallback_note = None
+
+    def _release(self):
+        if self.guard is None:
+            return {"violations": [], "changed_files": []}
+        violations, changed = self.guard.release()
+        return {"violations": violations, "changed_files": changed}
+
+    def _on_event(self):
+        return self.live.feed if self.live is not None else None
+
+    def _wait(self, run):
+        timeout = self.agent.cfg.run_timeout
+        if not run.done.wait(timeout):
+            self.agent.close("run deadline exceeded", kind="timeout")
+        run.done.wait()
+
+    def _guard_denials(self):
+        if self.agent is None:
+            return []
+        return self.server.supervisor.pop_denials(self.agent.agent_id)
+
+    def _make_agent(self, provider, model, fallback):
+        return self.registry.create_agent(
+            None, self.root, provider=provider, model=model, fallback=fallback,
+            on_event=self._on_event(), agent_id=f"loop-{uuid.uuid4().hex[:12]}",
+        )
+
+    def run_round(self, candidates, fallback, prompt):
+        """A fresh worker round; a failed, no-work candidate walks to the next."""
+        for attempt, (provider, model) in enumerate(candidates):
+            if self.live is not None:
+                self.live.write(f"=== model: {model or 'default'}")
+            self.agent = self._make_agent(provider, model, fallback)
+            self.run = self.agent.delegate(
+                prompt, self.test_cmd, pre_verify=self._release, on_event=self._on_event()
+            )
+            self._wait(self.run)
+            self.model = model
+            if attempt < len(candidates) - 1 and self._fallback_ok(self.run):
+                nxt = candidates[attempt + 1][1]
+                self.fallback_note = (
+                    f"{model or 'default'} failed ({self.run.finish_reason}); "
+                    f"retried with {nxt or 'default'}"
+                )
+                if self.live is not None:
+                    self.live.write(f"=== {self.fallback_note}")
+                self.agent.close("candidate failed")
+                continue
+            break
+        return self
+
+    def follow_up(self, record, prompt):
+        """Continue the recorded agent session (--continue, autopilot rounds 2+)."""
+        self.model = record.get("model")
+        if self.live is not None:
+            self.live.write(f"=== model: {self.model or 'default'}")
+        self.agent = self.registry.adopt(record, workspace=self.root, on_event=self._on_event())
+        self.run = self.agent.follow_up(
+            prompt, verification=self.test_cmd, pre_verify=self._release, on_event=self._on_event()
+        )
+        self._wait(self.run)
+        return self
+
+    @staticmethod
+    def _fallback_ok(run):
+        return run.state == "failed" and run.finish_reason in FALLBACK_REASONS and not run.worked
 
 
 # ---------------------------------------------------------------- run bookkeeping
@@ -167,21 +245,21 @@ def _feedback(args):
 
 
 def _load_session(root):
-    return read_json(root / STATE_DIR / "session.json") or {}
+    return session.load(root)
 
 
-def _save_session(root, session):
-    write_json(root / STATE_DIR / "session.json", session)
+def _save_session(root, data):
+    session.save(root, data)
 
 
-def _check_test_counts(session, tests_hash, tests):
+def _check_test_counts(session_data, tests_hash, tests):
     """Flag a passing suite that runs fewer tests (or skips more) than seen before for the same tests."""
-    if session.get("tests_hash") != tests_hash:
-        session["tests_hash"], session["best_counts"] = tests_hash, None
+    if session_data.get("tests_hash") != tests_hash:
+        session_data["tests_hash"], session_data["best_counts"] = tests_hash, None
     counts = (tests or {}).get("counts")
     if not tests or not counts or counts.get("total") is None:
         return None
-    best = session.get("best_counts")
+    best = session_data.get("best_counts")
     problem = None
     if tests["passed"] and best:
         if counts["total"] < best["total"]:
@@ -190,7 +268,7 @@ def _check_test_counts(session, tests_hash, tests):
             problem = f"the suite passed but skipped {counts['skipped']} tests, more than the {best['skipped']} before"
     if not best or counts["total"] > best["total"] or (
             counts["total"] == best["total"] and counts["skipped"] < best["skipped"]):
-        session["best_counts"] = {"total": counts["total"], "skipped": counts["skipped"]}
+        session_data["best_counts"] = {"total": counts["total"], "skipped": counts["skipped"]}
     return problem
 
 
@@ -205,26 +283,26 @@ def _tests_summary(tests):
     return out
 
 
-def _run_worker(cfg, prompt, cwd, session_id, candidates, live, env):
-    """Run the worker with model fallback. Returns (exit_code, timed_out, model, fallback_note)."""
-    fallback_note, exit_code, timed_out, model = None, None, False, None
-    for attempt, model in enumerate(candidates):
-        live.write(f"=== model: {model or 'default'}")
-        exit_code, timed_out = run_backend(backend_argv(cfg, prompt, cwd, session_id, model), cwd, env,
-                                           cfg["timeout"], live)
-        if timed_out or exit_code == 0 or attempt == len(candidates) - 1:
-            break
-        fallback_note = f"{model} failed (exit {exit_code}); retried with {candidates[attempt + 1]}"
-        live.write(f"=== {fallback_note}")
-    return exit_code, timed_out, model, fallback_note
+def _tests_from_verification(verification, state):
+    """The {passed, cmd, counts, output_tail} dict for a run_verification result; writes its full log."""
+    if verification is None or verification.exit_code is None:
+        return None
+    tests = {"passed": verification.passed, "cmd": verification.command}
+    if verification.counts is not None:
+        tests["counts"] = verification.counts
+    if not verification.passed:
+        tests["output_tail"] = tail(verification.output)
+    log_path = state / "logs" / f"test-{_stamp()}.log"
+    log_path.write_text(verification.output)
+    return tests
 
 
-def _status(violations, timed_out, exit_code, report, tests):
+def _status(violations, timed_out, failed, report, tests):
     if violations:
         return "violated_tests"
     if timed_out:
         return "timeout"
-    if exit_code != 0:
+    if failed:
         return "backend_error"
     if report.get("status") == "needs_test_change":
         return "needs_test_change"
@@ -235,48 +313,60 @@ def _status(violations, timed_out, exit_code, report, tests):
 
 # ---------------------------------------------------------------- run: one round
 
-def run_round(root, cfg, args, live_view=True):
+def run_round(root, server, args, live_view=True):
+    settings = server.settings
     state = state_dir(root)
-    info = detect(root, cfg)
+    info = detect(root, settings.loop)
     plan = Path(args.plan).read_text()
     feedback = _feedback(args)
 
-    session = _load_session(root) if args.continue_session else {}
-    session.setdefault("session_id", str(uuid.uuid4()))
+    record = _load_session(root) if args.continue_session else {}
     cp = checkpoint.create(root, f"before round ({'retry' if args.continue_session else 'new task'})")
-    session.setdefault("base_checkpoint", cp["id"])
+    record.setdefault("base_checkpoint", cp["id"])
 
     for leftover in ("result.json", "test_change_request.md"):
         (state / leftover).unlink(missing_ok=True)
 
     log = _new_log(root, "run")
     sink = LogSink(log)
-    sink.write(f"=== delegate run {time.strftime('%Y-%m-%d %H:%M:%S')} · tier {args.tier} · "
+    sink.write(f"=== subagent run {time.strftime('%Y-%m-%d %H:%M:%S')} · tier {args.tier} · "
                f"{'continue' if args.continue_session else 'new'} session · checkpoint {cp['id']}")
-    live_view_error = open_live_view(cfg, root, RUNNER, ["--log", log]) if live_view else None
+    live_view_error = open_live_view(settings.loop, root, RUNNER, ["--log", log]) if live_view else None
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
 
     guard = TestGuard(root, info["test_globs"])
     guard.lock()
     prompt = build_prompt(plan, feedback, info, guard.protected)
-    env = {**os.environ, "DELEGATE_PROMPT": prompt, "DELEGATE_ROOT": str(root)}
     started = time.time()
+    worker = Worker(server, root, info["test_cmd"], guard, live)
     try:
-        exit_code, timed_out, model, fallback_note = _run_worker(
-            cfg, prompt, root, session["session_id"], resolve_models(cfg, args.tier, args.model), live, env)
-    finally:
+        if args.continue_session and record.get("agent_id"):
+            worker.follow_up(record, prompt)
+        else:
+            worker.run_round(resolve_tier(settings, args.tier, args.provider, args.model),
+                             settings.loop.fallback, prompt)
+    except Exception:
+        if not guard.released:
+            guard.release()
+        raise
+
+    run = worker.run
+    if run is not None and run.pre_verify_result is not None:
+        violations = run.pre_verify_result.get("violations", [])
+        changed = run.pre_verify_result.get("changed_files", [])
+    else:
         violations, changed = guard.release()
 
-    tests = None
-    if info["test_cmd"] and not timed_out and exit_code == 0:
-        sink.write("=== runner: running the test suite")
-        tests = run_tests(root, info["test_cmd"], state / "logs", "test")
-    count_problem = _check_test_counts(session, guard.protected_hash(), tests) if cfg.get("count_tests") else None
+    tests = _tests_from_verification(run.verification_result if run is not None else None, state)
+    count_problem = (_check_test_counts(record, guard.protected_hash(), tests)
+                     if settings.loop.count_tests else None)
     if count_problem:
         violations.append({"file": "(test run)", "change": count_problem})
 
     report = read_json(state / "result.json") or {}
-    status = _status(violations, timed_out, exit_code, report, tests)
+    timed_out = run is not None and run.state == "failed" and run.finish_reason == "timeout"
+    failed = run is not None and run.state == "failed" and not timed_out
+    status = _status(violations, timed_out, failed, report, tests)
     result = {
         "status": status,
         "summary": report.get("summary"),
@@ -284,19 +374,23 @@ def run_round(root, cfg, args, live_view=True):
         "changed_files": changed,
         "tests": _tests_summary(tests),
         "tier": args.tier,
-        "model": model,
+        "model": worker.model,
         "seconds": round(time.time() - started),
         "checkpoint": cp["id"],
         "log": str(log.relative_to(root)),
     }
-    if live.credits is not None:
-        result["worker_credits"] = round(live.credits, 2)
+    if run is not None and run.usage.credits is not None:
+        result["worker_credits"] = round(run.usage.credits, 2)
     if live_view_error:
         result["live_view_error"] = live_view_error
-    if fallback_note:
-        result["model_fallback"] = fallback_note
+    if worker.fallback_note:
+        result["model_fallback"] = worker.fallback_note
     if violations:
         result["violations"] = violations
+    if run is not None:
+        run.guard_verdicts = worker._guard_denials()
+        if run.guard_verdicts:
+            result["guard_denials"] = run.guard_verdicts
     request = state / "test_change_request.md"
     if request.exists():
         result["test_change_request"] = request.read_text()[:4000]
@@ -305,18 +399,21 @@ def run_round(root, cfg, args, live_view=True):
     if not changed and status == "done":
         result["warning"] = "tests pass but the worker changed no files"
 
-    credits = f" · AI credits {live.credits:.2f}" if live.credits is not None else ""
+    credits_val = run.usage.credits if run is not None else None
+    credits = f" · AI credits {credits_val:.2f}" if credits_val is not None else ""
     sink.write(f"{END_MARKER}: {status} · {result['seconds']}s · {len(changed)} files changed{credits}")
     live.close()
     sink.close()
-    _save_session(root, session)
-    checkpoint.prune(root, cfg.get("keep_checkpoints") or 0)
+    if worker.agent is not None:
+        record.update(session.record_for(worker.agent, record.get("base_checkpoint")))
+    _save_session(root, record)
+    checkpoint.prune(root, settings.loop.keep_checkpoints or 0)
     return {k: v for k, v in result.items() if v is not None}
 
 
 # ---------------------------------------------------------------- run: parallel round
 
-def run_parallel(root, cfg, args, live_view=True):
+def run_parallel(root, server, args, live_view=True):
     manifest = read_json(args.parallel)
     tasks = (manifest or {}).get("tasks") or []
     if len(tasks) < 2 or any(not t.get("name") or not t.get("plan") or not t.get("files") for t in tasks):
@@ -328,34 +425,31 @@ def run_parallel(root, cfg, args, live_view=True):
         return {"status": "unsupported", "error": "parallel rounds need a git repository; run the tasks one by one"}
 
     state_dir(root)
-    info = detect(root, cfg)
+    info = detect(root, server.settings.loop)
     feedback = _feedback(args)
-    session = _load_session(root) if args.continue_session else {}
-    session.setdefault("parallel", {})
+    record = _load_session(root) if args.continue_session else {}
+    record.setdefault("parallel", {})
     cp = checkpoint.create(root, f"before parallel round ({', '.join(t['name'] for t in tasks)})")
-    session.setdefault("base_checkpoint", cp["id"])
+    record.setdefault("base_checkpoint", cp["id"])
 
     log = _new_log(root, "parallel")
     sink = LogSink(log)
-    sink.write(f"=== delegate parallel run {time.strftime('%Y-%m-%d %H:%M:%S')} · "
+    sink.write(f"=== subagent parallel run {time.strftime('%Y-%m-%d %H:%M:%S')} · "
                f"{len(tasks)} workers · checkpoint {cp['id']}")
-    live_view_error = open_live_view(cfg, root, RUNNER, ["--log", log]) if live_view else None
+    live_view_error = open_live_view(server.settings.loop, root, RUNNER, ["--log", log]) if live_view else None
 
-    workers = []
     try:
-        return _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sink, live_view_error,
-                              workers)
+        return _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, sink,
+                              live_view_error)
     except BaseException:
-        for w in workers:
-            if not w.get("released"):
-                w["guard"].release()
-            checkpoint.worktree_remove(root, w["worktree"])
         sink.close()
         raise
 
 
-def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sink, live_view_error, workers):
+def _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, sink, live_view_error):
+    settings = server.settings
     state = root / STATE_DIR
+    workers = []
     for task in tasks:
         worktree, proj = checkpoint.worktree_add(root, cp)
         for dep in DEPENDENCY_DIRS:
@@ -363,21 +457,26 @@ def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sin
                 (proj / dep).symlink_to(root / dep)
         guard = TestGuard(proj, info["test_globs"])
         guard.lock()
-        session_id = session["parallel"].get(task["name"]) if args.continue_session else None
-        session["parallel"][task["name"]] = session_id or str(uuid.uuid4())
         others = [{"name": t["name"], "files": t["files"]} for t in tasks if t is not task]
         prompt = build_prompt(Path(task["plan"]).read_text(), task.get("feedback") or feedback, info,
                               guard.protected, {"name": task["name"], "files": task["files"],
                                                 "others": others, "test_cmd": task.get("test_cmd")})
-        workers.append({"task": task, "worktree": worktree, "proj": proj, "guard": guard, "prompt": prompt,
-                        "session_id": session["parallel"][task["name"]],
-                        "live": LiveLog(sink, log.with_name(f"{log.stem}-{task['name']}.jsonl"), proj, task["name"])})
+        live = LiveLog(sink, log.with_name(f"{log.stem}-{task['name']}.jsonl"), proj, task["name"])
+        worker = Worker(server, proj, "true", guard, live)
+        workers.append({"task": task, "worktree": worktree, "proj": proj, "guard": guard,
+                        "worker": worker, "live": live, "prompt": prompt,
+                        "tier": task.get("tier", args.tier)})
 
     def work(w):
-        env = {**os.environ, "DELEGATE_PROMPT": w["prompt"], "DELEGATE_ROOT": str(w["proj"])}
-        tier = w["task"].get("tier", args.tier)
-        w["outcome"] = _run_worker(cfg, w["prompt"], w["proj"], w["session_id"],
-                                   resolve_models(cfg, tier, args.model), w["live"], env)
+        wrec = record["parallel"].get(w["task"]["name"]) if args.continue_session else None
+        if isinstance(wrec, dict) and wrec.get("agent_id"):
+            w["worker"].follow_up(wrec, w["prompt"])
+        else:
+            candidates = resolve_tier(settings, w["tier"], args.provider, args.model)
+            w["worker"].run_round(candidates, settings.loop.fallback, w["prompt"])
+        w["run"] = w["worker"].run
+        w["model"] = w["worker"].model
+        w["fallback_note"] = w["worker"].fallback_note
 
     started = time.time()
     threads = [threading.Thread(target=work, args=(w,)) for w in workers]
@@ -389,9 +488,12 @@ def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sin
     applied, results, all_violations = {}, [], []
     for w in workers:
         task, proj = w["task"], w["proj"]
-        violations, changed = w["guard"].release()
-        w["released"] = True
-        exit_code, timed_out, model, fallback_note = w["outcome"]
+        run = w["run"]
+        if run is not None and run.pre_verify_result is not None:
+            violations = run.pre_verify_result.get("violations", [])
+            changed = run.pre_verify_result.get("changed_files", [])
+        else:
+            violations, changed = w["guard"].release()
         owned = [f for f in changed if matches(f, task["files"])]
         out_of_scope = [f for f in changed if f not in owned]
         conflicts = [f for f in owned if f in applied]
@@ -407,30 +509,34 @@ def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sin
             applied[rel] = task["name"]
         report = read_json(proj / STATE_DIR / "result.json") or {}
         request = proj / STATE_DIR / "test_change_request.md"
+        timed_out = run is not None and run.state == "failed" and run.finish_reason == "timeout"
+        failed = run is not None and run.state == "failed" and not timed_out
         entry = {
             "name": task["name"],
-            "status": _status(violations, timed_out, exit_code, report, None),
+            "status": _status(violations, timed_out, failed, report, None),
             "summary": report.get("summary"),
-            "model": model,
+            "model": w["model"],
             "applied_files": [f for f in owned if f not in conflicts],
             "out_of_scope_files": out_of_scope or None,
             "conflicts": [f"{f} (already changed by {applied[f]})" for f in conflicts] or None,
             "violations": violations or None,
-            "model_fallback": fallback_note,
-            "worker_credits": round(w["live"].credits, 2) if w["live"].credits is not None else None,
+            "model_fallback": w["fallback_note"],
+            "worker_credits": round(run.usage.credits, 2) if run is not None and run.usage.credits is not None else None,
             "test_change_request": request.read_text()[:4000] if request.exists() else None,
         }
         results.append({k: v for k, v in entry.items() if v is not None})
         all_violations += violations
+        if w["worker"].agent is not None:
+            record["parallel"][task["name"]] = session.record_for(w["worker"].agent)
         w["live"].close()
         checkpoint.worktree_remove(root, w["worktree"])
 
     tests = None
     if info["test_cmd"]:
         sink.write("=== runner: running the full test suite on the merged result")
-        tests = run_tests(root, info["test_cmd"], state / "logs", "test")
-    count_problem = (_check_test_counts(session, protected_hash(root, info["test_globs"]), tests)
-                     if cfg.get("count_tests") else None)
+        tests = _tests_from_verification(run_verification(info["test_cmd"], root, settings), state)
+    count_problem = (_check_test_counts(record, protected_hash(root, info["test_globs"]), tests)
+                     if settings.loop.count_tests else None)
 
     statuses = {r["status"] for r in results}
     if all_violations or count_problem:
@@ -456,8 +562,8 @@ def _parallel_work(root, cfg, args, tasks, info, feedback, session, cp, log, sin
     total = f" · AI credits {sum(credits):.2f}" if credits else ""
     sink.write(f"{END_MARKER}: {status} · {result['seconds']}s · {len(applied)} files applied{total}")
     sink.close()
-    _save_session(root, session)
-    checkpoint.prune(root, cfg.get("keep_checkpoints") or 0)
+    _save_session(root, record)
+    checkpoint.prune(root, settings.loop.keep_checkpoints or 0)
     return {k: v for k, v in result.items() if v is not None}
 
 
@@ -467,7 +573,7 @@ TEST_WRITER_PROMPT = """You are writing a TEST SUITE from an outline. The code u
 agent will implement it later against your tests. Do NOT write or change implementation code: only the
 test files named in the outline.
 
-Read the outline in `{outline}` and the plan in `.delegate/review/plan.md` (and any spec it references).
+Read the outline in `{outline}` and the plan in `.subagent/review/plan.md` (and any spec it references).
 For every case in the outline, write one test that checks exactly the stated input and expected result.
 Use the project's test framework and conventions (test command: `{test_cmd}`). Put each test in the file
 named by the outline heading it is listed under. Keep tests plain and direct: no helpers that compute
@@ -476,7 +582,7 @@ expected values, no skipped tests.
 The tests will fail until the code exists; that is expected. Only check that each test file is
 syntactically valid (for example `node --check file.js` or `python3 -m py_compile file.py`).
 {feedback}
-When you finish, write `.delegate/test_writer_result.json`:
+When you finish, write `.subagent/test_writer_result.json`:
 {{"status": "done" | "failed", "files": ["path", ...], "cases": <number of tests written>,
   "notes": "anything the planner should know, e.g. where you deviated from the outline and why"}}
 """
@@ -505,8 +611,8 @@ def _write_review_plan(root, plan_paths):
     (review_dir / "plan.md").write_text("\n\n".join(parts) or "(no plan file; use the spec files in the repository)")
 
 
-def write_tests_from_outline(root, cfg, outline_path, plan_paths, issues=None):
-    """Turn Claude's test outline into test files with a separate Copilot session (test files only).
+def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None):
+    """Turn Claude's test outline into test files with a separate worker session (test files only).
 
     Skipped when the outline is unchanged and its files exist, unless `issues` (wrong tests found by the
     test review) ask for a fix pass.
@@ -525,7 +631,7 @@ def write_tests_from_outline(root, cfg, outline_path, plan_paths, issues=None):
     if not issues and record.get("outline_hash") == outline_hash and all((root / f).exists() for f in declared):
         return {"status": "skipped", "note": "outline unchanged; tests already written"}
 
-    info = detect(root, cfg)
+    info = detect(root, server.settings.loop)
     _write_review_plan(root, plan_paths)
     feedback = ""
     if issues:
@@ -536,18 +642,31 @@ def write_tests_from_outline(root, cfg, outline_path, plan_paths, issues=None):
     prompt = TEST_WRITER_PROMPT.format(outline=Path(outline_path).as_posix(),
                                        test_cmd=info["test_cmd"] or "(use the project's test setup)",
                                        feedback=feedback)
-    session_id = record.get("session_id") or str(uuid.uuid4())
-    model = cfg.get("test_writer_model") or "claude-sonnet-5"
+    target = server.settings.loop.test_writer
     cp = checkpoint.create(root, "before test writing")
     before = hash_tree(root)
     (state / "test_writer_result.json").unlink(missing_ok=True)
     log = _new_log(root, "tests")
     sink = LogSink(log)
-    sink.write(f"=== delegate test writer {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(declared)} files · model {model}"
-               + (" · fix pass" if issues else ""))
+    sink.write(f"=== subagent test writer {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(declared)} files"
+               f" · model {target.model or 'default'}" + (" · fix pass" if issues else ""))
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
-    env = {**os.environ, "DELEGATE_PROMPT": prompt, "DELEGATE_ROOT": str(root)}
-    exit_code, timed_out, used, _ = _run_worker(cfg, prompt, root, session_id, [model], live, env)
+    previous_record = record.get("session") if issues and isinstance(record.get("session"), dict) else None
+    agent = None
+    if previous_record and previous_record.get("agent_id"):
+        agent = server.registry.adopt(previous_record, workspace=root, on_event=live.feed)
+        run = agent.follow_up(prompt, verification="true", on_event=live.feed)
+    else:
+        agent = server.registry.create_agent(
+            None, root, provider=target.provider, model=target.model, fallback="none",
+            on_event=live.feed, agent_id=f"loop-{uuid.uuid4().hex[:12]}",
+        )
+        run = agent.delegate(prompt, "true", on_event=live.feed)
+    if not run.done.wait(agent.cfg.run_timeout):
+        agent.close("run deadline exceeded", kind="timeout")
+    run.done.wait()
+    used = target.model
+    agent.close("test writer done")
 
     # Only test files may change: revert anything else the writer touched.
     changed = changed_between(before, hash_tree(root))
@@ -561,7 +680,7 @@ def write_tests_from_outline(root, cfg, outline_path, plan_paths, issues=None):
             (root / rel).write_bytes(data)
     written = sorted(f for f in changed if f not in reverted and (root / f).exists())
     report = read_json(state / "test_writer_result.json") or {}
-    if exit_code != 0 or timed_out:
+    if run.state == "failed" or run.finish_reason == "timeout":
         status = "test_writer_error"
     elif not written and not issues and not all((root / f).exists() for f in declared):
         status = "no_tests_written"
@@ -569,7 +688,8 @@ def write_tests_from_outline(root, cfg, outline_path, plan_paths, issues=None):
         status = "done"
     if status == "done":
         files = sorted(set(record.get("files", [])) | set(written) | {f for f in declared if (root / f).exists()})
-        write_json(state / "test_writer.json", {"outline_hash": outline_hash, "session_id": session_id, "files": files})
+        write_json(state / "test_writer.json",
+                   {"outline_hash": outline_hash, "session": session.record_for(agent), "files": files})
     result = {
         "status": status,
         "model": used,
@@ -578,10 +698,10 @@ def write_tests_from_outline(root, cfg, outline_path, plan_paths, issues=None):
         "outline_cases": sum(1 for line in outline.splitlines() if line.lstrip().startswith(("- ", "* "))),
         "notes": report.get("notes") or None,
         "reverted_files": reverted or None,
-        "worker_credits": round(live.credits, 2) if live.credits is not None else None,
+        "worker_credits": round(run.usage.credits, 2) if run.usage.credits is not None else None,
         "log_tail": tail(log.read_text(errors="ignore"), 30) if status == "test_writer_error" else None,
     }
-    credits = f" · AI credits {live.credits:.2f}" if live.credits is not None else ""
+    credits = f" · AI credits {run.usage.credits:.2f}" if run.usage.credits is not None else ""
     sink.write(f"{END_MARKER}: test writer {status} · {len(written)} files{credits}")
     live.close()
     sink.close()
@@ -593,35 +713,35 @@ def _wrong_tests(review):
             if i.get("severity") == "high" and i.get("kind", "wrong_test") == "wrong_test"]
 
 
-def _prepare_tests(root, cfg, args):
+def _prepare_tests(root, server, args):
     """Outline mode: write the tests; then review them. Returns (hand_back_result | None, extras)."""
     plans = [args.plan] if args.plan else [t.get("plan") for t in (read_json(args.parallel) or {}).get("tasks", [])
                                            if t.get("plan")]
     extras = {"test_writer": None, "test_review": None, "credits": []}
     writer = None
     if args.test_outline:
-        writer = write_tests_from_outline(root, cfg, args.test_outline, plans)
+        writer = write_tests_from_outline(root, server, args.test_outline, plans)
         extras["test_writer"] = writer
         extras["credits"].append(writer.get("worker_credits"))
         if writer["status"] not in ("done", "skipped"):
             return {"status": writer["status"], "summary": writer.get("error") or "the test writer failed",
                     "test_writer": writer}, extras
-    if not (cfg.get("review_tests") or args.test_outline):
+    if not (server.settings.loop.review_tests or args.test_outline):
         return None, extras
     review_plans = plans + ([args.test_outline] if args.test_outline else [])
-    review = do_test_review(root, cfg, args.tier, review_plans)
+    review = do_test_review(root, server, args.tier, review_plans)
     extras["credits"].append(review.get("worker_credits"))
     wrong = _wrong_tests(review)
     if wrong and writer and writer["status"] == "done":
         # The generated tests may have transcription errors: one fix pass by the test writer.
-        fix = write_tests_from_outline(root, cfg, args.test_outline, plans, issues=wrong)
+        fix = write_tests_from_outline(root, server, args.test_outline, plans, issues=wrong)
         extras["credits"].append(fix.get("worker_credits"))
         writer["fix_pass"] = fix["status"]
         if fix.get("notes"):
             writer["notes"] = fix["notes"]
         if fix["status"] == "done":
             # force: even if the fix pass changed nothing, the wrong tests must be checked again.
-            review = do_test_review(root, cfg, args.tier, review_plans, force=True)
+            review = do_test_review(root, server, args.tier, review_plans, force=True)
             extras["credits"].append(review.get("worker_credits"))
             wrong = _wrong_tests(review)
     extras["test_review"] = review
@@ -691,16 +811,17 @@ def _review_feedback(issues):
             "test suite passing:\n" + "\n".join(lines))
 
 
-def autopilot(root, cfg, args, run_id):
+def autopilot(root, server, args, run_id):
     """Run rounds until the tests pass and the review has no high-severity issues, or until stuck.
 
     Failing tests and high-severity review issues go back to the worker automatically, so Claude only
     sees the final result (or a problem only Claude can solve, like a disputed test).
     """
-    live_view_error = open_live_view(cfg, root, RUNNER, ["--run", run_id, "--since", time.time()])
+    settings = server.settings
+    live_view_error = open_live_view(settings.loop, root, RUNNER, ["--run", run_id, "--since", time.time()])
 
     # Tests first: write them from the outline (outline mode), then check them against the plan/spec.
-    hand_back, extras = _prepare_tests(root, cfg, args)
+    hand_back, extras = _prepare_tests(root, server, args)
     test_review = extras["test_review"]
     if hand_back:
         credits = [c for c in extras["credits"] if c is not None]
@@ -708,7 +829,7 @@ def autopilot(root, cfg, args, run_id):
                           "live_view_error": live_view_error})
         return {k: v for k, v in hand_back.items() if v is not None}
 
-    first = run_parallel(root, cfg, args, live_view=False) if args.parallel else run_round(root, cfg, args, False)
+    first = run_parallel(root, server, args, live_view=False) if args.parallel else run_round(root, server, args, False)
     rounds, reviews = [first], []
     fix_plan = args.plan or (_combined_plan(root, args.parallel) if first["status"] not in AUTO_HAND_BACK else None)
     tier, failed_in_row, escalated, stop, reviewed_round = args.tier, 0, False, None, 0
@@ -720,10 +841,10 @@ def autopilot(root, cfg, args, run_id):
             break
         if status == "done":
             failed_in_row = 0
-            if not cfg.get("auto_review") or len(reviews) >= cfg["auto_review_cycles"]:
+            if not settings.loop.auto_review or len(reviews) >= settings.loop.auto_review_cycles:
                 stop = "done"
                 break
-            review = do_review(root, cfg, tier, model=None)
+            review = do_review(root, server, tier, model=None)
             reviews.append(review)
             reviewed_round = len(rounds)
             if review.get("verdict") not in ("ok", "concerns"):
@@ -741,21 +862,21 @@ def autopilot(root, cfg, args, run_id):
                 break
             feedback = ("Your changes to tests or test configuration were reverted: "
                         + json.dumps(last.get("violations")) + "\nDo not modify tests or test settings. "
-                        "If a test is wrong, use .delegate/test_change_request.md.")
+                        "If a test is wrong, use .subagent/test_change_request.md.")
         else:  # tests_failed, failed, no_report, timeout, partial
             failed_in_row += 1
             output = (last.get("tests") or {}).get("output_tail")
             feedback = (f"The test suite fails:\n{output}" if output else
                         f"The previous round ended with status {status}: {last.get('summary') or 'no summary'}. "
                         "Finish the task and make the tests pass.")
-        if len(rounds) >= cfg["auto_max_rounds"]:
+        if len(rounds) >= settings.loop.auto_max_rounds:
             stop = "max_rounds"
             break
         if tier == "normal" and failed_in_row >= 2 and not args.model:
             tier, escalated = "hard", True
         next_args = SimpleNamespace(plan=fix_plan, feedback=feedback, feedback_file=None, continue_session=True,
-                                    tier=tier, model=args.model)
-        rounds.append(run_round(root, cfg, next_args, live_view=False))
+                                    tier=tier, model=args.model, provider=args.provider)
+        rounds.append(run_round(root, server, next_args, live_view=False))
 
     last = rounds[-1]
     final = last["status"]
@@ -821,7 +942,7 @@ def _child_argv(argv):
     return out
 
 
-def cmd_run(root, cfg, args):
+def cmd_run(root, server, args, raw):
     active = _active_run(root)
     if active and active["run_id"] != args.run_id:
         return {"status": "busy", "error": f"run {active['run_id']} is still in progress; use `wait`"}, 2
@@ -833,22 +954,22 @@ def cmd_run(root, cfg, args):
     if args.background or args.wait is not None:
         out = state / "logs" / f"runner-{run_id}.out"
         with open(out, "w") as fh:
-            proc = subprocess.Popen([*RUNNER, *_child_argv(sys.argv[1:]), "--run-id", run_id],
+            proc = subprocess.Popen([*RUNNER, *_child_argv(raw), "--run-id", run_id],
                                     cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                                     start_new_session=True)
         write_json(state / "current.json", {"run_id": run_id, "pid": proc.pid, "started": time.time(),
                                              "runner_output": str(out.relative_to(root))})
         if args.wait is not None:
-            return cmd_wait(root, cfg, SimpleNamespace(timeout=args.wait))
+            return cmd_wait(root, server, SimpleNamespace(timeout=args.wait))
         return {"status": "started", "run_id": run_id, "next": "wait --timeout 540"}, 0
 
     if not args.run_id:  # a background child's record was written by its parent
         write_json(state / "current.json", {"run_id": run_id, "pid": os.getpid(), "started": time.time()})
     try:
         if args.auto:
-            result = autopilot(root, cfg, args, run_id)
+            result = autopilot(root, server, args, run_id)
         else:
-            result = run_parallel(root, cfg, args) if args.parallel else run_round(root, cfg, args)
+            result = run_parallel(root, server, args) if args.parallel else run_round(root, server, args)
     except Exception as exc:  # the result file must always be written, or `wait` reports a crash
         result = {"status": "runner_error", "error": f"{type(exc).__name__}: {exc}"}
     result["run_id"] = run_id
@@ -856,7 +977,7 @@ def cmd_run(root, cfg, args):
     return result, STATUS_EXIT.get(result["status"], 2)
 
 
-def cmd_wait(root, cfg, args):
+def cmd_wait(root, server, args):
     current = read_json(root / STATE_DIR / "current.json")
     if not current:
         return {"status": "no_run", "error": "no run has been started in this project"}, 2
@@ -881,24 +1002,29 @@ def cmd_wait(root, cfg, args):
         time.sleep(2)
 
 
-def cmd_detect(root, cfg, _args):
-    info = detect(root, cfg)
+def cmd_detect(root, server, args):
+    info = detect(root, server.settings.loop)
     info["protected_files"] = sorted(f for f in walk_files(root) if matches(f, info["test_globs"]))
-    info["backend"] = cfg["backend"]
-    info["models"] = {"pinned": cfg["model"]} if cfg.get("model") else cfg.get("models")
     info["git"] = git_prefix(root) is not None
     return info, 0
 
 
-def cmd_test(root, cfg, _args):
-    info = detect(root, cfg)
+def cmd_test(root, server, args):
+    info = detect(root, server.settings.loop)
     if not info["test_cmd"]:
-        return {"passed": False, "error": "no test command detected; set test_cmd in .delegate/config.json"}, 2
-    result = run_tests(root, info["test_cmd"], state_dir(root) / "logs", "test")
+        return {"passed": False, "error": "no test command detected; set test_cmd in [loop]"}, 2
+    verification = run_verification(info["test_cmd"], root, server.settings)
+    result = {"passed": verification.passed, "exit_code": verification.exit_code,
+              "cmd": verification.command, "counts": verification.counts}
+    log_path = state_dir(root) / "logs" / f"test-{_stamp()}.log"
+    log_path.write_text(verification.output)
+    result["log"] = str(log_path.relative_to(root))
+    if not verification.passed:
+        result["output_tail"] = tail(verification.output)
     return result, 0 if result["passed"] else 1
 
 
-def cmd_undo(root, cfg, args):
+def cmd_undo(root, server, args):
     if _active_run(root):
         return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
     if args.to:
@@ -914,13 +1040,13 @@ def cmd_undo(root, cfg, args):
             "redo_checkpoint": safety["id"]}, 0
 
 
-def cmd_checkpoints(root, cfg, _args):
+def cmd_checkpoints(root, server, args):
     return {"checkpoints": checkpoint.list_all(root)}, 0
 
 
-REVIEW_PROMPT = """You are a code reviewer. Do NOT modify any file except `.delegate/review/result.json`.
+REVIEW_PROMPT = """You are a code reviewer. Do NOT modify any file except `.subagent/review/result.json`.
 
-The patch in `.delegate/review/diff.patch` contains all implementation changes made by another agent for
+The patch in `.subagent/review/diff.patch` contains all implementation changes made by another agent for
 this task (tests excluded; the tests pass). You may read other files in the repository for context.
 
 Report only issues that matter:
@@ -929,17 +1055,17 @@ Report only issues that matter:
 - code that games tests (hardcoded expected values, special-casing test inputs)
 Do not report style, naming, or minor improvements.
 
-Write `.delegate/review/result.json` exactly as:
+Write `.subagent/review/result.json` exactly as:
 {"verdict": "ok" | "concerns",
  "issues": [{"severity": "high" | "medium", "file": "path", "line": 123, "issue": "one sentence"}]}
 Use "ok" with an empty list when there is nothing that matters.
 """
 
 TEST_REVIEW_PROMPT = """You are checking a TEST SUITE before the code under test is written. Do NOT modify any
-file except `.delegate/review/tests_result.json`.
+file except `.subagent/review/tests_result.json`.
 
-The tests were written from the plan in `.delegate/review/plan.md`. Read it, and any spec file it
-references (for example TASK.md). The test files are listed in `.delegate/review/test_files.txt`. The
+The tests were written from the plan in `.subagent/review/plan.md`. Read it, and any spec file it
+references (for example TASK.md). The test files are listed in `.subagent/review/test_files.txt`. The
 code under test may not exist yet: do not run the tests.
 
 Your main job is to find WRONG tests: assertions whose expected value, error type or input contradicts
@@ -953,7 +1079,7 @@ Secondary: requirements of the plan or spec with no test at all ("missing_test")
 "medium", and only for behavior users would rely on. Do not report style or test organization.
 Check each claim before reporting it: a false alarm costs a round.
 
-Write `.delegate/review/tests_result.json` exactly as:
+Write `.subagent/review/tests_result.json` exactly as:
 {"verdict": "ok" | "concerns",
  "issues": [{"severity": "high" | "medium", "kind": "wrong_test" | "missing_test", "file": "path",
              "line": 12, "issue": "one sentence, including the correct expectation"}]}
@@ -978,11 +1104,12 @@ def _verdict_from_text(text):
     return None
 
 
-def _review_model(cfg, tier, explicit=None):
-    return explicit or cfg.get("review_model") or (cfg.get("review_models") or {}).get(tier) or "gpt-5.6-sol"
+def _review_target(settings, tier, explicit=None):
+    target = settings.loop.review_hard if tier == "hard" else settings.loop.review
+    return target.provider, explicit or target.model
 
 
-def _run_reviewer(root, cfg, reviewer, prompt, result_name, kind, detail):
+def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
     """Run a read-only reviewer; retry once without a verdict; undo any edits. Returns a result dict."""
     result_path = root / STATE_DIR / "review" / result_name
     result_path.unlink(missing_ok=True)
@@ -990,18 +1117,29 @@ def _run_reviewer(root, cfg, reviewer, prompt, result_name, kind, detail):
     before = hash_tree(root)
     log = _new_log(root, "review")
     sink = LogSink(log)
-    sink.write(f"=== delegate {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} · {detail} · model {reviewer}")
+    provider, model = target
+    sink.write(f"=== subagent {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} · {detail} · model {model or 'default'}")
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
-    review, credits, attempts, exit_code, timed_out, used = {}, 0.0, 0, None, False, reviewer
+    review, credits, attempts, used, errored, timed_out = {}, 0.0, 0, model, False, False
     for attempt in range(2):  # retry once if the reviewer produced no verdict
         attempts += 1
-        text = prompt if attempt == 0 else prompt + _retry_prompt(f".delegate/review/{result_name}")
-        env = {**os.environ, "DELEGATE_PROMPT": text, "DELEGATE_ROOT": str(root)}
+        text = prompt if attempt == 0 else prompt + _retry_prompt(f".subagent/review/{result_name}")
         live.credits, live.last_message = None, ""
-        exit_code, timed_out, used, _ = _run_worker(cfg, text, root, str(uuid.uuid4()), [reviewer], live, env)
-        credits += live.credits or 0.0
+        agent = server.registry.create_agent(
+            None, root, provider=provider, model=model, fallback="none",
+            on_event=live.feed, agent_id=f"loop-{uuid.uuid4().hex[:12]}",
+        )
+        run = agent.delegate(text, "true", on_event=live.feed)
+        if not run.done.wait(agent.cfg.run_timeout):
+            agent.close("run deadline exceeded", kind="timeout")
+        run.done.wait()
+        credits += run.usage.credits or 0.0
+        used = model
+        errored = run.state == "failed"
+        timed_out = run.finish_reason == "timeout"
+        agent.close("review done")
         review = read_json(result_path) or _verdict_from_text(live.last_message) or {}
-        if review.get("verdict") in ("ok", "concerns") or exit_code != 0 or timed_out:
+        if review.get("verdict") in ("ok", "concerns") or errored or timed_out:
             break
         sink.write("=== reviewer returned no verdict; asking once more")
     note = None
@@ -1009,7 +1147,7 @@ def _run_reviewer(root, cfg, reviewer, prompt, result_name, kind, detail):
         checkpoint.restore(root, cp)
         note = "the reviewer modified files; they were restored"
     result = {
-        "verdict": review.get("verdict") or ("error" if exit_code != 0 or timed_out else "no_report"),
+        "verdict": review.get("verdict") or ("error" if errored or timed_out else "no_report"),
         "issues": review.get("issues") or [],
         "model": used,
         "worker_credits": round(credits, 2) if credits else None,
@@ -1023,14 +1161,14 @@ def _run_reviewer(root, cfg, reviewer, prompt, result_name, kind, detail):
     return result
 
 
-def do_review(root, cfg, tier="normal", model=None, base_id=None):
+def do_review(root, server, tier="normal", model=None, base_id=None):
     """Review everything changed since the task started (tests excluded) with a model of another family."""
     state = state_dir(root)
-    session = _load_session(root)
-    base = checkpoint.get(root, base_id or session.get("base_checkpoint"))
+    session_data = _load_session(root)
+    base = checkpoint.get(root, base_id or session_data.get("base_checkpoint"))
     if not base:
         return {"verdict": "error", "issues": [], "error": "no base checkpoint; pass --base ID"}
-    info = detect(root, cfg)
+    info = detect(root, server.settings.loop)
     changes = [(s, p) for s, p in checkpoint.changes(root, base) if not matches(p, info["test_globs"])]
     if not changes:
         return {"verdict": "ok", "issues": [], "note": "no implementation changes since the base checkpoint"}
@@ -1051,21 +1189,21 @@ def do_review(root, cfg, tier="normal", model=None, base_id=None):
     review_dir = state / "review"
     review_dir.mkdir(exist_ok=True)
     (review_dir / "diff.patch").write_text(patch[:limit] + ("\n... (truncated)\n" if truncated else ""))
-    result = _run_reviewer(root, cfg, _review_model(cfg, tier, model), REVIEW_PROMPT, "result.json",
-                           "review", f"{len(changes)} files")
+    result = _run_reviewer(root, server, _review_target(server.settings, tier, model), REVIEW_PROMPT,
+                           "result.json", "review", f"{len(changes)} files")
     result["reviewed_files"] = [p for _, p in changes]
     result["truncated_diff"] = truncated or None
     return {k: v for k, v in result.items() if v is not None}
 
 
-def do_test_review(root, cfg, tier, plan_paths, model=None, force=False):
+def do_test_review(root, server, tier, plan_paths, model=None, force=False):
     """Check Claude's tests against the plan/spec before any worker round.
 
     Skipped (returns {"skipped": ...}) when the tests are unchanged since the last test review, so a
     rerun after Claude disagreed with the reviewer doesn't ask again.
     """
     state = state_dir(root)
-    info = detect(root, cfg)
+    info = detect(root, server.settings.loop)
     test_files = sorted(f for f in walk_files(root) if matches(f, info["test_globs"]))
     if not test_files:
         return {"skipped": "no test files"}
@@ -1075,21 +1213,21 @@ def do_test_review(root, cfg, tier, plan_paths, model=None, force=False):
         return {"skipped": "tests unchanged since the last test review"}
     _write_review_plan(root, plan_paths)
     (state / "review" / "test_files.txt").write_text("\n".join(test_files) + "\n")
-    result = _run_reviewer(root, cfg, _review_model(cfg, tier, model), TEST_REVIEW_PROMPT, "tests_result.json",
-                           "test review", f"{len(test_files)} test files")
+    result = _run_reviewer(root, server, _review_target(server.settings, tier, model), TEST_REVIEW_PROMPT,
+                           "tests_result.json", "test review", f"{len(test_files)} test files")
     result["test_files"] = test_files
     if result["verdict"] in ("ok", "concerns"):
         write_json(state / "test_review.json", {"tests_hash": tests_hash, "verdict": result["verdict"]})
     return {k: v for k, v in result.items() if v is not None}
 
 
-def cmd_review(root, cfg, args):
+def cmd_review(root, server, args):
     if _active_run(root):
         return {"status": "busy", "error": "a run is in progress; wait for it first"}, 2
     if args.tests:
-        result = do_test_review(root, cfg, args.tier, [args.plan], args.model, force=True)
+        result = do_test_review(root, server, args.tier, [args.plan], args.model, force=True)
     else:
-        result = do_review(root, cfg, args.tier, args.model, args.base)
+        result = do_review(root, server, args.tier, args.model, args.base)
     return result, 0 if result.get("verdict") == "ok" else 1
 
 
@@ -1101,7 +1239,7 @@ def _hold(args):
             pass
 
 
-def cmd_watch(root, cfg, args):
+def cmd_watch(root, server, args):
     latest = root / STATE_DIR / "logs" / "latest.log"
     if args.log:
         follow(Path(args.log), stop_at_end=True)
@@ -1128,7 +1266,7 @@ def cmd_watch(root, cfg, args):
         _hold(args)
         return None, 0
     if not latest.exists():
-        print(f"Waiting for a delegate run in {root} ... (Ctrl-C to stop)", flush=True)
+        print(f"Waiting for a subagent run in {root} ... (Ctrl-C to stop)", flush=True)
         while not latest.exists():
             time.sleep(0.5)
     try:
@@ -1138,60 +1276,13 @@ def cmd_watch(root, cfg, args):
         return None, 0
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", default=".", help="project root (default: cwd)")
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("detect")
-    sub.add_parser("test")
-    sub.add_parser("checkpoints")
-    run = sub.add_parser("run")
-    what = run.add_mutually_exclusive_group(required=True)
-    what.add_argument("--plan", help="path to the plan markdown file")
-    what.add_argument("--parallel", help="path to a manifest of parallel tasks (see SKILL.md)")
-    run.add_argument("--feedback", help="feedback text for a retry (failing tests, decisions)")
-    run.add_argument("--feedback-file", help="read feedback from a file (\"-\" = stdin); safest for test output")
-    run.add_argument("--continue", dest="continue_session", action="store_true",
-                     help="continue the previous worker session(s) instead of starting fresh")
-    run.add_argument("--tier", choices=["normal", "hard"], default="normal",
-                     help="task complexity; picks the model from config \"models\"")
-    run.add_argument("--model", help="explicit model, overrides --tier and config")
-    run.add_argument("--test-outline", metavar="FILE",
-                     help="autopilot: have a Copilot test writer turn this outline into test files first")
-    run.add_argument("--auto", action="store_true",
-                     help="autopilot: retry failing tests and fix high-severity review issues automatically")
-    run.add_argument("--background", action="store_true", help="start the run and return immediately")
-    run.add_argument("--wait", type=int, metavar="S",
-                     help="start in the background and wait up to S seconds for the result in this call")
-    run.add_argument("--run-id", help=argparse.SUPPRESS)
-    wait = sub.add_parser("wait")
-    wait.add_argument("--timeout", type=int, default=540, help="seconds to wait before returning 'running'")
-    review = sub.add_parser("review")
-    review.add_argument("--base", help="checkpoint to diff against (default: start of the current task)")
-    review.add_argument("--tier", choices=["normal", "hard"], default="normal",
-                        help="picks the reviewer from config \"review_models\"")
-    review.add_argument("--model", help="explicit reviewer model")
-    review.add_argument("--tests", action="store_true",
-                        help="review the test files against the plan instead of the code")
-    review.add_argument("--plan", default=".delegate/PLAN.md", help="plan for --tests (default .delegate/PLAN.md)")
-    undo = sub.add_parser("undo")
-    undo.add_argument("--to", help="checkpoint id or prefix (default: the one before the last worker round)")
-    watch = sub.add_parser("watch", help="follow the worker's live log")
-    watch.add_argument("--log", help="follow this log file until its run ends (default: latest, forever)")
-    watch.add_argument("--run", help="follow all logs of this run (autopilot) until it finishes")
-    watch.add_argument("--since", type=float, help=argparse.SUPPRESS)
-    watch.add_argument("--hold", action="store_true", help="wait for Enter after the run ends")
-    args = parser.parse_args()
-
-    root = Path(args.root).resolve()
-    cfg = load_config(root)
-    handler = {"detect": cmd_detect, "test": cmd_test, "run": cmd_run, "wait": cmd_wait, "review": cmd_review,
-               "undo": cmd_undo, "checkpoints": cmd_checkpoints, "watch": cmd_watch}[args.command]
-    result, code = handler(root, cfg, args)
-    if result is not None:
-        print(json.dumps(result, indent=2))
-    sys.exit(code)
-
-
-if __name__ == "__main__":
-    main()
+LOOP_COMMANDS = {
+    "detect": cmd_detect,
+    "run": cmd_run,
+    "wait": cmd_wait,
+    "test": cmd_test,
+    "review": cmd_review,
+    "undo": cmd_undo,
+    "checkpoints": cmd_checkpoints,
+    "watch": cmd_watch,
+}

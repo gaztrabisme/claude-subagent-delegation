@@ -47,6 +47,12 @@ from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapabil
 from ..config import Settings, log
 from .classify import ALLOW, DENY, ESCALATE, Verdict, classify
 
+
+def _classify(tool_name, tool_input, workspace, cwd=None, guard_context=None):
+    """`classify()` has no guard-context parameter yet (P2b adds the rules);
+    this seam is where the supervisor passes it, so tests can observe it."""
+    return classify(tool_name, tool_input, workspace, cwd)
+
 TIER_UNRESOLVED = "unresolved"
 TIER_AGENT = "agent"
 TIER_SAMPLING = "sampling"
@@ -92,6 +98,8 @@ class Supervisor:
         self.tier: str = TIER_UNRESOLVED
         self._ladder: list[str] = []
         self.decisions: list[dict[str, Any]] = []
+        # Denials keyed by agent id, drained by the loop after each run.
+        self.denials: dict[str, list[dict[str, Any]]] = {}
 
     # -- session binding ------------------------------------------------
 
@@ -137,15 +145,17 @@ class Supervisor:
 
     # -- decisions ------------------------------------------------------
 
-    def workspace_for(self, agent_id: str | None, fallback: str | None) -> Path:
-        """The workspace a verdict is judged against, resolved server-side."""
+    def workspace_for(self, agent_id: str | None, fallback: str | None) -> tuple[Path, dict]:
+        """The workspace a verdict is judged against, resolved server-side,
+        plus the agent's guard context (protected paths, .subagent allowlist).
+        """
         if agent_id and self.registry is not None:
             agent = self.registry.find_agent(agent_id)
             if agent is not None:
-                return agent.workspace
+                return agent.workspace, getattr(agent, "guard_context", None) or {}
             log.warning("verdict for unknown agent %r; using the server workspace", agent_id)
-            return self.settings.workspace
-        return Path(fallback) if fallback else self.settings.workspace
+            return self.settings.workspace, {}
+        return (Path(fallback) if fallback else self.settings.workspace), {}
 
     async def decide(
         self,
@@ -154,9 +164,10 @@ class Supervisor:
         workspace: Path,
         agent_id: str | None = None,
         cwd: str | None = None,
+        guard_context: dict | None = None,
     ) -> Verdict:
         started = time.monotonic()
-        verdict = classify(tool_name, tool_input, workspace, cwd)
+        verdict = _classify(tool_name, tool_input, workspace, cwd, guard_context=guard_context)
         if verdict.action != ESCALATE:
             self._record(verdict, tier="policy", tool=tool_name, agent_id=agent_id,
                          started=started)
@@ -283,6 +294,10 @@ class Supervisor:
             return Verdict(ALLOW, "operator allowed", verdict.facts)
         return Verdict(DENY, "operator denied", verdict.facts)
 
+    def pop_denials(self, agent_id: str) -> list[dict[str, Any]]:
+        """Denials recorded for one agent, drained (one worker run consumes them)."""
+        return self.denials.pop(agent_id, [])
+
     def _record(
         self,
         verdict: Verdict,
@@ -298,6 +313,13 @@ class Supervisor:
             "tool": tool,
             "agent_id": agent_id,
         })
+        if agent_id and verdict.action != ALLOW:
+            self.denials.setdefault(agent_id, []).append({
+                "action": verdict.action,
+                "reason": verdict.reason,
+                "tier": tier,
+                "tool": tool,
+            })
         del self.decisions[:-200]
         log.info("verdict %s [%s] agent=%s tool=%s: %s",
                  verdict.action, tier, agent_id or "-", tool or "-", verdict.reason)
@@ -337,13 +359,14 @@ class Supervisor:
                 raw = await _read_line(stream)
                 request = json.loads(raw)
                 agent_id = request.get("agent_id") or None
-                workspace = self.workspace_for(agent_id, request.get("workspace"))
+                workspace, guard_context = self.workspace_for(agent_id, request.get("workspace"))
                 verdict = await self.decide(
                     request.get("tool_name") or "",
                     request.get("tool_input") or {},
                     workspace,
                     agent_id,
                     request.get("cwd") or None,
+                    guard_context,
                 )
                 reply = {"action": verdict.action, "reason": verdict.reason}
             except Exception as exc:  # noqa: BLE001 - a broken request denies

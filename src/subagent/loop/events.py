@@ -1,18 +1,63 @@
-"""Readable live log of worker runs, the process runner that feeds it, and live-view terminals."""
+"""Readable live log of worker runs (stream-json events) and live-view terminals."""
 
 import json
 import os
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 END_MARKER = "=== end"
-PARTIAL_LINES_PER_TOOL = 30
+
+
+def _truncate(text, limit=160):
+    text = str(text).replace("\n", " ⏎ ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def render(event):
+    """Readable lines for one stream-json event, or [] (nothing worth showing)."""
+    if not isinstance(event, dict):
+        return []
+    kind = event.get("type")
+    if kind == "system":
+        if event.get("subtype") == "init":
+            sid = event.get("session_id")
+            return [f"── session {sid}"] if sid else []
+        return []
+    if kind == "assistant":
+        message = event.get("message") or {}
+        content = message.get("content") or []
+        lines = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and (block.get("text") or "").strip():
+                lines += [f"💬 {line}" for line in str(block["text"]).strip().splitlines()]
+            elif block.get("type") == "tool_use":
+                name = block.get("name", "?")
+                args = block.get("input") or {}
+                if isinstance(args, dict):
+                    detail = args.get("command") or args.get("file_path") or args.get("path") or next(
+                        (v for v in args.values() if isinstance(v, str)), "")
+                else:
+                    detail = str(args).strip().splitlines()[0] if str(args).strip() else ""
+                lines.append(f"▸ {name} {_truncate(detail)}")
+        return lines
+    if kind == "user":
+        content = (event.get("message") or {}).get("content") or []
+        lines = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                mark = "✓" if not block.get("is_error") else "✗"
+                lines.append(f"  {mark} {block.get('tool_use_id') or ''}")
+        return lines
+    if kind == "result" and event.get("is_error"):
+        detail = event.get("error") or event.get("result") or ""
+        return [f"! {_truncate(detail, 300)}"]
+    return []
 
 
 class LogSink:
@@ -32,15 +77,12 @@ class LogSink:
 
 
 class LiveLog:
-    """Turns one worker's output (Copilot JSONL events, or plain text) into readable lines as it arrives."""
+    """Turns one worker's stream-json events into readable lines as they arrive."""
 
     def __init__(self, sink, raw_path, root, prefix=""):
         self.sink = sink
         self.raw = open(raw_path, "a", buffering=1)
-        self.root = str(root).rstrip("/") + "/"
         self.prefix = f"[{prefix}] " if prefix else ""
-        self.tools = {}     # toolCallId -> tool name
-        self.partial = {}   # toolCallId -> partial output lines shown
         self.credits = None
         self.last_message = ""  # the worker's last chat message (fallback when it forgets to write a file)
 
@@ -50,101 +92,28 @@ class LiveLog:
     def close(self):
         self.raw.close()
 
-    def _short(self, value, limit=160):
-        text = str(value).replace(self.root, "").replace(self.root.rstrip("/"), ".").replace("\n", " ⏎ ")
-        return text if len(text) <= limit else text[: limit - 1] + "…"
+    def _note(self, event):
+        if event.get("type") == "assistant":
+            for block in (event.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text" and (block.get("text") or "").strip():
+                    self.last_message = str(block["text"]).strip()
+        elif event.get("type") == "result":
+            usage = event.get("usage") or {}
+            if usage.get("credits") is not None:
+                self.credits = usage["credits"]
 
-    @staticmethod
-    def _time(event):
-        try:
-            return datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
-        except (KeyError, ValueError, AttributeError):
-            return datetime.now().strftime("%H:%M:%S")
-
-    def feed(self, line):
+    def feed(self, event):
         """Never raises: one malformed event must not stop the stream (usage and completion come last)."""
         try:
-            self._feed(line)
+            if not isinstance(event, dict):
+                return
+            self.raw.write(json.dumps(event) + "\n")
+            self._note(event)
+            for line in render(event):
+                if line:
+                    self.write(line)
         except Exception as exc:  # noqa: BLE001
             self.write(f"(could not format an event: {type(exc).__name__}: {exc})")
-
-    def _feed(self, line):
-        line = line.rstrip("\n")
-        try:
-            event = json.loads(line)
-        except ValueError:
-            event = None
-        if not isinstance(event, dict) or "type" not in event:
-            if line.strip():
-                self.write(line)
-            return
-        self.raw.write(line + "\n")
-        kind, data, ts = event["type"], event.get("data") or {}, self._time(event)
-        if kind == "assistant.turn_start":
-            self.write(f"{ts} ── turn {int(data.get('turnId', 0)) + 1}")
-        elif kind == "assistant.message":
-            if (data.get("content") or "").strip():
-                self.last_message = data["content"].strip()
-            for text_line in (data.get("content") or "").strip().splitlines():
-                self.write(f"{ts} 💬 {text_line}")
-        elif kind == "tool.execution_start":
-            name = data.get("toolName", "?")
-            self.tools[data.get("toolCallId")] = name
-            args = data.get("arguments") or {}
-            if isinstance(args, dict):
-                detail = args.get("command") or args.get("path") or next(
-                    (v for v in args.values() if isinstance(v, str)), "")
-            else:  # e.g. GPT models' apply_patch passes the patch text as a plain string
-                detail = str(args).strip().splitlines()[0] if str(args).strip() else ""
-            self.write(f"{ts} ▸ {name} {self._short(detail)}")
-        elif kind == "tool.execution_partial_result":
-            # partialOutput is cumulative: print only the complete lines not shown yet.
-            call = data.get("toolCallId")
-            shown = self.partial.get(call, 0)
-            lines = (data.get("partialOutput") or "").split("\n")[:-1]
-            for out_line in lines[shown:]:
-                if shown < PARTIAL_LINES_PER_TOOL:
-                    self.write(f"         │ {self._short(out_line, 200)}")
-                elif shown == PARTIAL_LINES_PER_TOOL:
-                    self.write("         │ …")
-                shown += 1
-            self.partial[call] = max(shown, self.partial.get(call, 0))
-        elif kind == "tool.execution_complete":
-            name = self.tools.get(data.get("toolCallId"), "tool")
-            if data.get("success"):
-                self.write(f"{ts}   ✓ {name}")
-            else:
-                detail = data.get("error") or data.get("result") or {}
-                if isinstance(detail, dict):
-                    detail = detail.get("message") or detail.get("content") or json.dumps(detail)
-                self.write(f"{ts}   ✗ {name} failed: {self._short(detail, 300)}")
-        elif kind == "session.usage_checkpoint":
-            if data.get("totalNanoAiu") is not None:
-                self.credits = data["totalNanoAiu"] / 1e9
-        elif "error" in kind:
-            self.write(f"{ts} ! {kind}: {self._short(json.dumps(data), 300)}")
-
-
-def run_backend(argv, cwd, env, timeout, live):
-    """Run the worker, feeding its output to the live log line by line. Returns (exit_code, timed_out)."""
-    try:
-        # Own session/process group: the worker (and anything it spawns) can't signal the runner, and a
-        # timeout can stop the whole group, not just the CLI process.
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, text=True, bufsize=1, errors="replace",
-                                start_new_session=True)
-    except FileNotFoundError as exc:
-        live.write(f"backend not found: {exc}")
-        return 127, False
-    reader = threading.Thread(target=lambda: [live.feed(line) for line in proc.stdout], daemon=True)
-    reader.start()
-    try:
-        code, timed_out = proc.wait(timeout=timeout), False
-    except subprocess.TimeoutExpired:
-        _kill_group(proc)
-        code, timed_out = None, True
-    reader.join(timeout=30)  # let the reader drain the last events (usage, completion)
-    return code, timed_out
 
 
 def _kill_group(proc):
@@ -160,21 +129,21 @@ def _kill_group(proc):
 
 
 TERMINALS = [
-    ["alacritty", "--title", "delegate", "-e"],
-    ["kitty", "--title", "delegate"],
+    ["alacritty", "--title", "subagent", "-e"],
+    ["kitty", "--title", "subagent"],
     ["wezterm", "start", "--"],
     ["ghostty", "-e"],
-    ["foot", "-T", "delegate"],
+    ["foot", "-T", "subagent"],
     ["konsole", "-e"],
-    ["gnome-terminal", "--title", "delegate", "--"],
-    ["xterm", "-T", "delegate", "-e"],
+    ["gnome-terminal", "--title", "subagent", "--"],
+    ["xterm", "-T", "subagent", "-e"],
 ]
 
 
 def open_live_view(cfg, root, runner, watch_args):
     """Open a terminal running `watch <watch_args> --hold` (config "live_view"). Returns an error or None."""
-    setting = cfg.get("live_view")
-    if not setting or setting == "off" or os.environ.get("DELEGATE_LIVE_VIEW") == "off":
+    setting = cfg.live_view
+    if not setting or setting == "off" or os.environ.get("SUBAGENT_LIVE_VIEW") == "off":
         return None
     watch = [*runner, "--root", str(root), "watch", *[str(a) for a in watch_args], "--hold"]
     if isinstance(setting, list):

@@ -24,7 +24,7 @@ import shlex
 import socket
 import sys
 
-TIMEOUT_S = float(os.environ.get("SAM_HOOK_TIMEOUT", "150"))
+TIMEOUT_S = float(os.environ.get("SUBAGENT_HOOK_TIMEOUT", "150"))
 
 # Codex (0.153.4) sends the same stdin keys as Claude Code (tool_name,
 # tool_input, cwd) plus turn_id, but rejects `permissionDecision: allow` as
@@ -131,9 +131,12 @@ def ask(socket_path: str, request: dict) -> dict:
 
 
 def main() -> None:
-    socket_path = os.environ.get("SAM_APPROVAL_SOCKET")
+    socket_path = os.environ.get("SUBAGENT_APPROVAL_SOCKET")
     if not socket_path:
-        block("blocked: SAM_APPROVAL_SOCKET is not set, so no supervisor can be reached")
+        block(
+            "blocked: SUBAGENT_APPROVAL_SOCKET is not set, so no supervisor "
+            "can be reached"
+        )
 
     try:
         payload = json.loads(sys.stdin.read() or "{}")

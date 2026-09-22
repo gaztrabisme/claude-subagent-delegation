@@ -1,16 +1,16 @@
-"""Per-lane request adapters: a small HTTP proxy on 127.0.0.1 between a child
-and a backend that cannot take Claude Code's requests as sent.
+"""Per-provider request adapters: a small HTTP proxy on 127.0.0.1 between a
+child and a backend that cannot take Claude Code's requests as sent.
 
-A lane that sets `adapter` gets its child's ANTHROPIC_BASE_URL pointed at one
+A provider that sets `adapter` gets its child's ANTHROPIC_BASE_URL pointed at one
 of these proxies instead of at the backend. The proxy rewrites the JSON body
 of each POST to /v1/messages (and /v1/messages/count_tokens) with the named
 adapter and forwards everything else untouched: method, path, query, headers
 (the key included) and the answer, streamed back as it arrives. It never logs
 bodies or headers.
 
-The lane's own base_url stays the backend's, so the health gate and telemetry
-keep probing the real host. One proxy per (adapter, upstream) is started on
-first use and lives until shutdown().
+The provider's own base_url stays the backend's, so the health gate and
+telemetry keep probing the real host. One proxy per (adapter, upstream) is
+started on first use and lives until shutdown().
 
 Adapters:
 
@@ -236,11 +236,11 @@ def proxy_url(name: str, upstream: str) -> str:
         return proxy.url
 
 
-def child_base_url(lane: Any) -> str | None:
-    """The base URL a child on `lane` is given: the lane's own, or the local
-    adapter proxy in front of it when the lane sets one."""
-    base = getattr(lane, "base_url", None)
-    name = getattr(lane, "adapter", None)
+def child_base_url(cfg: Any) -> str | None:
+    """The base URL a child on `cfg` is given: the provider's own, or the local
+    adapter proxy in front of it when the provider sets one."""
+    base = getattr(cfg, "base_url", None)
+    name = getattr(cfg, "adapter", None)
     if not base or not name:
         return base
     return proxy_url(name, base)

@@ -269,6 +269,69 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
 
 
 @dataclass(frozen=True, slots=True)
+class LoopTarget:
+    """One `[loop]` slot that names a provider/model: a tier, review, or the test writer."""
+
+    provider: str | None = None
+    model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LoopSettings:
+    """The parsed `[loop]` table. Defaults mirror the schema in plan-architecture."""
+
+    fallback: str = "none"
+    auto_max_rounds: int = 4
+    auto_review: bool = True
+    auto_review_cycles: int = 2
+    review_tests: bool = True
+    count_tests: bool = True
+    keep_checkpoints: int = 20
+    live_view: Any = None
+    test_cmd: str | None = None
+    test_globs: tuple[str, ...] = ()
+    extra_protected: tuple[str, ...] = ()
+    tiers: dict[str, LoopTarget] = field(default_factory=dict)
+    review: LoopTarget = field(default_factory=LoopTarget)
+    review_hard: LoopTarget = field(default_factory=LoopTarget)
+    test_writer: LoopTarget = field(default_factory=LoopTarget)
+
+
+def _loop_target(table: Mapping[str, Any]) -> LoopTarget:
+    return LoopTarget(
+        provider=_str(table, "provider", None),
+        model=_str(table, "model", None),
+    )
+
+
+def _loop_settings(loop: Mapping[str, Any]) -> LoopSettings:
+    tiers = _table(loop, "tiers")
+    tier_targets = {
+        str(name): _loop_target(table)
+        for name, table in tiers.items()
+        if isinstance(table, Mapping)
+    }
+    review = _table(loop, "review")
+    return LoopSettings(
+        fallback=_str(loop, "fallback", "none") or "none",
+        auto_max_rounds=int(_int(loop, "auto_max_rounds", 4)),
+        auto_review=_bool(loop, "auto_review", True),
+        auto_review_cycles=int(_int(loop, "auto_review_cycles", 2)),
+        review_tests=_bool(loop, "review_tests", True),
+        count_tests=_bool(loop, "count_tests", True),
+        keep_checkpoints=int(_int(loop, "keep_checkpoints", 20, positive=False)),
+        live_view=loop.get("live_view"),
+        test_cmd=_str(loop, "test_cmd", None),
+        test_globs=_strings(loop, "test_globs"),
+        extra_protected=_strings(loop, "extra_protected"),
+        tiers=tier_targets,
+        review=_loop_target(review),
+        review_hard=_loop_target(_table(review, "hard")),
+        test_writer=_loop_target(_table(loop, "test_writer")),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Server-wide settings. Per-backend values live on the providers.
 
@@ -313,7 +376,7 @@ class Settings:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     fallback_chain: tuple[str, ...] = ()
     pricing: Mapping[str, Any] = field(default_factory=dict)
-    loop: Mapping[str, Any] = field(default_factory=dict)
+    loop: LoopSettings = field(default_factory=LoopSettings)
     instructions: str = ""
     # Provider memory: how long a refusal with no reset time keeps one closed.
     balance_close_hours: float = 6.0
@@ -480,7 +543,7 @@ class Settings:
         return candidate.resolve()
 
 
-def _validate(settings: Settings, loop: Mapping[str, Any]) -> None:
+def _validate(settings: Settings, loop: LoopSettings) -> None:
     """Every config error that is about more than one table."""
     known = set(settings.providers)
     if settings.default_provider and settings.default_provider not in known:
@@ -493,26 +556,23 @@ def _validate(settings: Settings, loop: Mapping[str, Any]) -> None:
             raise ConfigError(
                 f"[fallback].chain names {name!r}, which is not a declared provider"
             )
-    for where, table in _loop_targets(loop):
-        name = table.get("provider")
-        if isinstance(name, str) and name and name not in known:
-            raise ConfigError(f"{where} names provider {name!r}, which is not declared")
+    for where, target in _loop_targets(loop):
+        if target.provider and target.provider not in known:
+            raise ConfigError(
+                f"{where} names provider {target.provider!r}, which is not declared"
+            )
     if settings.supervisor == "agent" and not (settings.supervisor_cmd or "").strip():
         raise ConfigError('[guard].supervisor = "agent" needs [guard].supervisor_cmd')
 
 
-def _loop_targets(loop: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
-    """The `[loop]` tables that name a provider, with a label for the error."""
-    found: list[tuple[str, Mapping[str, Any]]] = []
-    tiers = loop.get("tiers")
-    if isinstance(tiers, Mapping):
-        for tier, table in tiers.items():
-            if isinstance(table, Mapping):
-                found.append((f"[loop.tiers.{tier}]", table))
-    for key in ("review", "test_writer"):
-        table = loop.get(key)
-        if isinstance(table, Mapping):
-            found.append((f"[loop.{key}]", table))
+def _loop_targets(loop: LoopSettings) -> list[tuple[str, LoopTarget]]:
+    """The `[loop]` slots that name a provider, with a label for the error."""
+    found: list[tuple[str, LoopTarget]] = []
+    for tier, target in loop.tiers.items():
+        found.append((f"[loop.tiers.{tier}]", target))
+    found.append(("[loop.review]", loop.review))
+    found.append(("[loop.review.hard]", loop.review_hard))
+    found.append(("[loop.test_writer]", loop.test_writer))
     return found
 
 
@@ -584,11 +644,11 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
         providers=providers,
         fallback_chain=_strings(fallback, "chain"),
         pricing=pricing,
-        loop=loop,
+        loop=_loop_settings(loop),
         instructions=_str(core, "instructions", "") or "",
         balance_close_hours=float(_num(core, "balance_close_hours", 6.0)),
         throttle_close_minutes=float(_num(core, "throttle_close_minutes", 15.0)),
         warnings=tuple(warnings),
     )
-    _validate(settings, loop)
+    _validate(settings, settings.loop)
     return settings

@@ -102,12 +102,12 @@ def detect(root, cfg):
         if found:
             info = found
             break
-    if cfg.get("test_cmd"):
-        info["test_cmd"] = cfg["test_cmd"]
+    if cfg.test_cmd:
+        info["test_cmd"] = cfg.test_cmd
         info["framework"] = info["framework"] or "custom"
-    if cfg.get("test_globs"):
-        info["test_globs"] = list(cfg["test_globs"])
-    info["test_globs"] = info["test_globs"] + list(cfg.get("extra_protected") or [])
+    if cfg.test_globs:
+        info["test_globs"] = list(cfg.test_globs)
+    info["test_globs"] = info["test_globs"] + list(cfg.extra_protected or [])
     # Files written by the test writer (test outline mode) are tests, wherever they live.
     written = (read_json(root / STATE_DIR / "test_writer.json") or {}).get("files", [])
     info["test_globs"] += [f for f in written if f not in info["test_globs"]]

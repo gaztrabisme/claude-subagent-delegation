@@ -7,7 +7,7 @@ import subprocess
 import sys
 import unittest
 
-from .helpers import REPO, SCENARIOS, Sandbox, need
+from .helpers import REPO, SCENARIOS, Sandbox, for_drivers, need
 
 # The documented invocation, quoted so every shell sees one word per argument.
 DELEGATE = f"{shlex.quote(sys.executable)} -m subagent.cli"
@@ -42,21 +42,24 @@ class Shells(Sandbox):
                 steps = [
                     (f"{DELEGATE} detect", lambda r: r["test_cmd"] == "npm test"),
                     (f"{DELEGATE} detect", lambda r: "protected_files" in r),
-                    (f"{DELEGATE} run --plan .delegate/PLAN.md --background", lambda r: r["status"] == "started"),
+                    (f"{DELEGATE} run --plan .subagent/PLAN.md --background", lambda r: r["status"] == "started"),
                     (f"{DELEGATE} wait --timeout 60", lambda r: r["status"] == "done"),
-                    (f"env DELEGATE_LIVE_VIEW=off {DELEGATE} test", lambda r: r["passed"] is True),
+                    (f"env SUBAGENT_LIVE_VIEW=off {DELEGATE} test", lambda r: r["passed"] is True),
                     (f"{DELEGATE} checkpoints", lambda r: len(r["checkpoints"]) >= 1),
                     (f"{DELEGATE} undo", lambda r: r["status"] == "undone"),
                 ]
                 for command, ok in steps:
                     code, r = self.in_shell(shell, command, root)
                     self.assertTrue(isinstance(r, dict) and ok(r), f"{shell}: {command} -> {r}")
-                (root / ".delegate" / "feedback.md").write_text(NASTY)
-                for command in (f"{DELEGATE} run --plan .delegate/PLAN.md --feedback-file .delegate/feedback.md",
-                                f"cat .delegate/feedback.md | {DELEGATE} run --plan .delegate/PLAN.md "
+                (root / ".subagent" / "feedback.md").write_text(NASTY)
+                for command in (f"{DELEGATE} run --plan .subagent/PLAN.md --feedback-file .subagent/feedback.md",
+                                f"cat .subagent/feedback.md | {DELEGATE} run --plan .subagent/PLAN.md "
                                 "--feedback-file -"):
                     self.in_shell(shell, command, root)
-                    self.assertIn(NASTY, self.read(root, ".delegate/prompt_seen.txt"), f"{shell}: {command}")
+                    self.assertIn(NASTY, self.read(root, ".subagent/prompt_seen.txt"), f"{shell}: {command}")
+
+
+for_drivers(Shells)
 
 
 if __name__ == "__main__":

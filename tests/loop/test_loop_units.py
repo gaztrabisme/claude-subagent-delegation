@@ -1,13 +1,13 @@
-"""Unit tests for pure functions: test-count parsing, the live log, config, result shaping."""
+"""Unit tests for pure functions: test-count parsing, the live log, settings, result shaping."""
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from subagent import config
+from subagent.config import LoopSettings, LoopTarget
 from subagent.loop import detect
 from subagent.loop import loop as delegate
-from subagent.loop.common import load_config
 from subagent.loop.events import LiveLog, LogSink
 
 
@@ -46,41 +46,42 @@ class LiveLogFormatting(unittest.TestCase):
         self.sink = LogSink(self.dir / "x.log")
         self.live = LiveLog(self.sink, self.dir / "x.jsonl", self.dir)
 
-    def feed(self, kind, data):
-        self.live.feed(json.dumps({"type": kind, "data": data, "timestamp": "2026-09-19T05:00:00Z"}))
-
     def text(self):
         self.live.close()
         self.sink.close()
         return (self.dir / "x.log").read_text()
 
-    def test_cumulative_partial_output_printed_once(self):
-        for out in ["hi\n", "hi\nby", "hi\nbye\n", "hi\nbye\nend\n"]:
-            self.feed("tool.execution_partial_result", {"toolCallId": "c", "partialOutput": out})
-        self.assertEqual([l.split("│ ")[1] for l in self.text().splitlines()], ["hi", "bye", "end"])
-
-    def test_string_and_list_tool_arguments(self):
-        # GPT models' apply_patch passes a plain string; this used to crash the reader thread.
-        self.feed("tool.execution_start", {"toolCallId": "1", "toolName": "apply_patch", "arguments": "*** Begin Patch\nx"})
-        self.feed("tool.execution_start", {"toolCallId": "2", "toolName": "odd", "arguments": ["a", "b"]})
-        self.feed("tool.execution_complete", {"toolCallId": "1", "success": False, "error": "plain string"})
-        self.feed("session.usage_checkpoint", {"totalNanoAiu": 4200000000})
+    def test_assistant_text_and_tool_use_render(self):
+        self.live.feed({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "id": "1", "name": "Bash", "input": {"command": "echo hi"}},
+        ]}})
         text = self.text()
-        self.assertIn("apply_patch *** Begin Patch", text)
-        self.assertIn("apply_patch failed: plain string", text)
-        self.assertEqual(self.live.credits, 4.2)
+        self.assertIn("💬 hello", text)
+        self.assertIn("▸ Bash echo hi", text)
 
-    def test_error_object_and_last_message(self):
-        self.feed("tool.execution_start", {"toolCallId": "1", "toolName": "create", "arguments": {"path": "a.js"}})
-        self.feed("tool.execution_complete", {"toolCallId": "1", "success": False,
-                                              "error": {"message": "Parent directory does not exist"}})
-        self.feed("assistant.message", {"content": '{"verdict": "ok"}'})
-        self.assertIn("create failed: Parent directory does not exist", self.text())
+    def test_tool_result_marks(self):
+        self.live.feed({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "a", "is_error": False},
+            {"type": "tool_result", "tool_use_id": "b", "is_error": True},
+        ]}})
+        text = self.text()
+        self.assertIn("✓ a", text)
+        self.assertIn("✗ b", text)
+
+    def test_credits_from_result_and_last_message(self):
+        self.live.feed({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": '{"verdict": "ok"}'},
+        ]}})
+        self.live.feed({"type": "result", "is_error": False, "usage": {"credits": 2.5}})
+        self.assertEqual(self.live.credits, 2.5)
         self.assertEqual(self.live.last_message, '{"verdict": "ok"}')
 
-    def test_never_raises_on_bad_event(self):
-        self.live.feed('{"type": "assistant.turn_start", "data": {"turnId": "not a number"}}')
-        self.assertIn("could not format an event", self.text())
+    def test_never_raises_on_odd_event(self):
+        for event in ("not json", 42, {"type": "assistant", "message": {"content": None}},
+                      {"type": "result", "usage": "?"}):
+            self.live.feed(event)
+        self.text()
 
 
 class ResultShaping(unittest.TestCase):
@@ -101,12 +102,22 @@ class ResultShaping(unittest.TestCase):
         text = "# Outline\n## test/a.test.js\n- x\n## `tests/test_b.py` (unittest)\n- y\n## Notes\n"
         self.assertEqual(delegate._outline_files(text), ["test/a.test.js", "tests/test_b.py"])
 
-    def test_resolve_models(self):
-        cfg = {"models": {"normal": "s", "hard": "o"}, "model": None}
-        self.assertEqual(delegate.resolve_models(cfg, "hard", None), ["o", "s"])
-        self.assertEqual(delegate.resolve_models(cfg, "normal", None), ["s"])
-        self.assertEqual(delegate.resolve_models(cfg, "hard", "x"), ["x"])
-        self.assertEqual(delegate.resolve_models({**cfg, "model": "pin"}, "hard", None), ["pin"])
+    def test_resolve_tier(self):
+        loop = LoopSettings(tiers={
+            "normal": LoopTarget(provider="fake", model="s"),
+            "hard": LoopTarget(provider="fake", model="o"),
+        })
+
+        class Settings:
+            pass
+
+        settings = Settings()
+        settings.loop = loop
+        self.assertEqual(delegate.resolve_tier(settings, "hard", None, None), [("fake", "o"), ("fake", "s")])
+        self.assertEqual(delegate.resolve_tier(settings, "normal", None, None), [("fake", "s")])
+        self.assertEqual(delegate.resolve_tier(settings, "hard", "p", "x"), [("p", "x")])
+        self.assertEqual(delegate.resolve_tier(settings, "hard", None, "x"), [("fake", "x")])
+        self.assertEqual(delegate.resolve_tier(settings, "normal", "p", None), [("p", None)])
 
     def test_count_check(self):
         session = {}
@@ -120,13 +131,36 @@ class ResultShaping(unittest.TestCase):
         self.assertIsNone(check(session, "h2", t(True, 30, 0)))  # tests changed: history resets
 
 
-class Config(unittest.TestCase):
-    def test_nested_maps_merge(self):
+class SettingsFromToml(unittest.TestCase):
+    def test_loop_settings_parse(self):
         root = Path(tempfile.mkdtemp())
-        (root / ".delegate").mkdir()
-        (root / ".delegate" / "config.json").write_text('{"review_models": {"hard": "gpt-6-astra"}}')
-        cfg = load_config(root)
-        self.assertEqual(cfg["review_models"], {"normal": "gpt-5.6-sol", "hard": "gpt-6-astra"})
+        cfg = root / "config.toml"
+        cfg.write_text("""
+[providers.fake]
+driver = "copilot"
+binary = "copilot"
+
+[loop]
+auto_max_rounds = 7
+review_tests = false
+
+[loop.tiers.normal]
+provider = "fake"
+model = "claude-sonnet-5"
+
+[loop.review]
+provider = "fake"
+model = "gpt-5.6-sol"
+
+[loop.review.hard]
+model = "gpt-6-astra"
+""")
+        settings = config.load(extra=cfg)
+        self.assertEqual(settings.loop.auto_max_rounds, 7)
+        self.assertFalse(settings.loop.review_tests)
+        self.assertEqual(settings.loop.tiers["normal"], LoopTarget(provider="fake", model="claude-sonnet-5"))
+        self.assertEqual(settings.loop.review, LoopTarget(provider="fake", model="gpt-5.6-sol"))
+        self.assertEqual(settings.loop.review_hard, LoopTarget(model="gpt-6-astra"))
 
 
 if __name__ == "__main__":

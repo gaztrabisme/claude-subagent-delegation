@@ -129,8 +129,9 @@ def test_config_loop_tables_that_name_declared_providers_are_kept(tmp_path: Path
         "loop": {"auto_max_rounds": 4, "tiers": {"normal": {"provider": "glm"}},
                  "review": {"provider": "glm"}},
     })
-    assert settings.loop["auto_max_rounds"] == 4
-    assert settings.loop["tiers"]["normal"]["provider"] == "glm"
+    assert settings.loop.auto_max_rounds == 4
+    assert settings.loop.tiers["normal"].provider == "glm"
+    assert settings.loop.review.provider == "glm"
 
 
 def test_config_default_provider_must_be_declared(tmp_path: Path):

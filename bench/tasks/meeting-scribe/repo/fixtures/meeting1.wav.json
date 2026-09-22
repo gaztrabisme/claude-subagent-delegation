@@ -1,0 +1,14 @@
+[
+  {"start_s": 0.0, "end_s": 2.0, "speaker": "Alice", "text": "Good morning everyone.", "confidence": 0.98},
+  {"start_s": 4.0, "end_s": 6.0, "speaker": "Bob", "text": "Morning Alice.", "confidence": 0.97},
+  {"start_s": 8.0, "end_s": 13.0, "speaker": "Alice", "text": "We agreed to launch the beta in October.", "confidence": 0.95},
+  {"start_s": 15.0, "end_s": 21.0, "speaker": "Bob", "text": "Alice will write the release notes by Friday.", "confidence": 0.96},
+  {"start_s": 18.0, "end_s": 22.0, "speaker": "Carol", "text": "And I will prepare the demo.", "confidence": 0.90},
+  {"start_s": 24.0, "end_s": 27.0, "speaker": "Carol", "text": "@bob send the slides to the client by 2026-09-30.", "confidence": 0.94},
+  {"start_s": 29.0, "end_s": 32.0, "speaker": "Alice", "text": "I will review the slides.", "confidence": 0.93},
+  {"start_s": 34.0, "end_s": 37.0, "speaker": "Bob", "text": "Sounds good.", "confidence": 0.92},
+  {"start_s": 82.0, "end_s": 86.0, "speaker": "Alice", "text": "Any other topics?", "confidence": 0.95},
+  {"start_s": 88.0, "end_s": 91.0, "speaker": "Carol", "text": "No, that is all.", "confidence": 0.94},
+  {"start_s": 93.0, "end_s": 96.0, "speaker": "Bob", "text": "Thanks everyone.", "confidence": 0.93},
+  {"start_s": 98.0, "end_s": 100.0, "speaker": "Alice", "text": "Great, meeting adjourned.", "confidence": 0.92}
+]

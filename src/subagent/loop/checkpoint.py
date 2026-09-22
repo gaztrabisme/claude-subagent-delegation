@@ -1,9 +1,9 @@
 """Checkpoints of the project's working tree, taken before every worker round, so a round can be undone.
 
 In a git repository a checkpoint is a commit object built from a temporary index (the user's branch,
-index and stash are never touched), kept alive by a ref under refs/delegate/checkpoints/. Outside git
-it is a tarball in .delegate/checkpoints/. Ignored files (.gitignore, or SKIP_DIRS without git) and
-.delegate/ itself are not part of checkpoints.
+index and stash are never touched), kept alive by a ref under refs/subagent/checkpoints/. Outside git
+it is a tarball in .subagent/checkpoints/. Ignored files (.gitignore, or SKIP_DIRS without git) and
+.subagent/ itself are not part of checkpoints.
 """
 
 import hashlib
@@ -50,7 +50,7 @@ def create(root, label):
         parent = git(root, "rev-parse", "-q", "--verify", "HEAD", check=False)
         args = ["commit-tree", tree, "-m", f"delegate checkpoint: {label}"] + (["-p", parent] if parent else [])
         commit = git(root, *args)
-        git(root, "update-ref", f"refs/delegate/checkpoints/{record['id']}", commit)
+        git(root, "update-ref", f"refs/subagent/checkpoints/{record['id']}", commit)
         record.update(kind="git", commit=commit)
     else:
         archive = root / STATE_DIR / "checkpoints" / f"{record['id']}.tar.gz"
@@ -143,7 +143,7 @@ def prune(root, keep):
     old, kept = records[:-keep] if keep else [], records[-keep:] if keep else records
     for record in old:
         if record["kind"] == "git":
-            git(root, "update-ref", "-d", f"refs/delegate/checkpoints/{record['id']}", check=False)
+            git(root, "update-ref", "-d", f"refs/subagent/checkpoints/{record['id']}", check=False)
         else:
             (root / record["archive"]).unlink(missing_ok=True)
     if old:

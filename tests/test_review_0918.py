@@ -260,36 +260,24 @@ def test_l4_codex_reset_without_a_year():
         2026, 9, 20, 13, 29).astimezone()
 
 
-# --- M3: bppc is the peer holding its tailnet IP, and only an RFC1918 address -------
+# --- M3: the resolver is config-only; there is no peer discovery to fool -------------
 
 
-@pytest.mark.xfail(reason="P1d", strict=False)
-def test_m3_crafted_peer_named_bppc_is_ignored():
+def test_m3_resolver_reads_only_the_configured_candidates():
+    """M3: the pre-config resolver walked Tailscale peers, so a crafted peer
+    named "bppc" could point a dispatch at an attacker's host. The resolver is
+    now `health.resolve_urls`, which reads only the provider's config —
+    `[providers.<n>.health].resolve_cmd` output first, then `candidates` — and
+    never consults machine or network state. There is no peer discovery left
+    to fool; the resolver itself is covered in tests/test_health.py."""
     from subagent import health
 
-    status = {"Peer": {
-        "nodekey:evil": {"HostName": "bppc-evil", "TailscaleIPs": ["100.64.0.9"],
-                         "CurAddr": "203.0.113.9:41641", "Addrs": ["192.168.1.66:41641"]},
-        "nodekey:real": {"HostName": "bppc-System-Product-Name",
-                         "TailscaleIPs": ["100.106.185.34"],
-                         "CurAddr": "", "Addrs": ["203.0.113.50:41641", "192.168.1.17:41641"]},
-    }}
-    assert health.bppc_lan_from_tailscale(status) == "192.168.1.17"
-    assert health.bppc_hosts({}, status)[0] == "192.168.1.17"
+    from .conftest import provider_cfg
 
-
-@pytest.mark.xfail(reason="P1d", strict=False)
-def test_m3_public_endpoint_is_never_used():
-    from subagent import health
-
-    status = {"Peer": {"nodekey:real": {
-        "HostName": "bppc", "TailscaleIPs": ["100.106.185.34"],
-        "CurAddr": "203.0.113.9:41641", "Addrs": ["100.106.185.34:41641", "8.8.8.8:1"]}}}
-    assert health.bppc_lan_from_tailscale(status) is None
-    assert health.bppc_lan_from_tailscale({"Peer": {"n": {
-        "HostName": "x", "TailscaleIPs": ["100.106.185.34"], "CurAddr": "10.1.2.3:4"}}}) == "10.1.2.3"
-    assert health.bppc_lan_from_tailscale({"Peer": {"n": {
-        "HostName": "x", "TailscaleIPs": ["100.106.185.34"], "CurAddr": "172.32.0.1:4"}}}) is None
+    cfg = provider_cfg("bppc", health={
+        "candidates": ["http://10.1.2.3:8080", "http://10.1.2.4:8080"],
+    })
+    assert health.resolve_urls(cfg) == ["http://10.1.2.3:8080", "http://10.1.2.4:8080"]
 
 
 # --- M8: omlx cold_load is about the lane's model, not the server-wide count ---------

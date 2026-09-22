@@ -118,7 +118,10 @@ def default_providers() -> dict[str, dict[str, Any]]:
                 "url": "http://127.0.0.1:8000/api/status",
                 "cold_load_seconds": 120.0,
             },
-            "probe": {"host_parser": "mac"},
+            "probe": {
+                "host_cmd": ["mac"],
+                "metrics_url": "http://127.0.0.1:8000/api/status",
+            },
         },
     }
 

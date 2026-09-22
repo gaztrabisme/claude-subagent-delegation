@@ -99,28 +99,48 @@ def test_bppc_snapshot_shape(monkeypatch):
     assert snap["gpu"] == {"memory_used_mb": 120.0, "memory_total_mb": 16303.0,
                            "utilization_pct": 7.0, "power_w": 18.59, "temperature_c": 35.0}
     assert snap["slots"] == {"slots_total": 2, "slots_busy": 1}
-    assert snap["metrics"] == telemetry.UNAVAILABLE
+    assert snap["metrics"] == {"error": "HTTP 501 from http://10.0.0.9:8081/metrics"}
     argv = seen["argv"]
     assert argv[:5] == ["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes"]
     assert argv[5] == "bppc@10.0.0.9" and argv[6] == "nvidia-smi"
     assert seen["timeout"] == 3.0
 
 
-def test_llama_metrics_parsed_when_available(monkeypatch):
-    body = b"# HELP x\nllamacpp:predicted_tokens_seconds 41.5\nllamacpp:requests_processing 1\n"
+def test_metrics_probe_reads_omlx_json_or_prometheus_text(monkeypatch):
+    body = json.dumps({"status": "ok", "waiting_requests": 4, "model_memory_used": 123}).encode()
     monkeypatch.setattr(telemetry, "_http_get", lambda url, headers=None, timeout=3.0: (200, body))
-    assert telemetry.llama_metrics("http://h:8081/metrics") == {
+    snap = telemetry.metrics_probe("http://h:8000/api/status", {})
+    assert snap["omlx"]["waiting_requests"] == 4 and snap["omlx"]["model_memory_used"] == 123
+    prom = b"# HELP x\nllamacpp:predicted_tokens_seconds 41.5\nllamacpp:requests_processing 1\n"
+    monkeypatch.setattr(telemetry, "_http_get", lambda url, headers=None, timeout=3.0: (200, prom))
+    assert telemetry.metrics_probe("http://h:8081/metrics", {})["metrics"] == {
         "predicted_tokens_seconds": 41.5, "requests_processing": 1.0}
+
+
+def test_probe_for_is_none_only_when_the_probe_spec_is_empty():
+    assert telemetry.probe_for(provider_cfg("glm")) is None
+    assert telemetry.probe_for(_omlx()) is telemetry.probe_local
+    assert telemetry.probe_for(_bppc()) is telemetry.probe_local
+
+
+def test_host_cmd_runs_an_argv_and_parses_swap_or_json(monkeypatch):
+    def run(argv, timeout=3.0):
+        if argv == ["ssh", "host", "swap"]:
+            return "vm.swapusage: total = 1024.00M  used = 512.00M\n"
+        return '{"pressure_level": 2}'
+
+    monkeypatch.setattr(telemetry, "_run", run)
+    assert telemetry.host_probe(("ssh", "host", "swap"), "swap_mb") == {"swap_used_mb": 512.0}
+    assert telemetry.host_probe(("cat", "status.json"), "json") == {"pressure_level": 2}
 
 
 def test_probe_failures_are_recorded_not_raised():
     # conftest makes every HTTP and subprocess probe raise.
     omlx = telemetry.probe_local(_omlx())
-    assert "error" in omlx["omlx"]
+    assert "error" in omlx["metrics"]
     assert {"swap_error", "pressure_error", "thermal_error"} <= set(omlx["mac"])
     bppc = telemetry.probe_local(_bppc())
-    assert "error" in bppc["gpu"] and "error" in bppc["slots"]
-    assert bppc["metrics"] == telemetry.UNAVAILABLE
+    assert "error" in bppc["gpu"] and "error" in bppc["slots"] and "error" in bppc["metrics"]
     assert telemetry.probe_local(_bppc(None)) == {"error": "bppc: host not resolved"}
 
     def broken(lane):
@@ -200,6 +220,15 @@ def test_sampler_ignores_cloud_providers(tmp_path: Path):
     hub = Telemetry(Trace(tmp_path / "m.jsonl"), interval=0.05)
     hub.begin(provider_cfg("glm"), "run-1")
     assert not hub.active("glm") and hub.end("glm", "run-1") == []
+
+
+def test_registry_default_telemetry_uses_sample_seconds(tmp_path: Path):
+    settings = make_settings(tmp_path, sample_seconds=2.5)
+    reg = Registry(settings, start_reaper=False)
+    try:
+        assert reg.telemetry.interval == 2.5
+    finally:
+        reg.shutdown()
 
 
 # --- summary math ---------------------------------------------------------------

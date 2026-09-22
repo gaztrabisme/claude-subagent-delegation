@@ -1289,7 +1289,8 @@ class Registry:
             settings.trace, settings.session_root
         )
         self.telemetry = telemetry if telemetry is not None else Telemetry(
-            open_metrics(self.trace, settings.session_root)
+            open_metrics(self.trace, settings.session_root),
+            interval=settings.sample_seconds,
         )
         protect(settings.session_root)
         self.lane_state = LaneState(settings.session_root)

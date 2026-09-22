@@ -17,19 +17,22 @@ Three pieces, all for providers that declare a `[probe]` block:
 
 What a snapshot holds comes from the provider's config:
 
-  status      the `[health].url` of an oMLX-kind provider: models_loaded,
-              models_loading, active_requests, waiting_requests,
-              model_memory_used, model_memory_max, avg_prefill_tps,
-              avg_generation_tps, total_prompt_tokens, total_completion_tokens.
-  host_parser "mac": `sysctl vm.swapusage` (swap used, MB),
-              `sysctl kern.memorystatus_vm_pressure_level` (1 normal, 2 warn,
-              4 critical; `memory_pressure -Q` free percentage when sysctl
-              fails), `pmset -g therm` (thermal warning level, CPU speed limit).
+  metrics_url resolved with `{host}`, then read by body shape: a JSON body is
+              an oMLX /api/status answer (models_loaded, models_loading,
+              active_requests, waiting_requests, model_memory_used,
+              model_memory_max, avg_prefill_tps, avg_generation_tps,
+              total_prompt_tokens, total_completion_tokens); a text body is a
+              llama.cpp /metrics answer and its `llamacpp:` lines become a
+              dict.
+  host_cmd    `"mac"`: `sysctl vm.swapusage` (swap used, MB), `sysctl
+              kern.memorystatus_vm_pressure_level` (1 normal, 2 warn, 4
+              critical; `memory_pressure -Q` free percentage when sysctl
+              fails), `pmset -g therm` (thermal warning level, CPU speed
+              limit). Any other argv runs that command; `host_parser`
+              `"swap_mb"` or `"json"` reads its output.
   gpu_cmd     argv printing one nvidia-smi csv line (VRAM used/total MB,
               utilisation %, power W, temperature C).
   slots_url   a llama.cpp /slots endpoint.
-  metrics_url a llama.cpp /metrics endpoint, recorded as "unavailable" on any
-              non-200 (a server running without --metrics).
 
 `{host}` in any of those is replaced with the host of the provider's base URL,
 which is resolved at dispatch. Every probe is bounded to 3 s and never raises:
@@ -72,7 +75,6 @@ OMLX_FIELDS = (
     "total_completion_tokens",
 )
 GPU_FIELDS = ("memory_used_mb", "memory_total_mb", "utilization_pct", "power_w", "temperature_c")
-UNAVAILABLE = "unavailable"
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -106,24 +108,6 @@ def _error(exc: BaseException) -> dict[str, Any]:
 # --- probes -------------------------------------------------------------------
 
 
-def omlx_status(cfg: ProviderConfig) -> dict[str, Any]:
-    """The oMLX fields admission and the summary read, or {"error": ...}."""
-    try:
-        base = (cfg.base_url or "").rstrip("/")
-        url = cfg.health.url or f"{base}/api/status"
-        key = cfg.api_key()
-        headers = {"Authorization": f"Bearer {key}"} if key else {}
-        status, body = _http_get(url, headers)
-        if status != 200:
-            return {"error": f"HTTP {status} from {url}"}
-        data = json.loads(body.decode("utf-8", "replace"))
-        if not isinstance(data, dict):
-            return {"error": "status body is not a JSON object"}
-        return {name: data.get(name) for name in OMLX_FIELDS}
-    except Exception as exc:  # noqa: BLE001 - a probe never raises
-        return _error(exc)
-
-
 _SWAP_RE = re.compile(r"used\s*=\s*([0-9.]+)([KMG])", re.IGNORECASE)
 _FREE_PCT_RE = re.compile(r"free percentage:\s*([0-9]+)%", re.IGNORECASE)
 _THERM_LEVEL_RE = re.compile(r"thermal warning level\s*(?:set to|=|:)?\s*(\w+)", re.IGNORECASE)
@@ -153,7 +137,7 @@ def parse_therm(text: str) -> dict[str, Any]:
     return out
 
 
-def mac_status(cfg: ProviderConfig | None = None) -> dict[str, Any]:
+def host_mac() -> dict[str, Any]:
     """Swap, memory pressure and thermal state of this Mac. Each part fails alone."""
     out: dict[str, Any] = {}
     try:
@@ -175,6 +159,29 @@ def mac_status(cfg: ProviderConfig | None = None) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         out["thermal_error"] = _error(exc)["error"]
     return out
+
+
+def host_probe(host_cmd: tuple[str, ...], host_parser: str | None) -> dict[str, Any]:
+    """The host snapshot `host_cmd` asks for: the Mac parts when it is "mac",
+    else a command whose output `host_parser` reads ("swap_mb" or "json")."""
+    if host_cmd == ("mac",):
+        return host_mac()
+    try:
+        out = _run(list(host_cmd))
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+    if host_parser == "swap_mb":
+        swap = parse_swap_mb(out)
+        return {"swap_used_mb": swap} if swap is not None else _error(
+            ValueError(f"no swap usage in host output: {out[:120]!r}"))
+    if host_parser == "json":
+        try:
+            data = json.loads(out)
+        except ValueError as exc:
+            return _error(exc)
+        return data if isinstance(data, dict) else _error(
+            ValueError("host JSON body is not an object"))
+    return _error(ValueError(f"unknown host_parser {host_parser!r}"))
 
 
 def parse_nvidia(text: str) -> dict[str, Any]:
@@ -222,14 +229,8 @@ def llama_slots(url: str) -> dict[str, Any]:
         return _error(exc)
 
 
-def llama_metrics(url: str) -> dict[str, Any] | str:
-    """Prometheus gauges from a /metrics endpoint, or "unavailable" on any non-200."""
-    try:
-        status, body = _http_get(url)
-    except Exception:  # noqa: BLE001
-        return UNAVAILABLE
-    if status != 200:
-        return UNAVAILABLE
+def parse_prometheus(body: bytes) -> dict[str, Any]:
+    """Prometheus gauges from a /metrics body; only the `llamacpp:` lines."""
     values: dict[str, Any] = {}
     for line in body.decode("utf-8", "replace").splitlines():
         if not line or line.startswith("#"):
@@ -243,31 +244,54 @@ def llama_metrics(url: str) -> dict[str, Any] | str:
     return values
 
 
+def metrics_probe(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    """The provider's `metrics_url`: a JSON body is an oMLX /api/status answer
+    (OMLX_FIELDS), a text body is llama.cpp Prometheus lines."""
+    try:
+        status, body = _http_get(url, headers)
+    except Exception as exc:  # noqa: BLE001
+        return {"metrics": _error(exc)}
+    if status != 200:
+        return {"metrics": {"error": f"HTTP {status} from {url}"}}
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return {"metrics": parse_prometheus(body)}
+    if not isinstance(data, dict):
+        return {"metrics": {"error": "metrics body is not a JSON object"}}
+    return {"omlx": {name: data.get(name) for name in OMLX_FIELDS}}
+
+
 def probe_local(cfg: ProviderConfig) -> dict[str, Any]:
     """One snapshot of `cfg`, with exactly the parts its config asks for."""
     spec = cfg.probe
     host = provider_host(cfg)
-    needs_host = any("{host}" in part for part in
-                     (*spec.gpu_cmd, spec.slots_url or "", spec.metrics_url or ""))
+    needs_host = any(
+        "{host}" in part
+        for part in (*spec.gpu_cmd, *spec.host_cmd, spec.slots_url or "",
+                     spec.metrics_url or "")
+    )
     if needs_host and not host:
         return {"error": f"{cfg.name}: host not resolved"}
+    key = cfg.api_key()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     snap: dict[str, Any] = {}
-    if cfg.health.kind == "omlx" and (cfg.health.url or cfg.base_url):
-        snap["omlx"] = omlx_status(cfg)
-    if spec.host_parser == "mac":
-        snap["mac"] = mac_status(cfg)
+    if spec.metrics_url:
+        snap.update(metrics_probe(_fill(spec.metrics_url, host), headers))
+    if spec.host_cmd:
+        host_cmd = tuple(_fill(part, host) for part in spec.host_cmd)
+        snap["mac"] = host_probe(host_cmd, spec.host_parser)
     if spec.gpu_cmd:
         snap["gpu"] = gpu_status([_fill(part, host) for part in spec.gpu_cmd])
     if spec.slots_url:
         snap["slots"] = llama_slots(_fill(spec.slots_url, host))
-    if spec.metrics_url:
-        snap["metrics"] = llama_metrics(_fill(spec.metrics_url, host))
     return snap
 
 
 def probe_for(cfg: ProviderConfig) -> Probe | None:
     """The probe for `cfg`, or None when it declares nothing to sample."""
-    if cfg.probe.empty and cfg.health.kind != "omlx":
+    spec = cfg.probe
+    if not (spec.gpu_cmd or spec.metrics_url or spec.slots_url or spec.host_cmd):
         return None
     return probe_local
 

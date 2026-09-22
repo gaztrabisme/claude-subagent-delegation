@@ -1,0 +1,21 @@
+# z.ai GLM Coding Plan, run through Claude Code against z.ai's
+# Anthropic-compatible endpoint.
+#
+# This file only names the key variable, never the value. Put the key in the
+# environment (or run `subagent init --from glm`, which writes this file and
+# prints the export line you still need).
+
+[core]
+default_provider = "glm"
+
+[providers.glm]
+driver = "claude"
+base_url = "https://api.z.ai/api/anthropic"
+model = "glm-5.3-flash[1m]"
+api_key_env = ["GLM_API_KEY", "ZAI_API_KEY"]
+vendor = "zai"
+
+[providers.glm.pricing]
+# z.ai GLM Coding Plan, USD per month, spread evenly over that month's runs.
+kind = "flat_plan"
+monthly_usd = 80

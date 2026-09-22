@@ -1,0 +1,14 @@
+# OpenAI Codex. The Codex CLI owns its own connection and login
+# (CODEX_HOME/auth.json), so there is no base_url and no api_key_env here.
+
+[core]
+default_provider = "codex"
+
+[providers.codex]
+driver = "codex"
+
+[providers.codex.pricing]
+# A subscription. The monthly price is not known, so it is left out; the cost
+# model then reports it as unknown rather than zero.
+kind = "flat_plan"
+# monthly_usd = 0

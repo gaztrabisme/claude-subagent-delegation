@@ -1,0 +1,44 @@
+# llama.cpp behind its OpenAI-compatible proxy. The worked example for the
+# local-provider shape: the address is not fixed, the model template needs the
+# system message folded away, and capacity is read from the GPU host over ssh.
+
+[core]
+default_provider = "llamacpp"
+
+[providers.llamacpp]
+driver = "claude"
+model = "qwen3.8-27b"
+api_key_env = "LOCAL_API_KEY"
+api_key = "local"      # llama.cpp accepts any bearer token
+local = true
+max_agents = 1
+# llama.cpp's Qwen3.8 chat template refuses a system message inserted after
+# the first user turn, which Claude Code sends. fold_system folds it into the
+# first user message instead. Drop this line for a model whose template
+# accepts system messages mid-conversation.
+adapter = "fold_system"
+
+[providers.llamacpp.health]
+# The address is not fixed: the wired LAN candidate is tried first, then the
+# Tailscale one. `resolve_cmd` prints more base URLs when the host moves.
+kind = "llamacpp"
+candidates = ["http://192.168.1.17:8080", "http://100.106.185.34:8080"]
+# resolve_cmd = ["sh", "-c", "tailscale ip -4 llama-box"]   # prints extra base URLs
+warm = true
+cold_load_seconds = 180
+
+[providers.llamacpp.probe]
+# One nvidia-smi csv line, read from the GPU host over ssh; {host} is filled
+# from the candidate that answered.
+gpu_cmd = ["ssh", "user@{host}", "nvidia-smi",
+           "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu",
+           "--format=csv,noheader,nounits"]
+metrics_url = "http://{host}:8081/metrics"
+slots_url = "http://{host}:8081/slots"
+
+[providers.llamacpp.probe.admit]
+min_vram_free_mb = 2048
+
+[providers.llamacpp.pricing]
+kind = "local"
+usd = 0

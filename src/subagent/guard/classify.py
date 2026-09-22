@@ -84,18 +84,57 @@ GIT_BRANCH_READ = frozenset({
 })
 
 # Paths a delegated coding agent has no business touching, relative to $HOME.
+# Provider credential homes (`.codex`, `.omlx`, …) live in PROVIDER_HOMES and
+# are added only when that driver/vendor is configured (protect_provider_homes).
 SENSITIVE_HOME = (
     ".ssh", ".aws", ".gnupg", ".kube", ".docker/config.json", ".netrc",
-    ".config/gh", ".claude.json", ".claude", ".omlx", ".glm-subagent", ".subagent-mcp",
+    ".config/gh", ".claude.json", ".claude",
     "Library/Keychains",
-    # Codex's login (auth.json: OpenAI OAuth and refresh tokens) and sessions;
-    # git's plain-text credential store.
-    ".codex", ".git-credentials",
+    # git's plain-text credential store, and this server's own config.
+    ".git-credentials", ".subagent",
     # Shell and REPL history: commands typed with tokens in them.
     ".zsh_history", ".bash_history", ".history", ".python_history",
     ".node_repl_history", ".psql_history", ".mysql_history", ".sqlite_history",
     ".lesshst", ".zsh_sessions", ".bash_sessions",
 )
+
+# Credential/config homes that are off-limits only when a provider of that
+# driver or vendor is configured. `~/.claude` stays in SENSITIVE_HOME above
+# because this server and several drivers use it; the rest are added at
+# startup from the configured providers, so `~/.codex` is guarded exactly
+# when a codex provider can run and not otherwise.
+PROVIDER_HOMES = {
+    "claude": (".claude",),
+    "codex": (".codex",),
+    "copilot": (".copilot",),
+    "gemini": (".gemini",),
+    "grok": (".grok",),
+    "omlx": (".omlx",),
+}
+
+# The provider homes currently merged into SENSITIVE_HOME by
+# protect_provider_homes. Empty until the server starts.
+_provider_homes: tuple[str, ...] = ()
+
+
+def protect_provider_homes(settings) -> None:
+    """Protect the credential homes of every driver/vendor in `settings`.
+
+    Replaces the previous set (it does not accumulate): a home is off-limits
+    only while a provider that uses it is configured.
+    """
+    global _provider_homes
+    labels = {
+        label
+        for cfg in settings.providers.values()
+        for label in (cfg.driver, cfg.vendor)
+    }
+    homes: list[str] = []
+    for label in sorted(labels):
+        for home in PROVIDER_HOMES.get(label, ()):
+            if home not in homes:
+                homes.append(home)
+    _provider_homes = tuple(homes)
 # Basenames that carry secrets wherever they appear, including in a workspace.
 SENSITIVE_NAMES = frozenset({
     ".env", ".env.local", ".env.production", ".netrc", ".npmrc", ".pypirc",
@@ -246,7 +285,7 @@ def is_sensitive(path: Path) -> str | None:
         if candidate != home and not candidate.startswith(home + "/"):
             continue
         rel = candidate[len(home):].lstrip("/")
-        for entry in SENSITIVE_HOME:
+        for entry in SENSITIVE_HOME + _provider_homes:
             folded = entry.lower()
             if rel == folded or rel.startswith(folded + "/"):
                 return f"~/{entry} is off-limits to a delegated agent"

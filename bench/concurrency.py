@@ -4,10 +4,10 @@
 For each level N, starts N fresh agents on the provider at the same time
 (fallback "none", each in its own temporary workspace). Each reads a provided
 ~200-line Python file and writes summary.txt naming its three functions;
-verification is a grep for one of the names. SAM_<PROVIDER>_MAX_AGENTS and
-SAM_MAX_AGENTS are raised to the largest level for the run. One in-process
-server (this package's Settings, Registry, Supervisor) serves every level,
-with a fresh session root.
+verification is a grep for one of the names. [core].max_agents and the
+provider's own copy are raised to the largest level for the run, as config
+overrides layered over --config. One in-process server (this package's
+Settings, Registry, Supervisor) serves every level, with a fresh session root.
 
 Per child (bench_children.csv): TTFT, wall, output tokens, decode tok/s (from
 its turn records), verified. Per level (bench.csv, one row per level):
@@ -20,7 +20,8 @@ aggregate tok/s at least 1.3x the next lower level's, (3) has p90 TTFT under
 60 s, and (4) whose peak swap grew by no more than 512 MB over level 1. The
 printed line names the rule that decided it.
 
-    uv run python bench/concurrency.py --provider omlx --levels 1,2,4,8 --out /tmp/bench
+    uv run python bench/concurrency.py --config examples/config.omlx.toml \
+        --levels 1,2,4,8 --out /tmp/bench
 """
 
 from __future__ import annotations
@@ -246,25 +247,29 @@ def recommend(levels: Sequence[Mapping[str, Any]]) -> tuple[int | None, str]:
     return chosen, f"recommend max_agents={chosen}: {why}"
 
 
-def _pick_provider(settings: Any, name: str | None) -> tuple[str, Any]:
-    """(name, config) for `--provider`, or the config's default provider.
+def _default_provider(config: Path | None) -> str:
+    """The config's default provider, or its first declared one; "" for none."""
+    data = lane_harness.config_table(config)
+    core = data.get("core") or {}
+    providers = data.get("providers") or {}
+    name = core.get("default_provider") or next(iter(providers), "")
+    return name if isinstance(name, str) else ""
 
-    Reads `settings.providers` and, for the shapes the live-script fakes and
-    older scripts still build, `settings.lanes`.
-    """
-    lanes = getattr(settings, "lanes", None) or {}
-    tables = {**lanes, **(getattr(settings, "providers", None) or {})}
+
+def _pick_provider(settings: Any, name: str | None) -> tuple[str, Any]:
+    """(name, config) for `--provider`, or the settings' default provider."""
+    providers = getattr(settings, "providers", None) or {}
     if name:
-        if name not in tables:
+        if name not in providers:
             raise SystemExit(f"unknown provider {name!r}; configured: "
-                             f"{', '.join(sorted(tables)) or '(none)'}")
-        return name, tables[name]
+                             f"{', '.join(sorted(providers)) or '(none)'}")
+        return name, providers[name]
     default = getattr(settings, "default_provider", None)
-    if default in tables:
-        return default, tables[default]
-    if tables:
-        first = min(tables)
-        return first, tables[first]
+    if default in providers:
+        return default, providers[default]
+    if providers:
+        first = min(providers)
+        return first, providers[first]
     raise SystemExit("no providers configured")
 
 
@@ -282,7 +287,7 @@ def run_level(server: lane_harness.InProcessServer, provider: str, level: int, s
         workspace.mkdir(parents=True)
         (workspace / "module.py").write_text(source)
         runs.append((index, workspace, server.delegate(
-            lane=provider, task=TASK, verification=VERIFICATION, workspace=workspace,
+            provider=provider, task=TASK, verification=VERIFICATION, workspace=workspace,
             fallback="none", name=f"bench-{level}-{index}")))
     deadline = time.monotonic() + timeout
     for _, _, run in runs:
@@ -328,6 +333,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--provider", default=None,
                         help="provider name from the config (default: the default provider)")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="TOML naming the provider (default: $SUBAGENT_CONFIG, then "
+                             "the user's own config.toml)")
     parser.add_argument("--levels", default="1,2,4,8")
     parser.add_argument("--timeout", type=float, default=900.0,
                         help="seconds per level (also each child's run timeout)")
@@ -338,29 +346,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--levels must be positive integers")
     top = max(levels)
 
-    scratch = Path(tempfile.mkdtemp(prefix=f"sam-bench-{args.provider or 'default'}-")).resolve()
+    scratch = Path(tempfile.mkdtemp(
+        prefix=f"subagent-bench-{args.provider or 'default'}-")).resolve()
     out = args.out.expanduser().resolve() if args.out else scratch
     out.mkdir(parents=True, exist_ok=True)
-    # The default provider's name comes from the config; the caps must be in
-    # the environment before the server reads its settings.
-    provider = args.provider
+    # The caps have to be in the config the server reads, above everything it
+    # layers: [core] holds the defaults, and the provider's own copy (a config
+    # may pin it lower than the bench needs) is raised with them.
+    provider = args.provider or _default_provider(args.config)
     if not provider:
-        try:
-            from subagent.config import load
-            provider = load().default_provider
-        except Exception as exc:  # noqa: BLE001 - the server reports the real problem
-            print(f"config: {type(exc).__name__}: {exc}")
-    env = {
-        "SAM_MAX_AGENTS": str(top),
-        f"SAM_{(provider or 'default').upper()}_MAX_AGENTS": str(top),
-        f"SAM_{(provider or 'default').upper()}_RUN_TIMEOUT": str(int(args.timeout)),
-        "SAM_MAX_STEPS": "10",
-        "SAM_RATE_LIMIT_RETRIES": "0",
-        "SAM_SAMPLE_SECONDS": "5",
+        raise SystemExit("no --provider given and no config names a default_provider")
+    overrides = {
+        "core": {"max_agents": top, "max_steps": 10, "rate_limit_retries": 0,
+                 "run_timeout": args.timeout, "sample_seconds": 5.0},
+        "providers": {provider: {"max_agents": top, "run_timeout": args.timeout}},
     }
     print(f"scratch: {scratch}")
     print(f"out: {out}")
-    server = lane_harness.InProcessServer(scratch / "sessions", env).start()
+    server = lane_harness.InProcessServer(scratch / "sessions", args.config,
+                                          overrides=overrides).start()
     children: list[dict[str, Any]] = []
     level_rows: list[dict[str, Any]] = []
     try:

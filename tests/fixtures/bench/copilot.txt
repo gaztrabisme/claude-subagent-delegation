@@ -1,0 +1,5 @@
+{"type":"assistant.turn_start","data":{"turnId":"0"},"timestamp":"2026-09-19T05:00:00Z"}
+{"type":"tool.execution_start","data":{"toolCallId":"1","toolName":"bash","arguments":{"command":"python3 -m unittest discover"}},"timestamp":"2026-09-19T05:00:01Z"}
+{"type":"tool.execution_complete","data":{"toolCallId":"1","success":true},"timestamp":"2026-09-19T05:00:03Z"}
+{"type":"assistant.message","data":{"content":"the cron package is implemented"},"timestamp":"2026-09-19T05:00:04Z"}
+{"type":"session.usage_checkpoint","data":{"totalNanoAiu":2500000000,"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":20},"timestamp":"2026-09-19T05:00:04Z"}

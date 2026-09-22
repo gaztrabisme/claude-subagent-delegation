@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Concurrency benchmark for a local lane: 1, 2, 4, 8 children at once.
+"""Concurrency benchmark for one configured provider: 1, 2, 4, 8 children at once.
 
-For each level N, starts N fresh agents on the lane at the same time (fallback
-"none", each in its own temporary workspace). Each reads a provided ~200-line
-Python file and writes summary.txt naming its three functions; verification is
-a grep for one of the names. SAM_<LANE>_MAX_AGENTS and SAM_MAX_AGENTS are
-raised to the largest level for the run. One in-process server (this package's
-Settings, Registry, Supervisor) serves every level, with a fresh session root.
+For each level N, starts N fresh agents on the provider at the same time
+(fallback "none", each in its own temporary workspace). Each reads a provided
+~200-line Python file and writes summary.txt naming its three functions;
+verification is a grep for one of the names. SAM_<PROVIDER>_MAX_AGENTS and
+SAM_MAX_AGENTS are raised to the largest level for the run. One in-process
+server (this package's Settings, Registry, Supervisor) serves every level,
+with a fresh session root.
 
 Per child (bench_children.csv): TTFT, wall, output tokens, decode tok/s (from
 its turn records), verified. Per level (bench.csv, one row per level):
@@ -19,7 +20,7 @@ aggregate tok/s at least 1.3x the next lower level's, (3) has p90 TTFT under
 60 s, and (4) whose peak swap grew by no more than 512 MB over level 1. The
 printed line names the rule that decided it.
 
-    uv run python scripts/bench_concurrency.py --lane omlx --levels 1,2,4,8 --out /tmp/bench
+    uv run python bench/concurrency.py --provider omlx --levels 1,2,4,8 --out /tmp/bench
 """
 
 from __future__ import annotations
@@ -37,7 +38,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+BENCH_ROOT = Path(__file__).resolve().parent
+# The in-process server harness lives next to the other live scripts.
+sys.path.insert(0, str(BENCH_ROOT.parent / "scripts"))
 
 import lane_harness  # noqa: E402
 
@@ -243,10 +246,32 @@ def recommend(levels: Sequence[Mapping[str, Any]]) -> tuple[int | None, str]:
     return chosen, f"recommend max_agents={chosen}: {why}"
 
 
+def _pick_provider(settings: Any, name: str | None) -> tuple[str, Any]:
+    """(name, config) for `--provider`, or the config's default provider.
+
+    Reads `settings.providers` and, for the shapes the live-script fakes and
+    older scripts still build, `settings.lanes`.
+    """
+    lanes = getattr(settings, "lanes", None) or {}
+    tables = {**lanes, **(getattr(settings, "providers", None) or {})}
+    if name:
+        if name not in tables:
+            raise SystemExit(f"unknown provider {name!r}; configured: "
+                             f"{', '.join(sorted(tables)) or '(none)'}")
+        return name, tables[name]
+    default = getattr(settings, "default_provider", None)
+    if default in tables:
+        return default, tables[default]
+    if tables:
+        first = min(tables)
+        return first, tables[first]
+    raise SystemExit("no providers configured")
+
+
 # --- running a level ----------------------------------------------------------------
 
 
-def run_level(server: lane_harness.InProcessServer, lane: str, level: int, scratch: Path,
+def run_level(server: lane_harness.InProcessServer, provider: str, level: int, scratch: Path,
               timeout: float) -> tuple[list[dict[str, Any]], float, set[str]]:
     """Start `level` children at once, wait for all. (child rows, level wall, run ids)."""
     source = module_source()
@@ -257,7 +282,7 @@ def run_level(server: lane_harness.InProcessServer, lane: str, level: int, scrat
         workspace.mkdir(parents=True)
         (workspace / "module.py").write_text(source)
         runs.append((index, workspace, server.delegate(
-            lane=lane, task=TASK, verification=VERIFICATION, workspace=workspace,
+            lane=provider, task=TASK, verification=VERIFICATION, workspace=workspace,
             fallback="none", name=f"bench-{level}-{index}")))
     deadline = time.monotonic() + timeout
     for _, _, run in runs:
@@ -301,7 +326,8 @@ def _write_csv(path: Path, columns: list[str], rows: Iterable[Mapping[str, Any]]
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--lane", default="omlx", choices=("omlx", "bppc"))
+    parser.add_argument("--provider", default=None,
+                        help="provider name from the config (default: the default provider)")
     parser.add_argument("--levels", default="1,2,4,8")
     parser.add_argument("--timeout", type=float, default=900.0,
                         help="seconds per level (also each child's run timeout)")
@@ -312,13 +338,22 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--levels must be positive integers")
     top = max(levels)
 
-    scratch = Path(tempfile.mkdtemp(prefix=f"sam-bench-{args.lane}-")).resolve()
+    scratch = Path(tempfile.mkdtemp(prefix=f"sam-bench-{args.provider or 'default'}-")).resolve()
     out = args.out.expanduser().resolve() if args.out else scratch
     out.mkdir(parents=True, exist_ok=True)
+    # The default provider's name comes from the config; the caps must be in
+    # the environment before the server reads its settings.
+    provider = args.provider
+    if not provider:
+        try:
+            from subagent.config import load
+            provider = load().default_provider
+        except Exception as exc:  # noqa: BLE001 - the server reports the real problem
+            print(f"config: {type(exc).__name__}: {exc}")
     env = {
         "SAM_MAX_AGENTS": str(top),
-        f"SAM_{args.lane.upper()}_MAX_AGENTS": str(top),
-        f"SAM_{args.lane.upper()}_RUN_TIMEOUT": str(int(args.timeout)),
+        f"SAM_{(provider or 'default').upper()}_MAX_AGENTS": str(top),
+        f"SAM_{(provider or 'default').upper()}_RUN_TIMEOUT": str(int(args.timeout)),
         "SAM_MAX_STEPS": "10",
         "SAM_RATE_LIMIT_RETRIES": "0",
         "SAM_SAMPLE_SECONDS": "5",
@@ -329,11 +364,11 @@ def main(argv: list[str] | None = None) -> int:
     children: list[dict[str, Any]] = []
     level_rows: list[dict[str, Any]] = []
     try:
-        lane = server.settings.lanes[args.lane]
-        print(f"lane: {lane.name} model={lane.model} max_agents={lane.max_agents}")
+        provider, cfg = _pick_provider(server.settings, provider or None)
+        print(f"provider: {provider} model={cfg.model} max_agents={cfg.max_agents}")
         for level in levels:
             print(f"level {level}: starting {level} children", flush=True)
-            rows, wall, run_ids = run_level(server, args.lane, level, scratch, args.timeout)
+            rows, wall, run_ids = run_level(server, provider, level, scratch, args.timeout)
             children += rows
             samples = [m for m in lane_harness.read_jsonl(server.metrics_path)
                        if m.get("kind") == "sample" and set(m.get("run_ids") or []) & run_ids]
@@ -353,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
             shutil.copy2(path, out / path.name)
     chosen, line = recommend(level_rows)
     (out / "recommendation.json").write_text(json.dumps(
-        {"lane": args.lane, "recommended": chosen, "reason": line, "levels": level_rows},
+        {"provider": provider, "recommended": chosen, "reason": line, "levels": level_rows},
         indent=2))
     print(f"bench: {out / 'bench.csv'} ({len(level_rows)} rows)")
     print(f"children: {out / 'bench_children.csv'} ({len(children)} rows)")

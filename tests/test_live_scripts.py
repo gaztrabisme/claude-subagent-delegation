@@ -9,8 +9,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
+import tomllib
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -326,27 +329,32 @@ def test_bench_main_writes_one_row_per_level(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     class FakeServer:
-        def __init__(self, session_root, env):
+        def __init__(self, session_root, config=None, *, overrides=None):
+            # The caps arrive as config overrides, not environment.
+            assert overrides["providers"]["omlx"]["max_agents"] == 8
+            assert overrides["core"]["max_agents"] == 8
             self.session_root = session_root
             session_root.mkdir(parents=True, exist_ok=True)
             self.metrics_path = session_root / "metrics.jsonl"
             self.trace_path = session_root / "trace.jsonl"
-            self.settings = SimpleNamespace(lanes={"omlx": SimpleNamespace(
-                name="omlx", model="m", max_agents=int(env["SAM_OMLX_MAX_AGENTS"]))})
+            self.settings = SimpleNamespace(
+                providers={"omlx": SimpleNamespace(name="omlx", model="m", max_agents=8)},
+                default_provider="omlx")
             self.count = 0
             self.samples: list[str] = []
 
         def start(self):
             return self
 
-        def delegate(self, *, lane, task, verification, workspace, fallback, name):
+        def delegate(self, *, provider, task, verification, workspace, fallback, name):
             assert fallback == "none" and (workspace / "module.py").exists()
             self.count += 1
             now = time.time()
             done = threading.Event()
             done.set()
             run_id = f"run-{self.count}"
-            self.samples.append(json.dumps({"kind": "sample", "lane": lane, "run_ids": [run_id],
+            self.samples.append(json.dumps({"kind": "sample", "lane": provider,
+                                            "run_ids": [run_id],
                                             "snapshot": {"omlx": {"model_memory_used": 1},
                                                          "mac": {"swap_used_mb": 0.0}}}))
             self.metrics_path.write_text("\n".join(self.samples) + "\n")
@@ -372,3 +380,104 @@ def test_bench_main_writes_one_row_per_level(tmp_path, monkeypatch):
         assert len(list(csv.DictReader(handle))) == 15
     assert json.loads((tmp_path / "recommendation.json").read_text())["recommended"] in (
         1, 2, 4, 8)
+
+
+def test_bench_main_takes_the_default_provider_from_the_config(tmp_path, monkeypatch):
+    """With no --provider, the config's default provider gets the overrides."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    seen: dict[str, Any] = {}
+
+    class FakeServer:
+        def __init__(self, session_root, config=None, *, overrides=None):
+            seen["overrides"] = overrides
+            self.session_root = session_root
+            session_root.mkdir(parents=True, exist_ok=True)
+            self.metrics_path = session_root / "metrics.jsonl"
+            self.trace_path = session_root / "trace.jsonl"
+            self.settings = SimpleNamespace(
+                providers={"llama": SimpleNamespace(name="llama", model="m", max_agents=1)},
+                default_provider="llama")
+
+        def start(self):
+            return self
+
+        def delegate(self, *, provider, task, verification, workspace, fallback, name):
+            now = time.time()
+            done = threading.Event()
+            done.set()
+            return SimpleNamespace(
+                run_id="run-1", agent_id="a1", state="completed", done=done,
+                created_at=now - 2, finished_at=now, ttft_seconds=0.5, error=None,
+                verification_result=SimpleNamespace(passed=True),
+                turn_log=[{"output": 60, "ts_first_token": now - 1.5, "ts_end": now - 0.5}])
+
+        def close_agent(self, agent_id):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench.lane_harness, "config_table",
+                        lambda config: {"core": {"default_provider": "llama"}})
+    monkeypatch.setattr(bench.lane_harness, "InProcessServer", FakeServer)
+    assert bench.main(["--levels", "1", "--out", str(tmp_path)]) == 0
+    assert seen["overrides"]["core"]["max_agents"] == 1
+    assert seen["overrides"]["providers"]["llama"]["max_agents"] == 1
+
+
+# --- the config-driven server -------------------------------------------------------
+
+
+def test_toml_dump_writes_sections_and_drops_nones():
+    text = harness.toml_dump({
+        "core": {"max_agents": 8, "sample_seconds": 5.0, "trace": None},
+        "providers": {"omlx": {"driver": "claude", "local": True,
+                               "api_key_env": ["OMLX_API_KEY"],
+                               "health": {"kind": "omlx"}}},
+    })
+    parsed = tomllib.loads(text)
+    assert parsed == {"core": {"max_agents": 8, "sample_seconds": 5.0},
+                      "providers": {"omlx": {"driver": "claude", "local": True,
+                                             "api_key_env": ["OMLX_API_KEY"],
+                                             "health": {"kind": "omlx"}}}}
+    assert "trace" not in parsed["core"]
+
+
+def test_provider_config_declares_exactly_the_one_provider(tmp_path):
+    path = harness.write_provider_config("omlx", directory=tmp_path,
+                                         core={"max_steps": 8, "run_timeout": 600.0})
+    assert path.is_file()
+    assert set(tomllib.loads(path.read_text())["providers"]) == {"omlx"}
+    settings = harness.load_settings(path)
+    assert settings.default_provider == "omlx"
+    cfg = settings.providers["omlx"]
+    assert cfg.driver == "claude" and cfg.local is True
+    assert cfg.base_url == "http://127.0.0.1:8000/v1"
+    assert "OMLX_API_KEY" in cfg.api_key_envs
+    assert (cfg.max_steps, cfg.run_timeout) == (8, 600.0)
+
+
+def test_provider_config_takes_the_given_values_over_the_builtins(tmp_path):
+    path = harness.write_provider_config("omlx", directory=tmp_path,
+                                         base_url="http://127.0.0.1:9000/v1")
+    cfg = harness.load_settings(path).providers["omlx"]
+    assert cfg.base_url == "http://127.0.0.1:9000/v1"
+
+
+def test_an_unknown_provider_needs_a_config():
+    with pytest.raises(SystemExit):
+        harness.write_provider_config("bppc", directory=Path(tempfile.gettempdir()))
+
+
+def test_load_settings_layers_overrides_over_the_config(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text('[core]\nmax_agents = 2\nmax_steps = 5\n'
+                      '[providers.p]\ndriver = "claude"\nmax_agents = 2\n')
+    settings = harness.load_settings(config, overrides={
+        "core": {"max_agents": 8}, "providers": {"p": {"max_agents": 8}}})
+    assert settings.max_agents == 8
+    assert settings.providers["p"].max_agents == 8
+    assert settings.providers["p"].max_steps == 5  # the config's own value stands

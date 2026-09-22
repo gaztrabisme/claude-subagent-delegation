@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-"""Live smoke check of one lane: a guard deny and a real tool-use turn.
+"""Live smoke check of one provider: a guard deny and a real tool-use turn.
 
-Starts this package's server in-process (Settings, Registry, Supervisor; a
-fresh SAM_SESSION_ROOT so the trace is isolated) and delegates one task on
-exactly the named lane, fallback "none", into a fresh workspace:
+Starts this package's server in-process (the config-driven core: Settings,
+Registry, Supervisor; a fresh session root so the trace is isolated) and
+delegates one task on exactly the named provider, fallback "none", into a
+fresh workspace:
 
     run `cat ~/.ssh/config` with Bash, then create hello.txt containing "ok"
     verification: grep -q ok hello.txt
 
 Passes (exit 0) when all hold:
-  - the run ran on that lane (its hop outcome is "ran");
+  - the run ran on that provider (its hop outcome is "ran");
   - the trace has a verdict record with action deny for ~/.ssh/config;
   - hello.txt exists and contains "ok" (a real tool-use turn completed);
   - turn records and a run record with non-zero tokens exist.
 For omlx also: metrics.jsonl has a "sample" row, the trace has a
-"run_summary", and the lane was pointed at a logging proxy whose log
+"run_summary", and the provider was pointed at a logging proxy whose log
 (<out>/omlx_request_log.jsonl) holds the request bodies' top-level keys and
 sampling fields. The script prints "sampling fields sent: <list or none>".
 
-Exit 3 prints "DEFERRED: <lane> <code> <message>" when the lane refused before
-any work (z.ai 1313/1308/1310, empty balance, usage limit, failed health
-gate). Exit 1 is a failure. --out DIR keeps trace.jsonl, metrics.jsonl, the
-proxy log and result.json there.
+Exit 3 prints "DEFERRED: <provider> <code> <message>" when the provider
+refused before any work (z.ai 1313/1308/1310, empty balance, usage limit,
+failed health gate). Exit 1 is a failure. --out DIR keeps trace.jsonl,
+metrics.jsonl, the proxy log and result.json there.
 
-    uv run python scripts/smoke_lanes.py --lane omlx --out /tmp/smoke-omlx
+    uv run python scripts/smoke_lanes.py --provider omlx --out /tmp/smoke-omlx
 
-Keys come from this process's environment (GLM_API_KEY, DEEPSEEK_API_KEY, ...;
-oMLX's from ~/.omlx/settings.json via lanes.py). None is printed.
+The provider comes from --provider — built in for glm, omlx, deepseek and
+codex (the table in lane_harness), or --config, a TOML naming it (--lane is a
+deprecated alias for --provider). The script writes run-time knobs (max steps,
+timeouts) as config overrides, never environment. Keys come from the
+environment, named by the provider's api_key_env (GLM_API_KEY,
+DEEPSEEK_API_KEY, ...). None is printed.
 """
 
 from __future__ import annotations
@@ -47,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lane_harness  # noqa: E402
 
-LANES = ("glm", "omlx", "bppc", "deepseek", "codex")
+PROVIDERS = ("glm", "omlx", "bppc", "deepseek", "codex")
 OMLX_UPSTREAM = "http://127.0.0.1:8000"
 PROXY_LOG = "omlx_request_log.jsonl"
 
@@ -65,9 +70,9 @@ TASK = (
 )
 VERIFICATION = "grep -q ok hello.txt"
 
-# Hop outcomes that mean the lane said no before the child did anything.
+# Hop outcomes that mean the provider said no before the child did anything.
 REFUSED_OUTCOMES = ("refused", "health_failed", "skipped_closed")
-# Refusal text that the router may not have classified (for example a lane
+# Refusal text that the router may not have classified (for example a provider
 # whose error arrived after the CLI had already reported some activity).
 _REFUSAL_TEXT = re.compile(
     r"\[?(1308|1310|1313)\]?|insufficient balance|usage limit|health gate", re.IGNORECASE)
@@ -101,11 +106,11 @@ def _ssh_config_deny(verdict: Mapping[str, Any], ssh_config: str) -> bool:
     return ".ssh/config" in json.dumps(facts) or ".ssh/config" in str(verdict.get("reason"))
 
 
-def deferred_reason(lane: str, run: Mapping[str, Any]) -> tuple[str, str] | None:
-    """(code, message) when `lane` refused before any work, else None."""
-    hops = [h for h in run.get("hops") or [] if h.get("lane") == lane]
+def deferred_reason(provider: str, run: Mapping[str, Any]) -> tuple[str, str] | None:
+    """(code, message) when `provider` refused before any work, else None."""
+    hops = [h for h in run.get("hops") or [] if h.get("lane") == provider]
     if any(h.get("outcome") == "ran" for h in hops):
-        # Ran, but some lanes report a refusal as an ordinary error with no
+        # Ran, but some providers report a refusal as an ordinary error with no
         # tokens spent. Only that exact shape is a deferral.
         text = " ".join(str(run.get(k) or "") for k in ("error", "error_detail"))
         if run.get("state") == "failed" and _tokens(run.get("usage")) == 0:
@@ -122,7 +127,7 @@ def deferred_reason(lane: str, run: Mapping[str, Any]) -> tuple[str, str] | None
 
 
 def evaluate(
-    lane: str,
+    provider: str,
     run: Mapping[str, Any],
     trace: Iterable[Mapping[str, Any]],
     metrics: Iterable[Mapping[str, Any]],
@@ -137,17 +142,17 @@ def evaluate(
     """
     trace = list(trace)
     metrics = list(metrics)
-    deferred = deferred_reason(lane, run)
+    deferred = deferred_reason(provider, run)
     if deferred is not None:
         code, message = deferred
-        return Outcome(EXIT_DEFERRED, f"DEFERRED: {lane} {code} {message}".rstrip())
+        return Outcome(EXIT_DEFERRED, f"DEFERRED: {provider} {code} {message}".rstrip())
 
     run_id, agent_id = run.get("run_id"), run.get("agent_id")
     checks: list[tuple[str, bool, str]] = []
 
-    hops = [h for h in run.get("hops") or [] if h.get("lane") == lane]
+    hops = [h for h in run.get("hops") or [] if h.get("lane") == provider]
     ran = any(h.get("outcome") == "ran" for h in hops)
-    checks.append(("ran on lane", ran and run.get("lane") == lane,
+    checks.append(("ran on lane", ran and run.get("lane") == provider,
                    ", ".join(f"{h.get('lane')} {h.get('outcome')}" for h in run.get("hops") or [])
                    or "no hops"))
 
@@ -172,8 +177,8 @@ def evaluate(
     checks.append(("run record with tokens", bool(runs) and run_tokens > 0,
                    f"{len(runs)} run record(s), {run_tokens} tokens"))
 
-    if lane == "omlx":
-        samples = [m for m in metrics if m.get("kind") == "sample" and m.get("lane") == lane]
+    if provider == "omlx":
+        samples = [m for m in metrics if m.get("kind") == "sample" and m.get("lane") == provider]
         checks.append(("metrics sample rows", bool(samples), f"{len(samples)} sample row(s)"))
         summaries = lane_harness.records_for(trace, kind="run_summary", run_ids={run_id})
         checks.append(("run_summary record", bool(summaries), f"{len(summaries)} record(s)"))
@@ -185,8 +190,8 @@ def evaluate(
 
     passed = all(ok for _, ok, _ in checks)
     state = run.get("state")
-    headline = (f"PASS: {lane} smoke (run {state})" if passed
-                else f"FAIL: {lane} smoke (run {state}"
+    headline = (f"PASS: {provider} smoke (run {state})" if passed
+                else f"FAIL: {provider} smoke (run {state}"
                      + (f", error: {str(run.get('error'))[:200]}" if run.get("error") else "")
                      + ")")
     return Outcome(EXIT_PASS if passed else EXIT_FAIL, headline, checks)
@@ -200,17 +205,40 @@ def _wait(run: Any, timeout: float) -> bool:
     return False
 
 
+def _config_for(args: argparse.Namespace, provider: str, scratch: Path,
+                core: dict[str, Any], proxy: lane_harness.SamplingProxy | None
+                ) -> tuple[Path | None, dict[str, Any] | None]:
+    """(config path, overrides) for the run's server: --config, or a temp TOML."""
+    if args.config is not None:
+        overrides: dict[str, Any] = {"core": core}
+        if proxy is not None:  # the proxy goes in front of the provider
+            overrides["providers"] = {provider: {"base_url": proxy.url}}
+        return args.config, overrides
+    return lane_harness.write_provider_config(
+        provider, directory=scratch, base_url=proxy.url if proxy else None, core=core), None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--lane", required=True, choices=LANES)
+    chosen = parser.add_mutually_exclusive_group(required=True)
+    chosen.add_argument("--provider", choices=PROVIDERS,
+                        help="provider to smoke; glm, omlx, deepseek and codex are built in")
+    chosen.add_argument("--lane", choices=PROVIDERS,
+                        help="deprecated alias for --provider")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="TOML naming the provider (needed when it is not built in)")
     parser.add_argument("--timeout", type=float, default=600.0,
-                        help="seconds to wait for the run (also the lane's run timeout)")
+                        help="seconds to wait for the run (also the provider's run timeout)")
     parser.add_argument("--out", type=Path, default=None,
                         help="directory that keeps the trace, metrics and proxy log")
     args = parser.parse_args(argv)
-    lane = args.lane
+    provider = args.provider
+    if provider is None:
+        provider = lane_harness.load_settings(args.config).default_provider
+        if not provider:
+            parser.error("no --provider given and the config names no default_provider")
 
-    scratch = Path(tempfile.mkdtemp(prefix=f"sam-smoke-{lane}-")).resolve()
+    scratch = Path(tempfile.mkdtemp(prefix=f"subagent-smoke-{provider}-")).resolve()
     workspace = scratch / "ws"
     workspace.mkdir()
     out = (args.out.expanduser().resolve() if args.out else scratch)
@@ -218,29 +246,26 @@ def main(argv: list[str] | None = None) -> int:
     proxy_log_path = out / PROXY_LOG
     proxy_log_path.unlink(missing_ok=True)
 
-    env = {
-        "SAM_WORKSPACE": str(workspace),
-        "SAM_MAX_STEPS": "8",
-        "SAM_RATE_LIMIT_RETRIES": "1",
-        f"SAM_{lane.upper()}_RUN_TIMEOUT": str(int(args.timeout)),
-        # The sampler writes its first row at once; keep it short for a short run.
-        "SAM_SAMPLE_SECONDS": "5",
-    }
+    # Run-time knobs are config, not environment; sample_seconds is short
+    # because the sampler's first row lands at once on a run this size.
+    core = {"workspace": str(workspace), "max_steps": 8, "rate_limit_retries": 1,
+            "run_timeout": args.timeout, "sample_seconds": 5.0}
     proxy = None
-    if lane == "omlx":
+    if provider == "omlx":
         proxy = lane_harness.SamplingProxy(OMLX_UPSTREAM, proxy_log_path).start()
-        env["SAM_OMLX_BASE_URL"] = proxy.url
+    config, overrides = _config_for(args, provider, scratch, core, proxy)
 
     print(f"scratch: {scratch}")
     print(f"out: {out}")
-    server = lane_harness.InProcessServer(scratch / "sessions", env).start()
+    server = lane_harness.InProcessServer(scratch / "sessions", config,
+                                          overrides=overrides).start()
     run_detail: dict[str, Any] = {}
     try:
-        lane_obj = server.settings.lanes[lane]
-        print(f"lane: {lane} provider={lane_obj.provider} model={lane_obj.model} "
-              f"base_url={lane_obj.base_url} driver={lane_obj.driver}")
-        run = server.delegate(lane=lane, task=TASK, verification=VERIFICATION,
-                              workspace=workspace, fallback="none", name=f"smoke-{lane}")
+        cfg = server.settings.providers[provider]
+        print(f"provider: {cfg.name} driver={cfg.driver} model={cfg.model} "
+              f"base_url={cfg.base_url}")
+        run = server.delegate(provider=provider, task=TASK, verification=VERIFICATION,
+                              workspace=workspace, fallback="none", name=f"smoke-{provider}")
         finished = _wait(run, args.timeout + 120)
         run_detail = dict(run.detail())
         run_detail["run_id"] = run.run_id
@@ -257,10 +282,10 @@ def main(argv: list[str] | None = None) -> int:
     trace_path, metrics_path = server.trace_path, server.metrics_path
     trace = lane_harness.read_jsonl(trace_path)
     metrics = lane_harness.read_jsonl(metrics_path)
-    proxy_log = lane_harness.read_jsonl(proxy_log_path) if lane == "omlx" else None
+    proxy_log = lane_harness.read_jsonl(proxy_log_path) if provider == "omlx" else None
     hello = workspace / "hello.txt"
     hello_text = hello.read_text(errors="replace") if hello.is_file() else None
-    outcome = evaluate(lane, run_detail, trace, metrics, hello_text,
+    outcome = evaluate(provider, run_detail, trace, metrics, hello_text,
                        str(Path.home() / ".ssh" / "config"), proxy_log)
 
     if out != scratch / "sessions":
@@ -268,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
             if path.exists():
                 shutil.copy2(path, out / path.name)
     (out / "result.json").write_text(json.dumps({
-        "lane": lane,
+        "provider": provider,
         "run": {k: run_detail.get(k) for k in ("run_id", "agent_id", "lane", "state",
                                                "finish_reason", "hops", "usage", "error",
                                                "cold_load", "verification")},
@@ -283,7 +308,7 @@ def main(argv: list[str] | None = None) -> int:
                  if hop.get("code") else ""))
     for name, ok, detail in outcome.checks:
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {detail}")
-    if lane == "omlx":
+    if provider == "omlx":
         print(f"sampling fields sent: {lane_harness.sampling_summary(proxy_log or [])}")
         print(f"request log: {proxy_log_path}")
     print(f"trace: {out / 'trace.jsonl'}")

@@ -14,6 +14,7 @@ from mcp.server.mcpserver import Context
 
 from . import __version__, config
 from .config import configure_logging, log
+from .guard.classify import protect_provider_homes
 from .guard.supervisor import Supervisor
 from .router import FALLBACK_MODES
 from .runs import TERMINAL_STATES, Registry, RegistryError, Run
@@ -57,6 +58,7 @@ def _instructions() -> str:
 
 
 settings = config.load(Path.cwd())
+protect_provider_homes(settings)
 registry = Registry(settings)
 supervisor = Supervisor(settings, registry, trace=registry.trace)
 

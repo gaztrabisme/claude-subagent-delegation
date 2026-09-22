@@ -10,8 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from subagent.config import APPROVAL_HOOK
+from subagent.config import APPROVAL_HOOK, Settings
 from subagent.guard.classify import ALLOW, DENY, classify
+from subagent.providers.base import ProviderConfig
 
 HOME = Path.home()
 
@@ -25,6 +26,23 @@ def _hook_module():
 
 
 HOOK = _hook_module()
+
+
+@pytest.fixture(autouse=True)
+def _codex_and_omlx_homes(monkeypatch):
+    """These review cases assume codex and omlx are configured providers, so
+    their credential homes are off-limits (protect_provider_homes)."""
+    from subagent.guard import classify as guard_classify
+
+    monkeypatch.setattr(guard_classify, "_provider_homes", ())
+    guard_classify.protect_provider_homes(Settings(
+        workspace=Path("."),
+        session_root=Path("/tmp/subagent-test-sessions"),
+        providers={
+            "codex": ProviderConfig(name="codex", driver="codex", vendor="codex"),
+            "omlx": ProviderConfig(name="omlx", driver="claude", vendor="omlx"),
+        },
+    ))
 
 
 @pytest.fixture

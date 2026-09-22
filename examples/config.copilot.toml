@@ -1,0 +1,15 @@
+# GitHub Copilot. This driver is named in the schema but not yet ported in
+# this build: the config loads, and a run on it reports "driver not yet
+# ported" rather than reaching the network.
+
+[core]
+default_provider = "copilot"
+
+[providers.copilot]
+driver = "copilot"
+model = "claude-sonnet-5"
+
+[providers.copilot.pricing]
+# Copilot is paid in credits.
+kind = "credits"
+usd_per_credit = 0.01

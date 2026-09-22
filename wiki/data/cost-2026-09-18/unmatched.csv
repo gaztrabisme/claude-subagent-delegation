@@ -1,0 +1,113 @@
+lane,run_id,agent_id,source,model,ts,state,error,duplicate_run_id
+glm,run-3a140c4af3a9,a8,glm-subagent,glm-5.3[1m],1788328790.12,completed,,False
+glm,run-366460b2cd15,a8,glm-subagent,glm-5.3[1m],1788329291.965,completed,,False
+glm,run-c0902a081652,a1,glm-subagent,glm-5.3[1m],1788337229.038,cancelled,"claude exited 143: [claude-code:unrecognized_model] {""model"":""glm-5.3[1m]"",""query_source"":""sdk""}",False
+glm,run-c3bf69b609b1,a2,glm-subagent,glm-5.3[1m],1788337389.881,completed_unverified,,False
+glm,run-eaa4a71d9d10,a2,glm-subagent,glm-5.3[1m],1788337524.216,completed,,False
+glm,run-18d26796f9cf,a2,glm-subagent,glm-5.3[1m],1788337601.053,completed,,False
+glm,run-a90ff7224f58,a2,glm-subagent,glm-5.3[1m],1788337901.853,completed,,False
+glm,run-7541583c28ed,a19,glm-subagent,glm-5.3[1m],1788610980.235,completed,,False
+glm,run-e5b7c95a13f2,a15,glm-subagent,glm-5.3[1m],1788659532.591,cancelled,"claude exited 143: [claude-code:unrecognized_model] {""model"":""glm-5.3[1m]"",""query_source"":""sdk""}",False
+glm,run-7457e6198b0c,a2,glm-subagent,glm-5.3-flash[1m],1788679678.983,completed,,False
+glm,run-0ba7e3dae7df,a5,glm-subagent,glm-5.3-flash[1m],1788681723.12,completed,,False
+glm,run-b93a5c978a78,a17,glm-subagent,glm-5.3-flash[1m],1788701004.832,completed,,False
+glm,run-69d6a4985516,a18,glm-subagent,glm-5.3-flash[1m],1788701901.346,completed,,False
+glm,run-e6972869e0fc,a32,glm-subagent,glm-5.3-flash[1m],1788764679.255,completed_unverified,,False
+glm,run-148799620911,a48,glm-subagent,glm-5.3-flash[1m],1788778625.022,completed_unverified,,False
+glm,run-48520285f8c7,a45,glm-subagent,glm-5.3-flash[1m],1788778785.521,completed_unverified,,False
+glm,run-495631c89e63,a45,glm-subagent,glm-5.3-flash[1m],1788779455.456,completed,,False
+glm,run-008eb2e6dd93,a49,glm-subagent,glm-5.3-flash[1m],1788780274.46,completed_unverified,,False
+glm,run-41bd1992bb06,a49,glm-subagent,glm-5.3-flash[1m],1788780940.227,completed,,False
+glm,run-2dae7f8cce81,a52,glm-subagent,glm-5.3-flash[1m],1788782112.746,completed,,False
+glm,run-841b36dc1ff8,a54,glm-subagent,glm-5.3-flash[1m],1788782217.184,completed,,False
+glm,run-85a43d6a1504,a55,glm-subagent,glm-5.3-flash[1m],1788782380.36,completed,,False
+glm,run-eddedca47fa3,a58,glm-subagent,glm-5.3-flash[1m],1788784965.513,completed,,False
+glm,run-62ea971ce360,a30,glm-subagent,glm-5.3-flash[1m],1788883373.296,completed,,False
+glm,run-e4c416a7e375,a32,glm-subagent,glm-5.3-flash[1m],1788883661.893,completed,,False
+glm,run-dc8e07c85f2a,a36,glm-subagent,glm-5.3-flash[1m],1788885548.174,completed,,False
+glm,run-f5631d5bb0c2,a35,glm-subagent,glm-5.3-flash[1m],1788887215.198,completed,,False
+glm,run-a47c07537444,a40,glm-subagent,glm-5.3-flash[1m],1788890653.843,completed,,False
+glm,run-277148a06208,a58,glm-subagent,glm-5.3-flash[1m],1788919475.148,completed,,False
+glm,run-d64a8882b063,a1,glm-subagent,glm-5.3-flash[1m],1789343313.382,cancelled,cli_error: claude exited 143:,False
+glm,run-8085b17269d6,a6,glm-subagent,glm-5.3-flash[1m],1789647202.461,cancelled,cli_error: claude exited 143:,False
+deepseek,run-a3bbd4faa19c,a2,deepseek-subagent,deepseek-v4-pro,1788142481.916,completed_unverified,"verification failed: blocked before execution: segment `python3 -c ""from pathlib import Path`: command does not parse as shell words: No closing quotation",False
+deepseek,run-067fbb38813c,a1,deepseek-subagent,deepseek-v4-pro,1788142501.454,cancelled,cancelled by caller,False
+deepseek,run-d138a2e70e91,a3,deepseek-subagent,deepseek-v4-pro,1788142527.94,failed,"UNKNOWN: session ""dsa-a3"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/media-generator-mcp) (id collision)",False
+deepseek,run-c74d119b02bf,a4,deepseek-subagent,deepseek-v4-pro,1788142550.841,failed,"UNKNOWN: session ""dsa-a4"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/media-generator-mcp) (id collision)",False
+deepseek,run-3793bada7ded,a5,deepseek-subagent,deepseek-v4-pro,1788142618.948,failed,"UNKNOWN: session ""dsa-a5"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/media-generator-mcp) (id collision)",False
+deepseek,run-592014bec98d,a1,deepseek-subagent,deepseek-v4-pro,1788170201.388,failed,"UNKNOWN: session ""dsa-a1"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/media-generator-mcp, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-d7175ad31a0f,a2,deepseek-subagent,deepseek-v4-pro,1788170201.534,failed,"UNKNOWN: session ""dsa-a2"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Skills/media-gen, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-52d4876650dc,a3,deepseek-subagent,deepseek-v4-pro,1788170201.704,failed,"UNKNOWN: session ""dsa-a3"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-a04fd44792eb,a4,deepseek-subagent,deepseek-v4-pro,1788170324.317,failed,"UNKNOWN: session ""dsa-a4"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-aac861143df6,a5,deepseek-subagent,deepseek-v4-pro,1788170324.494,failed,"UNKNOWN: session ""dsa-a5"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-71c980cc50f3,a6,deepseek-subagent,deepseek-v4-pro,1788170324.679,failed,"UNKNOWN: session ""dsa-a6"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-8e7861330658,a7,deepseek-subagent,deepseek-v4-pro,1788170324.849,failed,"UNKNOWN: session ""dsa-a7"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-956a57c17053,a8,deepseek-subagent,deepseek-v4-pro,1788170334.575,failed,"UNKNOWN: session ""dsa-a8"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-5813463fcf1b,a9,deepseek-subagent,deepseek-v4-pro,1788170334.756,failed,"UNKNOWN: session ""dsa-a9"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser/.claude/worktrees/agent-a9ca27753ea713cbd, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-a42465f7e854,a11,deepseek-subagent,deepseek-v4-pro,1788170344.508,completed,,False
+deepseek,run-e84708901f41,a10,deepseek-subagent,deepseek-v4-pro,1788170345.05,completed,,False
+deepseek,run-99b641dbbbd2,a12,deepseek-subagent,deepseek-v4-pro,1788171018.453,failed,runaway loop detected: the same tool call repeated 3 times (bash) with identical arguments; the runtime was killed,False
+deepseek,run-109ec23350e0,a13,deepseek-subagent,deepseek-v4-pro,1788171018.488,failed,"step ceiling exceeded: run reached 41 steps, over the DSA_MAX_STEPS ceiling of 40; the runtime was killed",False
+deepseek,run-b27377ed812c,a14,deepseek-subagent,deepseek-v4-pro,1788171018.511,failed,"step ceiling exceeded: run reached 41 steps, over the DSA_MAX_STEPS ceiling of 40; the runtime was killed",False
+deepseek,run-dd64903e674d,a1,deepseek-subagent,deepseek-v4-pro,1788171066.025,failed,"UNKNOWN: session ""dsa-a1"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/media-generator-mcp, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-4f9513fd1f37,a2,deepseek-subagent,deepseek-v4-pro,1788171066.176,failed,"UNKNOWN: session ""dsa-a2"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Skills/media-gen, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-11f1f6b4a314,a3,deepseek-subagent,deepseek-v4-pro,1788171066.368,failed,"UNKNOWN: session ""dsa-a3"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-3e0e454c97e3,a4,deepseek-subagent,deepseek-v4-pro,1788171097.251,failed,"UNKNOWN: session ""dsa-a4"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-806e5882564e,a5,deepseek-subagent,deepseek-v4-pro,1788171097.432,failed,"UNKNOWN: session ""dsa-a5"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-d034a1bdcf0a,a6,deepseek-subagent,deepseek-v4-pro,1788171097.616,failed,"UNKNOWN: session ""dsa-a6"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-44e39189e1f7,a7,deepseek-subagent,deepseek-v4-pro,1788171097.79,failed,"UNKNOWN: session ""dsa-a7"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-d9ba64b4bd42,a8,deepseek-subagent,deepseek-v4-pro,1788171107.468,failed,"UNKNOWN: session ""dsa-a8"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-5e0293240f42,a9,deepseek-subagent,deepseek-v4-pro,1788171107.642,failed,"UNKNOWN: session ""dsa-a9"" is already persisted at a different cwd (persisted: /Users/GaryT/Documents/Work/Lab/liquid-parser/.claude/worktrees/agent-a9ca27753ea713cbd, live: /Users/GaryT/Documents/Work/Lab/ultra-dex) (id collision)",False
+deepseek,run-76b5ac1578be,a10,deepseek-subagent,deepseek-v4-pro,1788171135.108,failed,"UNKNOWN: session ""dsa-a10"" already has a persisted log on disk that does not match this live session (id collision)",False
+deepseek,run-7babc69dbb99,a11,deepseek-subagent,deepseek-v4-pro,1788171135.258,failed,"UNKNOWN: session ""dsa-a11"" already has a persisted log on disk that does not match this live session (id collision)",False
+deepseek,run-53000bb1c6fc,a12,deepseek-subagent,deepseek-v4-pro,1788171135.438,failed,"UNKNOWN: session ""dsa-a12"" already has a persisted log on disk that does not match this live session (id collision)",False
+deepseek,run-1a201cb40dd4,a13,deepseek-subagent,deepseek-v4-pro,1788171151.27,failed,"UNKNOWN: session ""dsa-a13"" already has a persisted log on disk that does not match this live session (id collision)",False
+deepseek,run-cf48c1e393da,a14,deepseek-subagent,deepseek-v4-pro,1788171151.458,failed,"UNKNOWN: session ""dsa-a14"" already has a persisted log on disk that does not match this live session (id collision)",False
+deepseek,run-753938055c06,a15,deepseek-subagent,deepseek-v4-pro,1788171366.008,completed_unverified,verification failed: blocked before execution: segment `test -s wiki/research/A-s24-ultra-server.md`: `test` is not on the read-only list,False
+deepseek,run-31ecea01607f,a16,deepseek-subagent,deepseek-v4-pro,1788171378.549,completed_unverified,verification failed: blocked before execution: segment `test -s wiki/research/B-mybook-dock.md`: `test` is not on the read-only list,False
+deepseek,run-d5bbdfcb14fd,a17,deepseek-subagent,deepseek-v4-pro,1788171479.26,completed_unverified,verification failed: blocked before execution: segment `test -s wiki/research/C-3d-print-skill-corpus.md`: `test` is not on the read-only list,False
+deepseek,run-1e240d6b99da,a1,deepseek-subagent,deepseek-v4-pro,1788172591.775,completed,,False
+deepseek,run-2fed5d2929c7,a2,deepseek-subagent,deepseek-v4-pro,1788173060.599,completed,,False
+deepseek,run-30cb2de2668a,a3,deepseek-subagent,deepseek-v4-pro,1788173230.44,completed,,False
+deepseek,run-9a4585553030,a4,deepseek-subagent,deepseek-v4-pro,1788173283.054,completed,,False
+deepseek,run-9c177718a21d,a1,deepseek-subagent,deepseek-v4-pro,1788174013.474,cancelled,cancelled by caller,False
+deepseek,run-c3d0551b740c,a2,deepseek-subagent,deepseek-v4-pro,1788174013.498,cancelled,cancelled by caller,False
+deepseek,run-5530c8b2e5e9,a3,deepseek-subagent,deepseek-v4-pro,1788174013.515,cancelled,cancelled by caller,False
+deepseek,run-e3806e9b29e6,a4,deepseek-subagent,deepseek-v4-pro,1788174013.538,cancelled,cancelled by caller,False
+deepseek,run-72794562a211,a1,deepseek-subagent,deepseek-v4-pro,1788174152.303,failed,runaway loop detected: the same tool call repeated 3 times (read) with identical arguments; the runtime was killed,False
+deepseek,run-f4ddfaf630d7,a4,deepseek-subagent,deepseek-v4-pro,1788174442.882,completed_unverified,verification failed: exited 1,False
+deepseek,run-f32a35c9f293,a2,deepseek-subagent,deepseek-v4-pro,1788174534.169,completed_unverified,verification failed: exited 1,False
+deepseek,run-ce7a9730f454,a5,deepseek-subagent,deepseek-v4-pro,1788174538.508,completed_unverified,verification failed: exited 1,False
+deepseek,run-c75022f1d86c,a3,deepseek-subagent,deepseek-v4-pro,1788174542.409,failed,"step ceiling exceeded: run reached 41 steps, over the DSA_MAX_STEPS ceiling of 40; the runtime was killed",False
+deepseek,run-c436a3955012,a4,deepseek-subagent,deepseek-v4-pro,1788174588.655,completed_unverified,verification failed: exited 1,False
+deepseek,run-7db61d3540d6,a5,deepseek-subagent,deepseek-v4-pro,1788174644.142,completed_unverified,verification failed: exited 1,False
+deepseek,run-381dda1707b4,a2,deepseek-subagent,deepseek-v4-pro,1788174649.793,completed_unverified,verification failed: exited 1,False
+deepseek,run-df83faee9342,a6,deepseek-subagent,deepseek-v4-pro,1788174745.674,completed,,False
+deepseek,run-12ffc97194f8,a7,deepseek-subagent,deepseek-v4-pro,1788174827.335,completed,,False
+deepseek,run-ee42a0e1e051,a9,deepseek-subagent,deepseek-v4-pro,1788175073.331,completed,,False
+deepseek,run-080cd84419b0,a8,deepseek-subagent,deepseek-v4-pro,1788175096.992,completed,,False
+deepseek,run-55e50ee12be9,a10,deepseek-subagent,deepseek-v4-pro,1788177363.194,completed,,False
+deepseek,run-1582b2e5e6ed,a11,deepseek-subagent,deepseek-v4-pro,1788177371.096,completed,,False
+deepseek,run-1ee75241365f,a11,deepseek-subagent,deepseek-v4-pro,1788177418.537,completed_unverified,verification failed: blocked before execution: segment `! grep -q 'kimai service reports' hours-selfhost/wiki/runbo…`: `!` is not on the read-only list,False
+deepseek,run-f6d009227cbb,a12,deepseek-subagent,deepseek-v4-pro,1788180546.925,cancelled,cancelled by caller,False
+deepseek,run-e8d62c3197e9,a1,deepseek-subagent,deepseek-v4-pro,1788260491.136,completed,,False
+deepseek,run-b72ba473daa5,a4,deepseek-subagent,deepseek-v4-pro,1788261097.332,completed,,False
+deepseek,run-c5d48a0c4e47,a2,deepseek-subagent,deepseek-v4-pro,1788261215.377,completed,,False
+deepseek,run-c76fcdb3ab3f,a5,deepseek-subagent,deepseek-v4-pro,1788261302.912,completed,,False
+deepseek,run-4c7ea420399e,a3,deepseek-subagent,deepseek-v4-pro,1788261567.019,completed,,False
+deepseek,run-a3968bec3aed,a6,deepseek-subagent,deepseek-v4-pro,1788261783.854,cancelled,cancelled by caller,False
+deepseek,run-c3b0dc047d88,a7,deepseek-subagent,deepseek-v4-pro,1788262125.497,completed,,False
+deepseek,run-5cb073572904,a7,deepseek-subagent,deepseek-v4-pro,1788262163.229,cancelled,cancelled by caller,False
+deepseek,run-211fd79ad036,a10,deepseek-subagent,deepseek-v4-pro,1788262302.522,completed,,False
+deepseek,run-af0dcb86010f,a8,deepseek-subagent,deepseek-v4-pro,1788262467.378,cancelled,cancelled by caller,False
+deepseek,run-fb6f2ba92a90,a11,deepseek-subagent,deepseek-v4-pro,1788262492.083,cancelled,cancelled by caller,False
+deepseek,run-fff3971f2dd4,a9,deepseek-subagent,deepseek-v4-pro,1788262516.068,failed,"step ceiling exceeded: run reached 41 steps, over the DSA_MAX_STEPS ceiling of 40; the runtime was killed",False
+deepseek,run-d04ac21e1cdf,a12,deepseek-subagent,deepseek-v4-pro,1788262626.237,cancelled,cancelled by caller,False
+deepseek,run-5a4a60208981,a1,deepseek-subagent,deepseek-v4-pro,1788314179.102,cancelled,cancelled by caller,False
+deepseek,run-a446f6ac4632,a2,deepseek-subagent,deepseek-v4-pro,1788314179.172,cancelled,cancelled by caller,False
+deepseek,run-623432148624,a3,deepseek-subagent,deepseek-v4-pro,1788314505.695,cancelled,cancelled by caller,False
+deepseek,run-3eec164ae95c,a2,deepseek-subagent,deepseek-v4-pro,1789343544.236,failed,"step ceiling exceeded: run reached 26 steps, over the DSA_MAX_STEPS ceiling of 25; the runtime was killed",False
+deepseek,run-7109ad1d5ca1,a1,deepseek-subagent,deepseek-v4-pro,1789343574.274,failed,runaway loop detected: the same tool call repeated 3 times (bash) with identical arguments; the runtime was killed,False
+bppc,run-1afab363680d,a1,qwen-subagent,qwen3.8-27b,1788411607.535,failed,"run reached 47 steps, over GSA_MAX_STEPS of 40",False
+bppc,run-638deaac8896,a1,qwen-subagent,qwen3.8-27b,1788411607.814,failed,"claude exited 1: [claude-code:unrecognized_model] {""model"":""qwen3.8-27b"",""query_source"":""sdk""}",False
+bppc,run-571802ff1907,a1,qwen-subagent,qwen3.8-27b,1788411608.083,failed,"claude exited 1: [claude-code:unrecognized_model] {""model"":""qwen3.8-27b"",""query_source"":""sdk""}",False

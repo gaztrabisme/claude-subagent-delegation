@@ -1,0 +1,6 @@
+{"type": "assistant.turn_start", "data": {"turnId": "0"}, "timestamp": "2026-09-19T05:00:00Z"}
+{"type": "tool.execution_start", "data": {"toolCallId": "1", "toolName": "bash", "arguments": {"command": "uv run pytest -q"}}, "timestamp": "2026-09-19T05:00:01Z"}
+{"type": "tool.execution_partial_result", "data": {"toolCallId": "1", "partialOutput": "2 passed\n"}, "timestamp": "2026-09-19T05:00:03Z"}
+{"type": "tool.execution_complete", "data": {"toolCallId": "1", "success": true}, "timestamp": "2026-09-19T05:00:03Z"}
+{"type": "assistant.message", "data": {"content": "the tests pass"}, "timestamp": "2026-09-19T05:00:04Z"}
+{"type": "session.usage_checkpoint", "data": {"totalNanoAiu": 2500000000, "input_tokens": 120, "output_tokens": 30, "cache_read_input_tokens": 20}, "timestamp": "2026-09-19T05:00:04Z"}

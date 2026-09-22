@@ -220,6 +220,14 @@ def _pricing(table: Mapping[str, Any]) -> PricingSpec:
     return PricingSpec(kind=kind, values=values)
 
 
+_PROVIDER_KEYS = frozenset({
+    "driver", "vendor", "base_url", "model", "api_key_env", "api_key", "local",
+    "send_sampling", "max_agents", "compact_window", "max_steps", "run_timeout",
+    "idle_timeout", "adapter", "binary", "experimental", "health", "probe",
+    "pricing",
+})
+
+
 def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> ProviderConfig:
     driver = _str(table, "driver", None)
     if not driver:
@@ -256,6 +264,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         health=_health(table),
         probe=_probe(table),
         pricing=_pricing(table),
+        extra={k: v for k, v in table.items() if k not in _PROVIDER_KEYS},
     )
 
 

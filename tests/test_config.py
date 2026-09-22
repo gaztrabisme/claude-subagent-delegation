@@ -100,11 +100,12 @@ def test_config_unknown_driver_is_refused(tmp_path: Path):
         _load(tmp_path, {"providers": {"x": {"model": "m"}}})
 
 
-def test_config_a_driver_with_no_module_loads_but_cannot_run(tmp_path: Path):
+def test_config_a_ported_cli_driver_is_available(tmp_path: Path):
     settings = _load(tmp_path, {"providers": {"c": {"driver": "copilot", "model": "m"}}})
     cfg = settings.provider("c")
     assert cfg.vendor == "copilot"
-    assert "not yet ported" in (cfg.unavailable() or "")
+    # The Copilot CLI owns its own connection; only its binary is checked, at boot.
+    assert cfg.unavailable() is None
 
 
 def test_config_undeclared_provider_in_the_chain_is_refused(tmp_path: Path):

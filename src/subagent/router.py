@@ -30,6 +30,9 @@ ZAI_1313_EXHAUSTED = "zai_1313_exhausted"
 DEEPSEEK_BALANCE = "deepseek_balance"
 CODEX_USAGE_LIMIT = "codex_usage_limit"
 GROK_BALANCE = "grok_balance"
+# The Copilot CLI was asked for a model this account cannot use. It never
+# closes the lane: trying the same provider with another model may work.
+COPILOT_MODEL_UNAVAILABLE = "copilot_model_unavailable"
 HEALTH_FAILED = "health_failed"
 
 # z.ai puts its own code beside the HTTP status: "(429) · [1313][…]", or

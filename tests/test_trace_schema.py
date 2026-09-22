@@ -23,6 +23,9 @@ COMMON = {"schema", "ts", "kind"}
 
 USAGE_KEYS = {"input", "output", "cache_read", "cache_write", "reasoning", "total", "steps",
               "turns"}
+# Fields a usage dict may also carry, never required: credits is Copilot's
+# AI-credit spend (nano-AIU / 1e9), present only on providers that bill it.
+OPTIONAL_USAGE_KEYS = {"credits"}
 
 REQUIRED: dict[str, set[str]] = {
     "run": {
@@ -66,6 +69,12 @@ def problems(record: dict[str, Any]) -> list[str]:
     if kind == "run":
         usage = record.get("usage") or {}
         found += [f"{label}: usage missing {k}" for k in sorted(USAGE_KEYS - set(usage))]
+        found += [f"{label}: usage unknown {k}" for k in
+                  sorted(set(usage) - USAGE_KEYS - OPTIONAL_USAGE_KEYS)]
+        if "credits" in usage and usage["credits"] is not None and not isinstance(
+            usage["credits"], (int, float)
+        ):
+            found.append(f"{label}: usage credits not a number")
         verdicts = record.get("guard_verdicts")
         if not isinstance(verdicts, dict) or set(verdicts) != {"allow", "deny", "escalate"}:
             found.append(f"{label}: guard_verdicts {verdicts!r}")

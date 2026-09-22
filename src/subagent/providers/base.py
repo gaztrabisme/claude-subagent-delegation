@@ -268,12 +268,22 @@ class Process:
         self.prompt = prompt
         self._proc: subprocess.Popen[str] | None = None
 
-    def _start(self, stdin: bool = False) -> subprocess.Popen[str]:
+    def _start(self, stdin: bool = False, *, closed_stdin: bool = False) -> subprocess.Popen[str]:
+        """Start the child. `stdin` opens a pipe to write the prompt on;
+        `closed_stdin` hands it /dev/null (for a CLI that would otherwise
+        read the parent's stdin -- the MCP transport -- to EOF); neither
+        inherits the parent's."""
+        if stdin:
+            child_stdin: int | None = subprocess.PIPE
+        elif closed_stdin:
+            child_stdin = subprocess.DEVNULL
+        else:
+            child_stdin = None
         self._proc = subprocess.Popen(
             self.argv,
             cwd=self.cwd,
             env=self.env,
-            stdin=subprocess.PIPE if stdin else None,
+            stdin=child_stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

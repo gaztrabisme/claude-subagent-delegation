@@ -1,12 +1,18 @@
 """The omp driver: one ``omp -p --mode json`` subprocess per turn.
 
-Oh My Pi prints one JSON object per line: a session header (an object with no
-``type`` key, ignored), then ``agent_start`` / ``turn_start`` /
-``message_update`` / ``tool_execution_start`` / ``tool_execution_end`` /
-``turn_end`` / ``agent_end`` events (the shapes in
-``@oh-my-pi/pi-agent-core/src/types.ts``, ``AgentEvent``). That stream is not
-Claude stream-json, so a `Translator` rewrites it into the shapes
-`Agent._ingest` already reads, exactly like the copilot driver does.
+Oh My Pi prints one JSON object per line: a session header (``type:
+"session"``, ignored), then ``agent_start`` / ``turn_start`` /
+``message_start`` / ``message_update`` / ``message_end`` /
+``tool_execution_start`` / ``tool_execution_update`` / ``tool_execution_end``
+/ ``turn_end`` / ``agent_end`` events (the shapes in
+``@oh-my-pi/pi-agent-core/src/types.ts``, ``AgentEvent``, as
+``print-mode.ts`` trims them: a ``message_update`` carries only its delta).
+That stream is not Claude stream-json, so a `Translator` rewrites it into the
+shapes `Agent._ingest` already reads, exactly like the copilot driver does.
+The recorded streams in ``tests/fixtures/omp`` are the reference.
+
+omp reads a piped stdin to EOF before it starts, so the child gets /dev/null
+as stdin: inheriting the server's would hand it the MCP transport.
 
 omp has no PreToolUse hook, so this driver installs no guard: the child runs
 unguarded. That is only acceptable when the server itself said so --
@@ -34,7 +40,7 @@ import uuid
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-from ..config import Settings, log
+from ..config import Settings
 from ..router import COPILOT_MODEL_UNAVAILABLE, Refusal, clip
 from .base import DRIVER_OMP, Process, ProviderConfig, Session
 
@@ -49,17 +55,23 @@ DEFAULT_BINARY = "omp"
 # reopen (omp runs --no-session, so its own --resume is disabled).
 RESUME_PREFIX = "Continue the previous task in this directory."
 
-# What omp (or the server behind it) prints when the model cannot be reached:
-# a refused connection, a missing/unconfigured model, an auth or throttle
-# status. The closest code the router already defines is COPILOT_MODEL_UNAVAILABLE
-# ("a model this account cannot use"); it never closes the lane.
+# What omp prints when the model cannot be reached, as recorded in
+# tests/fixtures/omp: a server that is down stops the assistant message with
+# errorMessage "Unable to connect. Is the computer able to access the url?"
+# (no ECONNREFUSED in sight, though a raw one is matched too); an unknown
+# --model exits 1 with `Model "x" not found` on stderr. Plus an unconfigured
+# provider and the auth/throttle statuses. The closest code the router already
+# defines is COPILOT_MODEL_UNAVAILABLE ("a model this account cannot use"); it
+# never closes the lane.
 _REFUSAL_RE = re.compile(
-    r"connection refused|econnrefused|no model|model not found"
+    r"unable to connect|connection refused|econnrefused"
+    r"|no model|model\b[^\n]*\bnot found"
     r"|provider\s+\S+\s+not configured|\b401\b|\b429\b",
     re.IGNORECASE,
 )
 
-# omp's usage keys (agent_end) onto the keys Usage.add reads.
+# omp's usage keys (on each assistant message in agent_end) onto the keys
+# Usage.add reads.
 _USAGE_KEY_MAP = {
     "input": "input_tokens",
     "output": "output_tokens",
@@ -81,9 +93,11 @@ class Translator:
 
     Text/thinking deltas and tool starts map to claude `assistant` events,
     tool ends to `user`/`tool_result` events; each tool execution counts as
-    one step. `agent_end` usage is remembered, not emitted, and folded into
-    the synthetic `result` `finish()` writes when the process exits. The
-    session header (no `type` key) and every unlisted type are ignored.
+    one step. Usage is read from one place -- the assistant messages
+    `agent_end` carries (each is one model call; `message_end` repeats the
+    same numbers) -- remembered, not emitted, and folded into the synthetic
+    `result` `finish()` writes when the process exits. The session header
+    (`type: "session"`) and every unlisted type are ignored.
     """
 
     def __init__(self, session_id: str | None):
@@ -91,6 +105,7 @@ class Translator:
         self.seen: list[dict[str, Any]] = []
         self.last_message = ""
         self.usage_tokens: dict[str, int] = {}
+        self.turns = 0
         self.saw_error = False
         self.error_texts: list[str] = []
         self.raw_lines: list[str] = []
@@ -103,9 +118,17 @@ class Translator:
         if not self._emitted_init:
             out.append(self._init())
             self._emitted_init = True
-        if kind in (
-            "agent_start", "turn_start", "message_start", "message_end", "turn_end",
-        ):
+        if kind == "turn_start":
+            # One turn = one assistant message (+ its tool calls). The text
+            # restarts so `last_message` ends as the final turn's, the way a
+            # claude `result` carries the last assistant message.
+            self.turns += 1
+            self.last_message = ""
+            return out
+        if kind == "message_end":
+            self._note_message_error(event.get("message"))
+            return out
+        if kind in ("agent_start", "message_start", "tool_execution_update", "turn_end"):
             # turn_end repeats the message and the tool results that
             # message_update / tool_execution_end already streamed: ignored.
             return out
@@ -142,7 +165,9 @@ class Translator:
         if kind == "agent_end":
             self._collect_usage(event)
             return out
-        # Session header (no `type` key) and unknown types: ignored.
+        # Session header (`type: "session"`), auto_retry_start (its
+        # errorMessage already arrived on message_end) and unknown types:
+        # ignored.
         return out
 
     def finish(self, exit_code: int | None, extra_text: str = "") -> dict[str, Any]:
@@ -160,10 +185,10 @@ class Translator:
             "type": "result",
             "subtype": "error" if is_error else "success",
             "is_error": is_error,
-            "result": self.last_message,
+            "result": self.last_message.strip(),
             "session_id": self.session_id,
             "usage": usage,
-            "num_turns": 1,
+            "num_turns": max(self.turns, 1),
         }
         error = "\n".join([*self.error_texts, extra_text]).strip()
         if is_error:
@@ -171,18 +196,34 @@ class Translator:
         return event
 
     def _collect_usage(self, event: dict[str, Any]) -> None:
-        """Fold agent_end usage (event-level, or carried on `messages`) in."""
-        candidates: list[Any] = []
-        if isinstance(event.get("usage"), dict):
-            candidates.append(event["usage"])
+        """Sum the `usage` of every assistant message `agent_end` carries.
+
+        That is the one place usage is read from: omp puts it on each
+        assistant message (one per model call), and `message_end` / `turn_end`
+        repeat the same object, so reading those too would double-count.
+        """
         for msg in event.get("messages") or []:
-            if isinstance(msg, dict) and isinstance(msg.get("usage"), dict):
-                candidates.append(msg["usage"])
-        for usage in candidates:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            usage = msg.get("usage")
+            if not isinstance(usage, dict):
+                continue
             for src, dst in _USAGE_KEY_MAP.items():
                 value = usage.get(src)
                 if isinstance(value, (int, float)):
                     self.usage_tokens[dst] = self.usage_tokens.get(dst, 0) + int(value)
+
+    def _note_message_error(self, message: Any) -> None:
+        """An assistant message that stopped on `error` carries the reason in
+        `errorMessage` (a refused connection, a missing model): fold it in."""
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return
+        if message.get("stopReason") != "error":
+            return
+        self.saw_error = True
+        text = message.get("errorMessage") or "omp: request error"
+        if str(text) not in self.error_texts:
+            self.error_texts.append(str(text))
 
     def _init(self) -> dict[str, Any]:
         return {"type": "system", "subtype": "init", "session_id": self.session_id}
@@ -195,10 +236,21 @@ class Translator:
         }
 
     def _tool_result(self, data: dict[str, Any]) -> dict[str, Any]:
+        """`result` is a tool's `{content: [{type: "text", text}...], details}`;
+        the text blocks become the tool_result's content, anything else is
+        JSON-dumped."""
         is_error = bool(data.get("isError"))
-        content = data.get("result")
-        if not isinstance(content, str):
-            content = json.dumps(content, default=str) if content else ""
+        result = data.get("result")
+        blocks = result.get("content") if isinstance(result, dict) else None
+        if isinstance(result, str):
+            content = result
+        elif isinstance(blocks, list):
+            content = "\n".join(
+                str(b.get("text") or "") for b in blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        else:
+            content = json.dumps(result, default=str) if result else ""
         return {
             "type": "user",
             "session_id": self.session_id,
@@ -224,7 +276,8 @@ class OmpProcess(Process):
         self.session = session
 
     def events(self) -> Iterator[dict[str, Any]]:
-        proc = self._start()
+        # omp reads a piped stdin to EOF before starting; never hand it ours.
+        proc = self._start(closed_stdin=True)
         assert proc.stdout is not None
         stderr_buf: list[str] = []
         stderr_thread = self._drain_thread(proc, stderr_buf)

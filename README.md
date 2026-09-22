@@ -94,6 +94,7 @@ Anthropic-compatible endpoint; the CLI drivers own their own login and connectio
 | Copilot | `copilot` | the Copilot CLI (`copilot -p`) | own login; no guard hook, so MCP use needs `[guard].allow_unguarded = true` |
 | Grok | `grok` | the Grok CLI (`grok -p`) | own login |
 | Gemini | `gemini` | the Gemini CLI (`gemini -p`) | experimental: needs `experimental = true` |
+| Oh My Pi | `omp` | `omp -p --mode json` | own model config in `~/.omp/agent/models.yml`; no guard hook, so `[guard].allow_unguarded = true` |
 
 ## The delegation loop
 

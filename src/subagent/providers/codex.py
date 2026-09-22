@@ -1,15 +1,16 @@
 """The codex driver: one ``codex exec --json`` subprocess per turn.
 
-Parallel to runs.ClaudeDriver. An Agent uses `CodexDriver` for any hop on a
-lane whose driver is codex, and keeps its own run loop (queue, verification,
-distillation, trips, trace); the driver supplies only the boot check, the
-spawn (argv, environment, event stream) and the refusal reading. Codex's JSONL events are
-translated into the claude stream-json shapes Agent._ingest already reads, so
-a codex run fills the same Run fields a claude run does.
+Parallel to the claude driver. An Agent uses `CODEX_PROVIDER` for any hop on a
+provider whose driver is codex, and keeps its own run loop (queue,
+verification, distillation, trips, trace); the driver supplies only the boot
+check, the spawn (argv, environment, event stream) and the refusal reading.
+Codex's JSONL events are translated into the claude stream-json shapes
+Agent._ingest already reads, so a codex run fills the same Run fields a claude
+run does.
 
 Two guards stand between a codex child and the machine: Codex's own
 `workspace-write` sandbox, and the same PreToolUse hook the claude driver
-installs, which asks this server's supervisor over SAM_APPROVAL_SOCKET.
+installs, which asks this server's supervisor over SUBAGENT_APPROVAL_SOCKET.
 
 The child runs with CODEX_HOME set to a per-agent directory holding a symlink
 to the user's auth.json, a config.toml this module writes (no hooks, no MCP
@@ -22,34 +23,32 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import threading
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..config import Settings, log
-from ..lanes import DRIVER_CODEX, Lane
 from ..router import Refusal, codex_reset
-from ..runs import Agent, ClaudeProcess
+from .base import DRIVER_CODEX, Process, ProviderConfig, Session
 
 GUARD = "sandbox+hook"
 GUARD_NO_HOOK = "sandbox"
+
+DEFAULT_BINARY = "codex"
 
 REFUSAL_USAGE_LIMIT = "codex_usage_limit"
 KIND_CONTEXT_FULL = "context_full"
 KIND_USAGE_LIMIT_AFTER_WORK = "usage_limit_after_work"
 KIND_CLI_ERROR = "cli_error"
 
-# Item types that are the child acting on the machine: they count as steps.
+# Item types that are the child acting on the machine: they count as steps,
+# and they are the only items that count as work. An agent_message is the
+# child talking, which a refusal turn also does.
 STEP_ITEMS = frozenset({"command_execution", "file_change"})
 
 _USAGE_LIMIT_RE = re.compile(r"usage limit", re.IGNORECASE)
 _CONTEXT_RE = re.compile(r"context window", re.IGNORECASE)
-def codex_bin() -> str:
-    """The Codex CLI to run: SAM_CODEX_BIN, else `codex` on PATH."""
-    return os.environ.get("SAM_CODEX_BIN") or "codex"
 
 
 def source_codex_home() -> Path:
@@ -77,13 +76,31 @@ def _failure_messages(events: Iterable[dict[str, Any]]) -> list[str]:
             error = event.get("error")
             if isinstance(error, dict) and isinstance(error.get("message"), str):
                 found.append(error["message"])
+            elif isinstance(error, str):
+                found.append(error)
     return found
 
 
 def _did_work(events: Iterable[dict[str, Any]]) -> bool:
-    return any(
-        isinstance(e, dict) and str(e.get("type") or "").startswith("item.") for e in events
-    )
+    """Whether the child acted on the machine or produced output tokens.
+
+    A message item is not work: a child whose first turn answered a usage
+    limit emits one, with no tool call and no usage, and that run must still
+    be a refusal the router can move to another provider.
+    """
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("type") or "")
+        if kind.startswith("item."):
+            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            if item.get("type") in STEP_ITEMS:
+                return True
+        elif kind == "turn.completed":
+            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            if int(usage.get("output_tokens") or 0) > 0:
+                return True
+    return False
 
 
 def codex_refusal(
@@ -91,10 +108,10 @@ def codex_refusal(
 ) -> tuple[str, str, datetime | None] | None:
     """`(code, message, reset_at)` when Codex refused the turn, else None.
 
-    A refusal is a usage-limit error before the child produced any item: the
-    lane said no and nothing was done, so another lane may take the task.
-    A usage limit hit after items exist, context-window exhaustion and every
-    other failure are failures of the run, not refusals.
+    A refusal is a usage-limit error before the child did any work: the
+    provider said no and nothing was done, so another may take the task.
+    A usage limit hit after work, context-window exhaustion and every other
+    failure are failures of the run, not refusals.
     """
     events = list(events)
     if _did_work(events):
@@ -219,55 +236,32 @@ class Translator:
         return {"type": "assistant", "session_id": self.thread_id, "message": {"content": content}}
 
 
-class CodexProcess(ClaudeProcess):
+class CodexProcess(Process):
     """One ``codex exec`` subprocess: prompt on stdin, JSONL on stdout."""
 
     def __init__(self, argv: list[str], env: dict[str, str], cwd: str, prompt: str):
-        super().__init__(argv, env, cwd)
-        self.prompt = prompt
+        super().__init__(argv, env, cwd, prompt)
         self.raw: list[dict[str, Any]] = []
 
     def refusal(self) -> tuple[str, str, datetime | None] | None:
         return codex_refusal(self.raw)
 
     def events(self) -> Iterator[dict[str, Any]]:
-        self._proc = subprocess.Popen(
-            self.argv,
-            cwd=self.cwd,
-            env=self.env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        assert self._proc.stdin is not None and self._proc.stdout is not None
+        proc = self._start(stdin=True)
+        assert proc.stdin is not None and proc.stdout is not None
         stderr_buf: list[str] = []
-        stderr_thread = threading.Thread(
-            target=self._drain_stderr, args=(self._proc, stderr_buf), daemon=True
-        )
-        stderr_thread.start()
+        stderr_thread = self._drain_thread(proc, stderr_buf)
         try:
             try:
-                self._proc.stdin.write(self.prompt)
-                self._proc.stdin.close()
+                proc.stdin.write(self.prompt or "")
+                proc.stdin.close()
             except (BrokenPipeError, OSError) as exc:
                 log.debug("codex stdin closed early: %s", exc)
             translator = Translator()
-            for line in self._proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    log.debug("non-json codex line: %s", line[:200])
-                    continue
-                if not isinstance(event, dict):
-                    continue
+            for event in self._json_lines(proc.stdout):
                 self.raw.append(event)
                 yield from translator.feed(event)
-            code = self._proc.wait()
+            code = proc.wait()
             stderr_thread.join(timeout=5)
             if not translator.terminal:
                 # No turn.completed / turn.failed: the turn did not finish,
@@ -277,7 +271,7 @@ class CodexProcess(ClaudeProcess):
                     f"codex exited {code} without finishing the turn: {tail}".strip()
                 )
         finally:
-            if self._proc.poll() is None:
+            if proc.poll() is None:
                 self.kill()
             stderr_thread.join(timeout=5)
 
@@ -309,13 +303,13 @@ def _user_defaults(home: Path) -> dict[str, str]:
 
 
 def prepare_home(
-    settings: Settings, agent_id: str, lane: Lane, source: Path | None = None
+    settings: Settings, agent_id: str, cfg: ProviderConfig, source: Path | None = None
 ) -> Path:
     """Write the per-agent CODEX_HOME and return it.
 
     auth.json is a symlink to the user's (never copied, never read here);
     config.toml carries only model and reasoning effort, and only when the
-    lane names no model; hooks.json holds the guard hook and nothing else.
+    provider names no model; hooks.json holds the guard hook and nothing else.
     """
     source = source or source_codex_home()
     home = settings.session_root / "agents" / agent_id / "codex-home"
@@ -326,8 +320,8 @@ def prepare_home(
         auth.unlink()
     auth.symlink_to(source / "auth.json")
 
-    lines = ["# Written by subagent-mcp for one agent. Hooks live in hooks.json."]
-    if lane.model is None:
+    lines = ["# Written by subagent for one agent. Hooks live in hooks.json."]
+    if cfg.model is None:
         for key, value in _user_defaults(source).items():
             lines.append(f"{key} = {_toml_string(value)}")
     lines.append('approval_policy = "never"')
@@ -360,7 +354,7 @@ def codex_argv(
 ) -> list[str]:
     """argv for one turn. The prompt goes on stdin (the trailing `-`)."""
     argv = [
-        binary or codex_bin(),
+        binary or DEFAULT_BINARY,
         "exec",
         "--json",
         "-C",
@@ -382,62 +376,87 @@ def codex_argv(
 def codex_env(settings: Settings, agent_id: str, home: Path) -> dict[str, str]:
     """Environment for one codex child: this server's keys removed, CODEX_HOME per agent."""
     env = {k: v for k, v in os.environ.items() if v is not None}
-    server_keys = {n for lane in settings.lanes.values() for n in lane.api_key_envs}
-    for leaked in (
-        *sorted(server_keys),
-        "GLM_API_KEY",
-        "ZAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CONFIG_DIR",
-        "SAM_CODEX_BIN",
-    ):
+    for leaked in settings.leaked_keys:
         env.pop(leaked, None)
     env.update({
         "CODEX_HOME": str(home),
-        "SAM_APPROVAL_SOCKET": settings.approval_socket,
-        "SAM_HOOK_TIMEOUT": str(settings.supervisor_timeout + 20),
+        "SUBAGENT_APPROVAL_SOCKET": settings.approval_socket,
+        "SUBAGENT_HOOK_TIMEOUT": str(settings.supervisor_timeout + 20),
     })
     return env
 
 
-class CodexDriver:
-    """Runs a turn as ``codex exec --json``. The session id is Codex's thread_id.
-
-    The Agent picks this driver for a lane whose driver is codex, per hop;
-    see runs.ClaudeDriver for the interface.
-    """
+class CodexProvider:
+    """Runs a turn as ``codex exec --json``. The session id is Codex's thread_id."""
 
     name = DRIVER_CODEX
     needs_api_key = False  # the Codex CLI logs in with its own auth.json
+    prompt_on_stdin = True
 
-    def guard(self, settings: Settings) -> str:
+    def guard(self, settings: Settings, cfg: ProviderConfig | None = None) -> str:
         return GUARD_NO_HOOK if settings.supervisor == "off" else GUARD
 
-    def boot(self, agent: Agent, lane: Lane) -> str | None:
+    def binary(self, cfg: ProviderConfig) -> str:
+        return cfg.binary or DEFAULT_BINARY
+
+    def boot(
+        self, settings: Settings, agent_id: str, cfg: ProviderConfig
+    ) -> tuple[str | None, Session]:
         """Write the agent's CODEX_HOME; the reason codex cannot run, or None."""
+        session = Session(provider=cfg.name)
         try:
-            agent.codex_home = prepare_home(agent.settings, agent.agent_id, lane)
-            binary = codex_bin()
+            session.home = prepare_home(settings, agent_id, cfg)
+            binary = self.binary(cfg)
             if shutil.which(binary) is None:
-                return f"{binary!r} is not on PATH; install the Codex CLI"
+                return f"{binary!r} is not on PATH; install the Codex CLI", session
             if not (source_codex_home() / "auth.json").exists():
-                return f"no Codex login at {source_codex_home() / 'auth.json'}; run `codex login`"
+                return (
+                    f"no Codex login at {source_codex_home() / 'auth.json'}; "
+                    "run `codex login`"
+                ), session
         except Exception as exc:  # noqa: BLE001
-            return f"{type(exc).__name__}: {exc}"
-        return None
+            return f"{type(exc).__name__}: {exc}", session
+        return None, session
 
-    def spawn(self, agent: Agent, prompt: str, resume: str | None) -> CodexProcess:
-        home = getattr(agent, "codex_home", None) or prepare_home(
-            agent.settings, agent.agent_id, agent.lane
-        )
-        argv = codex_argv(agent.workspace, agent.model or None, resume)
-        env = codex_env(agent.settings, agent.agent_id, home)
-        return _spawn_codex(argv, env, str(agent.workspace), prompt)
+    def argv(
+        self,
+        cfg: ProviderConfig,
+        settings: Settings,
+        agent_id: str,
+        prompt: str,
+        cwd: Path,
+        session: Session,
+        model: str | None,
+    ) -> list[str]:
+        return codex_argv(cwd, model or None, session.session_id, self.binary(cfg))
 
-    def refusal(self, lane: Lane, events: list[dict[str, Any]]) -> Refusal | None:
+    def env(
+        self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,
+        model: str | None = None,
+    ) -> dict[str, str]:
+        home = session.home or prepare_home(settings, agent_id, cfg)
+        session.home = home
+        return codex_env(settings, agent_id, home)
+
+    def translator(self, session: Session) -> Translator:
+        """Codex prints its own event shapes; CodexProcess feeds this one."""
+        return Translator()
+
+    def spawn(
+        self,
+        cfg: ProviderConfig,
+        settings: Settings,
+        agent_id: str,
+        prompt: str,
+        cwd: Path,
+        session: Session,
+        model: str | None,
+    ) -> CodexProcess:
+        argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
+        env = self.env(settings, agent_id, cfg, session, model)
+        return _spawn_codex(argv, env, str(cwd), prompt)
+
+    def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:
         """The before-work refusal codex_refusal found, from the translated events.
 
         Translator.failure runs codex_refusal on the raw Codex events and
@@ -457,19 +476,21 @@ class CodexDriver:
         return Refusal(str(terminal["refusal"]), str(terminal.get("error") or ""), reset_at)
 
 
-CODEX_DRIVER = CodexDriver()
+CODEX_PROVIDER = CodexProvider()
+CodexDriver = CodexProvider  # the name the driver had before providers landed
 
 
 __all__ = [
-    "CODEX_DRIVER",
-    "CodexDriver",
+    "CODEX_PROVIDER",
     "CodexProcess",
+    "CodexProvider",
     "GUARD",
     "REFUSAL_USAGE_LIMIT",
     "Translator",
     "codex_argv",
     "codex_env",
     "codex_refusal",
+    "failure_kind",
     "parse_reset",
     "prepare_home",
 ]

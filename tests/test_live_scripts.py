@@ -1,5 +1,7 @@
 """The live scripts' pure parts: smoke_lanes classification, the sampling
-proxy, and bench_concurrency aggregation and recommendation.
+proxy, and bench_concurrency aggregation and recommendation — plus fake-server
+cases for smoke_guard, hook_isolation_check and reopen_lane's argument
+handling and config path.
 
 No network: the one proxy test forwards to a mock upstream on 127.0.0.1.
 """
@@ -8,15 +10,21 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from subagent.lane_state import LaneState
 from subagent.runs import Run
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,8 +48,12 @@ def _load(name: str, path: Path | None = None):
 smoke = _load("smoke_lanes")
 harness = _load("lane_harness")
 bench = _load("bench_concurrency", BENCH / "concurrency.py")
+guard = _load("smoke_guard")
+hcheck = _load("hook_isolation_check")
+reopener = _load("reopen_lane")
 
 SSH = "/Users/someone/.ssh/config"
+SSH_CONFIG = str(Path.home() / ".ssh" / "config")
 
 
 # --- smoke_lanes: pass / deferred / fail ----------------------------------------
@@ -481,3 +493,242 @@ def test_load_settings_layers_overrides_over_the_config(tmp_path):
     assert settings.max_agents == 8
     assert settings.providers["p"].max_agents == 8
     assert settings.providers["p"].max_steps == 5  # the config's own value stands
+
+
+# --- smoke_guard: one delegation, one deny verdict ----------------------------------
+
+
+def _fake_guard_server(seen: dict[str, Any], verdict: dict[str, Any] | None):
+    """An InProcessServer stand-in that writes one verdict into its trace."""
+
+    class FakeGuardServer:
+        def __init__(self, session_root, config=None, *, overrides=None):
+            seen["config"], seen["overrides"] = config, overrides
+            self.session_root = session_root
+            session_root.mkdir(parents=True, exist_ok=True)
+            self.trace_path = session_root / "trace.jsonl"
+            self.settings = SimpleNamespace(providers={"glm": SimpleNamespace(
+                name="glm", driver="claude", model="glm-5.3-flash[1m]",
+                base_url="https://api.z.ai/api/anthropic")})
+
+        def start(self):
+            return self
+
+        def delegate(self, *, provider, task, verification, workspace, fallback, name):
+            seen["provider"], seen["task"] = provider, task
+            assert verification == "true" and fallback == "none" and name == "smoke-guard"
+            if verdict is not None:
+                self.trace_path.write_text(json.dumps(verdict) + "\n")
+            done = threading.Event()
+            done.set()
+            return SimpleNamespace(
+                run_id="run-1", agent_id="a1", state="completed", done=done,
+                detail=lambda: {"state": "completed", "finish_reason": "end_turn",
+                                "error": None})
+
+        def close_agent(self, agent_id):
+            pass
+
+        def stop(self):
+            pass
+
+    return FakeGuardServer
+
+
+DENY_SSH = {"kind": "verdict", "agent_id": "a1", "tool": "Bash", "action": "deny",
+            "tier": "policy", "reason": "refused: credentials",
+            "facts": {"sensitive_path": SSH_CONFIG}}
+
+
+@pytest.mark.parametrize("verdict,expected", [
+    (DENY_SSH, guard.EXIT_PASS),
+    (dict(DENY_SSH, facts={"sensitive_path": "/Users/someone/.ssh/id_rsa"}),
+     guard.EXIT_FAIL),
+    (dict(DENY_SSH, action="allow"), guard.EXIT_FAIL),
+    (None, guard.EXIT_NO_ATTEMPT),
+])
+def test_smoke_guard_judges_the_trace(tmp_path, monkeypatch, verdict, expected):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(guard.lane_harness, "InProcessServer",
+                        _fake_guard_server(seen, verdict))
+    assert guard.main(["--provider", "glm"]) == expected
+    assert seen["provider"] == "glm"
+    assert "cat ~/.ssh/config" in seen["task"]
+
+
+def test_smoke_guard_writes_a_provider_toml_for_a_built_in(tmp_path, monkeypatch):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(guard.lane_harness, "InProcessServer",
+                        _fake_guard_server(seen, None))
+    assert guard.main(["--provider", "glm"]) == guard.EXIT_NO_ATTEMPT
+    assert seen["overrides"] is None and seen["config"].name == "provider.toml"
+    parsed = tomllib.loads(seen["config"].read_text())
+    assert parsed["providers"]["glm"]["driver"] == "claude"
+    assert parsed["core"]["default_provider"] == "glm"
+    # The run-time knobs are config, never environment.
+    assert (parsed["core"]["max_steps"], parsed["core"]["rate_limit_retries"]) == (6, 1)
+    assert parsed["core"]["run_timeout"] == 420.0 and "workspace" in parsed["core"]
+
+
+def test_smoke_guard_takes_a_config_naming_the_provider(tmp_path, monkeypatch):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(guard.lane_harness, "InProcessServer",
+                        _fake_guard_server(seen, None))
+    config = tmp_path / "my.toml"
+    config.write_text('[core]\ndefault_provider = "glm"\n'
+                      '[providers.glm]\ndriver = "claude"\n')
+    assert guard.main(["--config", str(config), "--timeout", "60"]) == guard.EXIT_NO_ATTEMPT
+    assert seen["config"] == config
+    assert (seen["overrides"]["core"]["max_steps"],
+            seen["overrides"]["core"]["run_timeout"]) == (6, 60.0)
+
+
+def test_smoke_guard_lane_alias_and_default_provider(tmp_path, monkeypatch):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(guard.lane_harness, "InProcessServer",
+                        _fake_guard_server(seen, None))
+
+    def settings_with(provider: str):
+        return lambda config=None, overrides=None: SimpleNamespace(default_provider=provider,
+                                                                   session_root=tmp_path)
+
+    monkeypatch.setattr(guard.lane_harness, "load_settings", settings_with(""))
+    with pytest.raises(SystemExit):
+        guard.main([])
+    monkeypatch.setattr(guard.lane_harness, "load_settings", settings_with("glm"))
+    assert guard.main(["--lane", "glm"]) == guard.EXIT_NO_ATTEMPT
+    assert seen["provider"] == "glm"
+    assert guard.main([]) == guard.EXIT_NO_ATTEMPT  # the config's default provider runs
+    assert seen["provider"] == "glm"
+
+
+# --- hook_isolation_check: the claude driver's guard, with a fake claude ------------
+
+
+def _fake_claude():
+    """A `claude` that honours the hook protocol the real one is subject to.
+
+    It fires the PreToolUse hook through the real fake supervisor when the
+    --settings file carries one and the setting sources do not switch it off,
+    and only then does it leave `x` unwritten.
+    """
+    def run(argv, env, workspace):
+        payload = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        planted = workspace / ".claude" / "settings.json"
+        sources = argv[argv.index("--setting-sources") + 1]
+        loaded = "project" in sources and planted.exists() and json.loads(
+            planted.read_text()).get("disableAllHooks")
+        if payload.get("hooks") and not loaded:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                conn.connect(env["SUBAGENT_APPROVAL_SOCKET"])
+                conn.sendall(json.dumps(
+                    {"tool_input": {"command": hcheck.COMMAND}}).encode() + b"\n")
+                reply = json.loads(conn.recv(65536).split(b"\n", 1)[0])
+            assert reply["action"] == "deny"
+        else:
+            (workspace / "x").write_text("hi")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    return run
+
+
+def test_hook_isolation_check_holds_with_a_fake_claude(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_API_KEY", "mock-key")
+    monkeypatch.setattr(hcheck, "run_claude", _fake_claude())
+    assert hcheck.main(["--provider", "glm"]) == 0
+
+
+def test_hook_isolation_check_fails_when_the_hook_misses(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_API_KEY", "mock-key")
+
+    def unguarded(argv, env, workspace):
+        (workspace / "x").write_text("hi")  # even the hook case writes: no guard
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hcheck, "run_claude", unguarded)
+    assert hcheck.main(["--lane", "glm"]) == 1
+
+
+def test_hook_isolation_check_points_the_provider_at_the_mock(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_API_KEY", "mock-key")
+    seen: dict[str, Any] = {}
+    real_load = hcheck.lane_harness.load_settings
+
+    def record(config=None, overrides=None):
+        seen["config"], seen["overrides"] = config, overrides
+        return real_load(config, overrides)
+
+    monkeypatch.setattr(hcheck.lane_harness, "load_settings", record)
+    monkeypatch.setattr(hcheck, "run_claude", _fake_claude())
+    assert hcheck.main(["--provider", "glm"]) == 0
+    parsed = tomllib.loads(Path(seen["config"]).read_text())
+    assert parsed["core"]["default_provider"] == "glm"
+    assert parsed["providers"]["glm"]["base_url"].startswith("http://127.0.0.1:")
+    assert seen["overrides"]["guard"]["approval_socket"].endswith(".sock")
+    assert seen["overrides"]["core"]["max_steps"] == 3
+    assert seen["overrides"]["core"]["session_root"].endswith("sessions")
+
+
+def test_hook_isolation_check_takes_a_config_naming_the_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_API_KEY", "mock-key")
+    seen: dict[str, Any] = {}
+    real_load = hcheck.lane_harness.load_settings
+
+    def record(config=None, overrides=None):
+        seen["config"], seen["overrides"] = config, overrides
+        return real_load(config, overrides)
+
+    monkeypatch.setattr(hcheck.lane_harness, "load_settings", record)
+    monkeypatch.setattr(hcheck, "run_claude", _fake_claude())
+    config = tmp_path / "my.toml"
+    config.write_text('[core]\ndefault_provider = "glm"\n'
+                      '[providers.glm]\ndriver = "claude"\nmodel = "mock-model"\n')
+    assert hcheck.main(["--config", str(config)]) == 0
+    assert seen["config"] == config
+    assert seen["overrides"]["providers"]["glm"]["base_url"].startswith("http://127.0.0.1:")
+
+
+# --- reopen_lane: the session root comes from the settings --------------------------
+
+
+def _closed(root: Path, name: str = "glm", code: str = "zai_1308"):
+    LaneState(root).close(name, datetime.now().astimezone() + timedelta(hours=1), code,
+                          "fair use")
+    return LaneState(root)
+
+
+def test_reopen_lane_lists_then_reopens(tmp_path, capsys):
+    root = tmp_path / "sessions"
+    _closed(root)
+    assert reopener.main(["--session-root", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "glm: closed until" in out and "(zai_1308)" in out
+    assert reopener.main(["--session-root", str(root), "glm"]) == 0
+    assert "glm: reopened" in capsys.readouterr().out
+    assert reopener.main(["--session-root", str(root)]) == 0
+    assert "no lane closed" in capsys.readouterr().out
+
+
+def test_reopen_lane_takes_the_session_root_from_the_config(tmp_path, capsys):
+    root = tmp_path / "sessions"
+    config = tmp_path / "subagent.toml"
+    config.write_text(f"[core]\nsession_root = {json.dumps(str(root))}\n")
+    _closed(root, code="deepseek_balance")
+    assert reopener.main(["--config", str(config)]) == 0
+    out = capsys.readouterr().out
+    assert "glm: closed until" in out and "(deepseek_balance)" in out
+    assert reopener.main(["--config", str(config), "glm", "omlx"]) == 0
+    out = capsys.readouterr().out
+    assert "glm: reopened" in out and "omlx: was not closed" in out
+
+
+def test_reopen_lane_reads_the_settings_when_no_root_is_given(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "settings-sessions"
+    _closed(root)
+    monkeypatch.setattr(
+        reopener.lane_harness, "load_settings",
+        lambda config=None, overrides=None: SimpleNamespace(session_root=root))
+    assert reopener.main([]) == 0
+    assert "glm: closed until" in capsys.readouterr().out
+    assert reopener.main(["omlx"]) == 0
+    assert "omlx: was not closed" in capsys.readouterr().out
+

@@ -200,6 +200,28 @@ def test_sampler_starts_on_first_child_writes_rows_and_stops_when_idle(tmp_path:
     assert row["snapshot"] == {"mac": {"swap_used_mb": 1}}
 
 
+def test_begin_takes_the_first_sample_itself(tmp_path: Path):
+    """A run that ends before the sampler thread's first pass still has a sample.
+
+    end() right after begin() is the worst case for the old race: the thread
+    had not run yet, the sample list was popped empty, and the run_summary
+    reported samples: 0 for a lane that had been sampled.
+    """
+    metrics = tmp_path / "metrics.jsonl"
+    hub = Telemetry(Trace(metrics), probes={"omlx": lambda cfg: {"mac": {"swap_used_mb": 1}}},
+                    interval=60.0)
+    hub.begin(_omlx(), "run-1")
+    samples = hub.end("omlx", "run-1")  # no wait: the thread cannot have run yet
+    assert len(samples) == 1
+    assert samples[0][1] == {"mac": {"swap_used_mb": 1}}
+    rows = _rows(metrics)
+    assert rows and rows[0]["run_ids"] == ["run-1"]
+    assert rows[0]["snapshot"] == {"mac": {"swap_used_mb": 1}}
+    assert _until(lambda: not hub.active("omlx"), timeout=0.05 + 0.5)
+    assert _until(lambda: not _samplers(), timeout=1.0)
+    hub.shutdown()
+
+
 def test_one_sampler_for_two_children_on_one_lane(tmp_path: Path):
     metrics = tmp_path / "metrics.jsonl"
     hub = Telemetry(Trace(metrics), probes={"omlx": lambda cfg: {}}, interval=0.05)

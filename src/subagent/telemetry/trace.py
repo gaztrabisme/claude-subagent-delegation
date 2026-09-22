@@ -10,8 +10,8 @@ All of that lived in memory and stderr, and died with the process.
 Three questions in wiki/active-work.md need exactly that data:
 
   - the classifier's false-positive rate (which escalations were routine)
-  - whether SAM_SUMMARY_TOKENS and SAM_CHARS_PER_TOKEN are calibrated
-  - whether SAM_MAX_STEPS and SAM_TURN_TOKEN_BUDGET are near real usage
+  - whether [core].summary_tokens and [core].chars_per_token are calibrated
+  - whether [core].max_steps and [core].turn_token_budget are near real usage
 
 So each decision and each finished run appends one JSON object here.
 `scripts/trace_report.py` reads them back.
@@ -222,7 +222,7 @@ class Trace:
 
 
 def open_trace(raw: str | None, session_root: Path) -> Trace:
-    """Resolve SAM_TRACE. Unset writes to the session root; `off` disables it."""
+    """Resolve [core].trace. Unset writes to the session root; `off` disables it."""
     if raw is not None and raw.strip().lower() in ("off", "0", "false", ""):
         return Trace(None)
     if raw:

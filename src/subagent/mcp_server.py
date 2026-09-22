@@ -1,27 +1,27 @@
-"""MCP server exposing coding subagents on several backends (lanes)."""
+"""MCP server exposing coding subagents on the configured providers."""
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
-from . import __version__
-from .config import Settings, configure_logging, log
+from . import __version__, config
+from .config import configure_logging, log
 from .guard.supervisor import Supervisor
-from .lanes import FALLBACK_MODES
+from .router import FALLBACK_MODES
 from .runs import TERMINAL_STATES, Registry, RegistryError, Run
 
 SERVER_INSTRUCTIONS = """\
 Delegate self-contained engineering work to a subagent running in its own
-process, on one of several backends ("lanes": codex, deepseek, glm, bppc,
-omlx). delegate takes `lane` (default glm) to pick one. The child reads and
+process, on one of the backends this server is configured with ("providers";
+`list` names them). delegate takes `provider` to pick one. The child reads and
 edits files and runs shell commands in the workspace you name, so give it a
 task with a clear definition of done.
 
@@ -50,12 +50,13 @@ scratch directory rather than anything you cannot afford to have edited.
 
 
 def _instructions() -> str:
-    extra = (os.environ.get("SAM_INSTRUCTIONS") or "").strip()
+    extra = (settings.instructions or "").strip()
     if extra:
         return SERVER_INSTRUCTIONS + "\n" + extra + "\n"
     return SERVER_INSTRUCTIONS
 
-settings = Settings.from_env()
+
+settings = config.load(Path.cwd())
 registry = Registry(settings)
 supervisor = Supervisor(settings, registry, trace=registry.trace)
 
@@ -168,6 +169,7 @@ async def delegate(
     model: str | None = None,
     name: str | None = None,
     wait_seconds: float = 0,
+    provider: str | None = None,
     lane: str | None = None,
     fallback: str = "full",
     ctx: Context = None,  # type: ignore[assignment]
@@ -190,29 +192,32 @@ async def delegate(
             against the server's configured workspace. Defaults to that workspace.
         instructions: Optional standing guidance prepended to the task, e.g.
             coding conventions or files to leave alone.
-        model: Model id on the chosen lane. Defaults to the lane's model.
+        model: Model id on the chosen provider. Defaults to its model.
         name: Human label for this agent, shown in list.
         wait_seconds: Block up to this long for the run to finish. 0 returns at once.
-        lane: Backend to run on: codex, deepseek, glm, bppc or omlx. Defaults
-            to the server's default lane (SAM_DEFAULT_LANE, glm unless set).
-        fallback: Which other lanes may take the work if this one refuses
+        provider: Backend to run on, by its configured name (`list` reports
+            them). Defaults to the server's default provider.
+        lane: Deprecated alias for `provider`.
+        fallback: Which other providers may take the work if this one refuses
             before doing any work (quota spent, balance empty, usage limit,
-            local server down): "full" tries the other cloud lanes then bppc
-            and omlx, "local" only bppc and omlx, "none" no other lane. A
-            failure after work started is never moved. The result's `lane`
-            names the lane that ran and `hops` lists every lane tried.
-            continue always stays on that lane.
+            local server down): "full" tries the configured fallback chain,
+            "local" only the local providers in it, "none" no other provider.
+            A failure after work started is never moved. The result's `lane`
+            names the provider that ran and `hops` lists every one tried.
+            continue always stays on that provider.
     """
+    wanted = provider or lane
     try:
-        chosen = registry.select_lane(lane, fallback)
+        chosen = registry.select_provider(wanted, fallback)
     except RegistryError as exc:
         # Refused before anything is spawned.
         return {
             "state": "rejected",
             "error": str(exc),
-            "lane": lane or settings.default_lane,
+            "lane": wanted or settings.default_provider,
+            "provider": wanted or settings.default_provider,
             "fallback": fallback,
-            "known_lanes": list(settings.lanes),
+            "known_providers": list(settings.providers),
             "fallback_modes": list(FALLBACK_MODES),
         }
     if ctx is not None:
@@ -233,7 +238,7 @@ async def delegate(
         name=name,
         workspace=resolved,
         model=model or chosen.model,
-        lane=chosen.name,
+        provider=chosen.name,
         fallback=fallback,
     )
     start_error = await anyio.to_thread.run_sync(agent.wait_ready, 60.0)
@@ -245,7 +250,7 @@ async def delegate(
     out = _result(run)
     out["workspace"] = str(resolved)
     out["model"] = agent.model
-    out["lane"] = run.lane or agent.lane.name
+    out["lane"] = run.lane or agent.cfg.name
     out["fallback"] = agent.fallback
     return out
 
@@ -318,16 +323,16 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
         "agents": agents,
         "live": sum(1 for a in agents if a["state"] != "closed"),
         "limit": settings.max_agents,
-        "default_lane": settings.default_lane,
-        "lanes": [lane.as_dict() for lane in settings.lanes.values()],
+        "default_provider": settings.default_provider,
+        "providers": [cfg.as_dict() for cfg in settings.providers.values()],
         "default_workspace": str(settings.workspace),
         "tokens_spent": spent,
         "archived_runs": len(registry.archived_runs()),
         "trace": str(registry.trace.path) if registry.trace.enabled else None,
         "limits": {
-            "run_timeout_seconds": settings.lane().run_timeout,
-            "idle_timeout_seconds": settings.lane().idle_timeout,
-            "max_steps": settings.lane().max_steps,
+            "run_timeout_seconds": settings.provider().run_timeout,
+            "idle_timeout_seconds": settings.provider().idle_timeout,
+            "max_steps": settings.provider().max_steps,
             "turn_token_budget": settings.turn_token_budget,
             "result_cap_chars": settings.result_cap_chars,
         },
@@ -399,25 +404,21 @@ async def transcript(run_id: str, limit: int = 60, raw: bool = False) -> dict[st
 def main() -> None:
     configure_logging(settings.log_level)
     log.info(
-        "starting: default_lane=%s workspace=%s max_agents=%d supervisor=%s",
-        settings.default_lane,
+        "starting: default_provider=%s workspace=%s max_agents=%d supervisor=%s",
+        settings.default_provider,
         settings.workspace,
         settings.max_agents,
         settings.supervisor,
     )
     if registry.trace.enabled:
         log.info("tracing decisions and runs to %s", registry.trace.path)
-    for lane in settings.lanes.values():
-        reason = lane.unavailable()
+    for cfg in settings.providers.values():
+        reason = cfg.unavailable()
         if reason is not None:
-            log.info("lane %s: %s", lane.name, reason)
-        elif lane.api_key_envs and not lane.api_key():
-            # Names the variables only; key values are never logged.
-            print(
-                f"warning: lane {lane.name} has no API key in this server's environment; "
-                f"children on it will fail until one of {', '.join(lane.api_key_envs)} is set.",
-                file=sys.stderr,
-            )
+            log.info("provider %s: %s", cfg.name, reason)
+    # Names the variables only; key values are never logged.
+    for warning in settings.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     try:
         app.run()
     finally:

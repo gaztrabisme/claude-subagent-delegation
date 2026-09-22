@@ -14,7 +14,7 @@ Four tiers, in order of preference, chosen once at startup and logged:
 The `agent` tier exists because the two automated rungs are not always
 available. Claude Code advertises elicitation and not sampling, so on that
 client every escalation would interrupt a person -- which is the wrong price for
-a delegated agent that is supposed to run unattended. Pointing SAM_SUPERVISOR at
+a delegated agent that is supposed to run unattended. Setting [guard].supervisor to
 `agent` runs a reviewer locally instead: same prompt, same structured facts, no
 human in the loop. It costs a subprocess and a few seconds per escalation, and
 it spends tokens on whatever account the reviewer CLI is logged into.

@@ -1,46 +1,47 @@
-"""Capacity telemetry for the local lanes: what the machine looked like while a
-child ran on it.
+"""Capacity telemetry for local providers: what the machine looked like while
+a child ran on it.
 
-Three pieces, all for the two local lanes (omlx on this Mac, bppc's llama.cpp):
+Three pieces, all for providers that declare a `[probe]` block:
 
   admission  one snapshot at dispatch, stored on the hop record, checked
-             against per-lane thresholds. Log-only by default: a breach
-             records would_refuse and the child still runs.
-             SAM_<LANE>_ADMIT_ENFORCE=1 turns a breach into a skipped hop.
-  sampler    while at least one child is active on a lane, one daemon thread
-             per lane takes the same snapshot every SAM_SAMPLE_SECONDS
-             (default 10) and appends a "sample" row to metrics.jsonl.
-  summary    when a local-lane run ends, its samples and turn records become
-             one "run_summary" record in the trace: peak memory, peak swap,
-             worst pressure, decode tok/s, and bppc's energy.
+             against the provider's `[probe.admit]` thresholds. Log-only by
+             default: a breach records would_refuse and the child still runs.
+             `admit.enforce = true` turns a breach into a skipped hop.
+  sampler    while at least one child is active on a provider, one daemon
+             thread per provider takes the same snapshot every
+             `[telemetry].sample_seconds` (default 10) and appends a "sample"
+             row to metrics.jsonl.
+  summary    when such a run ends, its samples and turn records become one
+             "run_summary" record in the trace: peak memory, peak swap, worst
+             pressure, decode tok/s, and energy.
 
-Probes:
+What a snapshot holds comes from the provider's config:
 
-  omlx  GET <base_url>/api/status with the lane's key: models_loaded,
-        models_loading, active_requests, waiting_requests, model_memory_used,
-        model_memory_max, avg_prefill_tps, avg_generation_tps,
-        total_prompt_tokens, total_completion_tokens.
-  mac   `sysctl vm.swapusage` (swap used, MB),
-        `sysctl kern.memorystatus_vm_pressure_level` (1 normal, 2 warn,
-        4 critical; `memory_pressure -Q` free percentage when sysctl fails),
-        `pmset -g therm` (thermal warning level, CPU speed limit).
-  bppc  `ssh bppc@<host> nvidia-smi --query-gpu=...` (VRAM used/total MB,
-        utilisation %, power W, temperature C), llama.cpp GET :8081/slots
-        (the llama.cpp server port itself; :8080 is a preset proxy), and
-        GET :8081/metrics, recorded as "unavailable" on any non-200 (the
-        server runs without --metrics today).
+  status      the `[health].url` of an oMLX-kind provider: models_loaded,
+              models_loading, active_requests, waiting_requests,
+              model_memory_used, model_memory_max, avg_prefill_tps,
+              avg_generation_tps, total_prompt_tokens, total_completion_tokens.
+  host_parser "mac": `sysctl vm.swapusage` (swap used, MB),
+              `sysctl kern.memorystatus_vm_pressure_level` (1 normal, 2 warn,
+              4 critical; `memory_pressure -Q` free percentage when sysctl
+              fails), `pmset -g therm` (thermal warning level, CPU speed limit).
+  gpu_cmd     argv printing one nvidia-smi csv line (VRAM used/total MB,
+              utilisation %, power W, temperature C).
+  slots_url   a llama.cpp /slots endpoint.
+  metrics_url a llama.cpp /metrics endpoint, recorded as "unavailable" on any
+              non-200 (a server running without --metrics).
 
-Every probe is bounded to 3 s and never raises: a probe that fails records
-{"error": "..."} in place of its fields. Tests replace `_http_get` and `_run`
-(or pass their own probe functions); no test reaches the network, ssh or
-sysctl.
+`{host}` in any of those is replaced with the host of the provider's base URL,
+which is resolved at dispatch. Every probe is bounded to 3 s and never raises:
+a probe that fails records {"error": "..."} in place of its fields. Tests
+replace `_http_get` and `_run` (or pass their own probe functions); no test
+reaches the network, ssh or sysctl.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import subprocess
 import threading
@@ -53,14 +54,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..config import log
-from ..lanes import Lane
+from ..providers.base import ProviderConfig
 from .trace import Trace
 
 PROBE_TIMEOUT = 3.0
 SAMPLE_SECONDS = 10.0
-LLAMA_PORT = 8081
-BPPC_USER = "bppc"
-
 OMLX_FIELDS = (
     "models_loaded",
     "models_loading",
@@ -78,7 +76,7 @@ UNAVAILABLE = "unavailable"
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-Probe = Callable[[Lane], dict[str, Any]]
+Probe = Callable[[ProviderConfig], dict[str, Any]]
 
 
 def _http_get(url: str, headers: dict[str, str] | None = None,
@@ -108,12 +106,12 @@ def _error(exc: BaseException) -> dict[str, Any]:
 # --- probes -------------------------------------------------------------------
 
 
-def omlx_status(lane: Lane) -> dict[str, Any]:
+def omlx_status(cfg: ProviderConfig) -> dict[str, Any]:
     """The oMLX fields admission and the summary read, or {"error": ...}."""
     try:
-        base = (lane.base_url or "").rstrip("/")
-        url = lane.health_url or f"{base}/api/status"
-        key = lane.api_key()
+        base = (cfg.base_url or "").rstrip("/")
+        url = cfg.health.url or f"{base}/api/status"
+        key = cfg.api_key()
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         status, body = _http_get(url, headers)
         if status != 200:
@@ -155,7 +153,7 @@ def parse_therm(text: str) -> dict[str, Any]:
     return out
 
 
-def mac_status(lane: Lane | None = None) -> dict[str, Any]:
+def mac_status(cfg: ProviderConfig | None = None) -> dict[str, Any]:
     """Swap, memory pressure and thermal state of this Mac. Each part fails alone."""
     out: dict[str, Any] = {}
     try:
@@ -194,27 +192,25 @@ def parse_nvidia(text: str) -> dict[str, Any]:
     return values
 
 
-def lane_host(lane: Lane) -> str | None:
-    """The host a lane's base URL points at (bppc's is resolved at dispatch)."""
-    return urlsplit(lane.base_url).hostname if lane.base_url else None
+def provider_host(cfg: ProviderConfig) -> str | None:
+    """The host a provider's base URL points at (resolved at dispatch)."""
+    return urlsplit(cfg.base_url).hostname if cfg.base_url else None
 
 
-def bppc_gpu(host: str) -> dict[str, Any]:
+def _fill(value: str, host: str | None) -> str:
+    return value.replace("{host}", host or "")
+
+
+def gpu_status(argv: list[str]) -> dict[str, Any]:
     try:
-        text = _run([
-            "ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", f"{BPPC_USER}@{host}",
-            "nvidia-smi",
-            "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ])
-        return parse_nvidia(text)
+        return parse_nvidia(_run(argv))
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
 
-def llama_slots(host: str) -> dict[str, Any]:
+def llama_slots(url: str) -> dict[str, Any]:
     try:
-        status, body = _http_get(f"http://{host}:{LLAMA_PORT}/slots")
+        status, body = _http_get(url)
         if status != 200:
             return {"error": f"HTTP {status} from /slots"}
         data = json.loads(body.decode("utf-8", "replace"))
@@ -226,10 +222,10 @@ def llama_slots(host: str) -> dict[str, Any]:
         return _error(exc)
 
 
-def llama_metrics(host: str) -> dict[str, Any] | str:
-    """Prometheus gauges from :8081/metrics, or "unavailable" on any non-200."""
+def llama_metrics(url: str) -> dict[str, Any] | str:
+    """Prometheus gauges from a /metrics endpoint, or "unavailable" on any non-200."""
     try:
-        status, body = _http_get(f"http://{host}:{LLAMA_PORT}/metrics")
+        status, body = _http_get(url)
     except Exception:  # noqa: BLE001
         return UNAVAILABLE
     if status != 200:
@@ -247,18 +243,33 @@ def llama_metrics(host: str) -> dict[str, Any] | str:
     return values
 
 
-def probe_omlx(lane: Lane) -> dict[str, Any]:
-    return {"omlx": omlx_status(lane), "mac": mac_status(lane)}
+def probe_local(cfg: ProviderConfig) -> dict[str, Any]:
+    """One snapshot of `cfg`, with exactly the parts its config asks for."""
+    spec = cfg.probe
+    host = provider_host(cfg)
+    needs_host = any("{host}" in part for part in
+                     (*spec.gpu_cmd, spec.slots_url or "", spec.metrics_url or ""))
+    if needs_host and not host:
+        return {"error": f"{cfg.name}: host not resolved"}
+    snap: dict[str, Any] = {}
+    if cfg.health.kind == "omlx" and (cfg.health.url or cfg.base_url):
+        snap["omlx"] = omlx_status(cfg)
+    if spec.host_parser == "mac":
+        snap["mac"] = mac_status(cfg)
+    if spec.gpu_cmd:
+        snap["gpu"] = gpu_status([_fill(part, host) for part in spec.gpu_cmd])
+    if spec.slots_url:
+        snap["slots"] = llama_slots(_fill(spec.slots_url, host))
+    if spec.metrics_url:
+        snap["metrics"] = llama_metrics(_fill(spec.metrics_url, host))
+    return snap
 
 
-def probe_bppc(lane: Lane) -> dict[str, Any]:
-    host = lane_host(lane)
-    if host is None:
-        return {"error": "bppc host not resolved"}
-    return {"gpu": bppc_gpu(host), "slots": llama_slots(host), "metrics": llama_metrics(host)}
-
-
-DEFAULT_PROBES: dict[str, Probe] = {"omlx": probe_omlx, "bppc": probe_bppc}
+def probe_for(cfg: ProviderConfig) -> Probe | None:
+    """The probe for `cfg`, or None when it declares nothing to sample."""
+    if cfg.probe.empty and cfg.health.kind != "omlx":
+        return None
+    return probe_local
 
 
 # --- admission ----------------------------------------------------------------
@@ -266,7 +277,7 @@ DEFAULT_PROBES: dict[str, Probe] = {"omlx": probe_omlx, "bppc": probe_bppc}
 
 @dataclass(frozen=True, slots=True)
 class Thresholds:
-    """SAM_<LANE>_ADMIT_*; None means that check is off."""
+    """`[providers.<name>.probe.admit]`; None means that check is off."""
 
     max_swap_mb: float | None = None
     max_pressure: int | None = None
@@ -275,22 +286,21 @@ class Thresholds:
     enforce: bool = False
 
     @classmethod
-    def from_env(cls, lane: str, env: Mapping[str, str]) -> Thresholds:
+    def from_spec(cls, admit: Mapping[str, Any]) -> Thresholds:
         def num(knob: str) -> float | None:
-            raw = env.get(f"SAM_{lane.upper()}_ADMIT_{knob}")
-            if raw is None or not raw.strip():
+            raw = admit.get(knob)
+            if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 return None
             return float(raw)
 
-        pressure = num("MAX_PRESSURE")
-        waiting = num("MAX_WAITING")
-        flag = (env.get(f"SAM_{lane.upper()}_ADMIT_ENFORCE") or "").strip().lower()
+        pressure = num("max_pressure")
+        waiting = num("max_waiting")
         return cls(
-            max_swap_mb=num("MAX_SWAP_MB"),
+            max_swap_mb=num("max_swap_mb"),
             max_pressure=int(pressure) if pressure is not None else None,
             max_waiting=int(waiting) if waiting is not None else None,
-            min_vram_free_mb=num("MIN_VRAM_FREE_MB"),
-            enforce=flag in ("1", "true", "yes", "on"),
+            min_vram_free_mb=num("min_vram_free_mb"),
+            enforce=bool(admit.get("enforce", False)),
         )
 
 
@@ -411,7 +421,7 @@ def summarize(
 
 @dataclass
 class _Sampler:
-    lane: Lane
+    lane: ProviderConfig
     runs: set[str] = field(default_factory=set)
     wake: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
@@ -425,40 +435,40 @@ class Telemetry:
         metrics: Trace | None = None,
         *,
         probes: Mapping[str, Probe] | None = None,
-        env: Mapping[str, str] | None = None,
         interval: float | None = None,
     ):
-        source = os.environ if env is None else env
         self.metrics = metrics
-        self.probes = dict(DEFAULT_PROBES if probes is None else probes)
-        if interval is None:
-            raw = source.get("SAM_SAMPLE_SECONDS")
-            interval = float(raw) if raw and raw.strip() else SAMPLE_SECONDS
+        # A probe per provider name overrides what its config would build.
+        self.probes = dict(probes or {})
+        interval = SAMPLE_SECONDS if interval is None else interval
         if interval <= 0:
-            raise ValueError(f"SAM_SAMPLE_SECONDS must be positive, got {interval!r}")
+            raise ValueError(f"[telemetry].sample_seconds must be positive, got {interval!r}")
         self.interval = interval
-        self.thresholds = {name: Thresholds.from_env(name, source) for name in self.probes}
         self._lock = threading.Lock()
         self._samplers: dict[str, _Sampler] = {}
         self._samples: dict[str, list[tuple[float, dict[str, Any]]]] = {}
 
-    def covers(self, lane: Lane) -> bool:
-        return lane.local and lane.name in self.probes
+    def probe(self, cfg: ProviderConfig) -> Probe | None:
+        """The probe for `cfg`: the injected one, else what its config builds."""
+        return self.probes.get(cfg.name) or probe_for(cfg)
 
-    def snapshot(self, lane: Lane) -> dict[str, Any]:
+    def covers(self, cfg: ProviderConfig) -> bool:
+        return bool(cfg.local and self.probe(cfg))
+
+    def snapshot(self, cfg: ProviderConfig) -> dict[str, Any]:
         """One probe pass. Never raises."""
-        probe = self.probes.get(lane.name)
+        probe = self.probe(cfg)
         if probe is None:
             return {}
         try:
-            snap = probe(lane)
+            snap = probe(cfg)
             return snap if isinstance(snap, dict) else {"error": "probe returned no fields"}
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 
-    def admission(self, lane: Lane) -> Admission:
-        snap = self.snapshot(lane)
-        limits = self.thresholds.get(lane.name) or Thresholds()
+    def admission(self, cfg: ProviderConfig) -> Admission:
+        snap = self.snapshot(cfg)
+        limits = Thresholds.from_spec(cfg.probe.admit)
         found = breaches(snap, limits)
         return Admission(
             snapshot=snap,
@@ -469,8 +479,8 @@ class Telemetry:
 
     # sampler ---------------------------------------------------------------
 
-    def begin(self, lane: Lane, run_id: str) -> None:
-        """A child started on `lane`: start the lane's sampler if it is idle."""
+    def begin(self, lane: ProviderConfig, run_id: str) -> None:
+        """A child started on `lane`: start its sampler if that one is idle."""
         if not self.covers(lane):
             return
         with self._lock:

@@ -11,25 +11,31 @@ import dataclasses
 import hashlib
 import itertools
 import json
-import os
-import re
 import secrets
-import signal
-import subprocess
 import threading
 import time
 import uuid
 from collections import Counter, OrderedDict, deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import adapter, health, router
+from . import adapter, health, providers, router
 from .config import Settings, log
 from .guard.classify import protect
 from .lane_state import LaneState
-from .lanes import DRIVER_CLAUDE, DRIVER_CODEX, FALLBACK_MODES, Lane
+from .providers.base import ProviderConfig, Session
+
+# classify_exit and exit_event are re-exported: they were part of this
+# module's surface before the drivers moved into providers/.
+from .providers.claude import (  # noqa: F401
+    ClaudeProcess,
+    _strip_model_warning,
+    classify_exit,
+    exit_event,
+)
+from .router import FALLBACK_MODES
 from .telemetry.sampler import Telemetry, open_metrics, summarize
 from .telemetry.trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
@@ -56,10 +62,6 @@ KILL_STEPS = "steps"
 KILL_SHUTDOWN = "shutdown"
 KILL_IDLE = "idle"
 KILL_IS_FAILURE = frozenset({KILL_TIMEOUT, KILL_LOOP, KILL_BUDGET, KILL_STEPS})
-
-# The child's built-in tools. Bash, Read and Edit are what it had under --bare;
-# Write, Grep and Glob are file tools the guard already classifies.
-CHILD_TOOLS = "Bash,Read,Edit,Write,Grep,Glob"
 
 DISTIL_PROMPT = """\
 Stop working on the task. Summarize what you did, for a different engineer who \
@@ -156,261 +158,6 @@ class Usage:
         self.turns += other.turns
 
 
-# --- claude exit classification -------------------------------------------
-# Claude Code 2.1.261 prints this harmless warning to stderr on every request
-# (the wrapper passes the raw GLM model name; the env maps only the aliases).
-# It is never the cause of a failure, so it is stripped from every message.
-MODEL_WARNING = "[claude-code:unrecognized_model]"
-
-# z.ai / Anthropic-compatible rate-limit wording. 429 = rate limit,
-# 529 = provider overloaded; "quota"/"Insufficient Balance" are z.ai billing
-# limits that behave the same way (transient, retryable).
-_RATE_LIMIT_WORDS = (
-    "rate_limit",
-    "rate limit",
-    "overloaded",
-    "insufficient balance",
-    "quota",
-)
-_AUTH_WORDS = ("invalid api key", "invalid_api_key", "unauthorized", "authentication")
-
-# z.ai puts its own code beside the HTTP status: "(429) · [1313][…]", or
-# `"code":"1308"` in a JSON body. The code decides whether waiting helps.
-_ZAI_CODE_RE = re.compile(r'\[(1[0-9]{3})\]|"code"\s*:\s*"?(1[0-9]{3})\b')
-_RESET_RE = re.compile(
-    r"reset(?:s)?\s+(?:at|on)\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}(?::[0-9]{2})?)",
-    re.IGNORECASE,
-)
-# Plan quota: the 5-hour (1308) or weekly/monthly (1310) allowance is spent.
-# It resets hours later, so a retry seconds from now only burns wall clock.
-ZAI_QUOTA_CODES = frozenset({"1308", "1310"})
-# Fair-use throttle: clears on the order of minutes, not seconds.
-ZAI_THROTTLE_CODE = "1313"
-
-
-def zai_code(text: str) -> str | None:
-    """The z.ai error code in `text`, if it carries one."""
-    match = _ZAI_CODE_RE.search(text or "")
-    if match is None:
-        return None
-    return match.group(1) or match.group(2)
-
-
-def zai_reset(text: str) -> str | None:
-    """The quota reset time z.ai quoted, if any."""
-    match = _RESET_RE.search(text or "")
-    return match.group(1) if match else None
-_HTTP_RATE_RE = re.compile(r"\b(?:429|529)\b")
-_HTTP_AUTH_RE = re.compile(r"\b(?:401|403)\b")
-
-
-def _strip_model_warning(stderr: str) -> str:
-    """Drop cosmetic unrecognized-model warning lines; keep the real cause."""
-    kept = [ln for ln in (stderr or "").splitlines() if MODEL_WARNING not in ln]
-    return "\n".join(kept).strip()
-
-
-def _rate_limit_line(text: str) -> str:
-    """The last line of `text` that actually mentions a rate limit, if any."""
-    for line in reversed(text.splitlines()):
-        low = line.lower()
-        if _HTTP_RATE_RE.search(line) or any(w in low for w in _RATE_LIMIT_WORDS):
-            return line.strip()
-    return ""
-
-
-def _event_error_text(event: dict | None) -> str:
-    """The text a result event itself reports as an error, or "".
-
-    Only fields the CLI fills when a turn actually failed: `error`, and
-    `result` when `is_error` is set (Claude Code puts the API error there --
-    status, message and retry info). Everything else in a result event --
-    `subtype`, usage, cost, durations, the model's answer -- is metadata or
-    payload, never a diagnostic, so it is not searched for failure keywords:
-    a `subtype: success` event whose answer text merely mentions 429/quota
-    does not make the run rate-limited.
-    """
-    if not isinstance(event, dict):
-        return ""
-    parts: list[str] = []
-    err = event.get("error")
-    if isinstance(err, str) and err.strip():
-        parts.append(err)
-    if event.get("is_error"):
-        res = event.get("result")
-        if isinstance(res, str) and res.strip():
-            parts.append(res)
-    return "\n".join(parts)
-
-
-def exit_event(code: int, stderr: str, last_result_event: dict | None) -> dict[str, Any]:
-    """The synthetic result event for a non-zero ``claude -p`` exit."""
-    kind, message = classify_exit(code, stderr, last_result_event)
-    event: dict[str, Any] = {
-        "type": "result",
-        "is_error": True,
-        "result": "",
-        "error": message,
-        # Honest kind so the run loop can decide to retry.
-        "error_kind": kind,
-    }
-    if kind == "rate_limited":
-        found = zai_code(_code_evidence(stderr, last_result_event))
-        if found:
-            event["zai_code"] = found
-    return event
-
-
-def _code_evidence(stderr: str, event: dict | None) -> str:
-    """Where a z.ai code may be read: stderr, the event's `error`, and its
-    `result` only when that is an API error the CLI reports, never model text.
-    A stray `[1308]` in an answer must not switch off a retry."""
-    parts = [stderr or ""]
-    if isinstance(event, dict):
-        if isinstance(event.get("error"), str):
-            parts.append(event["error"])
-        result = event.get("result")
-        if event.get("is_error") and isinstance(result, str) and result.lstrip().startswith(
-            "API Error"
-        ):
-            parts.append(result)
-    return "\n".join(parts)
-
-
-def classify_exit(code: int, stderr: str, last_result_event: dict | None) -> tuple[str, str]:
-    """Honest ``(kind, message)`` for a non-zero ``claude -p`` exit.
-
-    kind is one of:
-      - ``rate_limited``: transient upstream limit (429/529/quota/overloaded)
-        reported by stderr or by the last result event's own error fields;
-        the run loop retries these.
-      - ``auth``: credential failure (401/403/invalid key).
-      - ``cli_error``: anything else. Not retried.
-    """
-    if code in (0, None):
-        # Defensive: a clean exit is not an error; events() never classifies it.
-        return "cli_error", ""
-    cleaned = _strip_model_warning(stderr)
-    # Evidence is stderr plus only what the event reports as an error. The
-    # live trace's "rate_limited: success" runs were real z.ai 429s (code
-    # 1313, Fair Usage throttle): the CLI printed subtype "success" with
-    # is_error true and no `error` field, the class was right, and only the
-    # old `error or subtype` detail fallback mislabelled them. Scanning the
-    # whole event was a latent false positive (a successful answer merely
-    # mentioning 429 would have tripped the class), so it is gone.
-    event_error = _event_error_text(last_result_event)
-    haystack = f"{cleaned}\n{event_error}".lower()
-    if _HTTP_RATE_RE.search(haystack) or any(w in haystack for w in _RATE_LIMIT_WORDS):
-        # The actual limit text -- status, message or retry info, whichever
-        # stream carried it. Never the event's `subtype`: metadata like
-        # "success" is how "rate_limited: success" labels happened.
-        detail = _rate_limit_line(cleaned) or _rate_limit_line(event_error)
-        detail = detail or "no rate-limit detail in stderr or result event"
-        evidence = _code_evidence(cleaned, last_result_event)
-        found = zai_code(evidence)
-        if found in ZAI_QUOTA_CODES:
-            reset = zai_reset(evidence)
-            when = f", resets at {reset}" if reset else ", reset time not given"
-            return "rate_limited", (
-                f"rate_limited: z.ai plan quota exhausted ({found}{when}); "
-                f"not retried: {_clip(detail, 300)}"
-            )
-        if found == ZAI_THROTTLE_CODE:
-            return "rate_limited", (
-                "rate_limited: z.ai fair-use throttle (1313); run fewer children at "
-                f"once: {_clip(detail, 300)}"
-            )
-        return "rate_limited", f"rate_limited: {_clip(detail, 300)}"
-    tail = _clip(cleaned[-2000:], 800)
-    message = f"claude exited {code}: {tail}".strip()
-    if _HTTP_AUTH_RE.search(haystack) or any(w in haystack for w in _AUTH_WORDS):
-        return "auth", f"auth: {message}"
-    return "cli_error", f"cli_error: {message}"
-
-
-class ClaudeProcess:
-    """One ``claude -p`` subprocess. Tests replace `_spawn_claude` with a fake."""
-
-    def __init__(self, argv: list[str], env: dict[str, str], cwd: str):
-        self.argv = argv
-        self.env = env
-        self.cwd = cwd
-        self._proc: subprocess.Popen[str] | None = None
-
-    def events(self) -> Iterator[dict[str, Any]]:
-        self._proc = subprocess.Popen(
-            self.argv,
-            cwd=self.cwd,
-            env=self.env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        assert self._proc.stdout is not None
-        # Drain stderr on a side thread while iterating stdout. Claude Code
-        # writes a per-request model warning there; if we only read stdout the
-        # stderr pipe fills up and the child blocks forever (pipe deadlock).
-        # The full text is kept for classify_exit().
-        stderr_buf: list[str] = []
-        stderr_thread = threading.Thread(
-            target=self._drain_stderr, args=(self._proc, stderr_buf), daemon=True
-        )
-        stderr_thread.start()
-        try:
-            last_result: dict[str, Any] | None = None
-            for line in self._proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    log.debug("non-json claude line: %s", line[:200])
-                    continue
-                if isinstance(event, dict) and event.get("type") == "result":
-                    last_result = event
-                yield event
-            code = self._proc.wait()
-            stderr_thread.join(timeout=5)
-            if code not in (0, None):
-                yield exit_event(code, "".join(stderr_buf), last_result)
-        finally:
-            if self._proc.poll() is None:
-                self.kill()
-            stderr_thread.join(timeout=5)
-
-    @staticmethod
-    def _drain_stderr(proc: subprocess.Popen[str], buf: list[str]) -> None:
-        """Read all of the child's stderr into `buf`; runs beside stdout."""
-        if proc.stderr is None:
-            return
-        try:
-            buf.append(proc.stderr.read())
-        except (ValueError, OSError) as exc:  # pipe torn down by kill()
-            log.debug("stderr drain ended: %s", exc)
-
-    def kill(self) -> None:
-        proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
-
-
-def _spawn_claude(argv: list[str], env: dict[str, str], cwd: str) -> ClaudeProcess:
-    return ClaudeProcess(argv, env, cwd)
-
-
 def _assistant_text(event: dict[str, Any]) -> str:
     message = event.get("message") if isinstance(event.get("message"), dict) else event
     content = message.get("content") if isinstance(message, dict) else None
@@ -476,7 +223,7 @@ class _Watch:
             # limit is not retried.
             return (
                 KILL_STEPS,
-                f"reached --max-turns of {self.max_steps} (SAM_MAX_STEPS) "
+                f"reached --max-turns of {self.max_steps} ([core].max_steps) "
                 "before finishing",
             )
         if event.get("type") != "assistant":
@@ -501,7 +248,7 @@ class _Watch:
         if used > budget:
             return (
                 KILL_BUDGET,
-                f"run used about {used} tokens, over SAM_TURN_TOKEN_BUDGET of {budget}",
+                f"run used about {used} tokens, over [core].turn_token_budget of {budget}",
             )
         return None
 
@@ -787,71 +534,12 @@ class Run:
         self.transcript.append(line)
 
 
-class ClaudeDriver:
-    """Runs a turn as ``claude -p`` against the lane's Anthropic-compatible endpoint.
-
-    A driver is stateless; per-agent state (the hooks file, CODEX_HOME) lives
-    under the agent's session directory. The Agent picks one per lane, so a
-    delegate can refuse on one driver and run on the other.
-    """
-
-    name = DRIVER_CLAUDE
-    # Whether a run needs the lane's API key in this server's environment.
-    needs_api_key = True
-
-    def guard(self, settings: Settings) -> str:
-        """What stands between the child and the machine, for the trace."""
-        return "hook"
-
-    def boot(self, agent: Agent, lane: Lane) -> str | None:
-        """Why this driver cannot run for `agent` on `lane`, or None."""
-        try:
-            agent.settings.hooks_config(agent.agent_id, lane, agent.model)
-            probe = subprocess.run(
-                [agent.settings.claude_bin, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if probe.returncode != 0:
-                return (
-                    probe.stderr.strip() or probe.stdout.strip()
-                    or f"{agent.settings.claude_bin} --version exited {probe.returncode}"
-                )
-        except FileNotFoundError:
-            return f"{agent.settings.claude_bin!r} is not on PATH; install Claude Code"
-        except Exception as exc:  # noqa: BLE001
-            return f"{type(exc).__name__}: {exc}"
-        return None
-
-    def spawn(self, agent: Agent, prompt: str, resume: str | None) -> ClaudeProcess:
-        argv = agent._argv(prompt, resume)
-        env = agent.settings.child_env(agent.agent_id, agent.lane, agent.model)
-        return _spawn_claude(argv, env, str(agent.workspace))
-
-    def refusal(self, lane: Lane, events: list[dict[str, Any]]) -> router.Refusal | None:
-        """The before-work refusal in a turn's events, or None."""
-        return router.classify_refusal(lane.name, events)
-
-
-CLAUDE_DRIVER = ClaudeDriver()
-
-
-def driver_for(lane: Lane) -> Any:
-    """The driver object for a lane (ClaudeDriver or providers.codex.CodexDriver)."""
-    if lane.driver == DRIVER_CODEX:
-        from .providers.codex import CODEX_DRIVER  # the codex driver imports this module
-
-        return CODEX_DRIVER
-    return CLAUDE_DRIVER
-
-
 class Agent:
     """One child session, driven by a serial task queue.
 
-    The session runs on one lane and that lane's driver. A delegate may move
-    along the chain before any work is done; from the first hop that runs,
-    `lane`, `driver` and `session_id` (a claude session_id or a codex
+    The session runs on one provider and that provider's driver. A delegate
+    may move along the chain before any work is done; from the first hop that
+    runs, `cfg`, `driver` and `session_id` (a claude session_id or a codex
     thread_id) belong together for every continue.
     """
 
@@ -863,27 +551,32 @@ class Agent:
         model: str,
         settings: Settings,
         trace: Trace | None = None,
-        lane: Lane | None = None,
+        cfg: ProviderConfig | None = None,
         fallback: str = "full",
-        chain: list[Lane] | None = None,
+        chain: list[ProviderConfig] | None = None,
         lane_state: LaneState | None = None,
-        lane_load: Callable[[str, Agent], int] | None = None,
+        provider_load: Callable[[str, Agent], int] | None = None,
         telemetry: Telemetry | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.trace = trace
         self.telemetry = telemetry
-        # The lane this agent runs on. The delegate's run may move it along
-        # `chain` (router.chain) when a lane refuses before work; after that
-        # every continue stays on the lane that ran.
-        self.lane = lane or settings.lane()
+        # The provider this agent runs on. The delegate's run may move it
+        # along `chain` (Settings.chain) when a provider refuses before work;
+        # after that every continue stays on the provider that ran.
+        self.cfg = cfg or settings.provider()
         self.fallback = fallback
-        self.driver = driver_for(self.lane)
-        # Driver name -> its boot result (None when it can run). Filled
-        # lazily: a later hop's driver is checked only when the walk gets there.
+        self.driver = providers.for_driver(self.cfg.driver)
+        # Driver name -> its boot result (None when it can run) and the
+        # session it minted. Filled lazily: a later hop's driver is checked
+        # only when the walk gets there.
         self._booted: dict[str, str | None] = {}
-        self.chain = list(chain) if chain else [self.lane]
+        self._sessions: dict[str, Session] = {}
+        self.chain = list(chain) if chain else [self.cfg]
         self.lane_state = lane_state
-        self._lane_load = lane_load
+        self._provider_load = provider_load
+        # Called for every parsed event of every turn, as it arrives.
+        self.on_event = on_event
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -942,11 +635,11 @@ class Agent:
             prompt=prompt,
             verification=verification,
             verification_note=note,
-            lane=self.lane.name,
+            lane=self.cfg.name,
             fallback=self.fallback,
-            provider=self.lane.provider,
+            provider=self.cfg.vendor,
             driver=self.driver.name,
-            guard=self.driver.guard(self.settings),
+            guard=self.driver.guard(self.settings, self.cfg),
             route=route,
             parent=parent or None,
         )
@@ -1020,7 +713,7 @@ class Agent:
             "agent_id": self.agent_id,
             "name": self.name,
             "model": self.model,
-            "lane": self.lane.name,
+            "lane": self.cfg.name,
             "fallback": self.fallback,
             "workspace": str(self.workspace),
             "session_id": self.session_id,
@@ -1052,15 +745,28 @@ class Agent:
 
     def _boot(self) -> None:
         try:
-            self._start_error = self._boot_driver(self.driver, self.lane)
+            self._start_error = self._boot_driver(self.driver, self.cfg)
         finally:
             self._ready.set()
 
-    def _boot_driver(self, driver: Any, lane: Lane) -> str | None:
+    def _boot_driver(self, driver: Any, cfg: ProviderConfig) -> str | None:
         """Boot `driver` for this agent once; the reason it cannot run, or None."""
         if driver.name not in self._booted:
-            self._booted[driver.name] = driver.boot(self, lane)
+            try:
+                error, session = driver.boot(self.settings, self.agent_id, cfg)
+            except NotImplementedError as exc:
+                error, session = str(exc), Session(provider=cfg.name)
+            self._booted[driver.name] = error
+            self._sessions[driver.name] = session
         return self._booted[driver.name]
+
+    def session(self) -> Session:
+        """The current driver's per-agent session state."""
+        found = self._sessions.get(self.driver.name)
+        if found is None:
+            found = Session(provider=self.cfg.name)
+            self._sessions[self.driver.name] = found
+        return found
 
     def _worker(self) -> None:
         self._boot()
@@ -1083,50 +789,18 @@ class Agent:
                 run.finished_at = _now()
                 run.done.set()
 
-    def _argv(self, prompt: str, resume: str | None) -> list[str]:
-        argv = [
-            self.settings.claude_bin,
-            "-p",
-            prompt,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            # Per-token stream events: the only source of a message's real
-            # first-token time, which decode tok/s and TTFT are measured from.
-            "--include-partial-messages",
-            # No --bare: it skips hooks, and the PreToolUse hook is the guard.
-            # The flags below restore the isolation --bare gave: built-in tools
-            # only, no MCP servers, and no settings but the file passed with
-            # --settings (a workspace .claude/settings.json could otherwise
-            # carry the child's own hooks). CLAUDE_CONFIG_DIR is per-agent.
-            "--tools",
-            CHILD_TOOLS,
-            "--strict-mcp-config",
-            "--setting-sources",
-            "",
-            # Permission prompts are off; the PreToolUse hook is the gate.
-            "--dangerously-skip-permissions",
-            "--max-turns",
-            str(self.lane.max_steps),
-            "--model",
-            self.model,
-            "--settings",
-            str(self.settings.hooks_config(self.agent_id, self.lane, self.model)),
-        ]
-        claude_md = self.workspace / "CLAUDE.md"
-        if claude_md.is_file():
-            argv.extend(["--append-system-prompt-file", str(claude_md)])
-        if resume:
-            argv.extend(["--resume", resume])
-        return argv
-
     def _spawn(self, prompt: str, resume: str | None) -> ClaudeProcess:
-        """One turn's child process, on the current lane's driver."""
-        return self.driver.spawn(self, prompt, resume)
+        """One turn's child process, on the current provider's driver."""
+        session = self.session()
+        session.session_id = resume
+        return self.driver.spawn(
+            self.cfg, self.settings, self.agent_id, prompt, self.workspace,
+            session, self.model,
+        )
 
     def _execute(self, run: Run) -> None:
         run.started_at = _now()
-        run.deadline = run.started_at + self.lane.run_timeout
+        run.deadline = run.started_at + self.cfg.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
         if run.route:
@@ -1134,9 +808,9 @@ class Agent:
                 self._finish(run)
                 return
         else:
-            if self.driver.needs_api_key and not self.lane.api_key():
+            if self.driver.needs_api_key and not self.cfg.api_key():
                 run.state = FAILED
-                run.error = self._missing_key(self.lane)
+                run.error = self._missing_key(self.cfg)
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
                 run.done.set()
@@ -1177,9 +851,9 @@ class Agent:
         self._finish(run)
 
     @staticmethod
-    def _missing_key(lane: Lane) -> str:
-        names = ", ".join(lane.api_key_envs) or "(none configured)"
-        return f"missing API key for lane {lane.name!r}: set one of {names}"
+    def _missing_key(cfg: ProviderConfig) -> str:
+        names = ", ".join(cfg.api_key_envs) or "(none configured)"
+        return f"missing API key for provider {cfg.name!r}: set one of {names}"
 
     def _hop(self, run: Run, hop: router.Hop) -> None:
         run.hops.append(hop.as_dict())
@@ -1191,40 +865,40 @@ class Agent:
             self.trace.hop(run_id=run.run_id, agent_id=self.agent_id, hop=hop)
 
     def _route(self, run: Run) -> bool:
-        """Run a delegate on the first lane in the chain that takes it.
+        """Run a delegate on the first provider in the chain that takes it.
 
-        Per lane: skip it when it is unavailable in this build, has no key, is
-        full, is closed in lane memory, or its driver cannot start; run its
-        health gate; spawn on that lane's driver. A refusal before any work
-        (read by the driver: router.classify_refusal for claude, codex_refusal
-        for codex) moves to the next lane and may close this one on disk.
-        Anything else, including a failure after work started, is the run's
-        result and ends the walk. Returns False when no lane ran it.
+        Per provider: skip it when it is unavailable in this build, has no
+        key, is full, is closed in provider memory, or its driver cannot
+        start; run its health gate; spawn on its driver. A refusal before any
+        work (the driver reads it: router.classify_refusal for claude,
+        codex_refusal for codex) moves to the next provider and may close this
+        one on disk. Anything else, including a failure after work started, is
+        the run's result and ends the walk. Returns False when none ran it.
         """
         primary_model = self.model
         last_refusal: str | None = None
-        for index, lane in enumerate(self.chain):
+        for index, cfg in enumerate(self.chain):
             if self._closing:
                 return False
-            model = primary_model if index == 0 else (lane.model or "")
-            driver = driver_for(lane)
-            hop = router.Hop(index, lane.name, lane.provider, model, router.HOP_UNAVAILABLE,
-                             driver=driver.name, guard=driver.guard(self.settings))
-            reason = lane.unavailable()
-            if reason is None and driver.needs_api_key and not lane.api_key():
-                reason = self._missing_key(lane)
+            model = primary_model if index == 0 else (cfg.model or "")
+            driver = providers.for_driver(cfg.driver)
+            hop = router.Hop(index, cfg.name, cfg.vendor, model, router.HOP_UNAVAILABLE,
+                             driver=driver.name, guard=driver.guard(self.settings, cfg))
+            reason = cfg.unavailable()
+            if reason is None and driver.needs_api_key and not cfg.api_key():
+                reason = self._missing_key(cfg)
             if (
                 reason is None
                 and index > 0
-                and self._lane_load is not None
-                and self._lane_load(lane.name, self) >= lane.max_agents
+                and self._provider_load is not None
+                and self._provider_load(cfg.name, self) >= cfg.max_agents
             ):
-                reason = f"lane {lane.name!r} is at its agent limit ({lane.max_agents})"
+                reason = f"provider {cfg.name!r} is at its agent limit ({cfg.max_agents})"
             if reason is not None:
                 hop.message = reason
                 self._hop(run, hop)
                 continue
-            entry = self.lane_state.closed(lane.name) if self.lane_state else None
+            entry = self.lane_state.closed(cfg.name) if self.lane_state else None
             if entry is not None:
                 hop.outcome = router.HOP_SKIPPED_CLOSED
                 hop.code = entry.get("code")
@@ -1232,42 +906,42 @@ class Agent:
                 hop.closed_until = entry["closed_until"]
                 self._hop(run, hop)
                 continue
-            reason = self._boot_driver(driver, lane)
+            reason = self._boot_driver(driver, cfg)
             if reason is not None:
                 hop.message = reason
                 self._hop(run, hop)
                 continue
-            gate = health.check(lane)
+            gate = health.check(cfg)
             if not gate.ok:
                 hop.outcome = router.HOP_HEALTH_FAILED
                 hop.code = router.HEALTH_FAILED
                 hop.message = gate.message
                 self._hop(run, hop)
                 continue
-            if gate.base_url and gate.base_url != lane.base_url:
-                lane = dataclasses.replace(lane, base_url=gate.base_url)
-            if gate.cold_load and lane.resolver == "bppc" and gate.base_url:
+            if gate.base_url and gate.base_url != cfg.base_url:
+                cfg = dataclasses.replace(cfg, base_url=gate.base_url)
+            if gate.cold_load and cfg.health.warm and gate.base_url:
                 # Claude Code gives up on a request that waits out a container
                 # start; wake the backend first, bounded by the cold-load time.
-                warm = health.warm_bppc(gate.base_url, self.settings.cold_load_seconds(lane.name),
-                                        lane.api_key())
+                warm = health.warm(cfg, gate.base_url,
+                                   self.settings.cold_load_seconds(cfg.name))
                 if not warm.ok:
                     hop.outcome = router.HOP_HEALTH_FAILED
                     hop.code = router.HEALTH_FAILED
                     hop.message = warm.message
                     self._hop(run, hop)
                     continue
-            if self.telemetry is not None and self.telemetry.covers(lane):
-                admission = self.telemetry.admission(lane)
+            if self.telemetry is not None and self.telemetry.covers(cfg):
+                admission = self.telemetry.admission(cfg)
                 hop.admission = admission.snapshot
                 hop.would_refuse = admission.would_refuse
                 hop.admit_reason = admission.reason
                 if admission.would_refuse:
-                    log.warning("run %s: lane %s over its admission thresholds (%s)%s",
-                                run.run_id, lane.name, admission.reason,
+                    log.warning("run %s: provider %s over its admission thresholds (%s)%s",
+                                run.run_id, cfg.name, admission.reason,
                                 "; skipped" if admission.refuse else "; log-only")
                 if admission.refuse:
-                    # A skip for this dispatch, not a lane closure.
+                    # A skip for this dispatch, not a provider closure.
                     hop.outcome = router.HOP_REFUSED
                     hop.code = router.ADMISSION
                     hop.message = f"admission: {admission.reason}"
@@ -1275,23 +949,23 @@ class Agent:
                     last_refusal = hop.message
                     continue
 
-            self.lane = lane
+            self.cfg = cfg
             self.driver = driver
             self.model = model
             self.session_id = None
-            run.lane = lane.name
-            run.provider = lane.provider
+            run.lane = cfg.name
+            run.provider = cfg.vendor
             run.driver = hop.driver
             run.guard = hop.guard
             run.cold_load = gate.cold_load
             hop.cold_load = gate.cold_load
-            extra = self.settings.cold_load_seconds(lane.name) if gate.cold_load else 0.0
-            run.deadline = _now() + lane.run_timeout + extra
+            extra = self.settings.cold_load_seconds(cfg.name) if gate.cold_load else 0.0
+            run.deadline = _now() + cfg.run_timeout + extra
             run.worked = False
             events = self._collect(run, run.prompt, resume=None)
             refusal = None
             if not run.worked and run.trip is None and not self._closing:
-                refusal = driver.refusal(lane, events)
+                refusal = driver.refusal(cfg, events)
             if refusal is None:
                 hop.outcome = router.HOP_RAN
                 self._hop(run, hop)
@@ -1308,7 +982,7 @@ class Agent:
                 throttle_close_minutes=self.settings.throttle_close_minutes,
             )
             if until is not None and self.lane_state is not None:
-                self.lane_state.close(lane.name, until, refusal.code, refusal.message)
+                self.lane_state.close(cfg.name, until, refusal.code, refusal.message)
                 hop.closed_until = until
             self._hop(run, hop)
             last_refusal = refusal.message
@@ -1319,9 +993,14 @@ class Agent:
             for h in run.hops
         )
         run.state = FAILED
-        run.error = f"no lane took the run: {tried}"
+        run.error = f"no provider took the run: {tried}"
         run.error_detail = last_refusal
-        run.finish_reason = "no_lane"
+        # "refused" only when every provider said no itself. A hop skipped by
+        # an admission threshold is this machine's decision, not a refusal by
+        # the backend, and leaves the run a plain no_lane.
+        refused = [h for h in run.hops if h["outcome"] == router.HOP_REFUSED
+                   and h.get("code") != router.ADMISSION]
+        run.finish_reason = "refused" if refused and len(refused) == len(run.hops) else "no_lane"
         return False
 
     def _distill(self, run: Run) -> str:
@@ -1376,11 +1055,16 @@ class Agent:
             proc = self._spawn(prompt, resume)
             self._current = proc
             collected: list[dict[str, Any]] = []
-            watch = _Watch(run, self.settings, self.signatures, self.lane.max_steps)
+            watch = _Watch(run, self.settings, self.signatures, self.cfg.max_steps)
             try:
                 for event in proc.events():
                     self.last_activity = _now()
                     meter.see(event, self.last_activity)
+                    if self.on_event is not None:
+                        try:
+                            self.on_event(event)
+                        except Exception:  # noqa: BLE001 - a watcher never fails a run
+                            log.warning("on_event watcher failed", exc_info=True)
                     if event.get("type") == "stream_event":
                         # Timing only; nothing downstream reads partial messages,
                         # and one per token would bloat the attempt's event list.
@@ -1415,7 +1099,7 @@ class Agent:
                 isinstance(terminal, dict)
                 and terminal.get("error_kind") == "rate_limited"
                 # A spent plan quota resets hours later; retrying burns wall clock.
-                and code not in ZAI_QUOTA_CODES
+                and code not in router.ZAI_QUOTA_CODES
                 # Nor does an empty balance or a usage limit.
                 and not router.no_retry(str(terminal.get("error") or ""))
                 and not succeeded
@@ -1437,7 +1121,7 @@ class Agent:
                 ),
                 None,
             )
-            if code == ZAI_THROTTLE_CODE:
+            if code == router.ZAI_THROTTLE_CODE:
                 # Fair-use throttling does not clear in seconds.
                 delay = min(self.settings.throttle_backoff * (2 ** attempt), 900.0)
             else:
@@ -1466,8 +1150,8 @@ class Agent:
             record = {
                 "run_id": run.run_id,
                 "agent_id": self.agent_id,
-                "lane": self.lane.name,
-                "provider": self.lane.provider,
+                "lane": self.cfg.name,
+                "provider": self.cfg.vendor,
                 "turn": len(run.turn_log),
                 **turn,
                 "model": turn["model"] or self.model,
@@ -1478,13 +1162,14 @@ class Agent:
 
     def _sample_begin(self, run: Run) -> None:
         """Register a child about to start on a local lane with that lane's sampler."""
-        if self.telemetry is None or not self.telemetry.covers(self.lane):
+        if self.telemetry is None or not self.telemetry.covers(self.cfg):
             return
-        if run.sampling_lane != self.lane.name:
-            # A routed run that moved lanes: the summary covers the lane it ended on.
+        if run.sampling_lane != self.cfg.name:
+            # A routed run that moved providers: the summary covers the one it
+            # ended on.
             run.samples.clear()
-        run.sampling_lane = self.lane.name
-        self.telemetry.begin(self.lane, run.run_id)
+        run.sampling_lane = self.cfg.name
+        self.telemetry.begin(self.cfg, run.run_id)
 
     def _sample_end(self, run: Run) -> None:
         if self.telemetry is None or run.sampling_lane is None:
@@ -1511,13 +1196,14 @@ class Agent:
         if isinstance(session, str) and session:
             run.session_id = session
             self.session_id = session
+            self.session().session_id = session
         if kind == "system" and event.get("subtype") == "init":
             run.note("system/init")
             return
         if kind == "assistant":
             # Counting only. The loop and budget trips are decided by _Watch
             # while the stream is read; tool calls are not a step limit, since
-            # SAM_MAX_STEPS is Claude Code's --max-turns.
+            # [core].max_steps is Claude Code's --max-turns.
             for name, args in _tool_uses(event):
                 sig = _tool_signature(name, args)
                 run.signatures[sig] += 1
@@ -1535,14 +1221,15 @@ class Agent:
             if _hit_max_turns(event) and run.trip is None:
                 run.trip = (
                     KILL_STEPS,
-                    f"reached --max-turns of {self.lane.max_steps} (SAM_MAX_STEPS) "
+                    f"reached --max-turns of {self.cfg.max_steps} ([core].max_steps) "
                     "before finishing",
                 )
             budget = self.settings.turn_token_budget
             if budget is not None and run.usage.total > budget:
                 run.trip = (
                     KILL_BUDGET,
-                    f"run used {run.usage.total} tokens, over SAM_TURN_TOKEN_BUDGET of {budget}",
+                    f"run used {run.usage.total} tokens, over "
+                    f"[core].turn_token_budget of {budget}",
                 )
             text = str(event.get("result") or "")
             run.final_response = text
@@ -1619,7 +1306,8 @@ class Registry:
         self._reaper: threading.Thread | None = None
         if start_reaper:
             idle = min(
-                [lane.idle_timeout for lane in settings.lanes.values()] or [settings.idle_timeout]
+                [p.idle_timeout for p in settings.providers.values()]
+                or [settings.idle_timeout]
             )
             interval = max(1.0, min(30.0, idle / 4))
             self._reaper = threading.Thread(
@@ -1644,7 +1332,7 @@ class Registry:
                 agent.close("run deadline exceeded", kind=KILL_TIMEOUT)
                 acted.append((agent.agent_id, KILL_TIMEOUT))
             elif not active and not agent.busy:
-                if now - agent.last_activity > agent.lane.idle_timeout:
+                if now - agent.last_activity > agent.cfg.idle_timeout:
                     agent.close("idle", kind=KILL_IDLE)
                     acted.append((agent.agent_id, KILL_IDLE))
         self._evict_closed()
@@ -1670,22 +1358,24 @@ class Registry:
             except Exception:  # noqa: BLE001
                 log.warning("reaper pass failed", exc_info=True)
 
-    def select_lane(self, lane: str | None, fallback: str | None = "full") -> Lane:
-        """The lane a new agent runs on, or RegistryError saying why not.
+    def select_provider(
+        self, provider: str | None, fallback: str | None = "full"
+    ) -> ProviderConfig:
+        """The provider a new agent runs on, or RegistryError saying why not.
 
-        Checked before anything is spawned: an unknown lane, an unknown
-        fallback mode, or a lane this build cannot drive.
+        Checked before anything is spawned: an unknown provider, an unknown
+        fallback mode, or a provider this build cannot drive.
         """
         mode = fallback if fallback is not None else "full"
         if mode not in FALLBACK_MODES:
             raise RegistryError(
                 f"unknown fallback {fallback!r}; expected one of {', '.join(FALLBACK_MODES)}"
             )
-        name = lane or self.settings.default_lane
-        chosen = self.settings.lanes.get(name)
+        name = provider or self.settings.default_provider
+        chosen = self.settings.providers.get(name)
         if chosen is None:
-            known = ", ".join(self.settings.lanes) or "(none)"
-            raise RegistryError(f"unknown lane {name!r}; known lanes: {known}")
+            known = ", ".join(self.settings.providers) or "(none)"
+            raise RegistryError(f"unknown provider {name!r}; known providers: {known}")
         reason = chosen.unavailable()
         if reason is not None:
             raise RegistryError(reason)
@@ -1696,10 +1386,11 @@ class Registry:
         name: str | None,
         workspace: Path,
         model: str | None = None,
-        lane: str | None = None,
+        provider: str | None = None,
         fallback: str = "full",
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> Agent:
-        chosen = self.select_lane(lane, fallback)
+        chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
         if refusal is not None:
             raise RegistryError(refusal)
@@ -1708,13 +1399,14 @@ class Registry:
             if len(live) >= self.settings.max_agents:
                 raise RegistryError(
                     f"agent limit reached ({self.settings.max_agents} live). "
-                    "Cancel one with cancel, or raise SAM_MAX_AGENTS."
+                    "Cancel one with cancel, or raise [core].max_agents."
                 )
-            on_lane = [a for a in live if a.lane.name == chosen.name]
-            if len(on_lane) >= chosen.max_agents:
+            here = [a for a in live if a.cfg.name == chosen.name]
+            if len(here) >= chosen.max_agents:
                 raise RegistryError(
-                    f"agent limit reached on lane {chosen.name!r} ({chosen.max_agents} live). "
-                    f"Cancel one with cancel, or raise SAM_{chosen.name.upper()}_MAX_AGENTS."
+                    f"agent limit reached on provider {chosen.name!r} "
+                    f"({chosen.max_agents} live). Cancel one with cancel, or raise "
+                    f"[providers.{chosen.name}].max_agents."
                 )
             agent_id = self._claim_agent_id()
             agent = Agent(
@@ -1724,16 +1416,13 @@ class Registry:
                 model=model or chosen.model or "",
                 settings=self.settings,
                 trace=self.trace,
-                lane=chosen,
+                cfg=chosen,
                 fallback=fallback,
-                chain=[
-                    self.settings.lanes[n]
-                    for n in router.chain(chosen.name, fallback)
-                    if n in self.settings.lanes
-                ],
+                chain=self.settings.chain(chosen.name, fallback),
                 lane_state=self.lane_state,
-                lane_load=self._lane_load,
+                provider_load=self._provider_load,
                 telemetry=self.telemetry,
+                on_event=on_event,
             )
             self._agents[agent_id] = agent
             return agent
@@ -1750,12 +1439,12 @@ class Registry:
                 continue
             return agent_id
 
-    def _lane_load(self, lane: str, asking: Agent) -> int:
-        """Live agents other than `asking` currently on `lane`."""
+    def _provider_load(self, provider: str, asking: Agent) -> int:
+        """Live agents other than `asking` currently on `provider`."""
         with self._lock:
             return sum(
                 1 for a in self._agents.values()
-                if a is not asking and not a.closed and a.lane.name == lane
+                if a is not asking and not a.closed and a.cfg.name == provider
             )
 
     def agent(self, agent_id: str) -> Agent:

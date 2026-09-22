@@ -10,7 +10,9 @@ Three pieces, all for providers that declare a `[probe]` block:
   sampler    while at least one child is active on a provider, one daemon
              thread per provider takes the same snapshot every
              `[telemetry].sample_seconds` (default 10) and appends a "sample"
-             row to metrics.jsonl.
+             row to metrics.jsonl. The first sample is taken when the child
+             starts, on the thread that calls begin(), so even a run that
+             ends before the sampler thread's own first pass has one.
   summary    when such a run ends, its samples and turn records become one
              "run_summary" record in the trace: peak memory, peak swap, worst
              pressure, decode tok/s, and energy.
@@ -504,23 +506,42 @@ class Telemetry:
     # sampler ---------------------------------------------------------------
 
     def begin(self, lane: ProviderConfig, run_id: str) -> None:
-        """A child started on `lane`: start its sampler if that one is idle."""
+        """A child started on `lane`: start its sampler if that one is idle.
+
+        The sampler's first sample is taken here, synchronously. The thread
+        only starts after it: a child whose whole run fits inside the gap
+        before the thread's own first pass would otherwise end with no
+        samples at all, and its run_summary with none either. A sampler whose
+        runs all ended but whose thread has not unregistered itself yet is
+        replaced rather than joined, so the new child gets that first sample
+        too instead of waiting for a thread that is on its way out.
+        """
         if not self.covers(lane):
             return
         with self._lock:
             self._samples.setdefault(run_id, [])
             sampler = self._samplers.get(lane.name)
-            if sampler is None:
+            fresh = sampler is None or not sampler.runs
+            if fresh:
                 sampler = _Sampler(lane=lane)
                 self._samplers[lane.name] = sampler
-                sampler.runs.add(run_id)
-                sampler.thread = threading.Thread(
-                    target=self._sample_loop, args=(sampler,),
-                    name=f"sam-sampler-{lane.name}", daemon=True,
-                )
-                sampler.thread.start()
-            else:
-                sampler.runs.add(run_id)
+            sampler.runs.add(run_id)
+        if not fresh:
+            return
+        self._sample_pass(sampler, (run_id,))
+        with self._lock:
+            if not sampler.runs:
+                # end() raced the first pass: nobody is sampling, so the idle
+                # sampler does not stay registered waiting for a thread that
+                # would never run.
+                if self._samplers.get(lane.name) is sampler:
+                    del self._samplers[lane.name]
+                return
+            sampler.thread = threading.Thread(
+                target=self._sample_loop, args=(sampler,),
+                name=f"sam-sampler-{lane.name}", daemon=True,
+            )
+            sampler.thread.start()
 
     def end(self, lane_name: str, run_id: str) -> list[tuple[float, dict[str, Any]]]:
         """A child stopped. Returns its samples; the sampler exits when the lane is idle."""
@@ -536,29 +557,38 @@ class Telemetry:
         with self._lock:
             return lane_name in self._samplers
 
-    def _sample_loop(self, sampler: _Sampler) -> None:
-        while True:
+    def _sample_pass(self, sampler: _Sampler, ids: tuple[str, ...]) -> None:
+        """One probe pass, recorded for every run of `ids` still collecting samples."""
+        try:
+            snap = self.snapshot(sampler.lane)
+            ts = round(time.time(), 3)
             with self._lock:
-                if not sampler.runs:
-                    # Removed under the lock, so a begin() that races this
-                    # exit starts a fresh sampler instead of joining a dead one.
-                    self._samplers.pop(sampler.lane.name, None)
-                    return
-                ids = sorted(sampler.runs)
-            try:
-                snap = self.snapshot(sampler.lane)
-                ts = round(time.time(), 3)
-                with self._lock:
-                    for run_id in ids:
-                        if run_id in self._samples:
-                            self._samples[run_id].append((ts, snap))
-                if self.metrics is not None:
-                    self.metrics.write("sample", lane=sampler.lane.name, run_ids=ids,
-                                       snapshot=snap)
-            except Exception:  # noqa: BLE001 - a sampler never takes the server down
-                log.warning("sampler for %s failed a pass", sampler.lane.name, exc_info=True)
+                for run_id in ids:
+                    if run_id in self._samples:
+                        self._samples[run_id].append((ts, snap))
+            if self.metrics is not None:
+                self.metrics.write("sample", lane=sampler.lane.name, run_ids=list(ids),
+                                   snapshot=snap)
+        except Exception:  # noqa: BLE001 - a sampler never takes the server down
+            log.warning("sampler for %s failed a pass", sampler.lane.name, exc_info=True)
+
+    def _sample_loop(self, sampler: _Sampler) -> None:
+        # begin() already took the sampler's first sample, so the thread
+        # sleeps a whole interval before its own first pass and the two do
+        # not land on top of each other.
+        while True:
             sampler.wake.wait(self.interval)
             sampler.wake.clear()
+            with self._lock:
+                if not sampler.runs:
+                    # Removed under the lock, and only if still the registered
+                    # one: a begin() that found this sampler dying has already
+                    # replaced it with a fresh sampler of its own.
+                    if self._samplers.get(sampler.lane.name) is sampler:
+                        del self._samplers[sampler.lane.name]
+                    return
+                ids = sorted(sampler.runs)
+            self._sample_pass(sampler, ids)
 
     def shutdown(self) -> None:
         with self._lock:

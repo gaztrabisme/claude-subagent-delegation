@@ -92,6 +92,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="only validate the file and check binaries")
     doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
 
+    sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard")
+
     # The delegate-loop subcommands are owned by loop.loop.main; these stubs
     # exist so `subagent --help` lists them.
     for name in LOOP_COMMANDS:
@@ -518,6 +520,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.argv = [sys.argv[0], *raw]
         loop_main()  # never returns; it exits the process itself
         return 0  # pragma: no cover - loop_main exits
+    if command == "report":
+        from .report import main as report_main
+
+        return report_main(raw)
     args = _parser().parse_args(raw)
     if args.command == "init":
         return cmd_init(args)

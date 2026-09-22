@@ -53,6 +53,15 @@ def render(event):
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 mark = "✓" if not block.get("is_error") else "✗"
                 lines.append(f"  {mark} {block.get('tool_use_id') or ''}")
+                text = block.get("content")
+                if text is None or text == "":
+                    continue
+                if not isinstance(text, str):
+                    text = str(text)
+                # The first lines of a tool's output are what a user watching the
+                # live log needs; the full output stays in the raw jsonl.
+                for line in text.strip().splitlines()[:12]:
+                    lines.append(f"    {_truncate(line, 300)}")
         return lines
     if kind == "result" and event.get("is_error"):
         detail = event.get("error") or event.get("result") or ""

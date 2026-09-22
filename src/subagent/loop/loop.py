@@ -156,10 +156,19 @@ class Worker:
         return self.server.supervisor.pop_denials(self.agent.agent_id)
 
     def _make_agent(self, provider, model, fallback):
-        return self.registry.create_agent(
+        agent = self.registry.create_agent(
             None, self.root, provider=provider, model=model, fallback=fallback,
             on_event=self._on_event(), agent_id=f"loop-{uuid.uuid4().hex[:12]}",
         )
+        agent.guard_context = self._guard_context()
+        return agent
+
+    def _guard_context(self):
+        protected = list(self.guard.protected) if self.guard is not None else []
+        return {
+            "protected": protected,
+            "state_allow": [f"{STATE_DIR}/result.json", f"{STATE_DIR}/test_change_request.md"],
+        }
 
     def run_round(self, candidates, fallback, prompt):
         """A fresh worker round; a failed, no-work candidate walks to the next."""
@@ -168,7 +177,8 @@ class Worker:
                 self.live.write(f"=== model: {model or 'default'}")
             self.agent = self._make_agent(provider, model, fallback)
             self.run = self.agent.delegate(
-                prompt, self.test_cmd, pre_verify=self._release, on_event=self._on_event()
+                prompt, self.test_cmd, pre_verify=self._release,
+                on_event=self._on_event(), distill=False,
             )
             self._wait(self.run)
             self.model = model
@@ -191,8 +201,10 @@ class Worker:
         if self.live is not None:
             self.live.write(f"=== model: {self.model or 'default'}")
         self.agent = self.registry.adopt(record, workspace=self.root, on_event=self._on_event())
+        self.agent.guard_context = self._guard_context()
         self.run = self.agent.follow_up(
-            prompt, verification=self.test_cmd, pre_verify=self._release, on_event=self._on_event()
+            prompt, verification=self.test_cmd, pre_verify=self._release,
+            on_event=self._on_event(), distill=False,
         )
         self._wait(self.run)
         return self
@@ -602,6 +614,8 @@ def _outline_files(text):
 def _write_review_plan(root, plan_paths):
     parts = []
     for path in plan_paths:
+        if not path:
+            continue
         try:
             parts.append(f"<!-- {path} -->\n{Path(path).read_text()}")
         except OSError:
@@ -655,13 +669,14 @@ def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None
     agent = None
     if previous_record and previous_record.get("agent_id"):
         agent = server.registry.adopt(previous_record, workspace=root, on_event=live.feed)
-        run = agent.follow_up(prompt, verification="true", on_event=live.feed)
+        run = agent.follow_up(prompt, verification="true", on_event=live.feed, distill=False)
     else:
         agent = server.registry.create_agent(
             None, root, provider=target.provider, model=target.model, fallback="none",
             on_event=live.feed, agent_id=f"loop-{uuid.uuid4().hex[:12]}",
         )
-        run = agent.delegate(prompt, "true", on_event=live.feed)
+        run = agent.delegate(prompt, "true", on_event=live.feed, distill=False)
+    agent.guard_context = {"protected": [], "state_allow": [f"{STATE_DIR}/test_writer_result.json"]}
     if not run.done.wait(agent.cfg.run_timeout):
         agent.close("run deadline exceeded", kind="timeout")
     run.done.wait()
@@ -1129,7 +1144,11 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
             None, root, provider=provider, model=model, fallback="none",
             on_event=live.feed, agent_id=f"loop-{uuid.uuid4().hex[:12]}",
         )
-        run = agent.delegate(text, "true", on_event=live.feed)
+        agent.guard_context = {
+            "protected": [],
+            "state_allow": [f"{STATE_DIR}/review/result.json", f"{STATE_DIR}/review/tests_result.json"],
+        }
+        run = agent.delegate(text, "true", on_event=live.feed, distill=False)
         if not run.done.wait(agent.cfg.run_timeout):
             agent.close("run deadline exceeded", kind="timeout")
         run.done.wait()

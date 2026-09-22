@@ -230,6 +230,15 @@ WRITE_COMMANDS = frozenset({
     "cp", "mv", "tee", "ln", "install", "dd", "truncate", "chmod", "chown", "touch",
 })
 
+# Guard-context rules (`Agent.guard_context`). With a context present, the loop's
+# own test files and state dir are read-only to the worker, and the git refs it
+# keeps its checkpoints in are off-limits.
+TEST_FILES_READ_ONLY = "test files are read-only; write .subagent/test_change_request.md instead"
+STATE_DIR_NAME = ".subagent"
+GIT_STATE_DENY = frozenset({"update-ref", "worktree", "reflog", "gc", "prune"})
+REF_SUBAGENT = "refs/subagent/"
+INPLACE_WRITERS = frozenset({"sed", "perl"})
+
 # Commands that reach the network and can execute what they fetch.
 NETWORK_FETCH = frozenset({"curl", "wget", "nc", "ncat", "telnet", "ssh", "scp", "sftp", "rsync"})
 
@@ -420,14 +429,20 @@ def classify_path_write(path_str: str, workspace: Path) -> Verdict:
     return Verdict(ESCALATE, "write outside the workspace", facts)
 
 
-def classify_bash(command: str, workspace: Path, cwd: Path | None = None) -> Verdict:
+def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
+                  context: dict | None = None) -> Verdict:
     """A bash command line.
 
     `cwd` is the directory relative paths resolve against. It is the workspace
     unless an earlier `cd` in the same line moved it; the boundary checks are
     always against `workspace`.
+
+    `context` is the agent's guard context (`protected` test paths and the
+    `state_allow` list); with it present, writes to those paths are denied here
+    instead of escalating.
     """
     cwd = cwd or workspace
+    protected, state_allow, state_root = _guard_rules(context, workspace)
     facts: dict[str, object] = {"command_length": len(command)}
     tokens, error = _tokenize(command)
     if tokens is None:
@@ -448,13 +463,20 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None) -> Ver
     heads = _command_heads(command, tokens)
     facts["programs"] = heads
 
+    if context:
+        denial = _context_denial(
+            command, tokens, argv, heads, cwd, state_root, protected, state_allow
+        )
+        if denial is not None:
+            return denial
+
     if len(segments) > 1 and unsupported is None and not substitution:
         # Cross-segment dangers first: they are the pipe or the chain itself
         # (`curl … | sh`), which no single segment shows.
         danger = _dangerous_head(heads, command, argv, workspace, cwd, compound, facts)
         if danger is not None:
             return danger
-        return _classify_segments(segments, workspace, cwd, facts)
+        return _classify_segments(segments, workspace, cwd, facts, context)
 
     # A read command is not automatically safe: `cat ~/.ssh/id_rsa` is a
     # read-only tool applied to a secret. Sensitive paths are refused whatever
@@ -1028,11 +1050,172 @@ def _protected_target(tokens: list[str], heads: list[str], cwd: Path) -> str | N
     return None
 
 
+def _folded_parts(path: Path) -> tuple[str, ...]:
+    return tuple(part.lower() for part in Path(os.path.normpath(str(path))).parts)
+
+
+def _under_folded(path: Path, roots: frozenset[Path]) -> bool:
+    """True when `path` sits under any `root`, case-folded, textually or resolved."""
+    if not roots:
+        return False
+    candidates = [Path(os.path.normpath(str(path)))]
+    try:
+        candidates.append(path.resolve())
+    except (OSError, RuntimeError):
+        pass
+    root_parts = [_folded_parts(root) for root in roots]
+    for candidate in candidates:
+        parts = _folded_parts(candidate)
+        if any(len(parts) >= len(rp) and parts[: len(rp)] == rp for rp in root_parts):
+            return True
+    return False
+
+
+def _guard_rules(
+    context: dict | None, workspace: Path
+) -> tuple[frozenset[Path], frozenset[Path], frozenset[Path]]:
+    """(protected, state_allow, state root) from `Agent.guard_context`.
+
+    The context keys are absolute paths; anything relative resolves against the
+    workspace. Without a context no rule fires.
+    """
+    state_root = frozenset({workspace / STATE_DIR_NAME})
+    if not context:
+        return frozenset(), frozenset(), state_root
+    protected = frozenset(_resolve(str(p), workspace) for p in context.get("protected") or ())
+    state_allow = frozenset(_resolve(str(p), workspace) for p in context.get("state_allow") or ())
+    return protected, state_allow, state_root
+
+
+def _inplace(argv: list[str]) -> bool:
+    return any(
+        w == "-i" or w == "--in-place" or (w.startswith("-i") and len(w) > 2 and w[2] != "-")
+        for w in argv[1:]
+    )
+
+
+def _context_write_targets(tokens: list[str], argv: list[str], heads: list[str]) -> list[str]:
+    """The paths a bash line writes: redirects, write commands, deletes, in-place edits."""
+    writers = {PurePosixPath(h).name for h in heads}
+    targets = [
+        tokens[i + 1] for i, t in enumerate(tokens[:-1])
+        if t in OUTPUT_REDIRECTS and not _is_operator(tokens[i + 1])
+    ]
+    if writers & WRITE_COMMANDS:
+        targets += [v for t in tokens if not _is_operator(t) for v in _values(t)]
+    if writers & {"rm", "rmdir", "shred", "unlink", "mkdir"}:
+        targets += [a for a in argv[1:] if not a.startswith("-")]
+    if writers & INPLACE_WRITERS and _inplace(argv):
+        targets += [a for a in argv[1:] if not a.startswith("-")]
+    return targets
+
+
+def _path_spellings(root: Path, cwd: Path) -> list[str]:
+    """The ways inline source or a heredoc body can name `root` from `cwd`."""
+    spellings = [str(root)]
+    try:
+        rel = os.path.relpath(root, cwd)
+    except ValueError:
+        return spellings
+    if rel not in (".", str(root)):
+        spellings.extend((rel, "./" + rel))
+    return spellings
+
+
+def _inline_named_protected(
+    command: str, tokens: list[str], argv: list[str], heads: list[str], cwd: Path,
+    protected: frozenset[Path],
+) -> Path | None:
+    """A protected path named inside inline source or a heredoc body."""
+    bases = {PurePosixPath(h).name for h in heads}
+    inline = bool(bases & INTERPRETERS) and any(f in argv for f in INLINE_CODE_FLAGS)
+    heredoc = any(t in ("<<", "<<<") for t in tokens)
+    if not (inline or heredoc):
+        return None
+    folded = command.lower()
+    for root in protected:
+        for spelling in _path_spellings(root, cwd):
+            if spelling.lower() in folded:
+                return root
+    return None
+
+
+def _state_git_denial(argv: list[str], heads: list[str]) -> str | None:
+    """Why a line rewrites the guard's own git refs, or None."""
+    for token in argv:
+        if REF_SUBAGENT in token:
+            return f"refused: `{token}` names a protected subagent ref"
+    if any(PurePosixPath(h).name == "git" for h in heads):
+        for index, word in enumerate(argv):
+            if PurePosixPath(word).name != "git":
+                continue
+            for candidate in argv[index + 1:]:
+                if candidate.startswith("-"):
+                    continue
+                if candidate in GIT_STATE_DENY:
+                    return f"refused: `git {candidate}` rewrites the subagent's own state"
+                break
+    return None
+
+
+def _context_protected_write(
+    command: str, tokens: list[str], argv: list[str], heads: list[str], cwd: Path,
+    protected: frozenset[Path], targets: list[str],
+) -> Path | None:
+    """A write aimed at a protected test path, or None."""
+    if not protected:
+        return None
+    for word in targets:
+        if _unresolvable(word):
+            continue
+        path = _resolve(word, cwd)
+        if _under_folded(path, protected):
+            return path
+    return _inline_named_protected(command, tokens, argv, heads, cwd, protected)
+
+
+def _context_state_write(
+    targets: list[str], cwd: Path, state_root: frozenset[Path], state_allow: frozenset[Path]
+) -> Path | None:
+    """A write under the state dir that is not allowlisted, or None."""
+    for word in targets:
+        if _unresolvable(word):
+            continue
+        path = _resolve(word, cwd)
+        if _under_folded(path, state_root) and not _under_folded(path, state_allow):
+            return path
+    return None
+
+
+def _context_denial(
+    command: str, tokens: list[str], argv: list[str], heads: list[str], cwd: Path,
+    state_root: frozenset[Path], protected: frozenset[Path], state_allow: frozenset[Path],
+) -> Verdict | None:
+    """The first guard-context rule a bash line breaks, or None."""
+    facts = {"programs": [PurePosixPath(h).name for h in heads]}
+    git_denial = _state_git_denial(argv, heads)
+    if git_denial is not None:
+        return Verdict(DENY, git_denial, facts)
+    targets = _context_write_targets(tokens, argv, heads)
+    state_path = _context_state_write(targets, cwd, state_root, state_allow)
+    if state_path is not None:
+        return Verdict(
+            DENY,
+            f"refused: writes under {STATE_DIR_NAME}/ are limited to the state files",
+            {**facts, "path": str(state_path)},
+        )
+    protected_path = _context_protected_write(command, tokens, argv, heads, cwd, protected, targets)
+    if protected_path is not None:
+        return Verdict(DENY, TEST_FILES_READ_ONLY, {**facts, "path": str(protected_path)})
+    return None
+
+
 SEVERITY = {ALLOW: 0, ESCALATE: 1, DENY: 2}
 
 
 def _classify_segments(
-    segments: list[tuple[str | None, list[str]]], workspace: Path, cwd: Path, facts: dict
+    segments: list[tuple[str | None, list[str]]], workspace: Path, cwd: Path, facts: dict,
+    context: dict | None = None,
 ) -> Verdict:
     """Judge a compound line one segment at a time, and keep the worst.
 
@@ -1063,7 +1246,7 @@ def _classify_segments(
         targets: list[Path] = []
         stays: list[Path] = []
         for here in now:
-            verdict = classify_bash(text, workspace, here)
+            verdict = classify_bash(text, workspace, here, context=context)
             if worst is None or SEVERITY[verdict.action] > SEVERITY[worst[0].action]:
                 worst = (verdict, text)
             target = _cd_target(words, here) if words[:1] == ["cd"] else None
@@ -1330,15 +1513,21 @@ def _working_dir(
 
 
 def classify(
-    tool_name: str, tool_input: dict, workspace: Path, cwd: str | Path | None = None
+    tool_name: str, tool_input: dict, workspace: Path, cwd: str | Path | None = None,
+    context: dict | None = None,
 ) -> Verdict:
     """Classify one proposed tool call. Unknown shapes escalate, never allow.
 
     `cwd` is the directory the calling agent reports it is in (the hook
     payload's cwd). A shell call may name its own (`workdir`, `cwd`); either
     must sit inside the workspace, and relative paths resolve against it.
+
+    `context` is `Agent.guard_context`: `protected` test paths (absolute) and
+    `state_allow` state files (absolute). With it present, writes to protected
+    paths or to the state dir outside the allowlist are denied here.
     """
     name = (tool_name or "").strip()
+    protected, state_allow, state_root = _guard_rules(context, workspace)
     if name.startswith("mcp__") or name in NESTED_TOOLS:
         return Verdict(
             DENY,
@@ -1373,14 +1562,26 @@ def classify(
             if refused is not None:
                 return Verdict(refused.action, refused.reason, {"tool": name, **refused.facts})
             base = own or base
-        verdict = classify_bash(str(command), workspace, cwd=base)
+        verdict = classify_bash(str(command), workspace, cwd=base, context=context)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
-    if name in WRITE_TOOLS:
-        path = _first(tool_input, PATH_KEYS)
-        if path is None:
+    if name in WRITE_TOOLS or (context and name == "MultiEdit"):
+        paths = _tool_paths(name, tool_input)
+        if paths is None:
             return Verdict(ESCALATE, "write call with no readable path", {"tool": name})
-        target = str(path) if base == workspace else str(_resolve(str(path), base))
-        verdict = classify_path_write(target, workspace)
+        for raw in paths:
+            target = _resolve(str(raw), base)
+            if context and _under_folded(target, protected):
+                return Verdict(DENY, TEST_FILES_READ_ONLY, {"tool": name, "path": str(target)})
+            if context and _under_folded(target, state_root) and not _under_folded(
+                target, state_allow
+            ):
+                return Verdict(
+                    DENY,
+                    f"refused: writes under {STATE_DIR_NAME}/ are limited to the state files",
+                    {"tool": name, "path": str(target)},
+                )
+        target = _resolve(str(paths[0]), base)
+        verdict = classify_path_write(str(target), workspace)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
     return Verdict(ESCALATE, f"unrecognized tool `{name}`", {"tool": name})
 
@@ -1392,6 +1593,24 @@ def _first(payload: dict, keys: tuple[str, ...]):
         if payload.get(key) is not None:
             return payload[key]
     return None
+
+
+def _tool_paths(name: str, payload: dict) -> list | None:
+    """The paths a write tool names: one for the file tools, one per edit for MultiEdit."""
+    if name == "MultiEdit" and isinstance(payload, dict):
+        edits = payload.get("edits")
+        if not isinstance(edits, list):
+            return None
+        found = []
+        for edit in edits:
+            if isinstance(edit, dict):
+                for key in ("file_path", "file", "path"):
+                    if edit.get(key) is not None:
+                        found.append(edit[key])
+                        break
+        return found or None
+    path = _first(payload, PATH_KEYS)
+    return [path] if path is not None else None
 
 
 def classify_verification(command: str, workspace: Path) -> Verdict:

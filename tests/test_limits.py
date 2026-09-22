@@ -7,15 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from subagent import runs
-from subagent.config import Settings
+from subagent.providers.claude import exit_event
+from subagent.router import zai_code, zai_reset
 from subagent.runs import (
     COMPLETED,
     COMPLETED_UNVERIFIED,
     FAILED,
     Registry,
-    exit_event,
-    zai_code,
-    zai_reset,
 )
 
 from .conftest import make_settings
@@ -33,7 +31,7 @@ def _registry(tmp_path: Path, monkeypatch, script: list[list[dict[str, Any]]], *
         spawned.append(FakeProcess(events, argv, env))
         return spawned[-1]
 
-    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.providers.claude._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg
@@ -247,7 +245,7 @@ def test_fair_use_throttle_backs_off_on_its_own_clock(tmp_path, monkeypatch):
         run = _wait(agent.submit("do", verification="true"))
         assert run.state == COMPLETED
         assert len(reg.spawned) == 3  # type: ignore[attr-defined]
-        # 0.02 then 0.04 from SAM_THROTTLE_BACKOFF, not 0.001 + 0.002.
+        # 0.02 then 0.04 from [core].throttle_backoff, not 0.001 + 0.002.
         assert sum(slices) >= 0.05
     finally:
         reg.shutdown()
@@ -266,6 +264,10 @@ def test_fair_use_throttle_exhaustion_tells_the_caller_to_run_fewer(tmp_path, mo
         reg.shutdown()
 
 
-def test_throttle_backoff_default_is_a_minute(monkeypatch):
-    monkeypatch.delenv("SAM_THROTTLE_BACKOFF", raising=False)
-    assert Settings.from_env().throttle_backoff == 60.0
+def test_throttle_backoff_default_is_a_minute(tmp_path):
+    from subagent import config
+
+    from .conftest import write_config
+
+    path = write_config(tmp_path / "c.toml", {"core": {"workspace": str(tmp_path)}})
+    assert config.load(extra=path).throttle_backoff == 60.0

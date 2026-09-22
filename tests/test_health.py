@@ -1,32 +1,24 @@
-"""Health gates: gpubox address resolution and the oMLX status check.
+"""Health gates: base-URL resolution for a llama.cpp provider and the oMLX
+status check.
 
 No test reaches the network: conftest answers every probe outside the local
-mock endpoint with "nothing there", and stubs `tailscale status`.
+mock endpoint with "nothing there", and stubs the resolve command.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from subagent import health
-from subagent.lanes import load_lanes
 
+from .conftest import provider_cfg
 from .test_router import _delegate, _registry, lanes_on_mock  # noqa: F401 - fixture
 
-
-def _tailscale(lan: str | None = "192.0.2.50", host: str = "gpubox") -> dict:
-    addrs = [f"{lan}:41641"] if lan else []
-    return {"Peer": {
-        "nodekey:aaa": {"HostName": "devmac", "CurAddr": "192.0.2.216:41641"},
-        "nodekey:bbb": {"HostName": host, "CurAddr": "",
-                        "TailscaleIPs": ["198.51.100.34", "fd7a:115c:a1e0::1"],
-                        "Addrs": ["198.51.100.34:41641", *addrs],
-                        "Endpoints": ["[fd7a::1]:41641"]},
-    }}
+TAILNET = "http://198.51.100.34:8080"
+LAN = "http://192.0.2.17:8080"
 
 
 @pytest.fixture
@@ -46,96 +38,88 @@ def probes(monkeypatch):
 
 @pytest.fixture
 def gpubox_lane():
-    return load_lanes({})["gpubox"]
+    return provider_cfg("gpubox")
 
 
-def test_health_gpubox_lan_from_tailscale_json():
-    assert health.gpubox_lan_from_tailscale(_tailscale("192.0.2.50")) == "192.0.2.50"
-    assert health.gpubox_lan_from_tailscale(_tailscale(None)) is None
-    assert health.gpubox_lan_from_tailscale(_tailscale("192.0.2.9", host="gpubox-2")) == "192.0.2.9"
-    assert health.gpubox_lan_from_tailscale({"Peer": {"x": {"HostName": "other",
-                                                          "CurAddr": "10.0.0.2:1"}}}) is None
-    assert health.gpubox_lan_from_tailscale(None) is None
-    assert health.gpubox_lan_from_tailscale({"Peer": "garbage"}) is None
+def _resolving(monkeypatch, printed: str) -> None:
+    """The provider's resolve command prints `printed` (one URL per line)."""
+    monkeypatch.setattr(health, "_run", lambda argv, timeout=health.RESOLVE_TIMEOUT: printed)
 
 
-def test_health_gpubox_host_order_lan_then_list_then_tailscale(monkeypatch):
-    monkeypatch.delenv("SAM_GPUBOX_LAN_HOSTS", raising=False)
-    assert health.gpubox_hosts({}, _tailscale("192.0.2.50")) == [
-        "192.0.2.50", "192.0.2.17", "198.51.100.34"]
-    # Deduplicated when tailscale reports the listed host.
-    assert health.gpubox_hosts({}, _tailscale("192.0.2.17")) == [
-        "192.0.2.17", "198.51.100.34"]
-    env = {"SAM_GPUBOX_LAN_HOSTS": "10.0.0.5, 10.0.0.6"}
-    assert health.gpubox_hosts(env, None) == ["10.0.0.5", "10.0.0.6", "198.51.100.34"]
+def test_health_resolve_cmd_comes_first_then_the_candidates(monkeypatch):
+    cfg = provider_cfg("gpubox", health={"resolve_cmd": ["echo", "found"]})
+    _resolving(monkeypatch, "http://192.0.2.50:8080\n")
+    assert health.resolve_urls(cfg) == ["http://192.0.2.50:8080", LAN, TAILNET]
+    # Deduplicated when the command prints a listed candidate, and a command
+    # that prints nothing leaves the candidates alone.
+    _resolving(monkeypatch, f"{LAN}\n")
+    assert health.resolve_urls(cfg) == [LAN, TAILNET]
+    _resolving(monkeypatch, "")
+    assert health.resolve_urls(cfg) == [LAN, TAILNET]
 
 
-def test_health_gpubox_picks_lan_first(monkeypatch, probes, gpubox_lane):
+def test_health_no_resolve_cmd_is_the_candidates_in_order(gpubox_lane):
+    assert health.resolve_urls(gpubox_lane) == [LAN, TAILNET]
+    assert health.resolve_urls(provider_cfg("gpubox", health={"candidates": []})) == []
+
+
+def test_health_llamacpp_picks_the_first_that_answers(monkeypatch, probes):
     seen, up = probes
-    monkeypatch.setattr(health, "_tailscale_status", lambda: _tailscale("192.0.2.50"))
+    cfg = provider_cfg("gpubox", health={"resolve_cmd": ["true"]})
+    _resolving(monkeypatch, "http://192.0.2.50:8080\n")
     up.update({"192.0.2.50", "198.51.100.34"})
-    gate = health.check_gpubox(gpubox_lane, {})
+    gate = health.check_llamacpp(cfg)
     assert gate.ok and gate.base_url == "http://192.0.2.50:8080"
     assert seen == ["http://192.0.2.50:8080/health"]
 
 
-def test_health_gpubox_falls_back_to_tailscale(monkeypatch, probes, gpubox_lane):
+def test_health_llamacpp_falls_back_to_the_last_candidate(monkeypatch, probes):
     seen, up = probes
-    monkeypatch.setattr(health, "_tailscale_status", lambda: _tailscale("192.0.2.50"))
+    cfg = provider_cfg("gpubox", health={"resolve_cmd": ["true"]})
+    _resolving(monkeypatch, "http://192.0.2.50:8080\n")
     up.add("198.51.100.34")
-    gate = health.check_gpubox(gpubox_lane, {})
-    assert gate.ok and gate.base_url == "http://198.51.100.34:8080"
-    assert seen == ["http://192.0.2.50:8080/health", "http://192.0.2.17:8080/health",
-                    "http://198.51.100.34:8080/health"]
+    gate = health.check_llamacpp(cfg)
+    assert gate.ok and gate.base_url == TAILNET
+    assert seen == ["http://192.0.2.50:8080/health", f"{LAN}/health", f"{TAILNET}/health"]
 
 
-def test_health_gpubox_no_tailscale_peer_default_lan_host_answers(monkeypatch, probes, gpubox_lane):
-    seen, up = probes
-    monkeypatch.setattr(health, "_tailscale_status", lambda: {"Peer": {}})
-    up.add("192.0.2.17")
-    gate = health.check_gpubox(gpubox_lane, {})
-    assert gate.ok and gate.base_url == "http://192.0.2.17:8080"
-    assert seen == ["http://192.0.2.17:8080/health"]
-
-
-def test_health_gpubox_nothing_answers_is_health_failed(probes, gpubox_lane):
+def test_health_llamacpp_nothing_answers_is_health_failed(probes, gpubox_lane):
     seen, _ = probes
-    gate = health.check_gpubox(gpubox_lane, {})
+    gate = health.check_llamacpp(gpubox_lane)
     assert not gate.ok and gate.base_url is None
     assert "no host answered" in gate.message
-    assert len(seen) == 2  # 192.0.2.17, then the Tailscale address
+    assert len(seen) == 2  # the LAN candidate, then the tailnet one
 
 
-def test_health_gpubox_resolves_against_a_live_mock(mock_endpoint, gpubox_lane):
-    mock_endpoint.routes["/health"] = (200, {"status": "ok"})
-    env = {"SAM_GPUBOX_LAN_HOSTS": "127.0.0.1", "SAM_GPUBOX_PORT": str(mock_endpoint.port),
-           "SAM_GPUBOX_TAILSCALE_HOST": "127.0.0.1"}
-    gate = health.check_gpubox(gpubox_lane, env)
-    assert gate.ok and gate.base_url == f"http://127.0.0.1:{mock_endpoint.port}"
-    assert mock_endpoint.hits["/health"] == 1
+def test_health_llamacpp_resolves_against_a_live_mock(mock_endpoint):
+    mock_endpoint.routes["/gpubox/health"] = (200, {"status": "ok"})
+    cfg = provider_cfg("gpubox", health={"candidates": [mock_endpoint.url("gpubox")]})
+    gate = health.check_llamacpp(cfg)
+    assert gate.ok and gate.base_url == mock_endpoint.url("gpubox")
+    assert mock_endpoint.hits["/gpubox/health"] == 1
 
 
-def test_health_gpubox_base_url_override_skips_resolution(monkeypatch, mock_endpoint):
-    def no_tailscale():
+def test_health_base_url_skips_resolution(monkeypatch, mock_endpoint):
+    def no_resolve(argv, timeout=health.RESOLVE_TIMEOUT):
         raise AssertionError("resolution must be skipped")
 
-    monkeypatch.setattr(health, "_tailscale_status", no_tailscale)
-    lane = load_lanes({"SAM_GPUBOX_BASE_URL": mock_endpoint.url("gpubox")})["gpubox"]
+    monkeypatch.setattr(health, "_run", no_resolve)
+    cfg = provider_cfg("gpubox", base_url=mock_endpoint.url("gpubox"),
+                       health={"resolve_cmd": ["true"]})
     mock_endpoint.routes["/gpubox/health"] = (200, {})
-    assert health.check(lane) == health.Health(True, mock_endpoint.url("gpubox"))
+    assert health.check(cfg) == health.Health(True, mock_endpoint.url("gpubox"))
     mock_endpoint.routes["/gpubox/health"] = (503, {})
-    assert not health.check(lane).ok
+    assert not health.check(cfg).ok
 
 
-def test_health_gpubox_backend_stopped_is_healthy_cold_load(mock_endpoint, gpubox_lane):
-    """gpubox's proxy answers /health with backend "stopped" while idle."""
-    mock_endpoint.routes["/health"] = (200, {"status": "ok", "backend": "stopped"})
-    env = {"SAM_GPUBOX_LAN_HOSTS": "127.0.0.1", "SAM_GPUBOX_PORT": str(mock_endpoint.port),
-           "SAM_GPUBOX_TAILSCALE_HOST": "127.0.0.1"}
-    gate = health.check_gpubox(gpubox_lane, env)
+def test_health_backend_stopped_is_healthy_cold_load(mock_endpoint):
+    """A llama.cpp proxy answers /health with backend "stopped" while idle."""
+    cfg = provider_cfg("gpubox", health={"candidates": [mock_endpoint.url("gpubox")]})
+    mock_endpoint.routes["/gpubox/health"] = (200, {"status": "ok", "backend": "stopped"})
+    gate = health.check_llamacpp(cfg)
     assert gate.ok and gate.cold_load
-    mock_endpoint.routes["/health"] = (200, {"status": "ok", "backend": "running"})
-    assert not health.check_gpubox(gpubox_lane, env).cold_load
+    mock_endpoint.routes["/gpubox/health"] = (200, {"status": "ok", "backend": "running"})
+    assert not health.check_llamacpp(cfg).cold_load
 
 
 def test_health_gpubox_cold_load_extends_deadline_and_marks_hop(
@@ -145,13 +129,14 @@ def test_health_gpubox_cold_load_extends_deadline_and_marks_hop(
     # The owner's proxy starts its backend on the first proxied request.
     ep.on_hit["/gpubox/v1/models"] = lambda: ep.routes.__setitem__(
         "/gpubox/health", (200, {"status": "ok", "backend": "running"}))
-    reg = _registry(tmp_path, ep, gpubox_cold_load_seconds=700.0, trace=str(tmp_path / "t.jsonl"))
+    ep.providers["gpubox"]["health"]["cold_load_seconds"] = 700.0
+    reg = _registry(tmp_path, ep, trace=str(tmp_path / "t.jsonl"))
     try:
         before = time.time()
         _, run = _delegate(reg, tmp_path, "gpubox", "none")
         assert ep.hits["/gpubox/v1/models"] == 1
         assert run.cold_load and run.hops[0]["cold_load"] is True
-        timeout = reg.settings.lanes["gpubox"].run_timeout
+        timeout = reg.settings.provider("gpubox").run_timeout
         assert run.deadline - before >= timeout + 700 - 1
         hops = [r for r in trace_records if r["kind"] == "hop"]
         assert hops and hops[-1]["cold_load"] is True
@@ -159,14 +144,13 @@ def test_health_gpubox_cold_load_extends_deadline_and_marks_hop(
         reg.shutdown()
 
 
-def _omlx(mock_endpoint, key="omlx-test"):
-    lane = load_lanes({"SAM_OMLX_BASE_URL": mock_endpoint.url("omlx"),
-                       "SAM_OMLX_API_KEY": key})["omlx"]
-    return replace(lane, health_url=f"{mock_endpoint.url('omlx')}/api/status")
+def _omlx(mock_endpoint):
+    return provider_cfg("omlx", base_url=mock_endpoint.url("omlx"),
+                        health={"url": f"{mock_endpoint.url('omlx')}/api/status"})
 
 
 def test_health_omlx_ok_sends_bearer_key(monkeypatch, mock_endpoint):
-    monkeypatch.setenv("SAM_OMLX_API_KEY", "omlx-test")
+    monkeypatch.setenv("OMLX_API_KEY", "omlx-test")
     lane = _omlx(mock_endpoint)
     mock_endpoint.routes["/omlx/api/status"] = (200, {"status": "ok", "models_loaded": 2})
     gate = health.check(lane)
@@ -176,7 +160,7 @@ def test_health_omlx_ok_sends_bearer_key(monkeypatch, mock_endpoint):
 
 
 def test_health_omlx_cold_load_flag(monkeypatch, mock_endpoint):
-    monkeypatch.setenv("SAM_OMLX_API_KEY", "omlx-test")
+    monkeypatch.setenv("OMLX_API_KEY", "omlx-test")
     mock_endpoint.routes["/omlx/api/status"] = (200, {"status": "ok", "models_loaded": 0})
     gate = health.check(_omlx(mock_endpoint))
     assert gate.ok and gate.cold_load
@@ -189,43 +173,40 @@ def test_health_omlx_cold_load_flag(monkeypatch, mock_endpoint):
     None,
 ])
 def test_health_omlx_unhealthy(monkeypatch, mock_endpoint, route):
-    monkeypatch.setenv("SAM_OMLX_API_KEY", "omlx-test")
+    monkeypatch.setenv("OMLX_API_KEY", "omlx-test")
     if route is not None:
         mock_endpoint.routes["/omlx/api/status"] = route
     gate = health.check(_omlx(mock_endpoint))
     assert not gate.ok and gate.message
 
 
-def test_health_cloud_lanes_have_no_gate(probes):
+def test_health_cloud_providers_have_no_gate(probes):
     seen, _ = probes
-    lanes = load_lanes({})
     for name in ("deepseek", "glm", "codex"):
-        assert health.check(lanes[name]).ok
+        assert health.check(provider_cfg(name)).ok
     assert seen == []
 
 
 def test_health_omlx_cold_load_extends_the_run_deadline(tmp_path: Path, lanes_on_mock):  # noqa: F811
     ep = lanes_on_mock
     ep.routes["/omlx/api/status"] = (200, {"status": "ok", "models_loaded": 0})
-    reg = _registry(tmp_path, ep, omlx_cold_load_seconds=500.0)
+    ep.providers["omlx"]["health"]["cold_load_seconds"] = 500.0
+    reg = _registry(tmp_path, ep)
     try:
         before = time.time()
         _, run = _delegate(reg, tmp_path, "omlx", "none")
         assert run.cold_load and run.detail()["cold_load"] is True
-        timeout = reg.settings.lanes["omlx"].run_timeout
+        timeout = reg.settings.provider("omlx").run_timeout
         assert run.deadline - before >= timeout + 500 - 1
     finally:
         reg.shutdown()
 
 
-def test_health_cold_load_seconds_default(monkeypatch):
-    from subagent.config import Settings
+def test_health_cold_load_seconds_comes_from_each_provider(tmp_path: Path):
+    from .conftest import make_settings
 
-    for name in ("SAM_OMLX_COLD_LOAD_SECONDS", "SAM_BALANCE_CLOSE_HOURS",
-                 "SAM_THROTTLE_CLOSE_MINUTES", "SAM_GPUBOX_COLD_LOAD_SECONDS"):
-        monkeypatch.delenv(name, raising=False)
-    s = Settings.from_env()
-    assert (s.omlx_cold_load_seconds, s.balance_close_hours, s.throttle_close_minutes) == (
-        120.0, 6.0, 15.0)
-    assert s.gpubox_cold_load_seconds == 180.0
+    s = make_settings(tmp_path)
+    assert (s.balance_close_hours, s.throttle_close_minutes) == (6.0, 15.0)
     assert (s.cold_load_seconds("gpubox"), s.cold_load_seconds("omlx")) == (180.0, 120.0)
+    # A provider with no health block (and an unknown name) extends nothing.
+    assert (s.cold_load_seconds("glm"), s.cold_load_seconds("nope")) == (0.0, 0.0)

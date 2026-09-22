@@ -62,7 +62,7 @@ def _registry(tmp_path: Path, monkeypatch, script, **overrides):
         tmp_path, rate_limit_retries=2, rate_limit_backoff=0.01, **overrides
     )
     spawn, spawned = _scripted_spawn(script)
-    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.providers.claude._spawn_claude", spawn)
     reg = Registry(settings, start_reaper=False)
     reg.spawned = spawned  # type: ignore[attr-defined]
     return reg

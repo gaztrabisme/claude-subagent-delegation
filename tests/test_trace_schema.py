@@ -12,12 +12,11 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from subagent.lanes import load_lanes
 from subagent.runs import COMPLETED, Registry
 from subagent.telemetry.sampler import Telemetry
 from subagent.telemetry.trace import KINDS, SCHEMA, Trace
 
-from .conftest import make_settings
+from .conftest import default_providers, make_settings
 from .test_runs import FakeProcess, _wait
 
 COMMON = {"schema", "ts", "kind"}
@@ -121,30 +120,28 @@ def test_records_from_a_local_lane_run_satisfy_the_schema(tmp_path: Path, monkey
                                                           mock_endpoint):
     """A routed run on omlx with telemetry on: run, hop, turn, run_summary and
     sample records, each validated from the files the server wrote."""
-    monkeypatch.setenv("SAM_OMLX_API_KEY", "omlx-test")
+    monkeypatch.setenv("OMLX_API_KEY", "omlx-test")
     mock_endpoint.routes["/omlx/api/status"] = (200, {"status": "ok", "models_loaded": 1})
-    lanes = load_lanes({"SAM_OMLX_BASE_URL": mock_endpoint.url("omlx")})
-    from dataclasses import replace
-
-    lanes["omlx"] = replace(lanes["omlx"],
-                            health_url=f"{mock_endpoint.url('omlx')}/api/status")
-    settings = make_settings(tmp_path, lanes=lanes, trace=str(tmp_path / "trace.jsonl"))
+    providers = default_providers()
+    providers["omlx"]["base_url"] = mock_endpoint.url("omlx")
+    providers["omlx"]["health"]["url"] = f"{mock_endpoint.url('omlx')}/api/status"
+    settings = make_settings(tmp_path, providers=providers,
+                             trace=str(tmp_path / "trace.jsonl"))
     gate = threading.Event()
 
     def spawn(argv, env, cwd):
         return FakeProcess(_events(), argv, env, gate=gate)
 
-    monkeypatch.setattr("subagent.runs._spawn_claude", spawn)
+    monkeypatch.setattr("subagent.providers.claude._spawn_claude", spawn)
     trace = Trace(tmp_path / "trace.jsonl")
     telemetry = Telemetry(
         Trace(tmp_path / "metrics.jsonl"),
-        probes={"omlx": lambda lane: {"omlx": {"model_memory_used": 5}, "mac": {}}},
-        env={},
+        probes={"omlx": lambda cfg: {"omlx": {"model_memory_used": 5}, "mac": {}}},
         interval=0.05,
     )
     reg = Registry(settings, start_reaper=False, trace=trace, telemetry=telemetry)
     try:
-        agent = reg.create_agent("t", tmp_path, lane="omlx", fallback="none")
+        agent = reg.create_agent("t", tmp_path, provider="omlx", fallback="none")
         run = agent.delegate("do it", "true")
         threading.Timer(0.2, gate.set).start()
         _wait(run)

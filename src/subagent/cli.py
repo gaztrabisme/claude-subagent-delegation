@@ -1,9 +1,14 @@
 """Console entry point: `subagent init`, `subagent doctor`, and the delegate loop.
 
 The delegate-loop subcommands (`detect run wait test review undo checkpoints
-watch`) are forwarded unchanged to `loop.loop.main`, which owns their parsing.
-`init` writes a starter config from the examples in `examples/`; `doctor`
-checks the configured providers against this machine.
+watch`) each print one JSON object on stdout and exit with the code the loop
+reports (`done` -> 0, `running` -> 3, anything else -> 2), except `watch`, which
+streams the live log. `init` writes a starter config from the examples in
+`examples/`; `doctor` checks the configured providers against this machine.
+
+Every loop command stands up an in-process server (Settings -> Registry ->
+Supervisor) so its workers run through the provider Registry, not a hand-built
+child process.
 """
 
 from __future__ import annotations
@@ -21,11 +26,8 @@ from typing import Any
 from . import config
 from .config import ConfigError, Settings
 from .health import check as health_check
-from .loop.loop import main as loop_main
+from .loop import loop
 from .providers.base import ProviderConfig
-
-# The delegate-loop subcommands, forwarded untouched to loop.loop.main.
-LOOP_COMMANDS = ("detect", "run", "wait", "test", "review", "undo", "checkpoints", "watch")
 
 # The examples `init` offers, one per file.
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
@@ -43,61 +45,6 @@ DRIVER_BINARY = {
 
 def _binary(cfg: ProviderConfig) -> str:
     return cfg.binary or DRIVER_BINARY.get(cfg.driver, cfg.driver)
-
-
-def _command_of(argv: list[str]) -> str | None:
-    """The first non-option word, skipping the loop's `--root VALUE`."""
-    index = 0
-    while index < len(argv):
-        arg = argv[index]
-        if arg in ("-h", "--help"):
-            return None
-        if arg == "--root":
-            index += 2
-            continue
-        if arg.startswith("--root="):
-            index += 1
-            continue
-        if arg.startswith("-"):
-            index += 1
-            continue
-        return arg
-    return None
-
-
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="subagent",
-        description="Delegate coding work to a subagent, and inspect its configuration.",
-    )
-    sub = parser.add_subparsers(dest="command")
-
-    init = sub.add_parser("init", help="write a starter config from the examples")
-    init.add_argument("--from", dest="from_example", metavar="EXAMPLE",
-                      help="seed the wizard with one example")
-    init.add_argument("--yes", action="store_true",
-                      help="write --from EXAMPLE non-interactively")
-    init.add_argument("--from-env", action="store_true",
-                      help="convert the old SAM_*/GLM_API_KEY/DEEPSEEK_API_KEY environment")
-    init.add_argument("--force", action="store_true",
-                      help="overwrite an existing config file")
-    init.add_argument("--path", metavar="PATH",
-                      help="write to PATH instead of $XDG_CONFIG_HOME/subagent/config.toml")
-
-    doctor = sub.add_parser("doctor", help="check the configured providers")
-    doctor.add_argument("--provider", metavar="NAME", help="check only this provider")
-    doctor.add_argument("--prompt", action="store_true",
-                        help="also run one cheap turn on each provider")
-    doctor.add_argument("--no-probe", action="store_true",
-                        help="only validate the file and check binaries")
-    doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
-
-    # The delegate-loop subcommands are owned by loop.loop.main; these stubs
-    # exist so `subagent --help` lists them.
-    for name in LOOP_COMMANDS:
-        sub.add_parser(name, help=f"delegate loop: see `subagent {name} --help`")
-
-    return parser
 
 
 # --- init -----------------------------------------------------------------------
@@ -506,25 +453,130 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if hard else 0
 
 
-# --- entry point ----------------------------------------------------------------
+# --- the delegate loop ----------------------------------------------------------
+
+
+def _loop_parsers(subparsers: argparse._SubParsersAction) -> None:
+    run = subparsers.add_parser("run", help="one worker round (or autopilot) on a plan")
+    run.add_argument("--plan", metavar="FILE", help="the plan file (single-round mode)")
+    run.add_argument("--parallel", metavar="MANIFEST", help="a manifest of parts, one worktree each")
+    run.add_argument("--auto", action="store_true", help="retry/repair until done or stuck")
+    run.add_argument("--continue", dest="continue_session", action="store_true",
+                     help="continue the previous worker session")
+    run.add_argument("--feedback", metavar="TEXT", help="reviewer feedback for this round")
+    run.add_argument("--feedback-file", metavar="FILE", help="feedback from a file ('-' = stdin)")
+    run.add_argument("--tier", choices=("normal", "hard"), default="normal")
+    run.add_argument("--model", metavar="MODEL", help="override the tier's model")
+    run.add_argument("--provider", metavar="NAME", help="override the tier's provider")
+    run.add_argument("--test-outline", metavar="FILE", help="write tests from this outline (--auto)")
+    run.add_argument("--background", action="store_true", help="start and return; collect with `wait`")
+    run.add_argument("--wait", metavar="SECONDS", type=float, help="background, then wait up to S")
+    run.add_argument("--run-id", metavar="ID", help="the run id (a background child reuses its parent's)")
+
+    wait = subparsers.add_parser("wait", help="wait for the current run")
+    wait.add_argument("--timeout", metavar="SECONDS", type=float, default=540.0)
+
+    subparsers.add_parser("test", help="run the test suite")
+    subparsers.add_parser("detect", help="detected test command and protected files")
+
+    review = subparsers.add_parser("review", help="review the work (or the tests) so far")
+    review.add_argument("--tier", choices=("normal", "hard"), default="normal")
+    review.add_argument("--base", metavar="ID", help="checkpoint to diff against (default: task start)")
+    review.add_argument("--tests", action="store_true", help="review the tests against the plan/spec")
+    review.add_argument("--plan", metavar="FILE", help="the plan file (for --tests)")
+    review.add_argument("--model", metavar="MODEL", help="override the reviewer's model")
+
+    undo = subparsers.add_parser("undo", help="restore the working tree to a checkpoint")
+    undo.add_argument("--to", metavar="ID", help="checkpoint to restore (default: before last round)")
+
+    subparsers.add_parser("checkpoints", help="list checkpoints")
+
+    watch = subparsers.add_parser("watch", help="follow the live log (run it in another terminal)")
+    watch.add_argument("--log", metavar="FILE", help="follow this log file")
+    watch.add_argument("--run", metavar="ID", help="follow one run's logs in order")
+    watch.add_argument("--since", metavar="TS", type=float, help="only logs modified after TS")
+    watch.add_argument("--hold", action="store_true", help="wait for Enter before closing")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="subagent",
+        description="Delegate coding work to a subagent, and inspect its configuration.",
+    )
+    parser.add_argument("--root", metavar="PATH", help="the project root (default: current directory)")
+    sub = parser.add_subparsers(dest="command")
+
+    init = sub.add_parser("init", help="write a starter config from the examples")
+    init.add_argument("--from", dest="from_example", metavar="EXAMPLE",
+                      help="seed the wizard with one example")
+    init.add_argument("--yes", action="store_true",
+                      help="write --from EXAMPLE non-interactively")
+    init.add_argument("--from-env", action="store_true",
+                      help="convert the old SAM_*/GLM_API_KEY/DEEPSEEK_API_KEY environment")
+    init.add_argument("--force", action="store_true",
+                      help="overwrite an existing config file")
+    init.add_argument("--path", metavar="PATH",
+                      help="write to PATH instead of $XDG_CONFIG_HOME/subagent/config.toml")
+
+    doctor = sub.add_parser("doctor", help="check the configured providers")
+    doctor.add_argument("--provider", metavar="NAME", help="check only this provider")
+    doctor.add_argument("--prompt", action="store_true",
+                        help="also run one cheap turn on each provider")
+    doctor.add_argument("--no-probe", action="store_true",
+                        help="only validate the file and check binaries")
+    doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
+
+    _loop_parsers(sub)
+    return parser
+
+
+def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
+                      root: Path, settings: Settings) -> int:
+    """Stand up the in-process server and run one loop command, printing its JSON."""
+    from .core import InProcessServer
+
+    # Each CLI process owns its own approval socket; the default path already
+    # embeds the pid, so a --background child never shares its parent's.
+    server = InProcessServer(settings.session_root, settings,
+                             approval_socket=settings.approval_socket)
+    server.start()
+    try:
+        handler = loop.LOOP_COMMANDS[command]
+        if command == "run":
+            result, code = handler(root, server, args, raw)
+        elif command == "watch":
+            result, code = handler(root, server, args)
+        else:
+            result, code = handler(root, server, args)
+        if result is not None:
+            print(json.dumps(result))
+        return code
+    finally:
+        server.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    command = _command_of(raw)
-    if command in LOOP_COMMANDS:
-        # Forward unchanged: loop.loop.main owns the delegate loop's parsing
-        # and reads sys.argv[1:], so hand it the remaining argv untouched.
-        sys.argv = [sys.argv[0], *raw]
-        loop_main()  # never returns; it exits the process itself
-        return 0  # pragma: no cover - loop_main exits
     args = _parser().parse_args(raw)
     if args.command == "init":
         return cmd_init(args)
     if args.command == "doctor":
         return cmd_doctor(args)
-    _parser().print_help()
-    return 2
+    if args.command not in loop.LOOP_COMMANDS:
+        _parser().print_help()
+        return 2
+
+    root = Path(args.root or ".").expanduser().resolve()
+    try:
+        settings = config.load(project_root=root)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        return _run_loop_command(args.command, args, raw, root, settings)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

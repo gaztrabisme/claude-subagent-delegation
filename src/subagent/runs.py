@@ -456,6 +456,9 @@ class Run:
     result_text: str = ""
     distilled: bool = False
     truncated: bool = False
+    # Loop runs read `.subagent/result.json`, not the distilled text, so they
+    # skip the distillation turn (`distill=False`).
+    distill: bool = True
     finish_reason: str | None = None
     error: str | None = None
     error_detail: str | None = None
@@ -493,6 +496,15 @@ class Run:
     # The local lane this run was sampled on, and the samples (ts, snapshot).
     sampling_lane: str | None = None
     samples: list[tuple[float, dict[str, Any]]] = field(default_factory=list)
+    # Caller hooks: `pre_verify()` runs in a finally before verification (the
+    # loop's test-guard release) and also on cancel/timeout; its return
+    # (`violations`, `changed_files`) lands in `pre_verify_result`. `on_event`
+    # overrides the agent-level watcher for this run only.
+    pre_verify: Callable[[], dict] | None = None
+    on_event: Callable[[dict[str, Any]], None] | None = None
+    pre_verify_result: dict | None = None
+    # Guard denials the supervisor recorded for this run (the loop drains them).
+    guard_verdicts: list[dict[str, Any]] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -584,6 +596,9 @@ class Agent:
         self._provider_load = provider_load
         # Called for every parsed event of every turn, as it arrives.
         self.on_event = on_event
+        # Guard context the classifier receives alongside each verdict: the
+        # loop sets {"protected": [...], "state_allow": [...]} before a run.
+        self.guard_context: dict[str, Any] = {}
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -633,6 +648,9 @@ class Agent:
         note: str | None = None,
         route: bool = False,
         parent: dict[str, Any] | None = None,
+        pre_verify: Callable[[], dict] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        distill: bool = True,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -649,6 +667,9 @@ class Agent:
             guard=self.driver.guard(self.settings, self.cfg),
             route=route,
             parent=parent or None,
+            pre_verify=pre_verify,
+            on_event=on_event,
+            distill=distill,
         )
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
@@ -660,20 +681,37 @@ class Agent:
         return run
 
     def delegate(
-        self, prompt: str, verification: str, parent: dict[str, Any] | None = None
+        self,
+        prompt: str,
+        verification: str,
+        parent: dict[str, Any] | None = None,
+        pre_verify: Callable[[], dict] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        distill: bool = True,
     ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
         This run walks the lane chain; continues stay on the lane it ran on.
         """
         self.delegate_verification = verification
-        return self.submit(prompt, verification=verification, route=True, parent=parent)
+        return self.submit(
+            prompt,
+            verification=verification,
+            route=True,
+            parent=parent,
+            pre_verify=pre_verify,
+            on_event=on_event,
+            distill=distill,
+        )
 
     def follow_up(
         self,
         message: str,
         verification: str | None = None,
         parent: dict[str, Any] | None = None,
+        pre_verify: Callable[[], dict] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        distill: bool = True,
     ) -> Run:
         """A continue. Omitting `verification` reuses the delegate's; "" skips it.
 
@@ -692,6 +730,9 @@ class Agent:
                     f"`{_clip(self.delegate_verification, 200)}`. Pass "
                     'verification="" to skip it.'
                 ),
+                pre_verify=pre_verify,
+                on_event=on_event,
+                distill=distill,
             )
         if verification is not None and not verification.strip():
             return self.submit(
@@ -699,8 +740,18 @@ class Agent:
                 verification=None,
                 parent=parent,
                 note='verification="" given: skipped, so this run reports completed_unverified',
+                pre_verify=pre_verify,
+                on_event=on_event,
+                distill=distill,
             )
-        return self.submit(message, verification=verification, parent=parent)
+        return self.submit(
+            message,
+            verification=verification,
+            parent=parent,
+            pre_verify=pre_verify,
+            on_event=on_event,
+            distill=distill,
+        )
 
     def get_run(self, run_id: str) -> Run | None:
         return self._runs.get(run_id)
@@ -823,6 +874,11 @@ class Agent:
                 run.done.set()
                 return
             self._turn(run, run.prompt, resume=self.session_id)
+        # Release the caller's guard (the loop's test lock) in a finally-style
+        # position: after the turn, so a tampered test never decides
+        # "completed", and also on the cancel/timeout path, where `_turn`
+        # returns only after the child was killed.
+        self._run_pre_verify(run)
         if self._closing or run.trip or run.state in TERMINAL_STATES:
             self._finish(run)
             return
@@ -836,7 +892,7 @@ class Agent:
             budget=remaining,
         )
 
-        if len(run.final_response) > self.settings.result_cap_chars:
+        if run.distill and len(run.final_response) > self.settings.result_cap_chars:
             run.phase = PHASE_DISTILLING
             distilled = self._distill(run)
             if distilled:
@@ -856,6 +912,19 @@ class Agent:
         else:
             run.state = COMPLETED_UNVERIFIED
         self._finish(run)
+
+    def _run_pre_verify(self, run: Run) -> None:
+        """Call the run's pre_verify hook once and store its return.
+
+        Never raises: a broken release must not mask the run's own outcome.
+        """
+        if run.pre_verify is None or run.pre_verify_result is not None:
+            return
+        try:
+            run.pre_verify_result = run.pre_verify() or {}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("pre_verify failed for %s", run.run_id, exc_info=True)
+            run.pre_verify_result = {"error": f"{type(exc).__name__}: {exc}"}
 
     @staticmethod
     def _missing_key(cfg: ProviderConfig) -> str:
@@ -1067,9 +1136,10 @@ class Agent:
                 for event in proc.events():
                     self.last_activity = _now()
                     meter.see(event, self.last_activity)
-                    if self.on_event is not None:
+                    watcher = run.on_event if run.on_event is not None else self.on_event
+                    if watcher is not None:
                         try:
-                            self.on_event(event)
+                            watcher(event)
                         except Exception:  # noqa: BLE001 - a watcher never fails a run
                             log.warning("on_event watcher failed", exc_info=True)
                     if event.get("type") == "stream_event":
@@ -1402,6 +1472,7 @@ class Registry:
         provider: str | None = None,
         fallback: str = "full",
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        agent_id: str | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -1421,10 +1492,10 @@ class Registry:
                     f"({chosen.max_agents} live). Cancel one with cancel, or raise "
                     f"[providers.{chosen.name}].max_agents."
                 )
-            agent_id = self._claim_agent_id()
+            claimed = agent_id or self._claim_agent_id()
             agent = Agent(
-                agent_id=agent_id,
-                name=name or f"subagent-{agent_id}",
+                agent_id=claimed,
+                name=name or f"subagent-{claimed}",
                 workspace=workspace,
                 model=model or chosen.model or "",
                 settings=self.settings,
@@ -1437,8 +1508,55 @@ class Registry:
                 telemetry=self.telemetry,
                 on_event=on_event,
             )
-            self._agents[agent_id] = agent
+            self._agents[claimed] = agent
             return agent
+
+    def adopt(
+        self,
+        record: dict[str, Any],
+        workspace: Path | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Agent:
+        """Reopen an Agent from a session record (the loop's `--continue`).
+
+        The recorded id is reused as-is — the loop mints ids as `loop-<uuid>`,
+        so they never collide with `_claim_agent_id`'s `a<n>-<tag>`. The
+        recorded session id and agent home are reopened, not recreated; adopt
+        itself never mkdirs.
+        """
+        provider_name = record.get("provider")
+        chosen = self.settings.providers.get(provider_name)
+        if chosen is None:
+            raise RegistryError(
+                f"session record names provider {provider_name!r}, which is not declared"
+            )
+        agent_id = record.get("agent_id")
+        if not agent_id:
+            raise RegistryError("session record has no agent_id")
+        fallback = record.get("fallback") or "none"
+        agent = Agent(
+            agent_id=agent_id,
+            name=f"subagent-{agent_id}",
+            workspace=workspace or self.settings.workspace,
+            model=record.get("model") or chosen.model or "",
+            settings=self.settings,
+            trace=self.trace,
+            cfg=chosen,
+            fallback=fallback,
+            chain=self.settings.chain(chosen.name, fallback),
+            lane_state=self.lane_state,
+            provider_load=self._provider_load,
+            telemetry=self.telemetry,
+            on_event=on_event,
+        )
+        session_id = record.get("session_id")
+        if session_id:
+            # The authoritative resume id: `_spawn` re-applies it to the
+            # driver's session on the first continue, after boot has run.
+            agent.session_id = session_id
+        with self._lock:
+            self._agents[agent_id] = agent
+        return agent
 
     def _claim_agent_id(self) -> str:
         """A fresh agent id whose session directory this process created."""

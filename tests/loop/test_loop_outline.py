@@ -1,23 +1,23 @@
-"""Test outline mode: a Copilot test writer turns Claude's outline into test files."""
+"""Test outline mode: a test writer turns the outline into test files."""
 
 import unittest
 
-from .helpers import Sandbox, need
+from .helpers import Sandbox, for_drivers, need
 
 
 @need("git", "node", "npm")
 class Outline(Sandbox):
     def project(self, name="o", test_file="test/add.test.js"):
         root = self.node_project(name=name, tests=False)
-        (root / ".delegate" / "TESTS.md").write_text(f"# Test outline\n\n## {test_file}\n- adds: add(2, 3) -> 5\n")
+        (root / ".subagent" / "TESTS.md").write_text(f"# Test outline\n\n## {test_file}\n- adds: add(2, 3) -> 5\n")
         return root
 
     def run_outline(self, root, mode="", *extra):
-        return self.delegate("run", "--plan", ".delegate/PLAN.md", "--test-outline", ".delegate/TESTS.md", "--auto",
+        return self.delegate("run", "--plan", ".subagent/PLAN.md", "--test-outline", ".subagent/TESTS.md", "--auto",
                              *extra, cwd=root, scenario="outline", env={"OUT": mode})[1]
 
     def calls(self, root):
-        path = root / ".delegate" / "calls.txt"
+        path = root / ".subagent" / "calls.txt"
         text = path.read_text().split() if path.exists() else []
         path.write_text("")
         return text
@@ -64,11 +64,14 @@ class Outline(Sandbox):
 
     def test_bad_input(self):
         root = self.project()
-        (root / ".delegate" / "TESTS.md").write_text("no headings here")
+        (root / ".subagent" / "TESTS.md").write_text("no headings here")
         self.assertEqual(self.run_outline(root)["status"], "bad_outline")
-        code, r = self.delegate("run", "--plan", ".delegate/PLAN.md", "--test-outline", ".delegate/TESTS.md",
+        code, r = self.delegate("run", "--plan", ".subagent/PLAN.md", "--test-outline", ".subagent/TESTS.md",
                                 cwd=root, scenario="outline")
         self.assertEqual(r["status"], "bad_arguments")
+
+
+for_drivers(Outline)
 
 
 if __name__ == "__main__":

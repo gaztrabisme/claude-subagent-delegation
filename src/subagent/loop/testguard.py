@@ -23,8 +23,9 @@ class TestGuard:
         self.before = hash_tree(self.root)
         self.protected = sorted(f for f in self.before if matches(f, globs))
         self.fragments = test_config_fragments(self.root)
-        self.snapshot = Path(tempfile.mkdtemp(prefix="delegate-snapshot-"))
+        self.snapshot = Path(tempfile.mkdtemp(prefix="subagent-snapshot-"))
         self.modes = {}
+        self.released = False
         for rel in self.protected:
             dst = self.snapshot / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +41,15 @@ class TestGuard:
             os.chmod(self.root / rel, self.modes[rel] & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
 
     def release(self):
-        """Restore protected files and test config. Returns (violations, changed_files)."""
+        """Restore protected files and test config. Returns (violations, changed_files).
+
+        Idempotent: a second call (e.g. a loop safety net after an agent already
+        released through pre_verify) reports the same result without touching the
+        now-removed snapshot.
+        """
+        if self.released:
+            return [], changed_between(self.before, hash_tree(self.root))
+        self.released = True
         violations = []
         for rel in self.protected:
             path = self.root / rel
@@ -66,6 +75,12 @@ class TestGuard:
             after = hash_tree(self.root)
         shutil.rmtree(self.snapshot, ignore_errors=True)
         return violations, changed_between(self.before, after)
+
+
+def protected_paths(root, globs):
+    """The protected files as paths relative to `root` (for the guard context)."""
+    root = Path(root)
+    return [rel for rel in walk_files(root) if matches(rel, globs)]
 
 
 def protected_hash(root, globs):

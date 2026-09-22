@@ -1,4 +1,4 @@
-"""Shared constants, configuration and file helpers."""
+"""Shared constants and file helpers (no configuration: settings come from `config.load`)."""
 
 import fnmatch
 import hashlib
@@ -7,8 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 
-STATE_DIR = ".delegate"
-GLOBAL_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "delegate" / "config.json"
+STATE_DIR = ".subagent"
 SKIP_DIRS = {
     ".git", ".hg", ".svn", STATE_DIR, "node_modules", ".venv", "venv", "env",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
@@ -16,34 +15,6 @@ SKIP_DIRS = {
 }
 # Dependency directories shared (symlinked) into parallel worktrees.
 DEPENDENCY_DIRS = ["node_modules", ".venv", "venv"]
-DEFAULT_CONFIG = {
-    "backend": "copilot",
-    "models": {             # model per complexity tier; Claude picks the tier with --tier
-        "normal": "claude-sonnet-5",
-        "hard": "claude-opus-5",
-    },
-    "model": None,          # pin one model for every tier (disables tier selection)
-    "timeout": 1800,        # seconds per worker run
-    "extra_args": [],       # extra CLI args for the backend
-    "builtin_mcps": False,  # Copilot's built-in GitHub MCP server (unused by workers; costs tokens)
-    "command": None,        # argv for the "command" backend; prompt in $DELEGATE_PROMPT
-    "test_cmd": None,       # override detection, e.g. "npm run test:unit"
-    "test_globs": None,     # override detection, e.g. ["tests/**"]
-    "extra_protected": [],  # added on top of detected globs
-    "count_tests": True,    # run the suite before/after each round and check the test count
-    "live_view": None,      # "auto" opens a terminal following the live log; or argv with "{cmd}"
-    "review_models": {      # reviewer per tier: a different model family than the (Claude) workers.
-        "normal": "gpt-5.6-sol",  # gpt-5-mini was ~12x cheaper but missed a real bug in comparisons;
-        "hard": "gpt-5.6-sol",    # gpt-6-astra finds more but costs ~4.5x more
-    },
-    "review_model": None,   # pin one reviewer for every tier
-    "auto_max_rounds": 4,   # autopilot: worker rounds before handing back to Claude
-    "auto_review": True,    # autopilot: review when the tests pass, auto-fix high-severity issues
-    "auto_review_cycles": 2,
-    "review_tests": True,   # autopilot: review Claude's tests against the plan before the first round
-    "test_writer_model": "claude-sonnet-5",  # writes test files from Claude's outline (--test-outline)
-    "keep_checkpoints": 20,
-}
 TAIL_LINES = 60
 
 
@@ -60,16 +31,6 @@ def write_json(path, data):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
-
-
-def load_config(root):
-    """Defaults, then ~/.config/delegate/config.json, then the project's .delegate/config.json."""
-    cfg = dict(DEFAULT_CONFIG)
-    for path in (GLOBAL_CONFIG, root / STATE_DIR / "config.json"):
-        for key, value in (read_json(path) or {}).items():
-            # Nested maps (models, review_models) merge, so one tier can be overridden alone.
-            cfg[key] = {**cfg[key], **value} if isinstance(value, dict) and isinstance(cfg.get(key), dict) else value
-    return cfg
 
 
 def state_dir(root):

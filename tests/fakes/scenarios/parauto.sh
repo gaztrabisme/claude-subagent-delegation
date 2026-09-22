@@ -1,6 +1,6 @@
-mkdir -p src .delegate
+mkdir -p src .subagent
 if printf '%s' "$FAKE_PROMPT" | grep -q "You are a code reviewer"; then
-  echo '{"verdict":"ok","issues":[]}' > .delegate/review/result.json; exit 0
+  echo '{"verdict":"ok","issues":[]}' > .subagent/review/result.json; exit 0
 fi
 if printf '%s' "$FAKE_PROMPT" | grep -q "Integration plan"; then
   echo "integration round sees both parts: $(ls src | tr '\n' ' ')"
@@ -10,4 +10,4 @@ elif printf '%s' "$FAKE_PROMPT" | grep -q 'You are worker "a"'; then
 else
   echo 'export const b = () => "b";' > src/b.js            # wrong case: merged suite fails
 fi
-echo '{"status":"done","summary":"part done"}' > .delegate/result.json
+echo '{"status":"done","summary":"part done"}' > .subagent/result.json

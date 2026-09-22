@@ -120,6 +120,7 @@ class Usage:
     reasoning: int = 0
     steps: int = 0  # tool calls
     turns: int = 0  # model turns, as --max-turns counts them
+    credits: float | None = None  # Copilot AI credits (nano-AIU / 1e9)
 
     @property
     def total(self) -> int:
@@ -135,8 +136,11 @@ class Usage:
             usage.get("cache_creation_input_tokens") or usage.get("cacheWriteTokens") or 0
         )
         self.reasoning += int(usage.get("reasoning_output_tokens") or 0)
+        credits = usage.get("credits")
+        if isinstance(credits, (int, float)):
+            self.credits = (self.credits or 0.0) + float(credits)
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "input": self.input,
             "output": self.output,
@@ -146,6 +150,7 @@ class Usage:
             "total": self.total,
             "steps": self.steps,
             "turns": self.turns,
+            "credits": self.credits,
         }
 
     def merge(self, other: Usage) -> None:
@@ -156,6 +161,8 @@ class Usage:
         self.reasoning += other.reasoning
         self.steps += other.steps
         self.turns += other.turns
+        if other.credits is not None:
+            self.credits = (self.credits or 0.0) + other.credits
 
 
 def _assistant_text(event: dict[str, Any]) -> str:
@@ -1216,6 +1223,11 @@ class Agent:
             return
         if kind == "result":
             # Tokens were counted as the events arrived (_Meter, via _account).
+            # Credits are whole-run (Copilot's session.usage_checkpoint), not
+            # per message, so the result event is the only place they arrive.
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                run.usage.add({"credits": usage.get("credits")})
             if isinstance(event.get("num_turns"), int):
                 run.usage.turns += event["num_turns"]
             if _hit_max_turns(event) and run.trip is None:

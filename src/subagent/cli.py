@@ -526,6 +526,9 @@ def _parser() -> argparse.ArgumentParser:
                         help="only validate the file and check binaries")
     doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
 
+    sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",
+                   add_help=False)
+
     _loop_parsers(sub)
     return parser
 
@@ -557,6 +560,10 @@ def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "report":
+        from .report import main as report_main
+
+        return report_main(raw[1:])
     args = _parser().parse_args(raw)
     if args.command == "init":
         return cmd_init(args)

@@ -205,29 +205,30 @@ def _price_row(row: dict[str, Any], specs: dict[str, dict[str, Any]]) -> None:
     plan's API-equivalent estimate, then the saving column."""
     spec = specs.get(row["provider"])
     cost = row.get("cost")
-    if isinstance(cost, dict):
+    if not isinstance(cost, dict):
+        # No `cost` dict: nothing priced this run, so every USD column is null.
+        row["provider_usd"] = None
+        row["api_equivalent_usd"] = None
+    else:
         run_end = _num(cost.get("provider_usd"))
         if run_end is not None:
             row["provider_usd"] = run_end
-    else:
-        row["provider_usd"] = None  # no `cost` dict: nothing priced this run
-
-    if spec is not None:
-        kind = spec["kind"]
-        if kind == "credits" and row["provider_usd"] is None:
-            rate = _num(spec.get("usd_per_credit"))
-            if rate is not None:
-                row["provider_usd"] = row["credits"] * rate
-        elif kind == "flat_plan":
-            ae = spec.get("api_equivalent")
-            if isinstance(ae, Mapping):
-                rin, rout, rread = (_num(ae.get(k)) for k in ("input", "output", "cache_read"))
-                if None not in (rin, rout, rread):
-                    row["api_equivalent_usd"] = (
-                        (row["input"] + row["cache_write"]) * rin
-                        + row["output"] * rout
-                        + row["cache_read"] * rread
-                    ) / M
+        if spec is not None:
+            kind = spec["kind"]
+            if kind == "credits" and row["provider_usd"] is None:
+                rate = _num(spec.get("usd_per_credit"))
+                if rate is not None:
+                    row["provider_usd"] = row["credits"] * rate
+            elif kind == "flat_plan":
+                ae = spec.get("api_equivalent")
+                if isinstance(ae, Mapping):
+                    rin, rout, rread = (_num(ae.get(k)) for k in ("input", "output", "cache_read"))
+                    if None not in (rin, rout, rread):
+                        row["api_equivalent_usd"] = (
+                            (row["input"] + row["cache_write"]) * rin
+                            + row["output"] * rout
+                            + row["cache_read"] * rread
+                        ) / M
 
     cf = row["counterfactual"]
     row["net_saving_usd"] = (

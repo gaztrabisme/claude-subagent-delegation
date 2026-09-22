@@ -1,23 +1,27 @@
-"""Which lanes a delegation may run on, and what counts as a refusal.
+"""Which providers a delegation may run on, and what counts as a refusal.
 
-A delegation names a primary lane and a fallback mode. The chain is the order
-the lanes are tried in. A lane that refuses before the child has done any work
+A delegation names a primary provider and a fallback mode. The chain is the
+order the providers are tried in: the primary, then the configured
+`[fallback].chain`. A provider that refuses before the child has done any work
 (plan quota spent, balance empty, usage limit hit, health gate failed) hands
-the run to the next lane. A failure after work started is the run's result on
-that lane and is never rerouted: the child may have edited files, and a second
-child starting from the task prompt would not know that.
+the run to the next one. A failure after work started is the run's result on
+that provider and is never rerouted: the child may have edited files, and a
+second child starting from the task prompt would not know that.
+
+Refusals are keyed by the provider's *vendor*, not its name: two providers on
+z.ai speak the same refusal dialect, and a provider named "glm" pointed at
+something else does not.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-# Chain order after the primary: the cloud lanes, then the local ones.
-CLOUD_ORDER = ("codex", "deepseek", "glm")
-LOCAL_ORDER = ("bppc", "omlx")
+FALLBACK_MODES = ("full", "local", "none")
 
 # Refusal codes.
 ZAI_1308 = "zai_1308"
@@ -25,7 +29,57 @@ ZAI_1310 = "zai_1310"
 ZAI_1313_EXHAUSTED = "zai_1313_exhausted"
 DEEPSEEK_BALANCE = "deepseek_balance"
 CODEX_USAGE_LIMIT = "codex_usage_limit"
+GROK_BALANCE = "grok_balance"
 HEALTH_FAILED = "health_failed"
+
+# z.ai puts its own code beside the HTTP status: "(429) · [1313][…]", or
+# `"code":"1308"` in a JSON body. The code decides whether waiting helps.
+_ZAI_CODE_RE = re.compile(r'\[(1[0-9]{3})\]|"code"\s*:\s*"?(1[0-9]{3})\b')
+_ZAI_RESET_RE = re.compile(
+    r"reset(?:s)?\s+(?:at|on)\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}(?::[0-9]{2})?)",
+    re.IGNORECASE,
+)
+# Plan quota: the 5-hour (1308) or weekly/monthly (1310) allowance is spent.
+# It resets hours later, so a retry seconds from now only burns wall clock.
+ZAI_QUOTA_CODES = frozenset({"1308", "1310"})
+# Fair-use throttle: clears on the order of minutes, not seconds.
+ZAI_THROTTLE_CODE = "1313"
+
+
+def clip(text: str, limit: int) -> str:
+    """One line of `text`, at most `limit` characters."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def zai_code(text: str) -> str | None:
+    """The z.ai error code in `text`, if it carries one."""
+    match = _ZAI_CODE_RE.search(text or "")
+    if match is None:
+        return None
+    return match.group(1) or match.group(2)
+
+
+def zai_reset(text: str) -> str | None:
+    """The quota reset time z.ai quoted, if any."""
+    match = _ZAI_RESET_RE.search(text or "")
+    return match.group(1) if match else None
+
+
+def code_evidence(stderr: str, event: dict | None) -> str:
+    """Where a vendor code may be read: stderr, the event's `error`, and its
+    `result` only when that is an API error the CLI reports, never model text.
+    A stray `[1308]` in an answer must not switch off a retry."""
+    parts = [stderr or ""]
+    if isinstance(event, dict):
+        if isinstance(event.get("error"), str):
+            parts.append(event["error"])
+        result = event.get("result")
+        if event.get("is_error") and isinstance(result, str) and result.lstrip().startswith(
+            "API Error"
+        ):
+            parts.append(result)
+    return "\n".join(parts)
 
 # Hop outcomes.
 HOP_RAN = "ran"
@@ -47,6 +101,10 @@ _BALANCE_RE = re.compile(
     re.IGNORECASE,
 )
 _CODEX_LIMIT = "you've hit your usage limit"
+# Grok: HTTP 402 with the account's balance spent.
+_GROK_BALANCE_RE = re.compile(
+    r"usage balance exhausted|\b402\b.*balance|balance.*\b402\b", re.IGNORECASE
+)
 # "try again at [Sep 20th[, 2026]] 1:29 PM". One parser for both drivers.
 _CODEX_AT_RE = re.compile(
     r"try again at\s+"
@@ -71,11 +129,11 @@ _MONTHS = {
 # The longest any refusal keeps a lane closed, whatever reset time it quotes.
 MAX_CLOSE = timedelta(days=7)
 
-# Which lane each refusal code can come from. A code seen on another lane is
-# text that happens to match, not that provider's refusal.
-LANE_OF_CODE = {
-    ZAI_1308: "glm", ZAI_1310: "glm", ZAI_1313_EXHAUSTED: "glm",
-    DEEPSEEK_BALANCE: "deepseek", CODEX_USAGE_LIMIT: "codex",
+# Which vendor each refusal code can come from. A code seen on another
+# vendor is text that happens to match, not that provider's refusal.
+VENDOR_OF_CODE = {
+    ZAI_1308: "zai", ZAI_1310: "zai", ZAI_1313_EXHAUSTED: "zai",
+    DEEPSEEK_BALANCE: "deepseek", CODEX_USAGE_LIMIT: "codex", GROK_BALANCE: "grok",
 }
 
 
@@ -86,21 +144,27 @@ def no_retry(text: str) -> bool:
     return bool(_BALANCE_RE.search(text)) or _CODEX_LIMIT in text.lower().replace("\u2019", "'")
 
 
-def chain(primary: str, fallback: str) -> list[str]:
-    """Lane names in the order they are tried.
+def chain(
+    primary: str,
+    mode: str,
+    configured: list[str] | tuple[str, ...] = (),
+    providers: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Provider names in the order they are tried.
 
-    full: the primary, the other cloud lanes (codex, deepseek, glm), then bppc
-    and omlx. local: the primary, then bppc and omlx. none: the primary only.
-    The primary is always first and no lane appears twice.
+    full: the primary, then `configured` ([fallback].chain). local: the
+    primary, then the configured ones marked local. none: the primary only.
+    The primary is always first and no provider appears twice.
     """
-    if fallback == "none":
+    if mode == "none":
         rest: tuple[str, ...] = ()
-    elif fallback == "local":
-        rest = LOCAL_ORDER
-    elif fallback == "full":
-        rest = CLOUD_ORDER + LOCAL_ORDER
+    elif mode == "local":
+        known = providers or {}
+        rest = tuple(n for n in configured if getattr(known.get(n), "local", False))
+    elif mode == "full":
+        rest = tuple(configured)
     else:
-        raise ValueError(f"unknown fallback {fallback!r}")
+        raise ValueError(f"unknown fallback {mode!r}")
     out = [primary]
     for name in rest:
         if name not in out:
@@ -185,6 +249,9 @@ def _error_text(events: list[dict[str, Any]]) -> str:
                 parts.append(event["error"])
             if event.get("is_error") and isinstance(event.get("result"), str):
                 parts.append(event["result"])
+            # Grok reports the API error in a list instead of a string.
+            if event.get("is_error") and isinstance(event.get("errors"), list):
+                parts.extend(e for e in event["errors"] if isinstance(e, str))
         elif kind == "error" and isinstance(event.get("message"), str):
             parts.append(event["message"])
         elif kind == "turn.failed":
@@ -246,20 +313,22 @@ def zai_reset_at(raw: str | None) -> datetime | None:
         return None
 
 
-def classify_refusal(lane: str, events_or_error: list[dict[str, Any]] | str) -> Refusal | None:
+def classify_refusal(
+    vendor: str, events_or_error: list[dict[str, Any]] | str
+) -> Refusal | None:
     """The refusal in a run's events (or an error string), or None.
 
-    Each code is read only on its own lane: z.ai codes on glm, an empty
-    balance on deepseek, a usage limit on codex. The local lanes never refuse
-    this way; their failures are the run's result.
+    Each code is read only on its own vendor: z.ai codes on "zai", an empty
+    balance on "deepseek", a usage limit on "codex", a spent balance on
+    "grok". A local backend never refuses this way; its failures are the run's
+    result.
 
     None means whatever went wrong is not a refusal the router acts on: a
-    plain 429 without a z.ai code, an auth error, a crash. Those fail the run
-    on its lane. A terminal 1313 counts as exhausted because the run loop has
-    already spent its throttle retries by the time the events come back.
+    plain 429 without a vendor code, an auth error, a crash. Those fail the
+    run on its provider. A terminal 1313 counts as exhausted because the run
+    loop has already spent its throttle retries by the time the events come
+    back.
     """
-    from . import runs  # runs imports this module; bind late.
-
     if isinstance(events_or_error, str):
         text = events_or_error
         evidence = text
@@ -270,34 +339,44 @@ def classify_refusal(lane: str, events_or_error: list[dict[str, Any]] | str) -> 
              if isinstance(e, dict) and e.get("type") == "result"),
             None,
         )
-        evidence = runs._code_evidence(text, terminal)
+        evidence = code_evidence(text, terminal)
     if not text.strip():
         return None
-    message = runs._clip(text, 300)
+    message = clip(text, 300)
     low = text.lower()
 
-    if lane == "codex":
+    if vendor == "codex":
         if _CODEX_LIMIT in low.replace("’", "'"):
             return Refusal(CODEX_USAGE_LIMIT, message, codex_reset(text))
         return None
-    if lane == "glm":
-        code = runs.zai_code(evidence)
-        if code in runs.ZAI_QUOTA_CODES:
-            return Refusal(f"zai_{code}", message, zai_reset_at(runs.zai_reset(evidence)))
-        if code == runs.ZAI_THROTTLE_CODE:
+    if vendor == "zai":
+        code = zai_code(evidence)
+        if code in ZAI_QUOTA_CODES:
+            return Refusal(f"zai_{code}", message, zai_reset_at(zai_reset(evidence)))
+        if code == ZAI_THROTTLE_CODE:
             return Refusal(ZAI_1313_EXHAUSTED, message, None)
         return None
-    if lane == "deepseek" and _BALANCE_RE.search(text):
+    if vendor == "deepseek" and _BALANCE_RE.search(text):
         return Refusal(DEEPSEEK_BALANCE, message, None)
+    if vendor == "grok" and (_GROK_BALANCE_RE.search(text) or _BALANCE_RE.search(text)):
+        return Refusal(GROK_BALANCE, message, None)
     return None
+
+
+# Codex item types that are the child acting on the machine. A message item
+# is not one of them: a child that only answered "I can't, I'm rate limited"
+# did no work, however many items the stream carried.
+WORK_ITEMS = frozenset({"command_execution", "file_change", "mcp_tool_call", "web_search"})
 
 
 def did_work(events: list[dict[str, Any]]) -> bool:
     """Whether the child did anything in these events.
 
-    Work is a tool call or assistant output tokens above zero. Assistant text
+    Work is a tool call or output tokens above zero, and nothing else. Text
     alone is not: Claude Code reports an API error as a synthetic assistant
-    message with zero usage, and that is exactly the refusal case.
+    message with zero usage, and a Codex child that answers a usage-limit
+    refusal emits an agent_message item with no usage at all. Both are
+    exactly the refusal case, whatever the terminal event says.
     """
     for event in events:
         if not isinstance(event, dict):
@@ -313,16 +392,13 @@ def did_work(events: list[dict[str, Any]]) -> bool:
             usage = message.get("usage") if isinstance(message, dict) else None
             if isinstance(usage, dict) and int(usage.get("output_tokens") or 0) > 0:
                 return True
-        elif kind == "result":
+        elif kind in ("result", "turn.completed"):
             usage = event.get("usage")
             if isinstance(usage, dict) and int(usage.get("output_tokens") or 0) > 0:
                 return True
         elif kind in ("item.started", "item.completed"):
-            # Codex: any item (command, file change, message) is work.
-            return True
-        elif kind == "turn.completed":
-            usage = event.get("usage")
-            if isinstance(usage, dict) and int(usage.get("output_tokens") or 0) > 0:
+            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            if item.get("type") in WORK_ITEMS:
                 return True
     return False
 
@@ -346,7 +422,7 @@ def close_until(
         return None
     if refusal.reset_at is not None:
         until = refusal.reset_at if refusal.reset_at > now else None
-    elif refusal.code == DEEPSEEK_BALANCE:
+    elif refusal.code in (DEEPSEEK_BALANCE, GROK_BALANCE):
         until = now + timedelta(hours=balance_close_hours)
     elif refusal.code == ZAI_1313_EXHAUSTED:
         until = now + timedelta(minutes=throttle_close_minutes)

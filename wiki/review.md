@@ -103,6 +103,7 @@ Reproduction: run a valid two-task `--parallel` manifest with `[core].max_agents
 
 Suggested fix: validate parallel task count against available agent capacity before creating worktrees, and put per-worker result initialization plus worktree/guard cleanup in `finally` paths.
 
+Outcome: open — parallel mode is not exercised by the benchmark yet; fix scheduled with the parallel-worker unit (active-work). Until then a provider with `max_agents = 1` must not be used with `--parallel`.
 **MED — a configured approval socket path breaks `run --background` after the parent exits.** [`supervisor.py:339`](../src/subagent/guard/supervisor.py#L339), [`supervisor.py:349`](../src/subagent/guard/supervisor.py#L349), [`loop.py:1109`](../src/subagent/loop/loop.py#L1109), [`cli.py:557`](../src/subagent/cli.py#L557)
 
 The parent and respawned CLI child load the same explicit `[guard].approval_socket`. The child unlinks and rebinds that pathname in `serve()`. The parent then reaches `server.stop()` and `cleanup()` unlinks the child's socket path. Subsequent hook calls fail closed because no socket is reachable, so the background worker cannot use guarded tools.
@@ -253,4 +254,5 @@ No finding: each orchestrator parser has a malformed-output test that returns a 
 
 ### Verdict
 
+Outcome: open — cosmetic for the matrix (the cell is reported as failed rather than as a hidden-test result); fix scheduled with the next bench change.
 **FAIL for unattended use on a developer's machine.** A worker subprocess receives undeclared environment secrets, the HTML dashboard can execute markup supplied by a trace, and direct file tools can corrupt the loop's checkpoint refs despite the shell guard. The Registry and background-socket lifecycle also have reproducible state/path and availability failures, while benchmark and accounting defects can silently produce misleading results. The test-release ordering and several reviewed parser/config paths appear sound, but these remaining issues are enough that unattended runs are not safe until the high-severity exposures and state-integrity gaps are closed.

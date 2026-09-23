@@ -1,7 +1,7 @@
 [project]
 name = "subagent"
 version = "0.1.0"
-description = "Delegate coding work to subagents: an MCP server for several backends (Codex, DeepSeek, GLM, local llama.cpp, oMLX) and a plan-build-test-review loop runner."
+description = "Delegate coding work to a cheaper AI worker on any configured provider (Codex, Copilot, DeepSeek, GLM, Grok, Gemini, local llama.cpp/vLLM/oMLX): plan, tests, worker rounds, verification, cross-family review, and per-provider cost."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -21,7 +21,7 @@ subagent = "subagent.cli:main"
 subagent-mcp = "subagent.mcp_server:main"
 
 [project.urls]
-Homepage = "https://github.com/gaztrabisme/subagent-mcp"
+Homepage = "https://github.com/gaztrabisme/claude-subagent-delegation"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]

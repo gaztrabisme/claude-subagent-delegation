@@ -277,8 +277,11 @@ def test_delegation_fields_price_the_flat_plan_from_the_cell_config(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))  # no other config layers
     monkeypatch.delenv("SUBAGENT_CONFIG", raising=False)
     config = tmp_path / "config.toml"
+    # A cell config declares the provider as well as its pricing.
     config.write_text(
-        '[providers.glm.pricing]\nkind = "flat_plan"\nmonthly_usd = 80\n', encoding="utf-8"
+        '[providers.glm]\ndriver = "claude"\nmodel = "glm-5.3-flash[1m]"\n\n'
+        '[providers.glm.pricing]\nkind = "flat_plan"\nmonthly_usd = 80\n',
+        encoding="utf-8",
     )
     delegations = [{
         "kind": "delegation",

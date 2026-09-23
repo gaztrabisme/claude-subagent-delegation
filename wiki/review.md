@@ -129,6 +129,8 @@ Reproduction: configure Copilot as a loop tier with default `allow_unguarded = f
 
 Suggested fix: pass a scoped loop capability into provider boot, without mutating shared config or broadening the MCP setting.
 
+Outcome: fixed (src/subagent/providers/copilot.py:52,287 — `allow_loop_agent()` registers the loop's own agent ids and `boot()` admits exactly those; src/subagent/loop/loop.py:59 registers before every create/adopt)
+
 No separate finding: Copilot mints a UUID session ID at boot and uses that same ID for `--session-id` and saved-session resume. The Grok driver removes the configured key variable and maps its configured value to `XAI_API_KEY`. Refusal classification passes the vendor into the router's vendor-specific rules. Codex translates one `turn.completed` usage object into one run result; the source and fixtures do not establish that resumed Codex usage is cumulative, so I am not reporting double counting as a defect.
 
 ### 4. Configuration and initialization
@@ -140,6 +142,8 @@ No separate finding: Copilot mints a UUID session ID at boot and uses that same 
 Reproduction: load a config with a Claude driver, reachable `base_url`, and model but no `api_key_env` or `api_key`; `load()` returns settings with no warning, then the first run fails with `missing API key ... (none configured)`.
 
 Suggested fix: validate required driver fields and warn or fail at load time when a key-required driver has no declared key source.
+
+Outcome: fixed (src/subagent/config.py:231,622 — load() warns when a driver whose driver object needs a key declares neither `api_key_env` nor `api_key`)
 
 No finding: the requested tier/review/test-writer provider names are checked against declarations by `_validate()`; config layering follows the documented user → project → `SUBAGENT_CONFIG` order; and `subagent init` writes key variable names/placeholders, not secret values ([`cli.py:128`](../src/subagent/cli.py#L128)).
 
@@ -153,6 +157,8 @@ Reproduction: invoke `run --auto --test-outline ...`; compare tagged test-writer
 
 Suggested fix: retain run blocks for setup workers/reviewers and include them in the same totals, with explicit phases so reports can distinguish them.
 
+Outcome: fixed (src/subagent/loop/loop.py:437,1013,1122 — the test writer's runs are now `_runs` phase-tagged `test_writer`, `_prepare_tests` collects them, and `_delegation_record(setup=...)` sums them into `usage_total`/`credits_total`/`cost_total`, including the `tests_questioned` hand-back)
+
 **MED — flat-plan costs are spread per provider/month but never into delegation or bench totals.** [`cost.py:207`](../src/subagent/telemetry/cost.py#L207), [`cost.py:481`](../src/subagent/telemetry/cost.py#L481), [`loop.py:360`](../src/subagent/loop/loop.py#L360), [`report.py:313`](../src/subagent/report.py#L313)
 
 Run-end flat-plan cost is `None`. The provider report later allocates monthly plan cost across runs, but `_delegation_record()` sums the original run costs and returns `provider_usd: null` if any block is null. The delegation table and bench CSV therefore show no worker cost even while the provider table shows a nonzero allocated cost.
@@ -160,6 +166,8 @@ Run-end flat-plan cost is `None`. The provider report later allocates monthly pl
 Reproduction: configure one provider with `pricing.kind = "flat_plan"`, create a delegation with a run in the month, then compare provider and delegation report rows: provider cost is allocated; delegation cost remains null and `bench/run.py` converts it to no `worker_usd`.
 
 Suggested fix: apply one documented allocation policy before grouping both provider and delegation costs, or report allocated cost at both levels as unavailable.
+
+Outcome: fixed (src/subagent/telemetry/cost.py:477 — `provider_costs` spreads from the config's `PricingSpec` even when the legacy `[pricing]` table builds no `Pricing`; src/subagent/report.py:237,367,391,448 — one policy at report time: run-end cost, then the spread, then the recorded delegation total shared over its runs; delegation rows and the bench's `worker_usd` both go through it)
 
 No finding: time-of-day handling is explicitly a peak/off-peak annotation, not a rate multiplier; the code does not claim to apply a discounted rate. Trace writes are locked within one `Trace` instance, and I found no concrete concurrent-cell `bench_run_id` bleed because benchmark cells run as separate processes with distinct environments.
 
@@ -175,6 +183,26 @@ Suggested fix: build SVG nodes with `createElementNS()` and assign labels with `
 
 No finding: empty traces produce empty chart/table inputs, and the chart returns before division when labels are empty; provider rate aggregation groups only nonempty run sets, so its denominator is nonzero. Task text is not persisted into the report data path reviewed.
 
+**MED — the report's provider table is keyed by vendor (`zai`) while delegations say `glm`.** [`report.py`](../src/subagent/report.py#L159), [`report.py:267`](../src/subagent/report.py#L267)
+
+Run rows key the provider table off the trace's raw `provider`/`lane` tag, so records written under a vendor tag group separately from the same provider named in the delegation records, and no row says which vendor stands behind it.
+
+Reproduction: feed a trace whose `run` records say `"provider": "zai"` alongside `delegation` records whose `rounds` say `"provider": "glm"`; the tables disagree.
+
+Suggested fix: key both tables by provider name (mapping a vendor tag to the one provider that declares it) and show the vendor as a column.
+
+Outcome: fixed (src/subagent/report.py:152,174,293,310 — `_aliases()` maps vendor tags to the provider name, run and delegation rows are keyed through it, and each provider row carries a `vendor` column; test_report.py::test_vendor_tagged_runs_group_under_the_provider_name)
+
+**MED — `prov_usd` is null for a flat-plan provider declared in the TOML config (`[providers.glm.pricing] monthly_usd = 80`).** [`cost.py:481`](../src/subagent/telemetry/cost.py#L481), [`report.py:237`](../src/subagent/report.py#L237)
+
+Spreading read only the legacy `Pricing.providers` table, and `_price_row` reset `provider_usd` to null whenever the run record carried no `cost` dict — so a flat-plan provider declared in the config's `[providers.<n>.pricing]` still reported null in the lane table.
+
+Reproduction: `subagent report --trace <trace>` with the provider's plan declared under `[providers.glm.pricing]`; `prov_usd` is null although the spread had the monthly fee.
+
+Suggested fix: spread from the config's `PricingSpec` and stop clobbering a spread value at `_price_row` time.
+
+Outcome: fixed (src/subagent/telemetry/cost.py:477; src/subagent/report.py:237,417 — the spread uses the config's PricingSpec with no `Pricing` required, `_price_row` keeps it, and with no config at all the recorded delegation total is shared over its runs as a fallback)
+
 ### 7. Benchmark and business case
 
 **MED — different config files can generate the same cell ID and collide on one workspace.** [`run.py:65`](../bench/run.py#L65), [`run.py:267`](../bench/run.py#L267), [`run.py:452`](../bench/run.py#L452)
@@ -185,6 +213,8 @@ Reproduction: pass `--config /tmp/a/config.glm.toml /tmp/b/config.glm.toml` for 
 
 Suggested fix: include a stable hash of the resolved config path/content in the cell ID and all result filenames.
 
+Outcome: fixed (bench/run.py:73,450 — `config_tag()` is a sha256 of the resolved path + content and every cell id/result filename carries it)
+
 **MED — `--from-report` ignores the report's measured wall time and verified rate fields.** [`report.py:267`](../src/subagent/report.py#L267), [`report.py:271`](../src/subagent/report.py#L271), [`report.py:281`](../src/subagent/report.py#L281), [`business_case.py:485`](../bench/business_case.py#L485), [`business_case.py:496`](../bench/business_case.py#L496)
 
 The report JSON emits `wall_p50` and `verified_rate`, while the business-case loader reads `wall_p50_s` and `verified_pass_rate`. Feeding the tool's own report JSON therefore silently skips measured throughput/parity inputs and keeps defaults, despite finding the requested provider rows.
@@ -193,6 +223,8 @@ Reproduction: pass `subagent report --json` output to `bench/business_case.py --
 
 Suggested fix: align the report schema and consumer names, and reject or visibly warn when requested measured fields are absent.
 
+Outcome: fixed (bench/business_case.py:501,515,719 — `report_overrides` reads both spellings (`wall_p50_s`/`wall_p50`, `verified_pass_rate`/`verified_rate`) and `build_inputs` prints a warning when a report row carries none of the measured fields)
+
 **MED — ROI is calculated for a fleet that cannot serve the declared demand.** [`business_case.py:297`](../bench/business_case.py#L297), [`business_case.py:417`](../bench/business_case.py#L417), [`business_case.py:430`](../bench/business_case.py#L430)
 
 With `hardware_count` fixed below `units_needed`, `capacity()` reports a nonzero shortfall but `model()` still prices that undersized fleet and computes break-even/ROI against the full cloud bill. A positive ROI can thus be shown for a local option that cannot handle the modeled workload.
@@ -200,6 +232,8 @@ With `hardware_count` fixed below `units_needed`, `capacity()` reports a nonzero
 Reproduction: choose workload needing two units, set `hardware_count = 1`, and use cloud costs above the one-unit local cost; the output simultaneously reports a capacity shortfall and positive ROI.
 
 Suggested fix: mark ROI and break-even infeasible when installed capacity is below demand, or calculate the served workload and cloud remainder explicitly.
+
+Outcome: fixed (bench/business_case.py:426-460 — `undersized_fleet` is set when a stated `hardware_count` leaves a shortfall; break-even and ROI become None while the priced fleet's costs are still reported, and the Markdown says so)
 
 **LOW — an agent-created hidden-test destination aborts the cell instead of producing a hidden-test result.** [`run.py:87`](../bench/run.py#L87), [`run.py:92`](../bench/run.py#L92), [`run.py:97`](../bench/run.py#L97)
 

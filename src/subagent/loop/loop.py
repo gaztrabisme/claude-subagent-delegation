@@ -323,6 +323,122 @@ def _status(violations, timed_out, failed, report, tests):
     return report.get("status") if report.get("status") in ("done", "failed") else "no_report"
 
 
+# ---------------------------------------------------------------- delegation trace
+
+_USAGE_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
+
+
+def _set_delegation_id(server, run_id):
+    """Tag every record this delegation writes with its run id."""
+    trace = getattr(getattr(server, "registry", None), "trace", None)
+    if trace is not None:
+        trace.set_context(delegation_id=run_id)
+
+
+def _run_block(run, model=None):
+    """The JSON-safe per-run facts a delegation record sums."""
+    return {
+        "run_id": run.run_id,
+        "provider": run.lane or run.provider,
+        "model": model,
+        "usage": run.usage.as_dict(),
+        "credits": run.usage.credits,
+        "cost": run.cost,
+    }
+
+
+def _usage_sum(usages):
+    total = {key: 0 for key in _USAGE_FIELDS}
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue
+        for key in _USAGE_FIELDS:
+            total[key] += int(usage.get(key) or 0)
+    return total
+
+
+def _cost_sum(costs):
+    provider = [c.get("provider_usd") for c in costs if isinstance(c, dict)]
+    counterfactual = sum(
+        float(c.get("counterfactual_usd") or 0) for c in costs if isinstance(c, dict)
+    )
+    provider_usd = None if not provider or any(p is None for p in provider) else float(sum(provider))
+    return {"provider_usd": provider_usd, "counterfactual_usd": counterfactual}
+
+
+def _delegation_rounds(result, blocks):
+    """One `rounds[]` entry per worker run, carrying that run's usage/credits/cost."""
+    tier = result.get("tier")
+    status = result.get("status")
+    guard = result.get("guard_denials") or None
+    violations = result.get("violations") or None
+    tests = result.get("tests")
+    seconds = result.get("seconds")
+    return [
+        {
+            "run_id": block["run_id"],
+            "provider": block["provider"],
+            "model": block["model"] or result.get("model"),
+            "tier": tier,
+            "status": status,
+            "guard": guard,
+            "violations": violations,
+            "tests": tests,
+            "seconds": seconds,
+            "usage": block["usage"],
+            "credits": block["credits"],
+            "cost": block["cost"],
+        }
+        for block in blocks
+    ]
+
+
+def _delegation_reviews(review, blocks):
+    """One `reviews[]` entry per reviewer run."""
+    return [
+        {
+            "run_id": block["run_id"],
+            "provider": block["provider"],
+            "model": block["model"] or review.get("model"),
+            "verdict": review.get("verdict"),
+            "usage": block["usage"],
+            "credits": block["credits"],
+            "cost": block["cost"],
+        }
+        for block in blocks
+    ]
+
+
+def _delegation_record(*, mode, status, stopped_because, changed_files, wall_seconds,
+                       rounds, reviews, test_writer, blocks):
+    """The schema-3 `delegation` record for one whole loop run."""
+    credits = [b.get("credits") for b in blocks if isinstance(b, dict) and b.get("credits") is not None]
+    return {
+        "orchestrator": {
+            "harness": os.environ.get("SUBAGENT_ORCHESTRATOR", "unknown"),
+            "model": os.environ.get("SUBAGENT_ORCHESTRATOR_MODEL"),
+        },
+        "mode": mode,
+        "status": status,
+        "stopped_because": stopped_because,
+        "rounds": rounds,
+        "reviews": reviews,
+        "test_writer": test_writer,
+        "usage_total": _usage_sum([b.get("usage") for b in blocks if isinstance(b, dict)]),
+        "credits_total": round(sum(float(v) for v in credits), 2) if credits else None,
+        "cost_total": _cost_sum([b.get("cost") for b in blocks if isinstance(b, dict)]),
+        "wall_seconds": wall_seconds,
+        "changed_files": changed_files,
+        "verified_pass": status == "done",
+    }
+
+
+def _write_delegation(server, record):
+    trace = getattr(getattr(server, "registry", None), "trace", None)
+    if trace is not None:
+        trace.delegation(**record)
+
+
 # ---------------------------------------------------------------- run: one round
 
 def run_round(root, server, args, live_view=True):
@@ -420,6 +536,7 @@ def run_round(root, server, args, live_view=True):
         record.update(session.record_for(worker.agent, record.get("base_checkpoint")))
     _save_session(root, record)
     checkpoint.prune(root, settings.loop.keep_checkpoints or 0)
+    result["_runs"] = [_run_block(run, worker.model)] if run is not None else []
     return {k: v for k, v in result.items() if v is not None}
 
 
@@ -576,6 +693,8 @@ def _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, s
     sink.close()
     _save_session(root, record)
     checkpoint.prune(root, settings.loop.keep_checkpoints or 0)
+    result["changed_files"] = sorted(applied) or None
+    result["_runs"] = [_run_block(w["run"], w["model"]) for w in workers if w["run"] is not None]
     return {k: v for k, v in result.items() if v is not None}
 
 
@@ -833,6 +952,8 @@ def autopilot(root, server, args, run_id):
     sees the final result (or a problem only Claude can solve, like a disputed test).
     """
     settings = server.settings
+    started = time.time()
+    _set_delegation_id(server, run_id)
     live_view_error = open_live_view(settings.loop, root, RUNNER, ["--run", run_id, "--since", time.time()])
 
     # Tests first: write them from the outline (outline mode), then check them against the plan/spec.
@@ -842,6 +963,12 @@ def autopilot(root, server, args, run_id):
         credits = [c for c in extras["credits"] if c is not None]
         hand_back.update({"worker_credits": round(sum(credits), 2) if credits else None,
                           "live_view_error": live_view_error})
+        _write_delegation(server, _delegation_record(
+            mode="auto", status=hand_back.get("status"), stopped_because=None,
+            changed_files=None, wall_seconds=round(time.time() - started),
+            rounds=[], reviews=[], test_writer=_brief_writer(extras["test_writer"]),
+            blocks=[],
+        ))
         return {k: v for k, v in hand_back.items() if v is not None}
 
     first = run_parallel(root, server, args, live_view=False) if args.parallel else run_round(root, server, args, False)
@@ -937,6 +1064,19 @@ def autopilot(root, server, args, run_id):
     for key in ("test_change_request", "violations", "log_tail", "error", "model_fallback", "warning"):
         if last.get(key):
             result[key] = last[key]
+    all_blocks = [b for r in rounds for b in (r.get("_runs") or [])]
+    all_blocks += [b for rev in reviews for b in (rev.get("_runs") or [])]
+    _write_delegation(server, _delegation_record(
+        mode="auto",
+        status=result["status"],
+        stopped_because=result.get("stopped_because"),
+        changed_files=changed,
+        wall_seconds=round(time.time() - started),
+        rounds=[e for r in rounds for e in _delegation_rounds(r, r.get("_runs") or [])],
+        reviews=[e for rev in reviews for e in _delegation_reviews(rev, rev.get("_runs") or [])],
+        test_writer=result.get("test_writer"),
+        blocks=all_blocks,
+    ))
     return {k: v for k, v in result.items() if v is not None}
 
 
@@ -984,7 +1124,25 @@ def cmd_run(root, server, args, raw):
         if args.auto:
             result = autopilot(root, server, args, run_id)
         else:
-            result = run_parallel(root, server, args) if args.parallel else run_round(root, server, args)
+            _set_delegation_id(server, run_id)
+            if args.parallel:
+                result = run_parallel(root, server, args)
+                mode = "parallel"
+            else:
+                result = run_round(root, server, args)
+                mode = "single"
+            blocks = result.pop("_runs", []) or []
+            _write_delegation(server, _delegation_record(
+                mode=mode,
+                status=result.get("status"),
+                stopped_because=result.get("stopped_because"),
+                changed_files=result.get("changed_files"),
+                wall_seconds=result.get("seconds"),
+                rounds=_delegation_rounds(result, blocks),
+                reviews=[],
+                test_writer=None,
+                blocks=blocks,
+            ))
     except Exception as exc:  # the result file must always be written, or `wait` reports a crash
         result = {"status": "runner_error", "error": f"{type(exc).__name__}: {exc}"}
     result["run_id"] = run_id
@@ -1136,6 +1294,7 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
     sink.write(f"=== subagent {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} · {detail} · model {model or 'default'}")
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
     review, credits, attempts, used, errored, timed_out = {}, 0.0, 0, model, False, False
+    review_runs = []
     for attempt in range(2):  # retry once if the reviewer produced no verdict
         attempts += 1
         text = prompt if attempt == 0 else prompt + _retry_prompt(f".subagent/review/{result_name}")
@@ -1152,6 +1311,7 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
         if not run.done.wait(agent.cfg.run_timeout):
             agent.close("run deadline exceeded", kind="timeout")
         run.done.wait()
+        review_runs.append(run)
         credits += run.usage.credits or 0.0
         used = model
         errored = run.state == "failed"
@@ -1172,6 +1332,7 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
         "worker_credits": round(credits, 2) if credits else None,
         "note": note,
         "attempts": attempts if attempts > 1 else None,
+        "_runs": [_run_block(r, model) for r in review_runs],
     }
     tail_credits = f" · AI credits {credits:.2f}" if credits else ""
     sink.write(f"{END_MARKER}: {kind} {result['verdict']} · {len(result['issues'])} issues{tail_credits}")
@@ -1247,6 +1408,7 @@ def cmd_review(root, server, args):
         result = do_test_review(root, server, args.tier, [args.plan], args.model, force=True)
     else:
         result = do_review(root, server, args.tier, args.model, args.base)
+    result.pop("_runs", None)
     return result, 0 if result.get("verdict") == "ok" else 1
 
 

@@ -217,6 +217,22 @@ def test_html_is_self_contained(settings_env: None) -> None:
     assert not [link for link in re.findall(r"<link\b[^>]*>", html) if 'href="http' in link]
 
 
+def test_html_escapes_trace_strings_before_embedding_and_svg_rendering() -> None:
+    attacker = "<img src=x onerror=alert(1)>"
+    rep = report.Report(
+        providers=[{"provider": attacker, "provider_usd": 1.0, "counterfactual_usd": 2.0}],
+        delegations=[{"delegation_id": attacker, "tokens": 1}],
+        lanes=[], runs=1, counterfactual=None,
+    )
+
+    html = report.render_html(rep)
+    match = re.search(r'<script type="application/json" id="data">(.*?)</script>', html, re.S)
+    assert match
+    assert "<img" not in html
+    assert r"\u003cimg" in match.group(1)
+    assert json.loads(match.group(1))["providers"][0]["provider"] == attacker
+
+
 def test_main_json(settings_env: None, capsys: pytest.CaptureFixture[str]) -> None:
     rc = report.main(["--trace", str(FIXTURE), "--json"])
     assert rc == 0

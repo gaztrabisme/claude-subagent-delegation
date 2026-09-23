@@ -158,7 +158,7 @@ class Worker:
     def _make_agent(self, provider, model, fallback):
         agent = self.registry.create_agent(
             None, self.root, provider=provider, model=model, fallback=fallback,
-            on_event=self._on_event(), agent_id=f"loop-{uuid.uuid4().hex[:12]}",
+            on_event=self._on_event(), agent_id=f"loop-{uuid.uuid4()}",
         )
         agent.guard_context = self._guard_context()
         return agent
@@ -792,7 +792,7 @@ def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None
     else:
         agent = server.registry.create_agent(
             None, root, provider=target.provider, model=target.model, fallback="none",
-            on_event=live.feed, agent_id=f"loop-{uuid.uuid4().hex[:12]}",
+            on_event=live.feed, agent_id=f"loop-{uuid.uuid4()}",
         )
         run = agent.delegate(prompt, "true", on_event=live.feed, distill=False)
     agent.guard_context = {"protected": [], "state_allow": [f"{STATE_DIR}/test_writer_result.json"]}
@@ -1301,7 +1301,7 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
         live.credits, live.last_message = None, ""
         agent = server.registry.create_agent(
             None, root, provider=provider, model=model, fallback="none",
-            on_event=live.feed, agent_id=f"loop-{uuid.uuid4().hex[:12]}",
+            on_event=live.feed, agent_id=f"loop-{uuid.uuid4()}",
         )
         agent.guard_context = {
             "protected": [],

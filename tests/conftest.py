@@ -131,6 +131,15 @@ GUARD_KEYS = ("supervisor", "supervisor_cmd", "supervisor_timeout", "approval_so
               "allow_unguarded")
 TELEMETRY_KEYS = ("sample_seconds",)
 
+# Fake CLI controls and record paths are explicit child inputs in tests. Keep
+# these here, in the test fixture, instead of baking test-only names into src.
+TEST_CHILD_ENV_PASSTHROUGH = (
+    "FAKE_SCRIPT", "FAKE_MODEL", "FAKE_PROMPT", "FAKE_FAIL_MODEL",
+    "FAKE_CODEX_RECORD", "FAKE_CODEX_FIXTURE",
+    "FAKE_GROK_RECORD", "FAKE_GROK_FIXTURE",
+    "FAKE_COPILOT_RECORD", "FAKE_COPILOT_FIXTURE",
+)
+
 
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool):
@@ -188,6 +197,7 @@ def make_settings(tmp_path: Path, providers: dict[str, Any] | None = None,
         "default_provider": "glm" if "glm" in tables else next(iter(tables), ""),
         "loop_strikes": 3,
         "trace": "off",
+        "child_env_passthrough": list(TEST_CHILD_ENV_PASSTHROUGH),
     }
     guard: dict[str, Any] = {
         "supervisor": "off",

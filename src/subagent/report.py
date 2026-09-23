@@ -366,7 +366,9 @@ def _report_data(report: Report) -> dict[str, Any]:
 
 def render_html(report: Report) -> str:
     """The self-contained dashboard: the template with the JSON data embedded."""
-    data = json.dumps(_report_data(report)).replace("</", "<\\/")
+    data = json.dumps(_report_data(report), ensure_ascii=False).translate(
+        str.maketrans({"<": r"\u003c", ">": r"\u003e", "&": r"\u0026"})
+    )
     return TEMPLATE.read_text(encoding="utf-8").replace("__DATA__", data)
 
 

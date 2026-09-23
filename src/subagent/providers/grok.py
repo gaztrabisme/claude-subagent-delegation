@@ -17,7 +17,6 @@ task, so this driver is not gated behind ``experimental``.
 
 from __future__ import annotations
 
-import os
 import shutil
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -134,10 +133,8 @@ class GrokProvider:
         self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,
         model: str | None = None,
     ) -> dict[str, str]:
-        """The parent's environment, minus leaked keys, plus XAI_API_KEY."""
-        env = {k: v for k, v in os.environ.items() if v is not None}
-        for leaked in settings.leaked_keys:
-            env.pop(leaked, None)
+        """The allowlisted runtime environment plus this provider's XAI key."""
+        env = settings.base_child_env()
         key = cfg.api_key()
         if key:
             env["XAI_API_KEY"] = key

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from subagent.runs import CANCELLED, COMPLETED, COMPLETED_UNVERIFIED, FAILED, Registry
+from subagent.runs import CANCELLED, COMPLETED, COMPLETED_UNVERIFIED, FAILED, Registry, RegistryError
 
 from .conftest import make_settings
 
@@ -80,6 +80,26 @@ def test_completed_verbatim_under_cap(registry, tmp_path: Path):
     assert run.distilled is False
     argv = registry.captured[0].argv  # type: ignore[attr-defined]
     assert "--dangerously-skip-permissions" in argv
+
+
+def test_adopt_rejects_agent_ids_outside_the_loop_uuid4_pattern(registry, tmp_path: Path):
+    with pytest.raises(RegistryError, match="loop-.*uuid4"):
+        registry.adopt({
+            "provider": "glm",
+            "agent_id": "../../outside",
+            "agent_home": str(tmp_path / "outside"),
+        })
+
+
+def test_adopt_rejects_a_persisted_agent_home_that_does_not_match(registry, tmp_path: Path):
+    agent_id = "loop-123e4567-e89b-42d3-a456-426614174000"
+    with pytest.raises(RegistryError, match="agent_home"):
+        registry.adopt({
+            "provider": "glm",
+            "agent_id": agent_id,
+            "agent_home": str(tmp_path / "outside"),
+        })
+    assert registry.find_agent(agent_id) is None
 
 
 def test_child_argv_runs_the_guard_hook(tmp_path: Path, monkeypatch):

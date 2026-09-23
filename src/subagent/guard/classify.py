@@ -417,10 +417,55 @@ def _expand_home(word: str) -> str:
     return re.sub(r"^\$(?:HOME\b|\{HOME\})", lambda _m: str(_home()), word)
 
 
-def classify_path_write(path_str: str, workspace: Path) -> Verdict:
+def _git_metadata_roots(workspace: Path) -> set[Path]:
+    """The worktree and common gitdirs, including the indirection in `.git` files."""
+    root = workspace.resolve()
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return {dot_git.resolve()}
+    if not dot_git.is_file():
+        return set()
+    try:
+        match = re.fullmatch(r"\s*gitdir:\s*(.+?)\s*", dot_git.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return set()
+    if match is None:
+        return set()
+    gitdir = Path(match.group(1))
+    if not gitdir.is_absolute():
+        gitdir = root / gitdir
+    gitdir = gitdir.resolve()
+    roots = {gitdir}
+    commondir = gitdir / "commondir"
+    if commondir.is_file():
+        try:
+            common = Path(commondir.read_text(encoding="utf-8").strip())
+            roots.add((gitdir / common).resolve() if not common.is_absolute() else common.resolve())
+        except (OSError, UnicodeError):
+            pass
+    return roots
+
+
+def _protected_git_state(path: Path, workspace: Path) -> bool:
+    roots = _git_metadata_roots(workspace)
+    protected_roots = {
+        root / "refs" / "subagent" for root in roots
+    } | {
+        root / "worktrees" for root in roots
+    }
+    # A `.git` file has no children on disk, but file tools can still name
+    # the conventional `.git/...` spelling. Protect those virtual paths too.
+    dot_git = workspace.resolve() / ".git"
+    protected_roots.update({dot_git / "refs" / "subagent", dot_git / "worktrees"})
+    return _under_folded(path, frozenset(protected_roots))
+
+
+def classify_path_write(path_str: str, workspace: Path, context: dict | None = None) -> Verdict:
     """A file-tool write or edit."""
     path = _resolve(path_str, workspace)
     facts = {"path": str(path), "inside_workspace": inside(path, workspace)}
+    if _protected_git_state(path, workspace):
+        return Verdict(DENY, "refused: writes to protected git state", facts)
     sensitive = is_sensitive(path) or protected(path)
     if sensitive:
         return Verdict(DENY, f"refused: {sensitive}", facts)
@@ -1581,7 +1626,7 @@ def classify(
                     {"tool": name, "path": str(target)},
                 )
         target = _resolve(str(paths[0]), base)
-        verdict = classify_path_write(str(target), workspace)
+        verdict = classify_path_write(str(target), workspace, context=context)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
     return Verdict(ESCALATE, f"unrecognized tool `{name}`", {"tool": name})
 

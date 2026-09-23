@@ -13,6 +13,9 @@ import pytest
 from subagent import config, health, runs
 from subagent.config import ConfigError
 from subagent.providers import claude as claude_provider
+from subagent.providers.base import Session
+from subagent.providers.codex import codex_env
+from subagent.providers.grok import GROK_PROVIDER
 from subagent.runs import COMPLETED, Registry
 
 from .conftest import default_providers, make_settings, write_config
@@ -297,6 +300,40 @@ def test_child_env_strips_parent_oauth_and_sets_the_provider_key(tmp_path: Path,
     assert "DEEPSEEK_API_KEY" not in env
     assert env["CLAUDE_CONFIG_DIR"].startswith(str(settings.session_root))
     assert env["SUBAGENT_APPROVAL_SOCKET"] == settings.approval_socket
+
+
+def test_provider_child_envs_drop_undeclared_secrets(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FOO_API_KEY", "server-secret")
+    monkeypatch.setenv("SAFE_TEST_PASS", "passed-through")
+    monkeypatch.setenv("CLAUDE_KEY", "claude-secret")
+    monkeypatch.setenv("GROK_KEY", "grok-secret")
+    settings = _load(tmp_path, {
+        "core": {
+            "workspace": str(tmp_path),
+            "session_root": str(tmp_path / "sessions"),
+            "default_provider": "claude",
+            "child_env_passthrough": ["SAFE_TEST_PASS", "FOO_API_KEY"],
+        },
+        "providers": {
+            "claude": {"driver": "claude", "base_url": "http://localhost", "api_key_env": "CLAUDE_KEY"},
+            "codex": {"driver": "codex"},
+            "grok": {"driver": "grok", "api_key_env": "GROK_KEY"},
+        },
+    })
+
+    agent_id = "loop-123e4567-e89b-42d3-a456-426614174000"
+    claude = settings.child_env(agent_id, settings.provider("claude"))
+    codex = codex_env(settings, agent_id, tmp_path / "codex-home")
+    grok_cfg = settings.provider("grok")
+    grok = GROK_PROVIDER.env(settings, agent_id, grok_cfg, Session(provider=grok_cfg.name))
+
+    assert settings.child_env_passthrough == ("SAFE_TEST_PASS", "FOO_API_KEY")
+    assert claude["ANTHROPIC_AUTH_TOKEN"] == "claude-secret"
+    assert codex["CODEX_HOME"] == str(tmp_path / "codex-home")
+    assert grok["XAI_API_KEY"] == "grok-secret"
+    for env in (claude, codex, grok):
+        assert env["SAFE_TEST_PASS"] == "passed-through"
+        assert "FOO_API_KEY" not in env
 
 
 def test_compact_window_from_the_config_file(tmp_path: Path):

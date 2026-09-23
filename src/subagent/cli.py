@@ -538,10 +538,25 @@ def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
     """Stand up the in-process server and run one loop command, printing its JSON."""
     from .core import InProcessServer
 
-    # Each CLI process owns its own approval socket; the default path already
-    # embeds the pid, so a --background child never shares its parent's.
+    # A launcher only spawns the background child (and may wait on its state);
+    # it must not own a listener that its cleanup could unlink from the child.
+    if command == "run" and (
+        getattr(args, "background", False) or getattr(args, "wait", None) is not None
+    ):
+        result, code = loop.LOOP_COMMANDS[command](root, None, args, raw)
+        if result is not None:
+            print(json.dumps(result))
+        return code
+
+    # Every serving process owns a private socket under the session root. A
+    # configured shared pathname can be rebound by a respawned child and then
+    # removed when the parent exits.
+    if command == "run" and getattr(args, "run_id", None):
+        approval_socket = settings.session_root / f"a{os.getpid():x}"
+    else:
+        approval_socket = Path(settings.approval_socket)
     server = InProcessServer(settings.session_root, settings,
-                             approval_socket=settings.approval_socket)
+                             approval_socket=str(approval_socket))
     server.start()
     try:
         handler = loop.LOOP_COMMANDS[command]

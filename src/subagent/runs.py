@@ -36,6 +36,7 @@ from .providers.claude import (  # noqa: F401
     exit_event,
 )
 from .router import FALLBACK_MODES
+from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
 from .telemetry.trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
@@ -467,6 +468,7 @@ class Run:
     done: threading.Event = field(default_factory=threading.Event)
     signatures: Counter[str] = field(default_factory=Counter)
     usage: Usage = field(default_factory=Usage)
+    cost: dict[str, Any] | None = None
     verification_result: VerificationResult | None = None
     trip: tuple[str, str] | None = None
     deadline: float | None = None
@@ -1347,6 +1349,11 @@ class Agent:
             run.finish_reason = kind
         run.phase = PHASE_DONE
         run.finished_at = _now()
+        try:
+            run.cost = self._price(run)
+        except Exception:  # noqa: BLE001 - costing must never fail a run
+            log.warning("cost pricing failed for %s", run.run_id, exc_info=True)
+            run.cost = None
         if self.trace is not None:
             try:
                 self._summarize(run)
@@ -1354,6 +1361,16 @@ class Agent:
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
         run.done.set()
+
+    def _price(self, run: Run) -> dict[str, Any] | None:
+        """The run's cost at run end (telemetry.cost.price_run), priced once per agent."""
+        pricing = getattr(self, "_pricing", None)
+        if pricing is None:
+            pricing = Pricing.from_settings(self.settings)
+            self._pricing = pricing
+        return price_run(
+            run.usage, run.usage.credits, self.cfg, pricing, run.finished_at or _now()
+        )
 
 
 class Registry:

@@ -23,6 +23,10 @@ this module reads the following minimal shape and ignores anything else:
       verified_pass_rate; `retry_factor` is local rounds_per_delegation / cloud
       rounds_per_delegation; `cache_read_share` comes from the cloud row.
 
+      The measured wall time and pass rate are also read under the names
+      `subagent report --json` emits (`wall_p50`, `verified_rate`); a report
+      with none of the measured fields warns and keeps the defaults.
+
   --from-concurrency bench.csv
       CSV with columns `level, aggregate_tps, ttft_p90_s` (one row per level).
       The chosen row is the highest level whose p90 TTFT is under 60 s, falling
@@ -415,10 +419,20 @@ def sensitivity(inputs: Inputs, cloud_monthly: float) -> list[dict[str, Any]]:
 
 
 def model(inputs: Inputs) -> dict[str, Any]:
-    """The full business case as a JSON-safe dict."""
+    """The full business case as a JSON-safe dict.
+
+    ROI and break-even compare the fleet's cost against the *whole* cloud
+    bill, so they are only meaningful for a fleet that can serve the demand:
+    when `hardware_count` is fixed below `units_needed`, `undersized_fleet`
+    is true and both are infeasible (None) even though the local cost of the
+    fleet that was priced is still reported.
+    """
     volumes = monthly_volumes(inputs)
     cloud = cloud_monthly_cost(inputs)
     cap = capacity(inputs)
+    # `hardware_count = None` sizes the fleet to the demand, so only a stated
+    # count can leave it short of what the workload needs.
+    undersized = inputs.hardware_count is not None and cap["shortfall_tokens_per_hour"] > 0
     units = effective_units(inputs, cap["units_needed"])
     local = local_costs(inputs, units)
 
@@ -429,12 +443,16 @@ def model(inputs: Inputs) -> dict[str, Any]:
     else:
         adjusted_cost = local["monthly_local_cost_usd"] * inputs.retry_factor / inputs.parity
         adjusted_cash = local["monthly_local_cash_usd"] * inputs.retry_factor / inputs.parity
-        break_even = break_even_month(local["capex_usd"], cloud, adjusted_cash)
-        roi = {
-            "12": roi_at(12, local["capex_usd"], cloud, adjusted_cash),
-            "24": roi_at(24, local["capex_usd"], cloud, adjusted_cash),
-            "36": roi_at(36, local["capex_usd"], cloud, adjusted_cash),
-        }
+        if undersized:
+            break_even = None
+            roi = {"12": None, "24": None, "36": None}
+        else:
+            break_even = break_even_month(local["capex_usd"], cloud, adjusted_cash)
+            roi = {
+                "12": roi_at(12, local["capex_usd"], cloud, adjusted_cash),
+                "24": roi_at(24, local["capex_usd"], cloud, adjusted_cash),
+                "36": roi_at(36, local["capex_usd"], cloud, adjusted_cash),
+            }
 
     return {
         "inputs": inputs_to_dict(inputs),
@@ -444,6 +462,7 @@ def model(inputs: Inputs) -> dict[str, Any]:
             "monthly_cost_usd": cloud,
         },
         "capacity": cap,
+        "undersized_fleet": undersized,
         "local": local or {},
         "adjusted_local_cost_usd": adjusted_cost,
         "adjusted_local_cash_usd": adjusted_cash,
@@ -479,10 +498,24 @@ def report_rows_for(rows: list[dict], local: str, cloud: str) -> tuple[dict, dic
     return by_provider[local], by_provider[cloud]
 
 
+def _measured(row: dict, *names: str) -> float | None:
+    """The first present, numeric value among `names`.
+
+    The measured fields are read under both spellings: this module's
+    documented ones (`wall_p50_s`, `verified_pass_rate`) and the ones
+    `subagent report --json` emits (`wall_p50`, `verified_rate`).
+    """
+    for name in names:
+        value = _f(row.get(name))
+        if value is not None:
+            return value
+    return None
+
+
 def report_overrides(local: dict, cloud: dict) -> dict[str, float]:
     """Map two measured report rows onto the model inputs they can fill."""
     overrides: dict[str, float] = {}
-    wall = _f(local.get("wall_p50_s"))
+    wall = _measured(local, "wall_p50_s", "wall_p50")
     if wall and wall > 0:
         tokens_in = _f(local.get("tokens_in")) or 0.0
         tokens_cache = _f(local.get("tokens_cache_read")) or 0.0
@@ -493,12 +526,12 @@ def report_overrides(local: dict, cloud: dict) -> dict[str, float]:
     cloud_cache = _f(cloud.get("tokens_cache_read")) or 0.0
     if cloud_in + cloud_cache > 0:
         overrides["cache_read_share"] = cloud_cache / (cloud_in + cloud_cache)
-    local_rate = _f(local.get("verified_pass_rate"))
-    cloud_rate = _f(cloud.get("verified_pass_rate"))
+    local_rate = _measured(local, "verified_pass_rate", "verified_rate")
+    cloud_rate = _measured(cloud, "verified_pass_rate", "verified_rate")
     if local_rate is not None and local_rate > 0 and cloud_rate and cloud_rate > 0:
         overrides["parity"] = local_rate / cloud_rate
-    local_rounds = _f(local.get("rounds_per_delegation"))
-    cloud_rounds = _f(cloud.get("rounds_per_delegation"))
+    local_rounds = _measured(local, "rounds_per_delegation")
+    cloud_rounds = _measured(cloud, "rounds_per_delegation")
     if local_rounds is not None and local_rounds > 0 and cloud_rounds and cloud_rounds > 0:
         overrides["retry_factor"] = local_rounds / cloud_rounds
     return overrides
@@ -626,13 +659,28 @@ def render_markdown(result: dict[str, Any]) -> str:
         "",
         "## Break-even and ROI",
         "",
+    ]
+    if result["undersized_fleet"]:
+        lines.append(
+            f"The installed fleet ({inputs['hardware_count']} unit(s)) is below the "
+            f"{cap['units_needed']} unit(s) the demand needs: it cannot serve the workload, "
+            "so break-even and ROI against the full cloud bill are infeasible."
+        )
+        lines.append("")
+    lines += [
         "| Horizon | Value |",
         "|---|---|",
-        f"| break-even month | {_months(result['break_even_month'])} |",
     ]
+    if result["undersized_fleet"]:
+        lines.append("| break-even month | infeasible (fleet below demand) |")
+    else:
+        lines.append(f"| break-even month | {_months(result['break_even_month'])} |")
     for months in ("12", "24", "36"):
         roi = result["roi"][months]
-        lines.append(f"| {months}-month ROI | {'—' if roi is None else f'{roi:+.0%}'} |")
+        value = "—" if roi is None else f"{roi:+.0%}"
+        if result["undersized_fleet"]:
+            value = "infeasible (fleet below demand)"
+        lines.append(f"| {months}-month ROI | {value} |")
     lines += ["", "## Sensitivity (parity x concurrency)", ""]
     cells = result["sensitivity"]
     parities = SENSITIVITY_PARITIES
@@ -699,8 +747,15 @@ def build_inputs(args: argparse.Namespace) -> tuple[Inputs, dict[str, Any]]:
             raise SystemExit("--from-report needs --provider and --cloud-provider")
         rows = read_report(args.from_report)
         local, cloud = report_rows_for(rows, args.provider, args.cloud_provider)
-        values.update(report_overrides(local, cloud))
-        measured["report"] = {args.provider: local, args.cloud_provider: cloud}
+        overrides = report_overrides(local, cloud)
+        values.update(overrides)
+        measured["report"] = {args.provider: local, args.cloud_provider: cloud,
+                              "overrides": overrides}
+        if not overrides:
+            print(f"warning: the report rows for {args.provider!r} and {args.cloud_provider!r} "
+                  "carry none of the measured fields (tokens, wall_p50_s/wall_p50, "
+                  "verified_pass_rate/verified_rate, rounds_per_delegation); "
+                  "the default assumptions are kept", file=sys.stderr)
     if args.from_concurrency is not None:
         row = pick_concurrency(read_concurrency(args.from_concurrency))
         values.update(concurrency_overrides(row))

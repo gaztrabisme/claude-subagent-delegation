@@ -82,7 +82,34 @@ def test_zero_capex_zero_power_parity_one_reduces_to_token_price():
     assert result["cloud"]["monthly_cost_usd"] == pytest.approx(3.55)
     assert result["local"]["monthly_local_cost_usd"] == pytest.approx(0.0)
     assert result["adjusted_local_cost_usd"] == pytest.approx(0.0)
-    assert result["break_even_month"] == 0
+    # A zero-GPU "fleet" cannot serve the demand: no ROI against the cloud bill.
+    assert result["undersized_fleet"] is True
+    assert result["break_even_month"] is None
+    assert result["roi"] == {"12": None, "24": None, "36": None}
+
+
+def test_a_fleet_below_demand_reports_infeasible_roi_not_positive_roi():
+    """`hardware_count` fixed below `units_needed`: the model still prices the
+    undersized fleet, but break-even/ROI against the full cloud bill are None."""
+    case = inputs(hardware_count=1)
+    result = bc.model(case)
+    assert result["capacity"]["units_needed"] == 12
+    assert result["capacity"]["shortfall_tokens_per_hour"] > 0
+    assert result["undersized_fleet"] is True
+    assert result["local"]["units"] == 1  # priced what was declared...
+    assert result["break_even_month"] is None  # ...but cannot serve the demand
+    assert result["roi"] == {"12": None, "24": None, "36": None}
+
+    sized = bc.model(inputs())  # hardware_count None sizes the fleet to demand
+    assert sized["undersized_fleet"] is False
+    assert sized["roi"]["12"] is not None
+
+
+def test_markdown_marks_the_undersized_fleet(capsys):
+    case = inputs(hardware_count=1)
+    text = bc.render_markdown(bc.model(case))
+    assert "infeasible" in text
+    assert "below the 12 unit(s)" in text
 
 
 def test_parity_and_retry_scale_adjusted_cost():
@@ -204,6 +231,45 @@ def test_from_report_fills_parity_retry_and_demand(tmp_path):
     assert overrides["retry_factor"] == pytest.approx(1.2)
     # cloud cache share: 20k / (80k + 20k).
     assert overrides["cache_read_share"] == pytest.approx(0.2)
+
+
+def test_from_report_reads_the_report_field_names(tmp_path, capsys):
+    """`subagent report --json` emits `wall_p50` and `verified_rate`; the same
+    overrides must be filled as from the documented spellings."""
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({"providers": [
+        {
+            "provider": "bppc", "tokens_in": 90_000, "tokens_out": 9_000,
+            "tokens_cache_read": 10_000, "verified_rate": 0.9,
+            "rounds_per_delegation": 1.2, "wall_p50": 360.0,
+            "provider_usd": 0.0, "counterfactual_usd": 1.0,
+        },
+        {
+            "provider": "claude", "tokens_in": 80_000, "tokens_out": 10_000,
+            "tokens_cache_read": 20_000, "verified_rate": 1.0,
+            "rounds_per_delegation": 1.0, "wall_p50": 300.0,
+            "provider_usd": 2.0, "counterfactual_usd": 1.0,
+        },
+    ]}))
+    local, cloud = bc.report_rows_for(bc.read_report(report), "bppc", "claude")
+    overrides = bc.report_overrides(local, cloud)
+    assert overrides["tokens_in_per_seat_hour"] == pytest.approx(1_000_000.0)
+    assert overrides["tokens_out_per_seat_hour"] == pytest.approx(90_000.0)
+    assert overrides["parity"] == pytest.approx(0.9)
+    assert overrides["retry_factor"] == pytest.approx(1.2)
+    assert overrides["cache_read_share"] == pytest.approx(0.2)
+
+    # A report with none of the measured fields keeps the defaults, loudly.
+    bare = tmp_path / "bare.json"
+    bare.write_text(json.dumps({"providers": [
+        {"provider": "bppc"}, {"provider": "claude"},
+    ]}))
+    local, cloud = bc.report_rows_for(bc.read_report(bare), "bppc", "claude")
+    assert bc.report_overrides(local, cloud) == {}
+    argv = ["--from-report", str(bare), "--provider", "bppc",
+            "--cloud-provider", "claude", "--json"]
+    assert bc.main(argv) == 0
+    assert "none of the measured fields" in capsys.readouterr().err
 
 
 def test_pick_concurrency_chooses_largest_under_ttft(tmp_path):

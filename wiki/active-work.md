@@ -12,12 +12,13 @@ Reader: the next session that picks this repo up. Read with `decisions.md` (S11�
 | Examples | `examples/config.{copilot,codex,glm,deepseek,llama.cpp,omlx,vllm,full}.toml`; all pass `subagent doctor --no-probe` |
 | Bench | `bench/run.py` matrix (harness × config × task × mode), `bench/harness.py` parsers for claude/codex/gemini/grok/copilot, `bench/concurrency.py`, `bench/business_case.py` + `docs/business-case.md`, task `meeting-scribe` (41 hidden tests, validated reference) |
 | Live | `doctor --provider glm --prompt` PASS; grok classifies its 402 as `grok_balance`; the autopilot loop on the cron task ended `done` (9 outline tests written by glm, 2 rounds, review refused on DeepSeek balance and reported as unverified); one bench cell with Claude orchestrating and glm workers: hidden 22/22, orchestrator $0.68, worker 70k in / 39k out / 1.0M cache-read tokens, counterfactual $1.84, wall 1065 s (`wiki/data/bench-2026-09-23/`) |
+| Bench (codex) | Codex gpt-6-luna orchestrating the fused skill built cron and passed hidden 22/22 (4,988 s, 193k/41k/10.8M orchestrator tokens); worker accounting missing (U-B4, `data/bench-2026-09-24-codex/`) |
 | Review | `review.md` 2026-09-23: 2 HIGH + 13 MED + 1 LOW; both HIGH and 12 MED fixed (F1a, F1b, M5, M6); 1 MED (parallel mode crash) and 1 LOW open with reasons |
 | Servers | The MCP servers Claude Code currently runs are a uv tool install of the pre-fusion package (`~/.local/share/uv/tools/subagent-mcp`); this checkout carries an untracked shim at `src/subagent_mcp/runtime/approval_hook.py` so their children's hook still works. Switch `~/.claude.json` to `subagent-mcp` from this checkout with `SUBAGENT_CONFIG` when convenient |
 
 ## Next
 
-1. Run one real bench cell per installed harness (`claude`, `codex`, `grok` when its balance is back) on `cron`, then `meeting-scribe` on a local provider, and look at `bench/results/<ts>/dashboard.html`.
+1. Fix U-B4 (make the orchestrator prompt and SKILL.md steer to `subagent wait`; refuse a `--tier` whose provider is closed; find why the cell's session root got no trace), U-B1, U-L1. Then run one real bench cell per installed harness (`claude`, `codex`, `grok` when its balance is back) on `cron`, then `meeting-scribe` on a local provider, and look at `bench/results/<ts>/dashboard.html`.
 2. Feed the measured rows into `bench/business_case.py --from-report` and rewrite the README's benchmark section with the fused numbers.
 3. Retire the uv-tool-installed server: `uv tool install --editable .` from this checkout, `~/.claude.json` env `SUBAGENT_CONFIG=<file>`; then delete the shim.
 4. Push `fuse` when Gary says so; open the PR against `main`.

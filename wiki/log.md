@@ -149,3 +149,18 @@ Goal: `goals/2026-09-22-fuse-delegation.md`. Plan: `~/.claude/plans/open-a-new-b
 | 00:2x | UAT 4.4 (codex) | coordinator | codex-orchestrator cell relaunched on the fixed harness (bench4). |
 | 00:3x | UAT | coordinator | goal rows audited on fuse eaca55f+: 0.1–0.5, 1.2–1.5, 2.1, 2.3, 2.5, 3.1–3.3, 4.1–4.3, R.1 (both HIGH fixed; two open findings carry reasons), R.3 (nothing pushed) PASS. Row 1.1 FAIL as written: `require_providers()` exists but the CLI never calls it (`doctor --no-probe` on an empty config exits 0 with an empty table). Fix unit M6 on Codex. |
 | 00:5x | M6 | Codex a10 | PASS 61114ac (committed by the coordinator; sandbox denied git add): every entry point except `init` calls `require_providers()`; `doctor --no-probe` on an empty config now exits 1 with "no providers configured". Row 1.1 PASS. Fast-forwarded; full suite 805 passed. |
+| 01:5x | UAT 4.4 (codex) | coordinator | second-harness cell PASS on the product: Codex gpt-6-luna orchestrating the fused skill delivered code that passes hidden tests 22/22 in 4988 s; orchestrator tokens parsed (193,422 in / 40,675 out / 10,768,128 cached). Worker accounting missing (finding U-B4): the orchestrator re-issued `subagent run … --wait 540` four times (each a new run id, `running`) instead of `subagent wait`; `--tier hard` named the closed DeepSeek provider; no delegation record under the cell's session root. Data in `wiki/data/bench-2026-09-24-codex/`. |
+| 01:5x | close | coordinator | UAT audit against `goals/2026-09-22-fuse-delegation.md`: 0.1–0.5 PASS; 1.1–1.5 PASS; 1.6 glm PASS, grok DEFERRED (balance); 2.1–2.5 PASS; 2.6 PASS (loop `done` on cron); 3.1–3.3 PASS; 4.1–4.3 PASS; 4.4 PASS for claude and codex harnesses (grok DEFERRED balance, gemini/copilot not installed; self-hosted providers not measured: bppc down, oMLX no model loaded); R.1 PASS (both HIGH fixed, two open findings with reasons); R.2 PASS; R.3 PASS (nothing pushed). |
+
+### Findings (U-*)
+
+- U-T2 `transcript` shows no activity while a run is live (351 lines appeared only at cancel).
+- U-R1 a Codex usage-limit refusal on the first turn was classified `usage_limit_after_work` (fixed in P1a).
+- U-H1 the server's hook path and env names were bound to the checkout it started from; a layout change silently failed every child call closed until a shim was added.
+- U-D1 deepseek-v4-pro spent 47 minutes re-reading files without an edit on P1a; the loop killer fired.
+- U-G1 the guard's `agent` supervisor tier runs `claude -p`, so it fails closed when the coordinator's Claude quota is out (blocked a child's git commit).
+- U-S1 the MCP servers Claude Code runs are a uv tool install of the pre-fusion package, not this checkout's venv.
+- U-L1 the loop reports `test_writer_error` without the provider's own error text.
+- U-L2 `subagent detect` started the approval server (fixed in M5).
+- U-C1 a Codex child cannot `git add` in a worktree (gitdir under the parent's .git/worktrees is outside its sandbox); U-C2 a timed-out Codex agent cannot be continued; U-C3 the Codex sandbox cannot bind sockets, so socket-backed tests and the loop's approval socket fail inside it (bench cells use `-s danger-full-access` since M5).
+- U-B1 the claude bench parser fills cost but not `orch_tokens_*`; U-B2 the bench did not install the skill or PATH for non-Claude orchestrators (fixed in M5); U-B4 the Codex-orchestrated cell has no worker accounting (see `data/bench-2026-09-24-codex/README.md`).

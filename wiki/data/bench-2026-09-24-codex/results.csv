@@ -1,0 +1,2 @@
+cell,harness,config,task,mode,run,hidden_passed,hidden_total,orch_cost_usd,orch_tokens_in,orch_tokens_out,orch_tokens_cache,orch_turns,worker_provider,worker_tokens_in,worker_tokens_out,worker_tokens_cache,worker_credits,worker_usd,counterfactual_usd,rounds,reviews,verified_pass,wall_s
+codex-config-0367aa72-cron-delegate-1,codex,config,cron,delegate,1,22,22,,193422,40675,10768128,1,,,,,,,,,,,4988

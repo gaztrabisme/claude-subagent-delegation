@@ -534,6 +534,9 @@ def run_round(root, server, args, live_view=True):
     sink.close()
     if worker.agent is not None:
         record.update(session.record_for(worker.agent, record.get("base_checkpoint")))
+        # The round owns this agent; its session record is what a later
+        # --continue or autopilot round reopens through Registry.adopt.
+        worker.agent.close("round done")
     _save_session(root, record)
     checkpoint.prune(root, settings.loop.keep_checkpoints or 0)
     result["_runs"] = [_run_block(run, worker.model)] if run is not None else []

@@ -1584,8 +1584,19 @@ class Registry:
             raise RegistryError(f"expected agent_home {expected_home} escapes the agents directory")
         fallback = record.get("fallback") or "none"
         with self._lock:
-            if agent_id in self._agents:
-                raise RegistryError(f"session record agent_id {agent_id!r} is already registered")
+            existing = self._agents.get(agent_id)
+            if existing is not None:
+                # A closed agent whose runs have all ended is the same process's
+                # earlier round waiting for the reaper; evict it so its session
+                # can be reopened. A live agent is never replaced.
+                if not (existing.closed
+                        and all(r.state in TERMINAL_STATES for r in existing.runs())):
+                    raise RegistryError(
+                        f"session record agent_id {agent_id!r} is already registered"
+                    )
+                for run in existing.runs():
+                    self._archive[run.run_id] = run
+                del self._agents[agent_id]
             agent = Agent(
                 agent_id=agent_id,
                 name=f"subagent-{agent_id}",

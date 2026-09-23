@@ -1,0 +1,2 @@
+cell,harness,config,task,mode,run,hidden_passed,hidden_total,orch_cost_usd,orch_tokens_in,orch_tokens_out,orch_tokens_cache,orch_turns,worker_provider,worker_tokens_in,worker_tokens_out,worker_tokens_cache,worker_credits,worker_usd,counterfactual_usd,rounds,reviews,verified_pass,wall_s
+claude-config-0367aa72-cron-delegate-1,claude,config,cron,delegate,1,22,22,0.6809725999999999,,,,11,glm,70259,39062,1019328,,80.0,1.8375,1,1,True,1065

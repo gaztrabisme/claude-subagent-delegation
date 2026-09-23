@@ -1,0 +1,2 @@
+provider,vendor,runs,verified_passed,verified_rate,tokens_in,tokens_out,tokens_cache_read,tokens_cache_write,credits,provider_usd,api_equivalent_usd,counterfactual_usd,saving_usd,wall_p50,wall_p90,ttft_p50,rounds_per_delegation,guard_denials
+zai,,1,0,0.0,49681,28711,856000,0,0.0,,,1.39418,,736.89,736.89,9.436,,6

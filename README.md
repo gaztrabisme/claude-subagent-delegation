@@ -222,6 +222,23 @@ child runs to the parent Claude Code turns that issued them, and price both side
 uv run --group report python -m subagent.telemetry.cost --out ./cost-out
 ```
 
+## First measured cell (2026-09-23)
+
+The fused tool has its first measured benchmark cell: Claude Code (the `claude` harness) ran
+the cron task in delegate mode through a private config with GLM workers — one run, one worker
+round, one review, all 22 hidden acceptance tests passed — and the raw outputs are in
+[wiki/data/bench-2026-09-23/](wiki/data/bench-2026-09-23/). The worker's price is missing from
+the table on purpose: GLM is billed as a flat monthly plan, and the accounting spreads that
+month's plan over the runs recorded that month, so with a single run recorded the whole plan
+($80.0 in `results.csv`'s `worker_usd`) lands on this cell and is not comparable in a
+single-cell view. Counterfactual USD is what the same worker tokens would have cost on the
+orchestrator's own provider; the next step is the same measurement across the matrix over
+harnesses and self-hosted providers described in [docs/benchmark.md](docs/benchmark.md).
+
+| Orchestrator | Worker provider | Task | Hidden tests | Orchestrator USD | Worker tokens in/out/cache-read | Counterfactual USD | Rounds | Reviews | Wall |
+|---|---|---|---|---|---|---|---|---|---|
+| claude | glm | cron | 22/22 | $0.68 | 70259 / 39062 / 1019328 | $1.8375 | 1 | 1 | 1065s |
+
 ## Benchmark results (these numbers predate the fusion)
 
 Each task was run 3 times by Claude alone (`"Implement TASK.md"`) and 3 times with `/delegate`,

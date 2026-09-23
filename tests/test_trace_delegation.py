@@ -3,12 +3,16 @@
 A single `run --plan` is the smallest delegation that writes run records, so
 it is the unit: exactly one delegation record whose rounds[].usage sums equal
 the `run` records in the same trace, and (with the env var set) every record
-carries the bench harness's run id.
+carries the bench harness's run id. The setup runs (test writer, test review)
+are summed too, tagged with their phase.
 """
 
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+
+from subagent.loop.loop import _delegation_record, _run_block
 
 from .loop.helpers import Sandbox, for_drivers, need
 
@@ -74,6 +78,58 @@ class DelegationTrace(Sandbox):
         for rec in records:
             self.assertEqual(rec.get("bench_run_id"), "bench-42", rec["kind"])
             self.assertTrue(rec.get("delegation_id"), rec["kind"])
+
+
+def _block(run_id, provider, input_tokens, credits, provider_usd, phase=None):
+    """A `_run_block` for a stand-in run object with the facts the record sums."""
+    run = SimpleNamespace(
+        run_id=run_id,
+        lane=provider,
+        provider=provider,
+        usage=SimpleNamespace(as_dict=lambda: {"input": input_tokens}, credits=credits),
+        cost={"provider_usd": provider_usd, "counterfactual_usd": 1.0},
+    )
+    return _run_block(run, "m", phase=phase)
+
+
+class SetupRunsInTotals(unittest.TestCase):
+    """The test-writer and test-review runs carry the delegation id, so they
+    belong in the delegation totals alongside the implementation rounds."""
+
+    def _record(self, blocks=(), setup=()):
+        return _delegation_record(
+            mode="auto", status="done", stopped_because=None, changed_files=None,
+            wall_seconds=1, rounds=[], reviews=[], test_writer=None,
+            blocks=list(blocks), setup=list(setup),
+        )
+
+    def test_setup_blocks_feed_the_totals_and_carry_their_phase(self):
+        setup = [
+            _block("run-w", "glm", 100, 1.0, None, phase="test_writer"),
+            _block("run-r", "glm", 50, 0.5, None, phase="test_review"),
+        ]
+        record = self._record(setup=setup)
+        self.assertEqual(record["usage_total"]["input"], 150)
+        self.assertEqual(record["credits_total"], 1.5)
+        self.assertEqual([b["phase"] for b in record["setup"]],
+                         ["test_writer", "test_review"])
+
+    def test_setup_and_rounds_are_summed_together(self):
+        setup = [_block("run-w", "glm", 100, 1.0, 2.0, phase="test_writer")]
+        blocks = [_block("run-1", "glm", 200, 2.0, 4.0)]
+        record = self._record(blocks=blocks, setup=setup)
+        self.assertEqual(record["usage_total"]["input"], 300)
+        self.assertEqual(record["credits_total"], 3.0)
+        self.assertEqual(record["cost_total"]["provider_usd"], 6.0)
+        self.assertEqual(record["cost_total"]["counterfactual_usd"], 2.0)
+
+    def test_a_flat_plan_setup_run_leaves_the_recorded_provider_cost_null(self):
+        record = self._record(
+            blocks=[_block("run-1", "glm", 200, 0.0, None)],
+            setup=[_block("run-w", "glm", 100, 0.0, None, phase="test_writer")],
+        )
+        # USD never treats a null as zero: the spread happens at report time.
+        self.assertIsNone(record["cost_total"]["provider_usd"])
 
 
 for_drivers(DelegationTrace)

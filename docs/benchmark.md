@@ -163,6 +163,26 @@ bench/tasks/<name>/
 3. Validate them against a reference solution in a temporary copy (not in `repo/`).
 4. Run `python3 bench/run.py --harness claude --tasks <name>`.
 
+## Measured cells
+
+Cells measured with the fused tool. The first one (2026-09-23), one run of the cron task
+delegated by the claude harness to a GLM worker, cell id
+`claude-config-0367aa72-cron-delegate-1`:
+
+```sh
+uv run python bench/run.py --harness claude --config <config.toml with glm tiers> --tasks cron --modes delegate --runs 1 --timeout 5400 --out wiki/data/bench-2026-09-23
+```
+
+| Harness | Config | Task | Mode | Hidden tests | Orchestrator USD | Worker tokens in/out/cache-read | Counterfactual USD | Rounds | Reviews | Wall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| claude | config-0367aa72 | cron | delegate | 22/22 | $0.68 | 70259 / 39062 / 1019328 | $1.8375 | 1 | 1 | 1065s |
+
+One worker round, one review, all 22 hidden tests passed. The config itself is private (GLM
+workers, a deepseek reviewer); its `config-0367aa72` stem in the cell id identifies it in the
+bench output. The cell's outputs — `results.csv`, `summary.md`, `providers.csv`,
+`delegations.csv`, `dashboard.html` — are committed under
+[wiki/data/bench-2026-09-23/](../wiki/data/bench-2026-09-23/).
+
 ---
 
 ## Results before the fusion (2026-09-19)

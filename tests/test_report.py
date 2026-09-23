@@ -31,6 +31,7 @@ output = 25.0
 [providers.glm]
 driver = "claude"
 model = "glm-5.3-flash[1m]"
+vendor = "zai"
 
 [providers.glm.pricing]
 kind = "flat_plan"
@@ -147,9 +148,9 @@ def test_since_and_bench_run_filters(settings_env: None) -> None:
     assert len(bench.delegations) == 3
 
 
-def test_run_only_trace_has_null_usd(settings_env: None, tmp_path: Path) -> None:
-    """A trace of bare `run` records (no `cost`, no `delegation`) still builds,
-    with null USD columns."""
+def test_run_only_trace_is_priced_from_the_config(settings_env: None, tmp_path: Path) -> None:
+    """A trace of bare `run` records (no `cost`, no `delegation`) still builds:
+    the config's PricingSpec prices them even without a run-end `cost` dict."""
     run = {
         "schema": 3, "ts": 1789700100.0, "kind": "run",
         "run_id": "run-x", "agent_id": "a1", "session_id": "s1", "model": "m",
@@ -173,12 +174,63 @@ def test_run_only_trace_has_null_usd(settings_env: None, tmp_path: Path) -> None
     assert rep.runs == 1
     p = rep.providers[0]
     assert p["provider"] == "glm"
+    assert p["vendor"] == "zai"  # shown as a column, not used as the key
     assert p["runs"] == 1
     assert p["tokens_in"] == 1000
-    assert p["provider_usd"] is None
-    assert p["counterfactual_usd"] is None
-    assert p["api_equivalent_usd"] is None
+    assert p["provider_usd"] == pytest.approx(80.0)  # 1 run, 80/month spread
+    assert p["counterfactual_usd"] is None  # no `cost` dict, no counterfactual rates here
+    assert p["api_equivalent_usd"] == pytest.approx((1000 + 100 * 5.0) / 1e6)
     assert p["saving_usd"] is None
+
+
+def test_vendor_tagged_runs_group_under_the_provider_name(settings_env: None,
+                                                          tmp_path: Path) -> None:
+    """A run record tagged with the vendor (`zai`) keys under the provider named
+    `glm`, and the vendor is a column of the row."""
+    records = [json.loads(line) for line in FIXTURE.read_text().splitlines() if line.strip()]
+    vendor_tagged = dict(records[0])  # run-1's shape, re-tagged
+    vendor_tagged.update({"run_id": "run-z", "provider": "zai", "lane": "zai",
+                          "delegation_id": "del-9"})
+    trace = tmp_path / "vendor.jsonl"
+    trace.write_text("".join(json.dumps(r) + "\n" for r in [*records, vendor_tagged]),
+                     encoding="utf-8")
+
+    rep = report.build([trace], None, None)
+    by = {p["provider"]: p for p in rep.providers}
+    assert list(by) == ["glm", "omlx"]  # `zai` did not become its own row
+    assert by["glm"]["vendor"] == "zai"
+    assert by["glm"]["runs"] == 3  # run-1, run-2 and the vendor-tagged run-z
+    assert by["omlx"]["vendor"] == "none"  # the vendor derived for an undeclared provider
+
+
+def test_delegation_usd_falls_back_to_the_spread(settings_env: None, tmp_path: Path) -> None:
+    """A delegation whose recorded cost total is null (flat plan: the loop
+    cannot price it at run end) shows the report's spread instead."""
+    records = [json.loads(line) for line in FIXTURE.read_text().splitlines() if line.strip()]
+    for rec in records:
+        if rec.get("kind") == "delegation":
+            rec["cost_total"]["provider_usd"] = None
+    trace = tmp_path / "unpriced.jsonl"
+    trace.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+    rep = report.build([trace], None, None)
+    by = {d["delegation_id"]: d for d in rep.delegations}
+    # del-1's single glm run: half of the 80/month plan (two glm runs in the month).
+    assert by["del-1"]["provider_usd"] == pytest.approx(40.0)
+    assert by["del-2"]["provider_usd"] == pytest.approx(40.0)
+    assert by["del-3"]["provider_usd"] == pytest.approx(0.0)
+
+
+def test_provider_usd_falls_back_to_the_recorded_delegation_total(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no config pricing the provider, the recorded delegation totals are
+    shared over the runs they name, so the provider row is not null."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))  # no config at all
+    rep = report.build([FIXTURE], None, None)
+    by = {p["provider"]: p for p in rep.providers}
+    # del-1 and del-2 each recorded 40.0 for their single glm run.
+    assert by["glm"]["provider_usd"] == pytest.approx(80.0)
+    assert by["omlx"]["provider_usd"] == pytest.approx(0.0)
 
 
 def _numbers_in(obj: object):

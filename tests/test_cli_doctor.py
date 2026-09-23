@@ -51,6 +51,23 @@ def test_doctor_no_probe_does_not_fail_on_missing_binary(tmp_path, monkeypatch, 
     assert main(["doctor", "--no-probe"]) == 0
 
 
+def test_doctor_requires_a_provider(tmp_path, monkeypatch, capsys):
+    _set_config(monkeypatch, tmp_path / "empty.toml").write_text("")
+    assert main(["doctor", "--no-probe"]) == 1
+    captured = capsys.readouterr()
+    assert "error: no providers configured; run `subagent init`" in captured.err
+
+
+def test_doctor_json_requires_a_provider(tmp_path, monkeypatch, capsys):
+    _set_config(monkeypatch, tmp_path / "empty.toml").write_text("")
+    assert main(["doctor", "--no-probe", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "error": "no providers configured; run `subagent init`"
+    }
+    assert captured.err == ""
+
+
 def test_doctor_json(tmp_path, monkeypatch, fake_codex, capsys):
     binary = os.environ["SUBAGENT_TEST_CODEX_BIN"]
     _set_config(monkeypatch, tmp_path / "config.toml").write_text(_codex_cfg(binary))

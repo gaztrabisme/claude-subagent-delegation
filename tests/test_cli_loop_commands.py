@@ -34,10 +34,14 @@ def _project(tmp_path: Path) -> Path:
 
 
 def _agent_config(tmp_path: Path) -> Path:
-    """`[guard].supervisor = "agent"`: the supervisor is outside this process."""
+    """A configured provider and external supervisor for loop command tests."""
     path = tmp_path / "config.toml"
-    path.write_text('[guard]\nsupervisor = "agent"\nsupervisor_cmd = "subagent serve"\n',
-                    encoding="utf-8")
+    path.write_text(
+        '[core]\ndefault_provider = "codex"\n\n'
+        '[guard]\nsupervisor = "agent"\nsupervisor_cmd = "subagent serve"\n\n'
+        '[providers.codex]\ndriver = "codex"\n',
+        encoding="utf-8",
+    )
     return path
 
 
@@ -85,8 +89,10 @@ def test_read_only_commands_work_where_no_socket_is_possible(
         assert "test_cmd" in data  # detect
 
 
-def test_run_wait_review_still_start_the_server(tmp_path, capsys, home, stub_server):
+def test_run_wait_review_still_start_the_server(
+        tmp_path, monkeypatch, capsys, home, stub_server):
     root = _project(tmp_path)
+    monkeypatch.setenv(config.CONFIG_ENV, str(_agent_config(tmp_path)))
     assert main(["--root", str(root), "wait", "--timeout", "0"]) == 2
     assert stub_server == ["start", "stop"]  # started, and stopped on the way out
     assert json.loads(capsys.readouterr().out)["status"] == "no_run"
@@ -96,7 +102,12 @@ def test_the_read_only_handlers_still_see_the_settings(
         tmp_path, monkeypatch, capsys, home):
     """The stand-in carries `settings`, so `[loop]` config still reaches `detect`."""
     path = tmp_path / "config.toml"
-    path.write_text('[loop]\ntest_cmd = "echo ok"\n', encoding="utf-8")
+    path.write_text(
+        '[core]\ndefault_provider = "codex"\n\n'
+        '[loop]\ntest_cmd = "echo ok"\n\n'
+        '[providers.codex]\ndriver = "codex"\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv(config.CONFIG_ENV, str(path))
     root = _project(tmp_path)
     _forbid_the_socket(monkeypatch)
@@ -106,7 +117,23 @@ def test_the_read_only_handlers_still_see_the_settings(
     assert data["framework"] == "custom"
 
 
-def test_checkpoints_never_built_a_server(tmp_path, capsys, home, stub_server):
+def test_checkpoints_never_built_a_server(tmp_path, monkeypatch, capsys, home, stub_server):
     root = _project(tmp_path)
+    monkeypatch.setenv(config.CONFIG_ENV, str(_agent_config(tmp_path)))
     assert main(["--root", str(root), "checkpoints"]) == 0
     assert stub_server == []
+
+
+@pytest.mark.parametrize("command", ["detect", "run", "report"])
+def test_commands_require_a_provider(tmp_path, monkeypatch, capsys, home, command):
+    empty_config = tmp_path / "empty.toml"
+    empty_config.write_text("")
+    monkeypatch.setenv(config.CONFIG_ENV, str(empty_config))
+    root = _project(tmp_path)
+
+    args = [command] if command == "report" else ["--root", str(root), command]
+    if command == "run":
+        args += ["--plan", str(tmp_path / "missing-plan.md")]
+    assert main(args) == 1
+    captured = capsys.readouterr()
+    assert "error: no providers configured; run `subagent init`" in captured.err

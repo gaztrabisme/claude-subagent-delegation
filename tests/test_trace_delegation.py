@@ -15,8 +15,9 @@ from .loop.helpers import Sandbox, for_drivers, need
 TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
 
 
-def _read_trace(home: Path) -> list[dict]:
-    path = home / ".subagent" / "sessions" / "trace.jsonl"
+def _read_trace(session_root: Path) -> list[dict]:
+    # The sandbox config sets [core].session_root to <tmp>/sessions.
+    path = session_root / "trace.jsonl"
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
@@ -41,7 +42,7 @@ class DelegationTrace(Sandbox):
         self.assertEqual(code, 0)
         self.assertEqual(result["status"], "done")
 
-        records = _read_trace(self.tmp / "home")
+        records = _read_trace(self.tmp / "sessions")
         delegations = [rec for rec in records if rec["kind"] == "delegation"]
         self.assertEqual(len(delegations), 1)
         delegation = delegations[0]
@@ -65,7 +66,7 @@ class DelegationTrace(Sandbox):
         )
         self.assertEqual(code, 0)
 
-        records = _read_trace(self.tmp / "home")
+        records = _read_trace(self.tmp / "sessions")
         self.assertTrue(records)
         delegation = next(rec for rec in records if rec["kind"] == "delegation")
         self.assertEqual(delegation["orchestrator"],

@@ -102,6 +102,24 @@ def test_adopt_rejects_a_persisted_agent_home_that_does_not_match(registry, tmp_
     assert registry.find_agent(agent_id) is None
 
 
+def test_adopt_rejects_a_live_id_and_reopens_a_closed_one(registry, tmp_path: Path):
+    agent_id = "loop-123e4567-e89b-42d3-a456-426614174000"
+    record = {
+        "provider": "glm",
+        "agent_id": agent_id,
+        "agent_home": str(registry.settings.agent_home(agent_id)),
+    }
+    first = registry.adopt(record, workspace=tmp_path)
+    with pytest.raises(RegistryError, match="already registered"):
+        registry.adopt(record, workspace=tmp_path)
+    assert registry.find_agent(agent_id) is first
+
+    first.close("round done")
+    second = registry.adopt(record, workspace=tmp_path)
+    assert second is not first
+    assert registry.find_agent(agent_id) is second
+
+
 def test_child_argv_runs_the_guard_hook(tmp_path: Path, monkeypatch):
     """--bare skips hooks, so the guard never ran on a child call (report item 0)."""
     settings = make_settings(tmp_path, supervisor="agent")

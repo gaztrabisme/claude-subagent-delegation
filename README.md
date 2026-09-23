@@ -55,6 +55,8 @@ whatever `$SUBAGENT_CONFIG` names. Eight starter examples live in `examples/`.
 ```toml
 [core]
 default_provider = "glm"
+# Optional exact names for non-secret child variables, mainly for test harnesses.
+# child_env_passthrough = ["TEST_SCENARIO"]
 
 [providers.glm]
 driver = "claude"
@@ -71,6 +73,10 @@ subagent doctor                 # check every configured provider against this m
 `api_key_env` names the variable, never the value: keys live in the environment, not in the
 file. A provider can also carry `local = true`, `max_agents`, per-provider timeouts, an
 `adapter`, and `[providers.<name>.health]` / `.probe` / `.pricing` tables for local servers.
+Provider subprocesses inherit a small runtime environment. Use
+`[core].child_env_passthrough` only for exact non-secret names a child needs (primarily fake
+CLI controls in tests); names containing `KEY`, `TOKEN`, `SECRET`, or `PASSWORD` stay blocked
+even when listed.
 
 ## Providers
 

@@ -183,8 +183,12 @@ class CodexOrchestrator(Orchestrator):
     name = "codex"
 
     def argv(self, prompt: str, workspace: str, model: str | None = None) -> list[str]:
-        argv = ["codex", "exec", "--json", "-C", str(workspace), "-s", "workspace-write",
-                "--skip-git-repo-check"]
+        # danger-full-access, not workspace-write: Codex's sandbox forbids
+        # binding Unix sockets, so the `subagent run` inside the cell dies on
+        # the approval socket. The cell workspace is throwaway, so the bench
+        # gives up the sandbox rather than measure a cell that cannot delegate.
+        argv = ["codex", "exec", "--json", "-C", str(workspace),
+                "-s", "danger-full-access", "--skip-git-repo-check"]
         if model:
             argv += ["-m", model]
         return [*argv, prompt]
@@ -257,7 +261,10 @@ class GrokOrchestrator(Orchestrator):
     name = "grok"
 
     def argv(self, prompt: str, workspace: str, model: str | None = None) -> list[str]:
-        argv = ["grok", "-p", prompt, "--output-format", "json"]
+        # --sandbox off, for the same reason as codex's danger-full-access
+        # above: the sandbox forbids binding the approval socket, and the cell
+        # workspace is throwaway.
+        argv = ["grok", "-p", prompt, "--output-format", "json", "--sandbox", "off"]
         if model:
             argv += ["-m", model]
         return argv

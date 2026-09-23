@@ -75,6 +75,30 @@ The hidden tests are copied in only after the agent is done, so no mode can
 see them or tailor the code to them. They measure whether the result actually
 meets the spec in `TASK.md`.
 
+## Non-Claude orchestrators
+
+A cell has to let the orchestrator delegate, and the non-Claude orchestrators
+need two things the bench sets up per cell (recorded in the cell's
+`cell.json`):
+
+- **The skill.** Claude finds `/delegate` in `~/.claude/skills/delegate`; the
+  others only read project-local skills, so `bench/run.py` copies the repo's
+  `skills/delegate/` into the cell as `.agents/skills/delegate/` (`.grok/skills/delegate/`
+  for grok), which is where codex, gemini, copilot and grok look.
+- **The `subagent` binary.** The mode prompts have the orchestrator run
+  `subagent run …`, and the console script lives in this repo's `.venv/bin`,
+  so the cell's `PATH` gets that directory prepended.
+
+The sandbox flags are off too: Codex's `workspace-write` sandbox forbids
+binding Unix sockets, so every `subagent` call inside such a cell died with
+`RuntimeError: approval socket did not start` — the codex harness runs
+`-s danger-full-access` and grok runs `--sandbox off` (gemini and copilot have
+no sandbox flag). The cell workspace is throwaway, so the bench gives up the
+sandbox rather than measure a cell that cannot delegate. Correspondingly, the
+read-only `subagent` commands (`detect`, `test`, `undo`, `checkpoints`,
+`watch`) run without starting the in-process server and so never touch the
+approval socket; only `run`, `wait` and `review` bind it.
+
 ## Output
 
 `bench/results/<timestamp>/`:
@@ -87,6 +111,7 @@ meets the spec in `TASK.md`.
 | `summary.md` | means with (min–max) per group, then a per-cell table |
 | `dashboard.html` | `subagent report` over the cells' traces (skipped, with a log line, if the report fails) |
 | `<cell>/` | the cell's working copy: inspect with `git diff`, `sessions/` for traces |
+| `<cell>/cell.json` | what the cell was set up with: the skill copy and the `PATH` prepended |
 | `<cell>.<harness>.out` | the orchestrator's raw output |
 | `<cell>.hidden.txt` | hidden test output |
 

@@ -6,9 +6,12 @@ reports (`done` -> 0, `running` -> 3, anything else -> 2), except `watch`, which
 streams the live log. `init` writes a starter config from the examples in
 `examples/`; `doctor` checks the configured providers against this machine.
 
-Every loop command stands up an in-process server (Settings -> Registry ->
-Supervisor) so its workers run through the provider Registry, not a hand-built
-child process.
+The delegating loop commands (`run`, `wait`, `review`) stand up an in-process
+server (Settings -> Registry -> Supervisor) so their workers run through the
+provider Registry, not a hand-built child process. The read-only ones (`detect`,
+`test`, `undo`, `checkpoints`, `watch`) run without one: starting the server
+binds the approval socket, which they never use and which some homes forbid
+(a sandboxed orchestrator cell cannot bind Unix sockets at all).
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import sys
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from . import config
@@ -533,9 +537,25 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+# The loop commands whose workers need the in-process server, and so the
+# approval socket; the rest run against a bare settings stand-in.
+SERVER_COMMANDS = frozenset({"run", "wait", "review"})
+
+
 def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
                       root: Path, settings: Settings) -> int:
-    """Stand up the in-process server and run one loop command, printing its JSON."""
+    """Run one loop command, printing its JSON.
+
+    The read-only commands never see a server: they only read `settings` off
+    it, so a stand-in keeps them working where binding a socket is impossible.
+    """
+    handler = loop.LOOP_COMMANDS[command]
+    if command not in SERVER_COMMANDS:
+        result, code = handler(root, SimpleNamespace(settings=settings), args)
+        if result is not None:
+            print(json.dumps(result))
+        return code
+
     from .core import InProcessServer
 
     # A launcher only spawns the background child (and may wait on its state);
@@ -559,11 +579,8 @@ def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
                              approval_socket=str(approval_socket))
     server.start()
     try:
-        handler = loop.LOOP_COMMANDS[command]
         if command == "run":
             result, code = handler(root, server, args, raw)
-        elif command == "watch":
-            result, code = handler(root, server, args)
         else:
             result, code = handler(root, server, args)
         if result is not None:

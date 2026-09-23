@@ -20,6 +20,9 @@ from .conftest import default_providers, make_settings
 from .test_runs import FakeProcess, _wait
 
 COMMON = {"schema", "ts", "kind"}
+# Optional on every kind: the bench harness tags records with its run id, and
+# the loop tags them with the delegation they belong to.
+COMMON_OPTIONAL = {"bench_run_id", "delegation_id"}
 
 USAGE_KEYS = {"input", "output", "cache_read", "cache_write", "reasoning", "total", "steps",
               "turns"}
@@ -54,6 +57,16 @@ REQUIRED: dict[str, set[str]] = {
     "verdict": {"agent_id", "tool", "action", "tier", "escalated", "reason", "facts",
                 "latency_ms"},
     "calibration": {"run_id", "chars", "output_tokens", "observed", "assumed"},
+    "delegation": {
+        "orchestrator", "mode", "status", "rounds", "reviews", "usage_total",
+        "credits_total", "cost_total", "wall_seconds", "changed_files", "verified_pass",
+    },
+}
+
+# Fields a kind may also carry, never required.
+OPTIONAL: dict[str, set[str]] = {
+    "run": {"cost"},
+    "delegation": {"stopped_because", "test_writer"},
 }
 
 
@@ -81,6 +94,12 @@ def problems(record: dict[str, Any]) -> list[str]:
         if not isinstance(record.get("turns"), int) or not isinstance(record.get("continues"),
                                                                         int):
             found.append(f"{label}: turns/continues not integers")
+        cost = record.get("cost")
+        if cost is not None and (
+            not isinstance(cost, dict)
+            or not {"provider_usd", "counterfactual_usd", "kind", "note"} <= set(cost)
+        ):
+            found.append(f"{label}: cost shape {cost!r}")
     if kind == "turn":
         if not isinstance(record.get("tool_calls"), list):
             found.append(f"{label}: tool_calls is not a list")
@@ -92,11 +111,41 @@ def problems(record: dict[str, Any]) -> list[str]:
         or not isinstance(record.get("snapshot"), dict)
     ):
         found.append(f"{label}: run_ids/snapshot shape")
+    if kind == "delegation":
+        orchestrator = record.get("orchestrator")
+        if not isinstance(orchestrator, dict) or not {"harness", "model"} <= set(orchestrator):
+            found.append(f"{label}: orchestrator shape")
+        if not isinstance(record.get("rounds"), list) or not isinstance(record.get("reviews"), list):
+            found.append(f"{label}: rounds/reviews not lists")
+        if not isinstance(record.get("usage_total"), dict):
+            found.append(f"{label}: usage_total not a dict")
+        cost_total = record.get("cost_total")
+        if not isinstance(cost_total, dict) or set(cost_total) != {"provider_usd", "counterfactual_usd"}:
+            found.append(f"{label}: cost_total shape")
+        for i, round_ in enumerate(record.get("rounds") or []):
+            if not isinstance(round_, dict):
+                found.append(f"{label}: round {i} not a dict")
+                continue
+            if not isinstance(round_.get("usage"), dict):
+                found.append(f"{label}: round {i} usage not a dict")
+            round_cost = round_.get("cost")
+            if round_cost is not None and (
+                not isinstance(round_cost, dict)
+                or not {"provider_usd", "counterfactual_usd", "kind", "note"} <= set(round_cost)
+            ):
+                found.append(f"{label}: round {i} cost shape")
     return found
 
 
 def test_every_kind_has_a_schema():
     assert set(REQUIRED) == set(KINDS)
+
+
+def test_optional_keys_are_not_required():
+    for kind, optionals in OPTIONAL.items():
+        assert not (optionals & REQUIRED[kind]), f"{kind}: {optionals} overlaps REQUIRED"
+    for kind, required in REQUIRED.items():
+        assert COMMON_OPTIONAL.isdisjoint(required), f"{kind}: common-optional overlap"
 
 
 def _read(path: Path) -> list[dict[str, Any]]:

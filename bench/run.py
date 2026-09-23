@@ -3,7 +3,10 @@
 
 One cell per combination. Each cell copies the task's `repo/` fresh, commits
 it, and runs the orchestrator CLI (claude, codex, gemini, grok or copilot)
-with the prompt for the mode. The cell's environment carries
+with the prompt for the mode. A non-Claude cell also gets the delegate skill
+copied in where that orchestrator reads project skills, and the running venv's
+bin prepended to PATH so `subagent` resolves; both land in the cell's
+`cell.json`. The cell's environment carries
 `SUBAGENT_BENCH_RUN_ID=<cell id>`, `SUBAGENT_CONFIG=<derived config>` and
 `SUBAGENT_ORCHESTRATOR=<harness>`, and the derived config sets `[core].session_root`
 to a directory inside the cell, so delegation traces never interleave.
@@ -101,6 +104,62 @@ def run_capture(cmd, cwd, env, timeout):
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout or ""
         return (out if isinstance(out, str) else out.decode()), "", True
+
+
+# --- what a cell needs to delegate ------------------------------------------------
+
+# Where each orchestrator reads project skills from. Claude finds the delegate
+# skill in ~/.claude/skills/delegate, so its cells need no copy; the others
+# only look in project-local skill directories, which a fresh cell lacks.
+SKILL_ROOTS = {"codex": ".agents/skills", "gemini": ".agents/skills",
+               "copilot": ".agents/skills", "grok": ".grok/skills"}
+
+
+def install_skill(work: Path, harness_name: str) -> list[str]:
+    """Copy the repo's `skills/delegate/` into the cell, where the harness reads it.
+
+    The mode prompts tell the orchestrator to follow `skills/delegate/SKILL.md`;
+    without the copy a non-Claude orchestrator cannot find the skill at all.
+    Returns the installed locations, relative to the cell.
+    """
+    root = SKILL_ROOTS.get(harness_name)
+    if root is None:
+        return []
+    shutil.copytree(ROOT / "skills" / "delegate", work / root / "delegate")
+    return [f"{root}/delegate"]
+
+
+def venv_bin() -> str | None:
+    """The running venv's bin directory, when it holds the `subagent` script.
+
+    The mode prompts have the orchestrator run `subagent run …`, and the console
+    script lives in this repo's `.venv/bin`, not on a child's inherited PATH.
+    No `.resolve()`: the venv's `python` is a symlink into the base install, and
+    the script sits next to the symlink, not the target.
+    """
+    bin_dir = Path(sys.executable).parent
+    return str(bin_dir) if (bin_dir / "subagent").exists() else None
+
+
+def prepare_cell(work: Path, harness_name: str, cell: str) -> dict:
+    """Set a cell up to delegate: the skill copy and the venv's bin, in cell.json.
+
+    Written before the orchestrator runs, so a crashed cell still records what
+    it was given. Returned for `cell_env`.
+    """
+    setup = {"cell": cell, "skills": install_skill(work, harness_name),
+             "path_prepend": venv_bin()}
+    (work / "cell.json").write_text(json.dumps(setup, indent=2) + "\n", encoding="utf-8")
+    return setup
+
+
+def cell_env(base: dict, setup: dict) -> dict:
+    """`base` with the running venv's bin prepended to PATH, so the cell's
+    orchestrator resolves the `subagent` console script."""
+    env = dict(base)
+    if setup["path_prepend"]:
+        env["PATH"] = setup["path_prepend"] + os.pathsep + env.get("PATH", os.defpath)
+    return env
 
 
 def run_hidden_tests(task, work):
@@ -328,12 +387,13 @@ def run_one(harness_name: str, config_path: Path, task: str, mode: str, n: int,
        work)
 
     config = write_cell_config(config_path, work, work / "sessions")
-    env = {**os.environ,
-           "SUBAGENT_BENCH_RUN_ID": cell,
-           "SUBAGENT_CONFIG": str(config),
-           "SUBAGENT_ORCHESTRATOR": harness_name,
-           # No live-view windows during benchmark runs.
-           "DELEGATE_LIVE_VIEW": "off"}
+    setup = prepare_cell(work, harness_name, cell)
+    env = cell_env({**os.environ,
+                    "SUBAGENT_BENCH_RUN_ID": cell,
+                    "SUBAGENT_CONFIG": str(config),
+                    "SUBAGENT_ORCHESTRATOR": harness_name,
+                    # No live-view windows during benchmark runs.
+                    "DELEGATE_LIVE_VIEW": "off"}, setup)
 
     argv = orch.argv(prompts(harness_name)[mode], str(work), model)
     started = time.time()
@@ -367,7 +427,7 @@ def run_one(harness_name: str, config_path: Path, task: str, mode: str, n: int,
         **fields,
         "wall_s": wall,
     }
-    print(f"done {cell_id}: hidden {row['hidden_passed']}/{row['hidden_total']}, "
+    print(f"done {cell}: hidden {row['hidden_passed']}/{row['hidden_total']}, "
           f"cost {row['orch_cost_usd']}, credits {row['worker_credits']}, {wall}s", flush=True)
     return row
 

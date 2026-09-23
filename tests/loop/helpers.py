@@ -93,9 +93,13 @@ class Sandbox(unittest.TestCase):
             "[core]",
             "default_provider = \"fake\"",
             "run_timeout = 60",
+            f'session_root = "{self.tmp / "sessions"}"',
+            ('child_env_passthrough = ["FAKE_SCRIPT", "FAKE_MODEL", "FAKE_PROMPT", '
+             '"FAKE_FAIL_MODEL", "AUTO_SCENARIO", "OUT", "REVIEWER", "TR"]'),
             "",
             "[guard]",
             "supervisor = \"deterministic\"",
+            f'approval_socket = "{self.tmp / "approval.sock"}"',
             "",
             "[providers.fake]",
             "driver = \"copilot\"",

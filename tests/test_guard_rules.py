@@ -169,6 +169,39 @@ def test_any_token_naming_refs_subagent_is_denied(ws, ctx):
     assert verdict.action == DENY, verdict.reason
 
 
+def test_file_tools_deny_checkpoint_refs_and_worktree_metadata(ws, ctx):
+    git_dir = ws / ".git"
+    for rel in (
+        "refs/subagent/checkpoints/existing-id",
+        "worktrees/linked-worktree/gitdir",
+    ):
+        target = git_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for tool, payload in (
+            ("Write", {"file_path": str(target)}),
+            ("Edit", {"file_path": str(target)}),
+            ("MultiEdit", {"edits": [{"file_path": str(target)}]}),
+            ("NotebookEdit", {"path": str(target)}),
+        ):
+            verdict = classify(tool, payload, ws, context=ctx)
+            assert verdict.action == DENY, (tool, rel, verdict.reason)
+            assert "git" in verdict.reason.lower()
+
+
+def test_file_tools_resolve_worktree_gitdir_before_protecting_refs(ws, ctx, tmp_path):
+    common = tmp_path / "common.git"
+    worktree_git = common / "worktrees" / "project"
+    worktree_git.mkdir(parents=True)
+    (worktree_git / "commondir").write_text("../..\n")
+    (ws / ".git").write_text(f"gitdir: {worktree_git}\n")
+    target = common / "refs" / "subagent" / "checkpoints" / "checkpoint-id"
+    target.parent.mkdir(parents=True)
+
+    verdict = classify("Write", {"file_path": str(target)}, ws, context=ctx)
+    assert verdict.action == DENY, verdict.reason
+    assert "git" in verdict.reason.lower()
+
+
 # --- reads and ordinary writes are untouched ----------------------------------
 
 

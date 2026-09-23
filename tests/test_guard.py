@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -323,9 +322,13 @@ def test_read_of_a_secret_is_denied(ws):
 
 
 @pytest.fixture
-def home_ws() -> Path:
+def home_ws(tmp_path: Path, monkeypatch) -> Path:
     """A workspace one level under $HOME, so `..` escapes reach ~/.ssh."""
-    root = Path(tempfile.mkdtemp(dir=Path.home(), prefix=".sam-test-")).resolve()
+    home = tmp_path / "fake-home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    root = home / ".sam-test"
+    root.mkdir()
     (root / "sub").mkdir()
     yield root
     (root / "sub").rmdir()

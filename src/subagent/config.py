@@ -364,6 +364,9 @@ class Settings:
     run_archive: int = 200
     trace: str | None = None
     compact_window: int = 1_000_000
+    # Explicit non-secret variables for provider subprocesses, primarily test
+    # harness controls. Secret-looking names are still rejected below.
+    child_env_passthrough: tuple[str, ...] = ()
     # Transient rate limits (HTTP 429/529) are retried with exponential
     # backoff: backoff * 2**attempt, capped at 300s.
     rate_limit_retries: int = 3
@@ -433,6 +436,22 @@ class Settings:
         declared = {n for cfg in self.providers.values() for n in cfg.api_key_envs}
         return (*sorted(declared), *FIXED_LEAKED_KEYS)
 
+    def base_child_env(self) -> dict[str, str]:
+        """Runtime allowlist plus explicitly configured non-secret child variables.
+
+        `[core].child_env_passthrough` is intended mainly for test harnesses
+        that drive fake provider CLIs. Names containing KEY, TOKEN, SECRET or
+        PASSWORD are excluded even when explicitly listed.
+        """
+        allowed = {"PATH", "HOME", "LANG", "TERM", "TMPDIR", *self.child_env_passthrough}
+        return {
+            name: value
+            for name, value in os.environ.items()
+            if value is not None
+            and (name in allowed or name.startswith("LC_"))
+            and not any(marker in name.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+        }
+
     def hooks_config(
         self, agent_id: str, cfg: ProviderConfig | None = None, model: str | None = None
     ) -> Path:
@@ -489,11 +508,9 @@ class Settings:
         """
         cfg = cfg or self.provider()
         model = model or cfg.model or ""
-        env = {k: v for k, v in os.environ.items() if v is not None}
-        # The server's own copies of every provider's key; the child gets
-        # exactly one, as ANTHROPIC_AUTH_TOKEN, because Claude Code needs it.
-        for leaked in self.leaked_keys:
-            env.pop(leaked, None)
+        # Start from the runtime allowlist; provider credentials are added only
+        # below after mapping the selected provider's key to Claude's name.
+        env = self.base_child_env()
         key = cfg.api_key() or ""
         env.update({
             "CLAUDE_CONFIG_DIR": str(self.agent_home(agent_id)),
@@ -635,6 +652,7 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
         run_archive=int(_int(core, "run_archive", 200)),
         trace=_str(core, "trace", None),
         compact_window=int(defaults["compact_window"]),
+        child_env_passthrough=_strings(core, "child_env_passthrough"),
         rate_limit_retries=int(_int(core, "rate_limit_retries", 3, positive=False)),
         rate_limit_backoff=float(_num(core, "rate_limit_backoff", 5.0)),
         throttle_backoff=float(_num(core, "throttle_backoff", 60.0)),

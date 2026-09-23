@@ -1,6 +1,7 @@
 """Single worker rounds: test guard, runner test run, background runs, undo, model fallback."""
 
 import json
+import time
 import unittest
 
 from .helpers import Sandbox, for_drivers, need
@@ -80,6 +81,36 @@ class BackgroundAndUndo(Sandbox):
         self.assertEqual(busy["status"], "busy")
         code, running = self.delegate("wait", "--timeout", "1", cwd=root)
         self.assertEqual((code, running["status"]), (3, "running"))
+        code, done = self.delegate("wait", "--timeout", "60", cwd=root)
+        self.assertEqual((code, done["status"]), (0, "done"))
+
+    def test_background_child_uses_its_own_socket_with_configured_parent_path(self):
+        root = self.node_project()
+        configured = self.tmp / "shared-approval.sock"
+        config_text = self.config.read_text()
+        self.config.write_text(config_text.replace(
+            f'approval_socket = "{self.tmp / "approval.sock"}"',
+            "approval_socket = " + json.dumps(str(configured)),
+        ))
+
+        code, started = self.delegate(
+            "run", "--plan", ".subagent/PLAN.md", "--background", cwd=root, scenario="slow"
+        )
+        self.assertIsInstance(started, dict, started)
+        self.assertEqual((code, started["status"]), (0, "started"))
+        session_root = self.tmp / "sessions"
+        deadline = time.monotonic() + 4
+        child_sockets = []
+        while time.monotonic() < deadline:
+            child_sockets = list(session_root.glob("a[0-9a-f]*"))
+            if child_sockets:
+                break
+            time.sleep(0.05)
+
+        self.assertFalse(configured.exists())
+        runner_logs = list((root / ".subagent" / "logs").glob("runner-*.out"))
+        log_tail = runner_logs[-1].read_text()[-2000:] if runner_logs else "no runner log"
+        self.assertEqual(len(child_sockets), 1, log_tail)
         code, done = self.delegate("wait", "--timeout", "60", cwd=root)
         self.assertEqual((code, done["status"]), (0, "done"))
 

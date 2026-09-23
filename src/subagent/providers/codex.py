@@ -374,10 +374,8 @@ def codex_argv(
 
 
 def codex_env(settings: Settings, agent_id: str, home: Path) -> dict[str, str]:
-    """Environment for one codex child: this server's keys removed, CODEX_HOME per agent."""
-    env = {k: v for k, v in os.environ.items() if v is not None}
-    for leaked in settings.leaked_keys:
-        env.pop(leaked, None)
+    """Environment for one codex child, with an isolated per-agent CODEX_HOME."""
+    env = settings.base_child_env()
     env.update({
         "CODEX_HOME": str(home),
         "SUBAGENT_APPROVAL_SOCKET": settings.approval_socket,

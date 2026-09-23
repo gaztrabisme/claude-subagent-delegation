@@ -1536,10 +1536,8 @@ class Registry:
     ) -> Agent:
         """Reopen an Agent from a session record (the loop's `--continue`).
 
-        The recorded id is reused as-is — the loop mints ids as `loop-<uuid>`,
-        so they never collide with `_claim_agent_id`'s `a<n>-<tag>`. The
-        recorded session id and agent home are reopened, not recreated; adopt
-        itself never mkdirs.
+        The recorded id and driver home are checked against the loop's opaque
+        UUID namespace before the recorded session is reopened.
         """
         provider_name = record.get("provider")
         chosen = self.settings.providers.get(provider_name)
@@ -1548,30 +1546,66 @@ class Registry:
                 f"session record names provider {provider_name!r}, which is not declared"
             )
         agent_id = record.get("agent_id")
-        if not agent_id:
-            raise RegistryError("session record has no agent_id")
+        if not isinstance(agent_id, str) or not agent_id.startswith("loop-"):
+            raise RegistryError("session record agent_id must match loop-<uuid4>")
+        try:
+            parsed_id = uuid.UUID(agent_id.removeprefix("loop-"))
+        except (ValueError, AttributeError):
+            parsed_id = None
+        if parsed_id is None or parsed_id.version != 4 or str(parsed_id) != agent_id[5:]:
+            raise RegistryError(f"session record agent_id {agent_id!r} must match loop-<uuid4>")
+
+        if chosen.driver == "claude":
+            expected_home = self.settings.agent_home(agent_id)
+        elif chosen.driver == "codex":
+            expected_home = self.settings.session_root / "agents" / agent_id / "codex-home"
+        else:
+            expected_home = None
+        recorded_home = record.get("agent_home")
+        if expected_home is None:
+            if recorded_home not in (None, ""):
+                raise RegistryError(
+                    f"session record agent_home {recorded_home!r} is not expected for {chosen.driver}"
+                )
+        else:
+            try:
+                home_matches = (
+                    isinstance(recorded_home, str)
+                    and Path(recorded_home).expanduser().resolve() == expected_home.resolve()
+                )
+            except (OSError, RuntimeError, ValueError):
+                home_matches = False
+            if not home_matches:
+                raise RegistryError(
+                    f"session record agent_home {recorded_home!r} does not match expected {expected_home}"
+                )
+        agents_root = (self.settings.session_root / "agents").resolve()
+        if expected_home is not None and not expected_home.resolve().is_relative_to(agents_root):
+            raise RegistryError(f"expected agent_home {expected_home} escapes the agents directory")
         fallback = record.get("fallback") or "none"
-        agent = Agent(
-            agent_id=agent_id,
-            name=f"subagent-{agent_id}",
-            workspace=workspace or self.settings.workspace,
-            model=record.get("model") or chosen.model or "",
-            settings=self.settings,
-            trace=self.trace,
-            cfg=chosen,
-            fallback=fallback,
-            chain=self.settings.chain(chosen.name, fallback),
-            lane_state=self.lane_state,
-            provider_load=self._provider_load,
-            telemetry=self.telemetry,
-            on_event=on_event,
-        )
-        session_id = record.get("session_id")
-        if session_id:
-            # The authoritative resume id: `_spawn` re-applies it to the
-            # driver's session on the first continue, after boot has run.
-            agent.session_id = session_id
         with self._lock:
+            if agent_id in self._agents:
+                raise RegistryError(f"session record agent_id {agent_id!r} is already registered")
+            agent = Agent(
+                agent_id=agent_id,
+                name=f"subagent-{agent_id}",
+                workspace=workspace or self.settings.workspace,
+                model=record.get("model") or chosen.model or "",
+                settings=self.settings,
+                trace=self.trace,
+                cfg=chosen,
+                fallback=fallback,
+                chain=self.settings.chain(chosen.name, fallback),
+                lane_state=self.lane_state,
+                provider_load=self._provider_load,
+                telemetry=self.telemetry,
+                on_event=on_event,
+            )
+            session_id = record.get("session_id")
+            if session_id:
+                # The authoritative resume id: `_spawn` re-applies it to the
+                # driver's session on the first continue, after boot has run.
+                agent.session_id = session_id
             self._agents[agent_id] = agent
         return agent
 

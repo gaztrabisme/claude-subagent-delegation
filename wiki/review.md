@@ -80,6 +80,7 @@ Reviewed the requested README, delegate skill, full example config, and implemen
 Reproduction: with context `{"protected": [], "state_allow": [".subagent/result.json"]}`, classify `Write` to `<workspace>/.git/refs/subagent/checkpoints/<existing-id>`; the path is inside the workspace and the verdict is allow. The equivalent `git update-ref ... refs/subagent/...` shell command is denied.
 
 Suggested fix: apply the refs rule to every write surface, including file tools, and resolve the repository's actual gitdir before checking paths (worktrees may use a `.git` file).
+Outcome: fixed (src/subagent/guard/classify.py:463)
 
 No separate repro was found for the reviewed case-folding, resolved-symlink, literal heredoc, inline `python -c`, or shell git-plumbing checks. The direct file-tool gap above is the concrete exception.
 
@@ -92,6 +93,7 @@ Adoption neither rejects an ID already in the registry nor validates its path co
 Reproduction: call `adopt()` twice with the same declared provider and `agent_id`; the second `self._agents[agent_id] = agent` replaces the first. For path escape, adopt a record with `agent_id="../../outside"`; `agent_home()` resolves outside `session_root` and creates the resulting provider home on boot.
 
 Suggested fix: accept only validated opaque IDs, require resolved homes to remain under the agents root, reject live ID collisions, and verify any recorded home instead of deriving it from unchecked input.
+Outcome: fixed (src/subagent/runs.py:1549)
 
 **MED — parallel mode turns an agent limit into a runner crash and leaked worktrees.** [`loop.py:599`](../src/subagent/loop/loop.py#L599), [`loop.py:611`](../src/subagent/loop/loop.py#L611), [`loop.py:620`](../src/subagent/loop/loop.py#L620), [`runs.py:1498`](../src/subagent/runs.py#L1498)
 
@@ -108,6 +110,7 @@ The parent and respawned CLI child load the same explicit `[guard].approval_sock
 Reproduction: set a fixed `approval_socket`, run `subagent run --background`, and let the parent return; inspect the configured socket path before the child finishes. Parent cleanup removes it even though the child listener is active on the now-unlinked socket inode.
 
 Suggested fix: allocate a per-process socket path for every server regardless of config, or transfer socket ownership to the child and make cleanup inode/owner-aware.
+Outcome: fixed (src/subagent/cli.py:554)
 
 **No finding: `pre_verify` ordering on normal completion, cancellation, timeout, and kill.** `Agent._execute()` calls `_run_pre_verify()` after `_turn()` returns and before it checks terminal/cancel state or starts verification ([`runs.py:879`](../src/subagent/runs.py#L879)); the timeout path kills the child before `_turn()` returns. The loop also releases the test guard on its exception safety path. I found no sequence in these paths where verification runs against the still-locked test tree.
 
@@ -120,6 +123,8 @@ All these child environments start as a copy of `os.environ` and remove only con
 Reproduction: launch with `AWS_SECRET_ACCESS_KEY=sentinel`, configure only a provider key such as `GLM_API_KEY`, and run a workspace script containing `print(os.environ.get("AWS_SECRET_ACCESS_KEY"))`. The configured key is stripped/remapped, but the sentinel remains in the child environment and prints. This follows from the child-env construction even without a network call.
 
 Suggested fix: construct child environments from an allowlist of required runtime variables and explicit provider auth, rather than inheriting the server's full environment.
+Outcome: fixed (src/subagent/config.py:437)
+Regression follow-up: fake CLI controls and record paths are listed by test fixtures via `[core].child_env_passthrough`; the setting is documented in `README.md`, while secret-shaped names remain filtered.
 
 **MED — Copilot's documented loop exception is never set by the loop.** [`copilot.py:247`](../src/subagent/providers/copilot.py#L247), [`copilot.py:255`](../src/subagent/providers/copilot.py#L255), [`loop.py:158`](../src/subagent/loop/loop.py#L158)
 
@@ -172,6 +177,7 @@ The HTML report safely embeds JSON against a literal `</script>` close, and tabl
 Reproduction: put provider name `</text><image href=x onerror=alert(1) />` in a trace, run `subagent report --trace malicious.jsonl --html report.html`, and open the report. `JSON.parse()` restores the string, `drawBars()` concatenates it into the `<text>` label, and the SVG parser creates the injected image with an error handler.
 
 Suggested fix: build SVG nodes with `createElementNS()` and assign labels with `textContent`; do not interpolate trace strings into markup.
+Outcome: fixed (src/subagent/report.py:367)
 
 No finding: empty traces produce empty chart/table inputs, and the chart returns before division when labels are empty; provider rate aggregation groups only nonempty run sets, so its denominator is nonzero. Task text is not persisted into the report data path reviewed.
 

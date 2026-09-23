@@ -99,6 +99,12 @@
 
   function isNull(v) { return v === null || v === undefined; }
 
+  function esc(value) {
+    return String(value).replace(/[&<>"']/g, function (ch) {
+      return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[ch];
+    });
+  }
+
   function num(v, digits) { return isNull(v) ? "—" : Number(v).toFixed(digits); }
   function usd(v) { return isNull(v) ? "—" : "$" + Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
   function int(v) { return isNull(v) ? "—" : Number(v).toLocaleString(); }
@@ -221,7 +227,7 @@
       parts.push('<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) +
                  '" y2="' + y.toFixed(1) + '" stroke="' + getCss("--grid") + '" stroke-width="1"/>');
       parts.push('<text x="' + (padL - 6) + '" y="' + (y + 4).toFixed(1) + '" text-anchor="end" ' +
-                 'font-size="11" fill="' + getCss("--muted") + '">' + opts.format(yv) + "</text>");
+                 'font-size="11" fill="' + esc(getCss("--muted")) + '">' + esc(opts.format(yv)) + "</text>");
     }
     // bars
     var n = labels.length;
@@ -235,24 +241,24 @@
         var h = plotH * v / max;
         var x = cx - barW * series.length / 2 + si * barW;
         parts.push('<rect x="' + x.toFixed(1) + '" y="' + (padT + plotH - h).toFixed(1) +
-                   '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + s.color + '"/>');
+                   '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + esc(s.color) + '"/>');
       });
       parts.push('<text x="' + cx.toFixed(1) + '" y="' + (H - 20) + '" text-anchor="middle" ' +
-                 'font-size="11" fill="' + getCss("--fg") + '">' + labels[i] + "</text>");
+                 'font-size="11" fill="' + esc(getCss("--fg")) + '">' + esc(labels[i]) + "</text>");
     }
     // axis titles
     parts.push('<text x="' + (padL - 40) + '" y="' + 14 + '" text-anchor="middle" ' +
-               'font-size="11" fill="' + getCss("--muted") + '" transform="rotate(-90 ' + (padL - 40) + ' 14)">' +
-               opts.yLabel + "</text>");
+               'font-size="11" fill="' + esc(getCss("--muted")) + '" transform="rotate(-90 ' + (padL - 40) + ' 14)">' +
+               esc(opts.yLabel) + "</text>");
     parts.push('<text x="' + (padL + plotW / 2) + '" y="' + (H - 4) + '" text-anchor="middle" ' +
-               'font-size="11" fill="' + getCss("--muted") + '">' + opts.xLabel + "</text>");
+               'font-size="11" fill="' + esc(getCss("--muted")) + '">' + esc(opts.xLabel) + "</text>");
     // legend
     if (series.length > 1) {
       var lx = padL;
       series.forEach(function (s) {
-        parts.push('<rect x="' + lx + '" y="4" width="10" height="10" fill="' + s.color + '"/>');
-        parts.push('<text x="' + (lx + 14) + '" y="13" font-size="11" fill="' + getCss("--muted") +
-                   '">' + s.name + "</text>");
+        parts.push('<rect x="' + lx + '" y="4" width="10" height="10" fill="' + esc(s.color) + '"/>');
+        parts.push('<text x="' + (lx + 14) + '" y="13" font-size="11" fill="' + esc(getCss("--muted")) +
+                   '">' + esc(s.name) + "</text>");
         lx += 14 + s.name.length * 6.2 + 18;
       });
     }

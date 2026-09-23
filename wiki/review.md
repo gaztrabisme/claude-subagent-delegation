@@ -66,3 +66,151 @@ Not reviewed in depth: supervisor escalation queueing under many agents; the scr
 | U-B2 | MED | bppc lane | First request after the proxy's idle shutdown fails while the container cold-starts | first smoke run, backend "stopped" → run failed; not separable from U-B1 until U-B1 is fixed | FIXED 5294af8 against the mock; the owner's proxy already holds the first request up to 180 s; cold path not live-tested |
 
 | U-T1 | MED | Telemetry | A turn whose usage arrived only in stream events after a tool result was recorded as 0 | live GLM smoke: turn sum 8321 vs run 12315 | FIXED 7fd571c; live GLM smoke on 197c681: turns 12132 = run 12132 |
+
+## 2026-09-23 — fused tool review
+
+Reviewed the requested README, delegate skill, full example config, and implementation paths for providers, routing, run registry, guard, loop, telemetry, report, CLI/MCP, and benchmark. Findings below are source-traced. A probe script could not be staged because the command reviewer rejected `mkdir -p /tmp/review-ws` as not being on its read-only list; no tests were run. Existing regression coverage was inspected where relevant.
+
+### 1. Guard context and protected state
+
+**MED — direct file tools can overwrite the checkpoint refs that shell checks protect.** [`classify.py:1567`](../src/subagent/guard/classify.py#L1567), [`classify.py:1143`](../src/subagent/guard/classify.py#L1143), [`checkpoint.py:53`](../src/subagent/loop/checkpoint.py#L53)
+
+`_state_git_denial()` runs only from `classify_bash()`. A `Write`/`Edit` tool call instead checks protected tests and `.subagent/` and then reaches `classify_path_write()`. That function protects `.git/hooks` and `.git/config`, but not `.git/refs/subagent/`. In a normal checkout with a `.git` directory, a worker can overwrite `refs/subagent/checkpoints/<id>` with a file tool call; checkpoint restore then cannot resolve the saved ref, so the loop loses that undo point.
+
+Reproduction: with context `{"protected": [], "state_allow": [".subagent/result.json"]}`, classify `Write` to `<workspace>/.git/refs/subagent/checkpoints/<existing-id>`; the path is inside the workspace and the verdict is allow. The equivalent `git update-ref ... refs/subagent/...` shell command is denied.
+
+Suggested fix: apply the refs rule to every write surface, including file tools, and resolve the repository's actual gitdir before checking paths (worktrees may use a `.git` file).
+
+No separate repro was found for the reviewed case-folding, resolved-symlink, literal heredoc, inline `python -c`, or shell git-plumbing checks. The direct file-tool gap above is the concrete exception.
+
+### 2. Loop, Registry, and approval lifecycle
+
+**MED — `Registry.adopt()` trusts persisted IDs for both map keys and agent-home paths.** [`runs.py:1531`](../src/subagent/runs.py#L1531), [`runs.py:1574`](../src/subagent/runs.py#L1574), [`config.py:420`](../src/subagent/config.py#L420)
+
+Adoption neither rejects an ID already in the registry nor validates its path components. A second record with the same ID replaces the registered agent, while `Settings.agent_home()` joins the raw ID into `session_root/agents/` and provider boot writes under that path. A crafted `.subagent/session.json` resumed with `--continue` can therefore reuse another agent's home or use an ID such as `../../outside` to put that home outside the session root. Direct guard rules deny edits to that state file, but an allowed workspace script can modify it and the later continue trusts the record.
+
+Reproduction: call `adopt()` twice with the same declared provider and `agent_id`; the second `self._agents[agent_id] = agent` replaces the first. For path escape, adopt a record with `agent_id="../../outside"`; `agent_home()` resolves outside `session_root` and creates the resulting provider home on boot.
+
+Suggested fix: accept only validated opaque IDs, require resolved homes to remain under the agents root, reject live ID collisions, and verify any recorded home instead of deriving it from unchecked input.
+
+**MED — parallel mode turns an agent limit into a runner crash and leaked worktrees.** [`loop.py:599`](../src/subagent/loop/loop.py#L599), [`loop.py:611`](../src/subagent/loop/loop.py#L611), [`loop.py:620`](../src/subagent/loop/loop.py#L620), [`runs.py:1498`](../src/subagent/runs.py#L1498)
+
+`run_parallel()` launches one thread per task without limiting the count. With two manifest tasks and `max_agents = 1`, one `Worker.run_round()` can raise `RegistryError` in its thread; the thread never sets `w["run"]`, and the join loop later indexes that missing key. The top-level command records `runner_error`; worktree cleanup is below the failing access and is skipped.
+
+Reproduction: run a valid two-task `--parallel` manifest with `[core].max_agents = 1`; one worker starts and the other hits the registry cap, after which the run reports `KeyError: 'run'` and leaves worktree registrations behind.
+
+Suggested fix: validate parallel task count against available agent capacity before creating worktrees, and put per-worker result initialization plus worktree/guard cleanup in `finally` paths.
+
+**MED — a configured approval socket path breaks `run --background` after the parent exits.** [`supervisor.py:339`](../src/subagent/guard/supervisor.py#L339), [`supervisor.py:349`](../src/subagent/guard/supervisor.py#L349), [`loop.py:1109`](../src/subagent/loop/loop.py#L1109), [`cli.py:557`](../src/subagent/cli.py#L557)
+
+The parent and respawned CLI child load the same explicit `[guard].approval_socket`. The child unlinks and rebinds that pathname in `serve()`. The parent then reaches `server.stop()` and `cleanup()` unlinks the child's socket path. Subsequent hook calls fail closed because no socket is reachable, so the background worker cannot use guarded tools.
+
+Reproduction: set a fixed `approval_socket`, run `subagent run --background`, and let the parent return; inspect the configured socket path before the child finishes. Parent cleanup removes it even though the child listener is active on the now-unlinked socket inode.
+
+Suggested fix: allocate a per-process socket path for every server regardless of config, or transfer socket ownership to the child and make cleanup inode/owner-aware.
+
+**No finding: `pre_verify` ordering on normal completion, cancellation, timeout, and kill.** `Agent._execute()` calls `_run_pre_verify()` after `_turn()` returns and before it checks terminal/cancel state or starts verification ([`runs.py:879`](../src/subagent/runs.py#L879)); the timeout path kills the child before `_turn()` returns. The loop also releases the test guard on its exception safety path. I found no sequence in these paths where verification runs against the still-locked test tree.
+
+### 3. Provider drivers and secrets
+
+**HIGH — provider subprocesses inherit undeclared secrets from the server environment.** [`config.py:431`](../src/subagent/config.py#L431), [`config.py:492`](../src/subagent/config.py#L492), [`codex.py:376`](../src/subagent/providers/codex.py#L376), [`grok.py:138`](../src/subagent/providers/grok.py#L138)
+
+All these child environments start as a copy of `os.environ` and remove only configured `api_key_env` names plus a short fixed Claude list. Variables such as `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, or a provider key not declared in this config survive into the worker CLI. The worker can write and run a workspace script that reads `os.environ` and prints the value into its tool output; the model then receives the secret.
+
+Reproduction: launch with `AWS_SECRET_ACCESS_KEY=sentinel`, configure only a provider key such as `GLM_API_KEY`, and run a workspace script containing `print(os.environ.get("AWS_SECRET_ACCESS_KEY"))`. The configured key is stripped/remapped, but the sentinel remains in the child environment and prints. This follows from the child-env construction even without a network call.
+
+Suggested fix: construct child environments from an allowlist of required runtime variables and explicit provider auth, rather than inheriting the server's full environment.
+
+**MED — Copilot's documented loop exception is never set by the loop.** [`copilot.py:247`](../src/subagent/providers/copilot.py#L247), [`copilot.py:255`](../src/subagent/providers/copilot.py#L255), [`loop.py:158`](../src/subagent/loop/loop.py#L158)
+
+Copilot boot requires either global `allow_unguarded = true` or `cfg.extra["loop"]`; its comment says the delegate loop sets the latter. `Worker._make_agent()` passes the configured provider unchanged, and no loop path sets that extra. With the default guard setting, choosing Copilot for a loop worker fails at boot before the loop's own test/checkpoint protections can run. Turning on the global option also permits ordinary MCP Copilot delegation.
+
+Reproduction: configure Copilot as a loop tier with default `allow_unguarded = false`, then run a loop round using that tier; provider boot returns the unguarded-child error although this is the delegate loop.
+
+Suggested fix: pass a scoped loop capability into provider boot, without mutating shared config or broadening the MCP setting.
+
+No separate finding: Copilot mints a UUID session ID at boot and uses that same ID for `--session-id` and saved-session resume. The Grok driver removes the configured key variable and maps its configured value to `XAI_API_KEY`. Refusal classification passes the vendor into the router's vendor-specific rules. Codex translates one `turn.completed` usage object into one run result; the source and fixtures do not establish that resumed Codex usage is cumulative, so I am not reporting double counting as a defect.
+
+### 4. Configuration and initialization
+
+**MED — Claude providers without any key declaration load without a missing-key warning.** [`config.py:231`](../src/subagent/config.py#L231), [`config.py:604`](../src/subagent/config.py#L604), [`runs.py:871`](../src/subagent/runs.py#L871)
+
+`api_key_env` and literal `api_key` are optional in `_provider()`. The loader warns about an absent environment key only when `api_key_envs` is nonempty. A Claude provider with `base_url` and `model`, but neither auth field, therefore loads silently and fails only when a run reaches the late `needs_api_key` check.
+
+Reproduction: load a config with a Claude driver, reachable `base_url`, and model but no `api_key_env` or `api_key`; `load()` returns settings with no warning, then the first run fails with `missing API key ... (none configured)`.
+
+Suggested fix: validate required driver fields and warn or fail at load time when a key-required driver has no declared key source.
+
+No finding: the requested tier/review/test-writer provider names are checked against declarations by `_validate()`; config layering follows the documented user → project → `SUBAGENT_CONFIG` order; and `subagent init` writes key variable names/placeholders, not secret values ([`cli.py:128`](../src/subagent/cli.py#L128)).
+
+### 5. Telemetry and cost
+
+**MED — auto delegation totals omit test-writer and test-review runs that carry the same delegation ID.** [`loop.py:850`](../src/subagent/loop/loop.py#L850), [`loop.py:1031`](../src/subagent/loop/loop.py#L1031), [`loop.py:1067`](../src/subagent/loop/loop.py#L1067), [`loop.py:412`](../src/subagent/loop/loop.py#L412)
+
+`autopilot()` sets the trace delegation context before `_prepare_tests()`. The test writer and test reviewer therefore emit run records tagged with that delegation ID, and their credits are added to the returned `worker_credits`. However, `_delegation_record()` totals only `all_blocks` from implementation rounds and code reviews; setup runs are not returned as `_runs` and never enter that list. The delegation `usage_total`, `credits_total`, and `cost_total` consequently disagree with the run records (and with `worker_credits`). The early `tests_questioned` return writes an empty block list despite those setup runs.
+
+Reproduction: invoke `run --auto --test-outline ...`; compare tagged test-writer/test-review `run` records with the resulting `delegation` record. Their usage and credits appear in run records and returned `worker_credits`, but not in the delegation totals.
+
+Suggested fix: retain run blocks for setup workers/reviewers and include them in the same totals, with explicit phases so reports can distinguish them.
+
+**MED — flat-plan costs are spread per provider/month but never into delegation or bench totals.** [`cost.py:207`](../src/subagent/telemetry/cost.py#L207), [`cost.py:481`](../src/subagent/telemetry/cost.py#L481), [`loop.py:360`](../src/subagent/loop/loop.py#L360), [`report.py:313`](../src/subagent/report.py#L313)
+
+Run-end flat-plan cost is `None`. The provider report later allocates monthly plan cost across runs, but `_delegation_record()` sums the original run costs and returns `provider_usd: null` if any block is null. The delegation table and bench CSV therefore show no worker cost even while the provider table shows a nonzero allocated cost.
+
+Reproduction: configure one provider with `pricing.kind = "flat_plan"`, create a delegation with a run in the month, then compare provider and delegation report rows: provider cost is allocated; delegation cost remains null and `bench/run.py` converts it to no `worker_usd`.
+
+Suggested fix: apply one documented allocation policy before grouping both provider and delegation costs, or report allocated cost at both levels as unavailable.
+
+No finding: time-of-day handling is explicitly a peak/off-peak annotation, not a rate multiplier; the code does not claim to apply a discounted rate. Trace writes are locked within one `Trace` instance, and I found no concrete concurrent-cell `bench_run_id` bleed because benchmark cells run as separate processes with distinct environments.
+
+### 6. Report and dashboard
+
+**HIGH — provider names and delegation IDs reach SVG `innerHTML` without escaping.** [`report.py:367`](../src/subagent/report.py#L367), [`report_template.html:240`](../src/subagent/report_template.html#L240), [`report_template.html:259`](../src/subagent/report_template.html#L259), [`report_template.html:267`](../src/subagent/report_template.html#L267)
+
+The HTML report safely embeds JSON against a literal `</script>` close, and table cells use `textContent`. The chart path does not: provider names and delegation IDs are concatenated into SVG markup and assigned to `svg.innerHTML`. A malicious or externally supplied trace can therefore inject active SVG/HTML when a user opens the dashboard.
+
+Reproduction: put provider name `</text><image href=x onerror=alert(1) />` in a trace, run `subagent report --trace malicious.jsonl --html report.html`, and open the report. `JSON.parse()` restores the string, `drawBars()` concatenates it into the `<text>` label, and the SVG parser creates the injected image with an error handler.
+
+Suggested fix: build SVG nodes with `createElementNS()` and assign labels with `textContent`; do not interpolate trace strings into markup.
+
+No finding: empty traces produce empty chart/table inputs, and the chart returns before division when labels are empty; provider rate aggregation groups only nonempty run sets, so its denominator is nonzero. Task text is not persisted into the report data path reviewed.
+
+### 7. Benchmark and business case
+
+**MED — different config files can generate the same cell ID and collide on one workspace.** [`run.py:65`](../bench/run.py#L65), [`run.py:267`](../bench/run.py#L267), [`run.py:452`](../bench/run.py#L452)
+
+`cell_id` uses only `config_label()`, which returns the file stem. Two configs in different directories with the same stem produce identical cell IDs for the same harness/task/mode/run. The first `copytree()` target is reused; with `--jobs > 1` the workers race, and with serial jobs the later cell still raises `FileExistsError`.
+
+Reproduction: pass `--config /tmp/a/config.glm.toml /tmp/b/config.glm.toml` for the same task and run; both expand to the same output directory and `cell_id`.
+
+Suggested fix: include a stable hash of the resolved config path/content in the cell ID and all result filenames.
+
+**MED — `--from-report` ignores the report's measured wall time and verified rate fields.** [`report.py:267`](../src/subagent/report.py#L267), [`report.py:271`](../src/subagent/report.py#L271), [`report.py:281`](../src/subagent/report.py#L281), [`business_case.py:485`](../bench/business_case.py#L485), [`business_case.py:496`](../bench/business_case.py#L496)
+
+The report JSON emits `wall_p50` and `verified_rate`, while the business-case loader reads `wall_p50_s` and `verified_pass_rate`. Feeding the tool's own report JSON therefore silently skips measured throughput/parity inputs and keeps defaults, despite finding the requested provider rows.
+
+Reproduction: pass `subagent report --json` output to `bench/business_case.py --from-report`; inspect `report_overrides()`: values under the emitted field names are ignored.
+
+Suggested fix: align the report schema and consumer names, and reject or visibly warn when requested measured fields are absent.
+
+**MED — ROI is calculated for a fleet that cannot serve the declared demand.** [`business_case.py:297`](../bench/business_case.py#L297), [`business_case.py:417`](../bench/business_case.py#L417), [`business_case.py:430`](../bench/business_case.py#L430)
+
+With `hardware_count` fixed below `units_needed`, `capacity()` reports a nonzero shortfall but `model()` still prices that undersized fleet and computes break-even/ROI against the full cloud bill. A positive ROI can thus be shown for a local option that cannot handle the modeled workload.
+
+Reproduction: choose workload needing two units, set `hardware_count = 1`, and use cloud costs above the one-unit local cost; the output simultaneously reports a capacity shortfall and positive ROI.
+
+Suggested fix: mark ROI and break-even infeasible when installed capacity is below demand, or calculate the served workload and cloud remainder explicitly.
+
+**LOW — an agent-created hidden-test destination aborts the cell instead of producing a hidden-test result.** [`run.py:87`](../bench/run.py#L87), [`run.py:92`](../bench/run.py#L92), [`run.py:97`](../bench/run.py#L97)
+
+After the worker finishes, hidden tests are copied into fixed paths inside its workspace with `copytree()` and no collision handling. If a worker or task has created `_hidden_tests/` (Python) or `.hidden/` (Node), the copy raises; the future then aborts result collection rather than recording that hidden tests could not run.
+
+Reproduction: leave the corresponding reserved directory in the cell workspace before `run_hidden_tests()`; `shutil.copytree()` raises `FileExistsError`.
+
+Suggested fix: use a fresh external temp directory for the hidden suite and report copy/run failures as explicit failed cells.
+
+No finding: each orchestrator parser has a malformed-output test that returns a failed-cell result rather than raising on plain garbage. Business-case ROI sign formulas are consistent with the stated cash basis; the concrete arithmetic defect found is the capacity shortfall being ignored above. No additional time-of-day pricing defect was found.
+
+### Verdict
+
+**FAIL for unattended use on a developer's machine.** A worker subprocess receives undeclared environment secrets, the HTML dashboard can execute markup supplied by a trace, and direct file tools can corrupt the loop's checkpoint refs despite the shell guard. The Registry and background-socket lifecycle also have reproducible state/path and availability failures, while benchmark and accounting defects can silently produce misleading results. The test-release ordering and several reviewed parser/config paths appear sound, but these remaining issues are enough that unattended runs are not safe until the high-severity exposures and state-integrity gaps are closed.

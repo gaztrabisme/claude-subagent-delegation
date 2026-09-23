@@ -39,6 +39,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+from ..providers import copilot as copilot_driver
 from ..verify import run_verification
 from . import checkpoint, session
 from .common import (DEPENDENCY_DIRS, STATE_DIR, changed_between, git_prefix, hash_tree,
@@ -53,6 +54,18 @@ STATUS_EXIT = {"done": 0, "running": 3, "started": 0}
 
 # A failed run with no work done walks to the next candidate on these endings.
 FALLBACK_REASONS = {"no_lane", "refused", "auth", "cli_error"}
+
+
+def _new_loop_agent_id() -> str:
+    """A fresh agent id, registered as this loop's own.
+
+    Drivers with an unguarded-child gate (copilot) admit exactly these ids:
+    the loop wraps its children in its own test-file and checkpoint
+    protection, so it may run them where a plain MCP delegation may not.
+    """
+    agent_id = f"loop-{uuid.uuid4()}"
+    copilot_driver.allow_loop_agent(agent_id)
+    return agent_id
 
 
 # ---------------------------------------------------------------- tiers and prompts
@@ -158,7 +171,7 @@ class Worker:
     def _make_agent(self, provider, model, fallback):
         agent = self.registry.create_agent(
             None, self.root, provider=provider, model=model, fallback=fallback,
-            on_event=self._on_event(), agent_id=f"loop-{uuid.uuid4()}",
+            on_event=self._on_event(), agent_id=_new_loop_agent_id(),
         )
         agent.guard_context = self._guard_context()
         return agent
@@ -200,7 +213,9 @@ class Worker:
         self.model = record.get("model")
         if self.live is not None:
             self.live.write(f"=== model: {self.model or 'default'}")
+        # adopt validates the recorded id first; only then is it the loop's own.
         self.agent = self.registry.adopt(record, workspace=self.root, on_event=self._on_event())
+        copilot_driver.allow_loop_agent(self.agent.agent_id)
         self.agent.guard_context = self._guard_context()
         self.run = self.agent.follow_up(
             prompt, verification=self.test_cmd, pre_verify=self._release,
@@ -335,9 +350,13 @@ def _set_delegation_id(server, run_id):
         trace.set_context(delegation_id=run_id)
 
 
-def _run_block(run, model=None):
-    """The JSON-safe per-run facts a delegation record sums."""
-    return {
+def _run_block(run, model=None, phase=None):
+    """The JSON-safe per-run facts a delegation record sums.
+
+    `phase` marks a setup run (the test writer's or the test reviewer's), so
+    reports can tell it apart from the implementation rounds it precedes.
+    """
+    block = {
         "run_id": run.run_id,
         "provider": run.lane or run.provider,
         "model": model,
@@ -345,6 +364,9 @@ def _run_block(run, model=None):
         "credits": run.usage.credits,
         "cost": run.cost,
     }
+    if phase is not None:
+        block["phase"] = phase
+    return block
 
 
 def _usage_sum(usages):
@@ -358,6 +380,10 @@ def _usage_sum(usages):
 
 
 def _cost_sum(costs):
+    """The run-end costs, summed. A flat-plan run costs None at run end (its
+    month's fee is only spread at report time), so one such run leaves the
+    recorded provider_usd null; `subagent report` and the bench then allocate
+    it (report.worker_usd) instead of treating it as zero."""
     provider = [c.get("provider_usd") for c in costs if isinstance(c, dict)]
     counterfactual = sum(
         float(c.get("counterfactual_usd") or 0) for c in costs if isinstance(c, dict)
@@ -410,9 +436,16 @@ def _delegation_reviews(review, blocks):
 
 
 def _delegation_record(*, mode, status, stopped_because, changed_files, wall_seconds,
-                       rounds, reviews, test_writer, blocks):
-    """The schema-3 `delegation` record for one whole loop run."""
-    credits = [b.get("credits") for b in blocks if isinstance(b, dict) and b.get("credits") is not None]
+                       rounds, reviews, test_writer, blocks, setup=None):
+    """The schema-3 `delegation` record for one whole loop run.
+
+    `blocks` are the implementation and code-review runs; `setup` the
+    test-writer and test-review runs made before the first round. Both feed
+    the totals, so they agree with the `run` records written under the same
+    delegation id; `setup` carries its blocks too, tagged with their phase.
+    """
+    every = [b for b in [*blocks, *(setup or [])] if isinstance(b, dict)]
+    credits = [b.get("credits") for b in every if b.get("credits") is not None]
     return {
         "orchestrator": {
             "harness": os.environ.get("SUBAGENT_ORCHESTRATOR", "unknown"),
@@ -424,9 +457,10 @@ def _delegation_record(*, mode, status, stopped_because, changed_files, wall_sec
         "rounds": rounds,
         "reviews": reviews,
         "test_writer": test_writer,
-        "usage_total": _usage_sum([b.get("usage") for b in blocks if isinstance(b, dict)]),
+        "setup": setup or None,
+        "usage_total": _usage_sum([b.get("usage") for b in every]),
         "credits_total": round(sum(float(v) for v in credits), 2) if credits else None,
-        "cost_total": _cost_sum([b.get("cost") for b in blocks if isinstance(b, dict)]),
+        "cost_total": _cost_sum([b.get("cost") for b in every]),
         "wall_seconds": wall_seconds,
         "changed_files": changed_files,
         "verified_pass": status == "done",
@@ -791,11 +825,12 @@ def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None
     agent = None
     if previous_record and previous_record.get("agent_id"):
         agent = server.registry.adopt(previous_record, workspace=root, on_event=live.feed)
+        copilot_driver.allow_loop_agent(agent.agent_id)
         run = agent.follow_up(prompt, verification="true", on_event=live.feed, distill=False)
     else:
         agent = server.registry.create_agent(
             None, root, provider=target.provider, model=target.model, fallback="none",
-            on_event=live.feed, agent_id=f"loop-{uuid.uuid4()}",
+            on_event=live.feed, agent_id=_new_loop_agent_id(),
         )
         run = agent.delegate(prompt, "true", on_event=live.feed, distill=False)
     agent.guard_context = {"protected": [], "state_allow": [f"{STATE_DIR}/test_writer_result.json"]}
@@ -837,6 +872,7 @@ def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None
         "reverted_files": reverted or None,
         "worker_credits": round(run.usage.credits, 2) if run.usage.credits is not None else None,
         "log_tail": tail(log.read_text(errors="ignore"), 30) if status == "test_writer_error" else None,
+        "_runs": [_run_block(run, used, phase="test_writer")],
     }
     credits = f" · AI credits {run.usage.credits:.2f}" if run.usage.credits is not None else ""
     sink.write(f"{END_MARKER}: test writer {status} · {len(written)} files{credits}")
@@ -851,15 +887,20 @@ def _wrong_tests(review):
 
 
 def _prepare_tests(root, server, args):
-    """Outline mode: write the tests; then review them. Returns (hand_back_result | None, extras)."""
+    """Outline mode: write the tests; then review them. Returns (hand_back_result | None, extras).
+
+    `extras["blocks"]` are the setup runs (test writer, test review) tagged
+    with their phase; the delegation record sums them into its totals.
+    """
     plans = [args.plan] if args.plan else [t.get("plan") for t in (read_json(args.parallel) or {}).get("tasks", [])
                                            if t.get("plan")]
-    extras = {"test_writer": None, "test_review": None, "credits": []}
+    extras = {"test_writer": None, "test_review": None, "credits": [], "blocks": []}
     writer = None
     if args.test_outline:
         writer = write_tests_from_outline(root, server, args.test_outline, plans)
         extras["test_writer"] = writer
         extras["credits"].append(writer.get("worker_credits"))
+        extras["blocks"].extend(writer.get("_runs") or [])
         if writer["status"] not in ("done", "skipped"):
             return {"status": writer["status"], "summary": writer.get("error") or "the test writer failed",
                     "test_writer": writer}, extras
@@ -868,11 +909,13 @@ def _prepare_tests(root, server, args):
     review_plans = plans + ([args.test_outline] if args.test_outline else [])
     review = do_test_review(root, server, args.tier, review_plans)
     extras["credits"].append(review.get("worker_credits"))
+    extras["blocks"].extend(review.get("_runs") or [])
     wrong = _wrong_tests(review)
     if wrong and writer and writer["status"] == "done":
         # The generated tests may have transcription errors: one fix pass by the test writer.
         fix = write_tests_from_outline(root, server, args.test_outline, plans, issues=wrong)
         extras["credits"].append(fix.get("worker_credits"))
+        extras["blocks"].extend(fix.get("_runs") or [])
         writer["fix_pass"] = fix["status"]
         if fix.get("notes"):
             writer["notes"] = fix["notes"]
@@ -880,6 +923,7 @@ def _prepare_tests(root, server, args):
             # force: even if the fix pass changed nothing, the wrong tests must be checked again.
             review = do_test_review(root, server, args.tier, review_plans, force=True)
             extras["credits"].append(review.get("worker_credits"))
+            extras["blocks"].extend(review.get("_runs") or [])
             wrong = _wrong_tests(review)
     extras["test_review"] = review
     if wrong:
@@ -970,7 +1014,7 @@ def autopilot(root, server, args, run_id):
             mode="auto", status=hand_back.get("status"), stopped_because=None,
             changed_files=None, wall_seconds=round(time.time() - started),
             rounds=[], reviews=[], test_writer=_brief_writer(extras["test_writer"]),
-            blocks=[],
+            blocks=[], setup=extras["blocks"],
         ))
         return {k: v for k, v in hand_back.items() if v is not None}
 
@@ -1079,6 +1123,7 @@ def autopilot(root, server, args, run_id):
         reviews=[e for rev in reviews for e in _delegation_reviews(rev, rev.get("_runs") or [])],
         test_writer=result.get("test_writer"),
         blocks=all_blocks,
+        setup=extras["blocks"],
     ))
     return {k: v for k, v in result.items() if v is not None}
 
@@ -1304,7 +1349,7 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
         live.credits, live.last_message = None, ""
         agent = server.registry.create_agent(
             None, root, provider=provider, model=model, fallback="none",
-            on_event=live.feed, agent_id=f"loop-{uuid.uuid4()}",
+            on_event=live.feed, agent_id=_new_loop_agent_id(),
         )
         agent.guard_context = {
             "protected": [],

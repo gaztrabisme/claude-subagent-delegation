@@ -1,0 +1,2 @@
+delegation_id,bench_run_id,orchestrator,providers,status,rounds,reviews,tests,tokens,provider_usd,counterfactual_usd,wall_seconds,verified_pass
+20260923-231141-931b,claude-config-0367aa72-cron-delegate-1,"{""harness"": ""claude"", ""model"": null}","[""glm""]",done,1,1,0,1128649,,1.8375089999999998,966.0,True

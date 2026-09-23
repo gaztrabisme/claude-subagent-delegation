@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -43,6 +44,7 @@ for _path in (str(ROOT / "src"), str(BENCH)):
 import harness as bench_harness  # noqa: E402
 from harness import prompts  # noqa: E402
 
+from subagent import report as subagent_report  # noqa: E402
 from subagent.loop.detect import parse_test_counts  # noqa: E402
 
 DEFAULT_CONFIG = ROOT / "examples" / "config.glm.toml"
@@ -66,6 +68,23 @@ def config_label(path: Path) -> str:
     """`glm` from `examples/config.glm.toml`; the file stem for anything else."""
     stem = Path(path).stem
     return stem.split(".", 1)[1] if stem.startswith("config.") else stem
+
+
+def config_tag(path: Path) -> str:
+    """A stable short hash of one config's resolved path and content.
+
+    Cell ids and result filenames carry it: two configs in different
+    directories with the same stem (`/tmp/a/config.glm.toml` vs
+    `/tmp/b/config.glm.toml`) would otherwise expand to the same cell id and
+    race for one workspace.
+    """
+    resolved = Path(path).resolve()
+    digest = hashlib.sha256(str(resolved).encode())
+    try:
+        digest.update(resolved.read_bytes())
+    except OSError:
+        pass
+    return digest.hexdigest()[:8]
 
 
 def sh(cmd, cwd, **kw):
@@ -178,6 +197,32 @@ def read_delegations(cell: Path) -> list[dict]:
     return records
 
 
+def read_cell_records(cell: Path) -> tuple[list[dict], list[dict]]:
+    """The cell's `delegation` and `run` trace records (either may be empty).
+
+    The run records are priced through `report.worker_usd`, so a flat-plan
+    provider's spread reaches the CSV's `worker_usd` too.
+    """
+    delegations: list[dict] = []
+    runs: list[dict] = []
+    root = cell / "sessions"
+    if not root.is_dir():
+        return delegations, runs
+    for path in sorted(root.rglob("trace.jsonl")):
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("kind") == "delegation":
+                delegations.append(record)
+            elif record.get("kind") == "run":
+                runs.append(record)
+    return delegations, runs
+
+
 def _num(mapping, *names):
     """The first present, numeric key of `mapping` (delegation fields are in flux)."""
     if not isinstance(mapping, dict):
@@ -189,13 +234,19 @@ def _num(mapping, *names):
     return None
 
 
-def delegation_fields(records: list[dict]) -> dict:
-    """The worker-side CSV fields, summed over the cell's delegation records."""
+def delegation_fields(records: list[dict], runs: list[dict] | None = None,
+                      config_path: Path | None = None) -> dict:
+    """The worker-side CSV fields, summed over the cell's delegation records.
+
+    With the cell's config, `worker_usd` uses the report's allocation policy
+    (`report.worker_usd`): a flat-plan month's fee reaches the CSV spread over
+    the cell's runs. Without it, only the records' own totals count.
+    """
     if not records:
         return dict.fromkeys(NULL_COLUMNS)
     provider = None
     tokens = {"in": 0, "out": 0, "cache": 0}
-    credits = usd = counterfactual = 0.0
+    credits = counterfactual = 0.0
     rounds = reviews = 0
     verified = None
     for record in records:
@@ -209,12 +260,16 @@ def delegation_fields(records: list[dict]) -> dict:
             (_num(usage, "cache_write", "cache_creation_input_tokens") or 0)
         credits += _num(record, "credits_total") or 0
         cost = record.get("cost_total") or {}
-        usd += _num(cost, "provider_usd") or 0
         counterfactual += _num(cost, "counterfactual_usd") or 0
         rounds += len(record.get("rounds") or [])
         reviews += len(record.get("reviews") or [])
         if isinstance(record.get("verified_pass"), bool):
             verified = record["verified_pass"]
+    if config_path is not None:
+        usd = subagent_report.worker_usd(config_path, [*records, *(runs or [])])
+    else:
+        total = sum(_num(r.get("cost_total"), "provider_usd") or 0 for r in records)
+        usd = round(total, 4) if total else None
     return {
         "worker_provider": provider,
         "worker_tokens_in": tokens["in"] or None,
@@ -264,8 +319,8 @@ def run_one(harness_name: str, config_path: Path, task: str, mode: str, n: int,
             out_dir: Path, model: str | None, timeout: int) -> dict:
     """One matrix cell: run the harness, the hidden tests, read the delegations."""
     orch = bench_harness.get(harness_name)
-    cell_id = f"{harness_name}-{config_label(config_path)}-{task}-{mode}-{n}"
-    work = out_dir / cell_id
+    cell = cell_id((harness_name, config_path, task, mode, n))
+    work = out_dir / cell
     shutil.copytree(BENCH / "tasks" / task / "repo", work)
     sh(["git", "init", "-q"], work)
     sh(["git", "add", "-A"], work)
@@ -274,7 +329,7 @@ def run_one(harness_name: str, config_path: Path, task: str, mode: str, n: int,
 
     config = write_cell_config(config_path, work, work / "sessions")
     env = {**os.environ,
-           "SUBAGENT_BENCH_RUN_ID": cell_id,
+           "SUBAGENT_BENCH_RUN_ID": cell,
            "SUBAGENT_CONFIG": str(config),
            "SUBAGENT_ORCHESTRATOR": harness_name,
            # No live-view windows during benchmark runs.
@@ -284,18 +339,19 @@ def run_one(harness_name: str, config_path: Path, task: str, mode: str, n: int,
     started = time.time()
     stdout, stderr, _timed_out = run_capture(argv, work, env, timeout)
     wall = round(time.time() - started)
-    (out_dir / f"{cell_id}.{harness_name}.out").write_text(stdout)
+    (out_dir / f"{cell}.{harness_name}.out").write_text(stdout)
     if stderr.strip():
-        (out_dir / f"{cell_id}.stderr.txt").write_text(stderr)
+        (out_dir / f"{cell}.stderr.txt").write_text(stderr)
     parsed = orch.parse(stdout, stderr)
 
     counts, output = run_hidden_tests(task, work)
-    (out_dir / f"{cell_id}.hidden.txt").write_text(output)
-    delegations = delegation_fields(read_delegations(work))
+    (out_dir / f"{cell}.hidden.txt").write_text(output)
+    delegations, runs = read_cell_records(work)
+    fields = delegation_fields(delegations, runs, config_path=config)
 
     usage = parsed["usage"]
     row = {
-        "cell": cell_id,
+        "cell": cell,
         "harness": harness_name,
         "config": config_label(config_path),
         "task": task,
@@ -308,7 +364,7 @@ def run_one(harness_name: str, config_path: Path, task: str, mode: str, n: int,
         "orch_tokens_out": usage["output"] or None,
         "orch_tokens_cache": (usage["cache_read"] + usage["cache_write"]) or None,
         "orch_turns": parsed["turns"],
-        **delegations,
+        **fields,
         "wall_s": wall,
     }
     print(f"done {cell_id}: hidden {row['hidden_passed']}/{row['hidden_total']}, "
@@ -393,7 +449,8 @@ def cell_argv(cell) -> str:
 
 def cell_id(cell) -> str:
     harness, config, task, mode, n = cell
-    return f"{harness}-{config_label(config)}-{task}-{mode}-{n}"
+    # The config tag keeps two configs with the same stem on one workspace.
+    return f"{harness}-{config_label(config)}-{config_tag(config)}-{task}-{mode}-{n}"
 
 
 def main():

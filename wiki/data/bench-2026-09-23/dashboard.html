@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subagent report</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --panel: #f7f7f7;
+    --border: #e5e5e5;
+    --grid: #ececec;
+    --bar-1: #4f6d7a;
+    --bar-2: #c17c5a;
+    --bar-3: #7a8b5a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111213;
+      --fg: #e6e6e6;
+      --muted: #9ca3af;
+      --panel: #18191b;
+      --border: #2a2b2d;
+      --grid: #26272a;
+      --bar-1: #7fa3b3;
+      --bar-2: #d39a77;
+      --bar-3: #a3b383;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 1rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; margin: 1.75rem 0 .5rem; }
+  h3 { font-size: .95rem; margin: 1rem 0 .25rem; font-weight: 600; }
+  .meta { color: var(--muted); font-size: .85rem; margin-bottom: 1rem; }
+  .chart { width: 100%; height: auto; display: block; background: var(--panel);
+           border: 1px solid var(--border); border-radius: 6px; }
+  .scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; min-width: 46rem; font-size: .83rem; }
+  th, td { padding: .4rem .55rem; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; position: sticky; left: 0; background: var(--panel); }
+  thead th { background: var(--panel); color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:nth-child(even) td { background: var(--panel); }
+  tbody tr:nth-child(even) td:first-child { background: var(--panel); }
+  .num-null { color: var(--muted); }
+  .badge { display: inline-block; padding: 0 .4rem; border-radius: 3px; font-size: .78rem; }
+  .badge.done { background: #2e7d4f33; color: #2e7d4f; }
+  .badge.failed { background: #b3404033; color: #b34040; }
+  @media (prefers-color-scheme: dark) {
+    .badge.done { color: #7fd1a0; }
+    .badge.failed { color: #e39090; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>subagent report</h1>
+  <div class="meta" id="meta"></div>
+
+  <h2>Providers</h2>
+  <h3>Provider USD vs counterfactual</h3>
+  <svg class="chart" id="chart-usd" viewBox="0 0 640 280" role="img" aria-label="Provider USD versus counterfactual USD per provider"></svg>
+  <h3>Verified-pass rate</h3>
+  <svg class="chart" id="chart-pass" viewBox="0 0 640 240" role="img" aria-label="Verified-pass rate per provider"></svg>
+  <h3>Wall time p50</h3>
+  <svg class="chart" id="chart-wall" viewBox="0 0 640 240" role="img" aria-label="Wall time p50 per provider"></svg>
+  <div class="scroll"><table id="providers"></table></div>
+
+  <h2>Delegations</h2>
+  <h3>Tokens per delegation over time</h3>
+  <svg class="chart" id="chart-tokens" viewBox="0 0 640 240" role="img" aria-label="Tokens per delegation over time"></svg>
+  <div class="scroll"><table id="delegations"></table></div>
+</main>
+
+<script type="application/json" id="data">{"meta": {"generated": "2026-09-23T16:28:10.323050+00:00", "runs": 1, "delegations": 1, "counterfactual": null}, "providers": [{"provider": "zai", "vendor": null, "runs": 1, "verified_passed": 0, "verified_rate": 0.0, "tokens_in": 49681, "tokens_out": 28711, "tokens_cache_read": 856000, "tokens_cache_write": 0, "credits": 0.0, "provider_usd": null, "api_equivalent_usd": null, "counterfactual_usd": 1.39418, "saving_usd": null, "wall_p50": 736.89, "wall_p90": 736.89, "ttft_p50": 9.436, "rounds_per_delegation": null, "guard_denials": 6}], "delegations": [{"delegation_id": "20260923-231141-931b", "bench_run_id": "claude-config-0367aa72-cron-delegate-1", "orchestrator": {"harness": "claude", "model": null}, "providers": ["glm"], "status": "done", "rounds": 1, "reviews": 1, "tests": 0, "tokens": 1128649, "provider_usd": null, "counterfactual_usd": 1.8375089999999998, "wall_seconds": 966.0, "verified_pass": true, "ts": 1790180868.32}]}</script>
+<script>
+"use strict";
+(function () {
+  var data = JSON.parse(document.getElementById("data").textContent);
+  var providers = data.providers || [];
+  var delegations = data.delegations || [];
+  var meta = data.meta || {};
+  var colors = [getCss("--bar-1"), getCss("--bar-2"), getCss("--bar-3")];
+
+  function getCss(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  function isNull(v) { return v === null || v === undefined; }
+
+  function num(v, digits) { return isNull(v) ? "—" : Number(v).toFixed(digits); }
+  function usd(v) { return isNull(v) ? "—" : "$" + Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+  function int(v) { return isNull(v) ? "—" : Number(v).toLocaleString(); }
+  function pct(v) { return isNull(v) ? "—" : (Number(v) * 100).toFixed(0) + "%"; }
+  function wall(v) { return isNull(v) ? "—" : Number(v).toFixed(1) + "s"; }
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function renderMeta() {
+    var parts = [];
+    if (!isNull(meta.counterfactual)) parts.push("counterfactual model: " + meta.counterfactual);
+    if (!isNull(meta.runs)) parts.push(meta.runs + " runs");
+    if (!isNull(meta.delegations)) parts.push(meta.delegations + " delegations");
+    if (meta.generated) parts.push("generated " + meta.generated);
+    document.getElementById("meta").textContent = parts.join("  ·  ");
+  }
+
+  function renderProviders() {
+    var table = document.getElementById("providers");
+    var headers = ["Provider", "Runs", "Pass%", "Tokens in", "Tokens out", "Cache read",
+                   "Cache write", "Credits", "Provider USD", "Plan (API-equivalent) USD",
+                   "Counterfactual USD", "Saving USD", "Wall p50", "Wall p90", "TTFT p50",
+                   "Rounds/deleg.", "Guard denials"];
+    var thead = el("thead");
+    var hr = el("tr");
+    headers.forEach(function (h) { hr.appendChild(el("th", null, h)); });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    var tbody = el("tbody");
+    providers.forEach(function (p) {
+      var tr = el("tr");
+      var cells = [
+        p.provider, int(p.runs), pct(p.verified_rate), int(p.tokens_in), int(p.tokens_out),
+        int(p.tokens_cache_read), int(p.tokens_cache_write), num(p.credits, 0),
+        usd(p.provider_usd), usd(p.api_equivalent_usd), usd(p.counterfactual_usd),
+        usd(p.saving_usd), wall(p.wall_p50), wall(p.wall_p90), wall(p.ttft_p50),
+        num(p.rounds_per_delegation, 2), int(p.guard_denials),
+      ];
+      cells.forEach(function (text) { tr.appendChild(el("td", null, text)); });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+  }
+
+  function renderDelegations() {
+    var table = document.getElementById("delegations");
+    var headers = ["Delegation", "Bench run", "Orchestrator", "Provider(s)", "Status",
+                   "Rounds", "Reviews", "Tests", "Tokens", "USD", "CF USD", "Wall"];
+    var thead = el("thead");
+    var hr = el("tr");
+    headers.forEach(function (h) { hr.appendChild(el("th", null, h)); });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    var tbody = el("tbody");
+    delegations.forEach(function (d) {
+      var tr = el("tr");
+      var orch = d.orchestrator ? (d.orchestrator.model || d.orchestrator.harness || "—") : "—";
+      var first = el("td", null, d.delegation_id || "—");
+      var status = el("td");
+      status.appendChild(el("span", "badge " + (d.status || "unknown"), d.status || "—"));
+      var cells = [
+        d.bench_run_id || "—", orch, (d.providers || []).join(", "),
+      ];
+      tr.appendChild(first);
+      tr.appendChild(el("td", null, cells[0]));
+      tr.appendChild(el("td", null, cells[1]));
+      tr.appendChild(el("td", null, cells[2]));
+      tr.appendChild(status);
+      tr.appendChild(el("td", null, int(d.rounds)));
+      tr.appendChild(el("td", null, int(d.reviews)));
+      tr.appendChild(el("td", null, int(d.tests)));
+      tr.appendChild(el("td", null, int(d.tokens)));
+      tr.appendChild(el("td", null, usd(d.provider_usd)));
+      tr.appendChild(el("td", null, usd(d.counterfactual_usd)));
+      tr.appendChild(el("td", null, wall(d.wall_seconds)));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+  }
+
+  // --- hand-rolled SVG bar charts ------------------------------------------------
+
+  function niceMax(v) {
+    if (!isFinite(v) || v <= 0) return 1;
+    var mag = Math.pow(10, Math.floor(Math.log10(v)));
+    var step = v / mag;
+    var nice = step <= 1 ? 1 : step <= 2 ? 2 : step <= 5 ? 5 : 10;
+    return nice * mag;
+  }
+
+  function compact(v) {
+    if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + "k";
+    return String(Math.round(v));
+  }
+
+  function drawBars(id, labels, series, opts) {
+    var svg = document.getElementById(id);
+    if (!labels.length) { svg.textContent = ""; return; }
+    var W = 640, H = Number(svg.getAttribute("viewBox").split(" ")[3]) || 240;
+    var padL = 52, padR = 16, padT = 18, padB = 46;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var max = niceMax(Math.max.apply(null, series.map(function (s) {
+      return Math.max.apply(null, s.values.map(function (v) { return isNull(v) ? 0 : v; }));
+    })));
+    var ticks = 4;
+    var parts = [];
+    // grid + y labels
+    for (var t = 0; t <= ticks; t++) {
+      var yv = max * t / ticks;
+      var y = padT + plotH - plotH * t / ticks;
+      parts.push('<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) +
+                 '" y2="' + y.toFixed(1) + '" stroke="' + getCss("--grid") + '" stroke-width="1"/>');
+      parts.push('<text x="' + (padL - 6) + '" y="' + (y + 4).toFixed(1) + '" text-anchor="end" ' +
+                 'font-size="11" fill="' + getCss("--muted") + '">' + opts.format(yv) + "</text>");
+    }
+    // bars
+    var n = labels.length;
+    var groupW = plotW / n;
+    var barW = Math.min(28, groupW / (series.length + 1) * 0.7);
+    for (var i = 0; i < n; i++) {
+      var cx = padL + groupW * (i + 0.5);
+      series.forEach(function (s, si) {
+        var v = s.values[i];
+        if (isNull(v)) return;
+        var h = plotH * v / max;
+        var x = cx - barW * series.length / 2 + si * barW;
+        parts.push('<rect x="' + x.toFixed(1) + '" y="' + (padT + plotH - h).toFixed(1) +
+                   '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + s.color + '"/>');
+      });
+      parts.push('<text x="' + cx.toFixed(1) + '" y="' + (H - 20) + '" text-anchor="middle" ' +
+                 'font-size="11" fill="' + getCss("--fg") + '">' + labels[i] + "</text>");
+    }
+    // axis titles
+    parts.push('<text x="' + (padL - 40) + '" y="' + 14 + '" text-anchor="middle" ' +
+               'font-size="11" fill="' + getCss("--muted") + '" transform="rotate(-90 ' + (padL - 40) + ' 14)">' +
+               opts.yLabel + "</text>");
+    parts.push('<text x="' + (padL + plotW / 2) + '" y="' + (H - 4) + '" text-anchor="middle" ' +
+               'font-size="11" fill="' + getCss("--muted") + '">' + opts.xLabel + "</text>");
+    // legend
+    if (series.length > 1) {
+      var lx = padL;
+      series.forEach(function (s) {
+        parts.push('<rect x="' + lx + '" y="4" width="10" height="10" fill="' + s.color + '"/>');
+        parts.push('<text x="' + (lx + 14) + '" y="13" font-size="11" fill="' + getCss("--muted") +
+                   '">' + s.name + "</text>");
+        lx += 14 + s.name.length * 6.2 + 18;
+      });
+    }
+    svg.innerHTML = parts.join("");
+  }
+
+  function rateToPercent(values) {
+    return values.map(function (v) { return isNull(v) ? null : v * 100; });
+  }
+
+  drawBars("chart-usd",
+    providers.map(function (p) { return p.provider; }),
+    [
+      { name: "provider", color: colors[0], values: providers.map(function (p) { return p.provider_usd; }) },
+      { name: "counterfactual", color: colors[1], values: providers.map(function (p) { return p.counterfactual_usd; }) },
+    ],
+    { yLabel: "USD", xLabel: "provider", format: function (v) { return "$" + compact(v); } });
+
+  drawBars("chart-pass",
+    providers.map(function (p) { return p.provider; }),
+    [{ name: "verified-pass", color: colors[2], values: rateToPercent(providers.map(function (p) { return p.verified_rate; })) }],
+    { yLabel: "%", xLabel: "provider", format: function (v) { return Math.round(v) + "%"; } });
+
+  drawBars("chart-wall",
+    providers.map(function (p) { return p.provider; }),
+    [{ name: "wall p50", color: colors[0], values: providers.map(function (p) { return p.wall_p50; }) }],
+    { yLabel: "seconds", xLabel: "provider", format: function (v) { return compact(v) + "s"; } });
+
+  drawBars("chart-tokens",
+    delegations.map(function (d) { return d.delegation_id || "—"; }),
+    [{ name: "tokens", color: colors[1], values: delegations.map(function (d) { return d.tokens; }) }],
+    { yLabel: "tokens", xLabel: "delegation (chronological)", format: compact });
+
+  renderMeta();
+  renderProviders();
+  renderDelegations();
+})();
+</script>
+</body>
+</html>

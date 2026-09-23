@@ -118,6 +118,28 @@ def test_boot_refuses_unguarded_unless_loop_or_allow_unguarded(tmp_path: Path, m
     assert error is None
 
 
+def test_boot_admits_registered_loop_agents_without_touching_config(
+        tmp_path: Path, monkeypatch):
+    """The delegate loop lifts the unguarded gate for its own agent ids only:
+    no config mutation, and a plain MCP delegation is still refused."""
+    monkeypatch.setattr(shutil, "which", lambda b: "/fake/copilot")
+    settings = make_settings(tmp_path)  # allow_unguarded defaults off
+    cfg = _copilot_cfg()  # no extra["loop"]
+
+    error, _ = copilot_driver.COPILOT_PROVIDER.boot(settings, "a1", cfg)
+    assert error and "allow_unguarded" in error
+
+    agent_id = f"loop-{uuid.uuid4().hex[:12]}"
+    copilot_driver.allow_loop_agent(agent_id)
+    error, _ = copilot_driver.COPILOT_PROVIDER.boot(settings, agent_id, cfg)
+    assert error is None
+    # The registration is scoped to the loop's ids: nobody else gains anything.
+    error, _ = copilot_driver.COPILOT_PROVIDER.boot(settings, "a2", cfg)
+    assert error and "allow_unguarded" in error
+    # The config was never mutated.
+    assert "loop" not in cfg.extra
+
+
 def test_boot_checks_the_binary(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda b: None)
     settings = make_settings(tmp_path, allow_unguarded=True)

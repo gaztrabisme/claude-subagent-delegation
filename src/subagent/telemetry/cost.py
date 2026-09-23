@@ -78,9 +78,24 @@ class Pricing:
         self.read = float(mult.get("cache_read", 0.1))
         self.models = data.get("models", {})
         self.providers = data.get("provider", {})
-        self.counterfactual = counterfactual or data.get("counterfactual_model", "claude-opus-5")
-        if self.resolve(self.counterfactual) is None:
-            raise SystemExit(f"counterfactual model {self.counterfactual!r} not in pricing.toml")
+        self.counterfactual = (
+            counterfactual
+            or data.get("counterfactual_model")
+            or data.get("counterfactual")
+            or "claude-opus-5"
+        )
+        # A Pricing built from an empty [pricing] table (or a config with no
+        # [pricing] at all) prices nothing, and must still exist: Agent._finish
+        # builds one on every run. Only a configured table whose counterfactual
+        # model is missing is an error.
+        if self.models and self.resolve(self.counterfactual) is None:
+            raise SystemExit(f"counterfactual model {self.counterfactual!r} not in pricing")
+
+    @classmethod
+    def from_settings(cls, settings) -> "Pricing":
+        """Pricing from parsed Settings: the [pricing] table (config uses the
+        `counterfactual` key; pricing.toml the older `counterfactual_model`)."""
+        return cls(dict(settings.pricing))
 
     def resolve(self, model: str | None) -> str | None:
         """Map a model string (possibly with a [1m] suffix or date) to a priced model."""
@@ -114,6 +129,91 @@ class Pricing:
 def load_pricing(path: Path, counterfactual: str | None) -> Pricing:
     with open(path, "rb") as fh:
         return Pricing(tomllib.load(fh), counterfactual)
+
+
+# --------------------------------------------------------------------------- run-end pricing
+
+
+def _tokens(usage: Any, key: str) -> int:
+    """One token count from a Usage object or a usage dict."""
+    if isinstance(usage, dict):
+        return int(usage.get(key) or 0)
+    return int(getattr(usage, key, 0) or 0)
+
+
+def _peak_note(ts: float, offpeak: Any) -> str | None:
+    """'peak'/'offpeak' for a timestamp, given `offpeak_hours_utc = [start, end]`.
+
+    Whole hours, half-open `[start, end)`; `end` may wrap past midnight. The
+    rates themselves are unchanged: this only labels the run.
+    """
+    if not isinstance(offpeak, (list, tuple)) or len(offpeak) != 2:
+        return None
+    try:
+        start, end = int(offpeak[0]), int(offpeak[1])
+        hour = dt.datetime.fromtimestamp(ts, dt.UTC).hour
+    except (TypeError, ValueError, OSError):
+        return None
+    off = start <= hour < end if start < end else (hour >= start or hour < end)
+    return "offpeak" if off else "peak"
+
+
+def price_run(usage, credits, provider_cfg, pricing, ts) -> dict[str, Any]:
+    """Price one finished run in-process, at run end.
+
+    Returns {"provider_usd", "counterfactual_usd", "kind", "note"}. per_token
+    uses the configured rates (the timestamp only labels peak/offpeak when the
+    provider declares `offpeak_hours_utc`); credits are priced at
+    `usd_per_credit`; local at `usd`; flat_plan is spread at report time, so
+    its run-end provider cost is None.
+    """
+    spec = provider_cfg.pricing
+    kind = spec.kind
+    values = spec.values
+    provider_usd = None
+    note = None
+
+    cf = pricing.resolve(pricing.counterfactual)
+    counterfactual = (
+        pricing.usd(
+            cf,
+            _tokens(usage, "input"),
+            _tokens(usage, "output"),
+            _tokens(usage, "cache_read"),
+            _tokens(usage, "cache_write"),
+            0,
+        )
+        if cf
+        else 0.0
+    )
+
+    if kind == "per_token":
+        rin = _num(values.get("input"))
+        rout = _num(values.get("output"))
+        rread = _num(values.get("cache_read"))
+        if None not in (rin, rout, rread):
+            provider_usd = (
+                (_tokens(usage, "input") + _tokens(usage, "cache_write")) * rin
+                + _tokens(usage, "output") * rout
+                + _tokens(usage, "cache_read") * rread
+            ) / M
+        note = _peak_note(ts, values.get("offpeak_hours_utc"))
+    elif kind == "credits":
+        rate = _num(values.get("usd_per_credit"))
+        if rate is not None and credits is not None:
+            provider_usd = float(credits) * rate
+    elif kind == "local":
+        provider_usd = _num(values.get("usd"))
+    elif kind == "flat_plan":
+        provider_usd = None
+        note = "spread at report time"
+
+    return {
+        "provider_usd": provider_usd,
+        "counterfactual_usd": counterfactual,
+        "kind": kind,
+        "note": note,
+    }
 
 
 # --------------------------------------------------------------------------- traces

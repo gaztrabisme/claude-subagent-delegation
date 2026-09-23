@@ -25,6 +25,7 @@ child wrote.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections import Counter
@@ -45,14 +46,15 @@ from ..config import log
 #    required keys: tests/test_trace_schema.py.
 SCHEMA = 3
 
-KINDS = ("run", "hop", "turn", "sample", "run_summary", "verdict", "calibration")
+KINDS = ("run", "hop", "turn", "sample", "run_summary", "verdict", "calibration", "delegation")
 
 
 class Trace:
     """One JSONL file, appended under a lock. Failures are logged, never raised."""
 
-    def __init__(self, path: Path | None):
+    def __init__(self, path: Path | None, context: dict[str, Any] | None = None):
         self.path = path
+        self.context = dict(context or {})
         self._lock = threading.Lock()
         # Guard verdicts per agent since that agent's last run record. An
         # agent's runs are serial, so these belong to the run that ends next.
@@ -68,10 +70,25 @@ class Trace:
     def enabled(self) -> bool:
         return self.path is not None
 
+    def set_context(self, **fields: Any) -> None:
+        """Merge caller context (delegation_id, ...) into every record written.
+
+        The loop sets `delegation_id` for the duration of a delegation so every
+        run, hop, turn and verdict it produces can be grouped later.
+        """
+        self.context.update(fields)
+
     def write(self, kind: str, **fields: Any) -> None:
         if self.path is None:
             return
-        record = {"schema": SCHEMA, "ts": round(time.time(), 3), "kind": kind, **fields}
+        # Bench runs tag every record with the harness's run id; delegation_id
+        # comes from the loop via set_context. Explicit fields always win.
+        context: dict[str, Any] = {}
+        bench_run_id = os.environ.get("SUBAGENT_BENCH_RUN_ID")
+        if bench_run_id:
+            context["bench_run_id"] = bench_run_id
+        context.update(self.context)
+        record = {"schema": SCHEMA, "ts": round(time.time(), 3), "kind": kind, **context, **fields}
         try:
             line = json.dumps(record, default=str, ensure_ascii=False)
             with self._lock, open(self.path, "a", encoding="utf-8") as handle:
@@ -169,6 +186,7 @@ class Trace:
             guard_verdicts=verdicts,
             refusal_code=refusal,
             usage=run.usage.as_dict(),
+            cost=getattr(run, "cost", None),
             # Lengths, not text: the trace is for measuring, not for archiving
             # somebody's source code or a client's data.
             prompt_chars=len(run.prompt),
@@ -219,6 +237,10 @@ class Trace:
             observed=round(chars / output_tokens, 3),
             assumed=assumed,
         )
+
+    def delegation(self, **fields: Any) -> None:
+        """One whole loop run (autopilot or a single round): rounds, totals, verdict."""
+        self.write("delegation", **fields)
 
 
 def open_trace(raw: str | None, session_root: Path) -> Trace:

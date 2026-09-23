@@ -178,6 +178,19 @@ def test_config_a_provider_with_no_key_is_a_warning_not_an_error(tmp_path: Path,
     assert _load(tmp_path, {"providers": {"glm": GLM}}, name="b.toml").warnings == ()
 
 
+def test_config_a_claude_provider_with_no_declared_key_warns_at_load(tmp_path: Path):
+    """`api_key_env` and `api_key` are both optional, but a driver that needs a
+    key must not load silently: the warning names the provider and the fix."""
+    settings = _load(tmp_path, {"providers": {
+        "bare": {"driver": "claude", "base_url": "https://api.z.ai/api/anthropic",
+                 "model": "m"},
+    }})
+    assert any("bare" in w and "api_key" in w for w in settings.warnings)
+    # A CLI driver that owns its login needs no key and stays silent.
+    settings = _load(tmp_path, {"providers": {"c": {"driver": "copilot"}}}, name="b.toml")
+    assert settings.warnings == ()
+
+
 def test_config_api_key_literal_is_used_when_no_variable_is_set(tmp_path: Path):
     settings = _load(tmp_path, {"providers": {
         "local": {"driver": "claude", "base_url": "http://127.0.0.1:8080",

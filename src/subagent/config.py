@@ -228,6 +228,18 @@ _PROVIDER_KEYS = frozenset({
 })
 
 
+def _driver_needs_key(driver: str) -> bool:
+    """Whether the driver fails a run without an API key (runs.py's late check).
+
+    Asked through `providers.for_driver`, which imports the driver module on
+    first use: at load() time this package is already importable, and a driver
+    name `_provider` has not validated cannot happen here.
+    """
+    from .providers import for_driver
+
+    return bool(for_driver(driver).needs_api_key)
+
+
 def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> ProviderConfig:
     driver = _str(table, "driver", None)
     if not driver:
@@ -601,10 +613,16 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
             raise ConfigError(f"[providers.{name}] must be a table")
         cfg = _provider(str(name), table, defaults)
         providers[cfg.name] = cfg
-        if cfg.api_key_envs and not cfg.api_key():
+        if cfg.api_key_envs:
+            if not cfg.api_key():
+                warnings.append(
+                    f"provider {cfg.name}: no API key in this server's environment; "
+                    f"set one of {', '.join(cfg.api_key_envs)}"
+                )
+        elif _driver_needs_key(cfg.driver):
             warnings.append(
-                f"provider {cfg.name}: no API key in this server's environment; "
-                f"set one of {', '.join(cfg.api_key_envs)}"
+                f"provider {cfg.name}: driver {cfg.driver!r} needs an API key but the config "
+                "declares neither api_key_env nor api_key; every run on it fails until one is set"
             )
 
     # Outside every workspace by default: the session root holds the per-agent

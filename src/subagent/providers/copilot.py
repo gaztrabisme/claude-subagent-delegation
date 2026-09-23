@@ -11,8 +11,10 @@ The Copilot CLI has no PreToolUse hook, so this driver installs no guard: the
 child runs with ``--allow-all-tools``. That is only acceptable when the server
 itself said so. ``boot()`` refuses for a plain MCP delegation unless
 ``[guard].allow_unguarded`` is true; the delegate loop (which does its own
-test-file and checkpoint protection around the child) lifts the gate by setting
-the provider's ``extra["loop"]`` flag.
+test-file and checkpoint protection around the child) lifts the gate for its
+own agents only, by registering each agent id with ``allow_loop_agent()``
+before it creates the agent. The config is never mutated, so a plain MCP
+Copilot delegation gains nothing.
 
 The session id is chosen up front, not learned from the stream: ``boot()``
 mints a uuid and every turn, first or resume, passes it as ``--session-id``.
@@ -24,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import uuid
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -38,6 +41,31 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 GUARD = "none"
 
 DEFAULT_BINARY = "copilot"
+
+# Agent ids the delegate loop registered as its own (see allow_loop_agent).
+# A per-id set, not a config flag: the gate is lifted for exactly the agents
+# the loop creates, never for an MCP delegation that happens to share config.
+_LOOP_AGENTS: set[str] = set()
+_LOOP_AGENTS_LOCK = threading.Lock()
+
+
+def allow_loop_agent(agent_id: str | None) -> None:
+    """Register one delegate-loop agent id, lifting the unguarded gate for it.
+
+    The loop wraps its children in its own test-file and checkpoint
+    protection; it calls this before ``Registry.create_agent()``/``adopt()``.
+    ``boot()`` admits exactly these ids, so no shared config is mutated and a
+    plain MCP delegation is still refused.
+    """
+    if not agent_id:
+        return
+    with _LOOP_AGENTS_LOCK:
+        _LOOP_AGENTS.add(agent_id)
+
+
+def _loop_allowed(agent_id: str) -> bool:
+    with _LOOP_AGENTS_LOCK:
+        return agent_id in _LOOP_AGENTS
 
 # What fake_copilot.py (and the real CLI) print when --model names an account
 # this build cannot use: Error: Model "gpt-5" from --model flag is not available.
@@ -246,13 +274,18 @@ class CopilotProvider:
 
         A plain MCP delegation may not run an unguarded child unless
         ``[guard].allow_unguarded`` is true. The delegate loop, which does its
-        own protection around the child, lifts this by setting the provider's
-        ``extra["loop"]`` flag.
+        own protection around the child, lifts this for the agents it
+        registered with :func:`allow_loop_agent` (or a provider that states
+        ``extra["loop"]`` in the config).
         """
         session = Session(provider=cfg.name)
         if not session.session_id:
             session.session_id = str(uuid.uuid4())
-        if not settings.allow_unguarded and not cfg.extra.get("loop"):
+        if not (
+            settings.allow_unguarded
+            or cfg.extra.get("loop")
+            or _loop_allowed(agent_id)
+        ):
             return (
                 "copilot runs without a guard hook (--allow-all-tools); set "
                 "[guard].allow_unguarded = true to use it from the MCP tools "
@@ -349,4 +382,5 @@ __all__ = [
     "CopilotProvider",
     "GUARD",
     "Translator",
+    "allow_loop_agent",
 ]

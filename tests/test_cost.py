@@ -92,6 +92,19 @@ def test_flat_plan_is_null_at_run_end_and_spread_at_report():
     assert runs[0]["provider_usd"] == pytest.approx(40.0)
 
 
+def test_spread_reads_the_config_specs_without_a_pricing_object():
+    """The flat-plan spread must not depend on the legacy `[pricing]` table:
+    the config's PricingSpec values price the runs with `pricing=None`."""
+    runs = [
+        {"lane": "glm", "ts": 1789700600.0, "input": 100, "output": 0,
+         "cache_read": 0, "cache_write": 0},
+        {"lane": "glm", "ts": 1789700600.0, "input": 100, "output": 0,
+         "cache_read": 0, "cache_write": 0},
+    ]
+    cost.provider_costs(None, runs, specs={"glm": {"kind": "flat_plan", "monthly_usd": 80}})
+    assert runs[0]["provider_usd"] == pytest.approx(40.0)
+
+
 def test_local_provider():
     result = cost.price_run(_usage(), None, _cfg("local", usd=0), _pricing(), 0.0)
     assert result["provider_usd"] == 0.0

@@ -128,17 +128,35 @@ def test_the_matrix_expands_to_the_expected_cells():
 
 
 def test_a_cell_id_names_harness_config_task_mode_and_run():
-    assert run.cell_id(("claude", Path("examples/config.glm.toml"), "cron", "alone", 2)) \
-        == "claude-glm-cron-alone-2"
+    config = Path("examples/config.glm.toml")
+    assert run.cell_id(("claude", config, "cron", "alone", 2)) \
+        == f"claude-glm-{run.config_tag(config)}-cron-alone-2"
+
+
+def test_two_configs_with_the_same_stem_get_different_cell_ids(tmp_path):
+    """`/tmp/a/config.glm.toml` and `/tmp/b/config.glm.toml` share a label but
+    must not share a workspace: the cell id carries the config's tag."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    one, two = a / "config.glm.toml", b / "config.glm.toml"
+    one.write_text("[core]\n", encoding="utf-8")
+    two.write_text("[core]\nmax_agents = 2\n", encoding="utf-8")
+    assert run.config_label(one) == run.config_label(two) == "glm"
+    cell_one = ("claude", one, "cron", "alone", 1)
+    assert run.cell_id(cell_one) != run.cell_id(("claude", two, "cron", "alone", 1))
+    # The tag is stable for the same file, so SUBAGENT_BENCH_RUN_ID is too.
+    assert run.cell_id(cell_one) == run.cell_id(cell_one)
 
 
 def test_the_dry_run_prints_the_one_cell_it_would_run(capsys, monkeypatch):
+    config = Path("examples/config.glm.toml")
     monkeypatch.setattr(sys, "argv", ["run.py", "--harness", "claude",
                                       "--config", "examples/config.glm.toml", "--tasks", "cron",
                                       "--modes", "alone", "--runs", "1", "--dry-run"])
     assert run.main() == 0
     out = capsys.readouterr().out
-    assert out.count("claude-glm-cron-alone-1") == 1
+    assert out.count(f"claude-glm-{run.config_tag(config)}-cron-alone-1") == 1
     assert "--output-format json" in out
     assert "--permission-mode acceptEdits" in out
     # Nothing ran: no results directory was created.
@@ -236,6 +254,48 @@ def test_read_delegations_takes_only_delegation_records(tmp_path):
     assert len(records) == 1
     assert records[0]["rounds"] == [{"provider": "glm"}]
     assert run.read_delegations(tmp_path / "empty") == []
+
+
+def test_read_cell_records_splits_delegations_from_runs(tmp_path):
+    trace = tmp_path / "sessions" / "trace.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("\n".join([
+        json.dumps({"kind": "run", "run_id": "r1"}),
+        "not json at all",
+        json.dumps({"kind": "delegation", "rounds": []}),
+    ]))
+    delegations, runs = run.read_cell_records(tmp_path)
+    assert [d["rounds"] for d in delegations] == [[]]
+    assert [r["run_id"] for r in runs] == ["r1"]
+    assert run.read_cell_records(tmp_path / "empty") == ([], [])
+
+
+def test_delegation_fields_price_the_flat_plan_from_the_cell_config(
+        tmp_path, monkeypatch):
+    """A flat-plan provider costs null at run end, so the records alone leave
+    `worker_usd` unknown; with the cell's config the report's spread prices it."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))  # no other config layers
+    monkeypatch.delenv("SUBAGENT_CONFIG", raising=False)
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[providers.glm.pricing]\nkind = "flat_plan"\nmonthly_usd = 80\n', encoding="utf-8"
+    )
+    delegations = [{
+        "kind": "delegation",
+        "rounds": [{"provider": "glm", "run_id": "run-1"}],
+        "cost_total": {"provider_usd": None, "counterfactual_usd": 1.0},
+        "delegation_id": "del-1",
+    }]
+    runs = [{
+        "kind": "run", "run_id": "run-1", "delegation_id": "del-1",
+        "provider": "glm", "lane": "glm", "ts": 1789700600.0, "usage": {},
+        "cost": {"provider_usd": None, "kind": "flat_plan"},
+    }]
+    fields = run.delegation_fields(delegations, runs, config_path=config)
+    assert fields["worker_usd"] == pytest.approx(80.0)  # one run in the month
+    # Without the config, the records' own totals are all there is.
+    fields = run.delegation_fields(delegations)
+    assert fields["worker_usd"] is None
 
 
 # --- the dashboard ---------------------------------------------------------------

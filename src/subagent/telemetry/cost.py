@@ -21,7 +21,9 @@ import re
 import sys
 import tomllib
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 HOME = Path.home()
 DEFAULT_TRACES = [
@@ -472,7 +474,22 @@ def message_usd(pricing: Pricing, msg: dict) -> tuple[float, bool]:
     return usd, unknown
 
 
-def provider_costs(pricing: Pricing, runs: list[dict]) -> None:
+def provider_costs(
+    pricing: Pricing | None,
+    runs: list[dict],
+    specs: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
+    """Price every run's provider cost in place, month by month.
+
+    The spec for a run's lane comes from `specs` (provider name -> its
+    `[providers.<n>.pricing]` values, as `report._specs` builds them); the
+    legacy `Pricing.providers` table is only the fallback. Spreading a flat
+    plan needs no counterfactual rates, so a `Pricing` that failed to build
+    must not stop it: pass the config's PricingSpec values and `pricing=None`.
+    """
+    lookup: Mapping[str, Any] = specs if specs is not None else (
+        pricing.providers if pricing is not None else {}
+    )
     month_counts: dict[tuple, int] = defaultdict(int)
 
     def month(r):
@@ -481,7 +498,7 @@ def provider_costs(pricing: Pricing, runs: list[dict]) -> None:
     for r in runs:
         month_counts[(r["lane"], month(r))] += 1
     for r in runs:
-        spec = pricing.providers.get(r["lane"])
+        spec = lookup.get(r["lane"])
         cost = None
         if spec:
             kind = spec.get("kind")

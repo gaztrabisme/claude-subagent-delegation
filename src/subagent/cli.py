@@ -429,8 +429,12 @@ def _print_table(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
 def cmd_doctor(args: argparse.Namespace) -> int:
     try:
         settings = config.load()
+        settings.require_providers()
     except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if args.provider and args.provider not in settings.providers:
@@ -593,6 +597,12 @@ def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "report":
+        try:
+            settings = config.load()
+            settings.require_providers()
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         from .report import main as report_main
 
         return report_main(raw[1:])
@@ -608,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root or ".").expanduser().resolve()
     try:
         settings = config.load(project_root=root)
+        settings.require_providers()
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -13,7 +13,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
 from . import __version__, config
-from .config import configure_logging, log
+from .config import ConfigError, configure_logging, log
 from .guard.classify import protect_provider_homes
 from .guard.supervisor import Supervisor
 from .router import FALLBACK_MODES
@@ -423,8 +423,13 @@ async def transcript(run_id: str, limit: int = 60, raw: bool = False) -> dict[st
     return out
 
 
-def main() -> None:
+def main() -> int:
     configure_logging(settings.log_level)
+    try:
+        settings.require_providers()
+    except ConfigError as exc:
+        log.error("%s", exc)
+        return 1
     log.info(
         "starting: default_provider=%s workspace=%s max_agents=%d supervisor=%s",
         settings.default_provider,
@@ -445,7 +450,8 @@ def main() -> None:
         app.run()
     finally:
         registry.shutdown()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

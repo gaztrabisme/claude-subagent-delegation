@@ -54,6 +54,17 @@ def test_instructions_name_only_the_configured_providers(instructions_module):
         assert other not in text
 
 
+def test_main_exits_before_serving_without_providers(instructions_module, monkeypatch, capsys):
+    instructions_module.settings = make_settings(
+        instructions_module.settings.workspace, providers={}
+    )
+    monkeypatch.setattr(instructions_module, "app", type("App", (), {
+        "run": staticmethod(lambda: pytest.fail("server must not start"))
+    })())
+    assert instructions_module.main() == 1
+    assert "no providers configured; run `subagent init`" in capsys.readouterr().err
+
+
 def test_lane_alias_yields_the_same_result_as_provider(server, tmp_path):  # noqa: F811
     by_provider = _delegate(server, tmp_path, provider="deepseek", fallback="none", wait_seconds=5)
     by_lane = _delegate(server, tmp_path, lane="deepseek", fallback="none", wait_seconds=5)

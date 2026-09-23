@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tomllib
@@ -113,6 +114,49 @@ def test_every_harness_has_a_prompt_for_each_mode(mode):
         assert "skills/delegate/SKILL.md" in harness.prompts(name)["force"], name
 
 
+# --- the command lines ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name,argv_head", [
+    ("claude", ["claude", "-p"]),
+    ("codex", ["codex", "exec", "--json"]),
+    ("gemini", ["gemini", "-p"]),
+    ("grok", ["grok", "-p"]),
+    ("copilot", ["copilot", "-p"]),
+])
+def test_an_argv_runs_headless_in_the_cell_workspace(name, argv_head):
+    argv = harness.get(name).argv("prompt", "/tmp/cell")
+    assert argv[:len(argv_head)] == argv_head
+    assert "prompt" in argv
+
+
+def test_only_codex_takes_the_workspace_as_a_flag():
+    # The other CLIs are run with cwd=cell, so they need no -C.
+    assert harness.get("codex").argv("prompt", "/tmp/cell").index("/tmp/cell") \
+        == harness.get("codex").argv("prompt", "/tmp/cell").index("-C") + 1
+
+
+def test_the_codex_sandbox_is_off_so_the_approval_socket_can_bind():
+    """Codex's workspace-write sandbox forbids binding Unix sockets, which kills
+    every `subagent` call inside the cell; the workspace is throwaway instead."""
+    argv = harness.get("codex").argv("prompt", "/tmp/cell")
+    assert argv[argv.index("-s") + 1] == "danger-full-access"
+    assert "workspace-write" not in argv
+
+
+def test_the_grok_sandbox_is_off_like_codex_full_access():
+    argv = harness.get("grok").argv("prompt", "/tmp/cell")
+    assert argv[argv.index("--sandbox") + 1] == "off"
+
+
+@pytest.mark.parametrize("name,flag", [("codex", "-m"), ("grok", "-m"),
+                                       ("gemini", "-m"), ("copilot", "--model"),
+                                       ("claude", "--model")])
+def test_an_optional_model_reaches_the_harness_flag(name, flag):
+    argv = harness.get(name).argv("prompt", "/tmp/cell", "some-model")
+    assert argv[argv.index(flag) + 1] == "some-model"
+
+
 # --- the matrix ------------------------------------------------------------------
 
 
@@ -163,6 +207,16 @@ def test_the_dry_run_prints_the_one_cell_it_would_run(capsys, monkeypatch):
     assert "results.json" not in out
 
 
+def test_the_codex_dry_run_prints_the_full_access_flag(capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run.py", "--harness", "codex",
+                                      "--config", "examples/config.glm.toml", "--tasks", "cron",
+                                      "--modes", "delegate", "--runs", "1", "--dry-run"])
+    assert run.main() == 0
+    out = capsys.readouterr().out
+    assert "danger-full-access" in out
+    assert "workspace-write" not in out
+
+
 def test_an_unknown_harness_or_config_is_rejected(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run.py", "--harness", "cursor", "--dry-run"])
     with pytest.raises(SystemExit):
@@ -202,6 +256,84 @@ def test_toml_dump_round_trips_the_shapes_a_bench_config_has():
     data["core"].pop("trace")
     assert parsed == data
     assert "trace" not in parsed["core"]
+
+
+# --- what a cell needs to delegate ------------------------------------------------
+
+
+def test_the_skill_copy_lands_where_each_harness_reads_skills(tmp_path):
+    targets = {"codex": ".agents/skills", "gemini": ".agents/skills",
+               "copilot": ".agents/skills", "grok": ".grok/skills"}
+    for name, root in targets.items():
+        cell = tmp_path / name
+        cell.mkdir()
+        assert run.install_skill(cell, name) == [f"{root}/delegate"]
+        assert (cell / root / "delegate" / "SKILL.md").is_file()
+    claude = tmp_path / "claude"  # claude reads ~/.claude/skills: no copy in the cell
+    claude.mkdir()
+    assert run.install_skill(claude, "claude") == []
+    assert not (claude / ".agents").exists() and not (claude / ".grok").exists()
+
+
+def test_venv_bin_is_the_running_interpreter_s_bin_with_subagent():
+    bin_dir = run.venv_bin()
+    expected = Path(sys.executable).parent
+    if (expected / "subagent").exists():
+        assert bin_dir == str(expected)
+    else:
+        assert bin_dir is None
+
+
+class StubOrchestrator(harness.Orchestrator):
+    """A harness that runs nothing, so a cell can be exercised end to end."""
+
+    name = "stub"
+
+    def argv(self, prompt, workspace, model=None):
+        return ["true", prompt]
+
+    def parse(self, stdout, stderr):
+        return {"ok": True, "cost_usd": None, "usage": harness._empty_usage(),
+                "turns": None, "models": [], "session_id": None, "credits": None,
+                "raw": stdout}
+
+
+def test_a_cell_gets_the_skill_the_path_and_a_cell_json(tmp_path, monkeypatch):
+    """`run_one` installs the skill, puts the venv's bin first on the child PATH,
+    and records both in the cell's cell.json before the orchestrator runs."""
+    config = tmp_path / "config.toml"
+    config.write_text("[core]\n", encoding="utf-8")
+    seen: dict = {}
+
+    def capture(argv, cwd, env, timeout):
+        seen["argv"], seen["env"], seen["cwd"] = argv, env, cwd
+        return "", "", False
+
+    monkeypatch.setattr(run.bench_harness, "get", lambda name: StubOrchestrator())
+    monkeypatch.setattr(run, "run_capture", capture)
+    monkeypatch.setattr(run, "run_hidden_tests", lambda task, work: ({"total": 0, "passed": 0}, ""))
+    row = run.run_one("codex", config, "cron", "alone", 1, tmp_path, None, 1)
+
+    work = Path(seen["cwd"])
+    assert work == tmp_path / row["cell"]
+    assert (work / ".agents" / "skills" / "delegate" / "SKILL.md").is_file()
+    setup = json.loads((work / "cell.json").read_text())
+    assert setup["cell"] == row["cell"]
+    assert setup["skills"] == [".agents/skills/delegate"]
+    assert setup["path_prepend"] == run.venv_bin()
+    # The orchestrator would have run with the venv's bin first on PATH ...
+    assert seen["env"]["PATH"].startswith(f"{run.venv_bin()}{os.pathsep}")
+    # ... and the bench variables, as before.
+    assert seen["env"]["SUBAGENT_BENCH_RUN_ID"] == row["cell"]
+    assert seen["env"]["SUBAGENT_CONFIG"] == str(work / "config.toml")
+
+
+def test_cell_env_leaves_the_path_alone_without_a_venv():
+    base = {"PATH": "/usr/bin:/bin"}
+    assert run.cell_env(base, {"path_prepend": None}) == base
+    assert run.cell_env(base, {"path_prepend": "/repo/.venv/bin"})["PATH"] \
+        == f"/repo/.venv/bin{os.pathsep}/usr/bin:/bin"
+    assert base == {"PATH": "/usr/bin:/bin"}  # the caller's dict is not mutated
 
 
 # --- the worker side -------------------------------------------------------------

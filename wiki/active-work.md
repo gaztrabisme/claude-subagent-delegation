@@ -35,31 +35,36 @@ Reader: the next session that picks this repo up. Read with `decisions.md` (S11�
 
 ## v2 feature list (2026-09-24, agreed in conversation, not yet a goal file)
 
+Khang's plan-tests-rounds-review loop stays as is. v2 adds a goal layer, a guard that enforces both, any worker, and the numbers.
+
+Correctness first (small, gates every number)
+1. U-B4: `run` refuses while a run is live; `wait` is what the skill says; trace lands under the cell's session root.
+2. U-B1 (claude bench parser leaves orchestrator tokens empty), U-L1 (test_writer error text).
+3. Review MED parallel-mode crash; LOW hidden-test destination.
+4. Pricing ships inside the package (today `scripts/pricing.toml` via three parent dirs, absent in a wheel); drop `init --from-env` and the `SAM_*` names.
+
 Setup and providers
-1. `subagent provider add|list|remove|test` and `subagent use <name>`; presets from `examples/`; `--project` writes `.subagent/config.toml` for a team-shared config.
-2. `subagent init` detects installed CLIs (claude, codex, copilot, gemini, grok) and offers them as subscription providers with no keys.
-3. `auth = "login"` on the claude driver: worker runs on the user's Claude seat (agent home seeded from the parent's OAuth credential); `examples/config.claude.toml`; flat-plan pricing.
-4. Local discovery: `provider add local --url` probes `/v1/models`, oMLX `/api/status`, `/metrics`, `/slots` and fills model, health and probe blocks.
+5. `subagent provider add|list|remove|test`, `subagent use <name>`; presets from `examples/`; `--project` writes `.subagent/config.toml`.
+6. `subagent init` detects installed CLIs (claude, codex, copilot, gemini, grok) and offers them as subscription providers with no keys.
+7. `auth = "login"` on the claude driver: a Claude seat as worker; `examples/config.claude.toml`; flat-plan pricing.
+8. Local discovery: `provider add local --url` probes `/v1/models`, oMLX `/api/status`, `/metrics`, `/slots` and fills model, health and probe.
+9. Lean worker driver: in-package agent loop, four tools, sub-1k system prompt, OpenAI and Anthropic wire formats, guard in-process, stable prefix for local KV cache. Replaces `claude -p` for API-key and local providers; vendor CLIs stay for seats. omp is not merged.
 
 Harness reach
-5. `subagent install --for claude|codex|gemini|copilot`: skill or instruction paragraph plus the `/plan` and `/goal` commands in each harness's location; MCP server registered on every harness with an add command (`claude|codex|gemini mcp add`, Copilot `/mcp add`), per-server tool timeout set where the harness has one. The skill stays the primary path for the loop; MCP is for one-shot `delegate` calls.
-6. Natural triggering: skill description written on task shape; `[loop] auto = ask|always|never`.
+10. `subagent install --for claude|codex|gemini|copilot`: skill or instruction paragraph, the `/plan` and `/goal` commands, MCP registration on every harness with an add command, per-server timeout set.
+11. Natural triggering: skill description on task shape; `[loop] auto = ask|always|never`.
 
 Outcomes
-7. `/plan` and `/goal`: `GOAL.md` with UAT rows; command rows run as server-side verification, prose rows go to the cross-family reviewer; goal file is a protected path; `uat` list in the `delegation` record and on the dashboard.
+12. `/plan` and `/goal`: `GOAL.md` with UAT rows; command rows run as server-side verification, prose rows go to the reviewer; goal file is a protected path; `uat` in the delegation record and dashboard; doctor warns on a goal with no command rows.
 
-Correctness (before more numbers go out)
-8. U-B4: `run` refuses while a run is live; `wait` is what the skill says; trace lands under the cell's session root.
-9. U-B1 (claude bench parser leaves orchestrator tokens empty), U-L1 (test_writer error text).
-10. Review MED parallel-mode crash; LOW hidden-test destination.
-
-Measurement
-11. Full matrix: claude, codex, grok (when funded), gemini and copilot (when installed) × glm, deepseek, bppc, omlx × cron, meeting-scribe; `business_case.py --from-report`; README benchmark section rewritten on the numbers.
-12. Concurrency cells on both self-hosted boxes (`bench/concurrency.py`).
+Measurement (replaces the plain matrix)
+13. Per-turn instrumentation: usage per turn tagged by source (harness prompt, plan, tool results, test output, model output).
+14. Token knobs, each a config flag: test-output cap, compaction window, parallel tool calls, no-narration rule, per-provider `thinking = off|low`, test writer delegated with orchestrator review.
+15. Task ladder: single function, cron, meeting-scribe, change inside an existing codebase, protocol/parser with a subtle spec. Models: bppc 27B, oMLX, GLM, DeepSeek, Codex Luna, Claude. Three runs per cell; knobs A/B on two tasks x three models, local and GLM first, winners confirmed on SOTA. Output: per model class, knob -> tokens saved and pass-rate change; `business_case.py --from-report`; README rewritten on the numbers.
 
 Housekeeping
-13. Retire the uv-tool pre-fusion server and the untracked hook shim; `~/.claude.json` to `subagent-mcp` with `SUBAGENT_CONFIG`.
-14. Name: `subagent` is taken on PyPI and the repo name says "claude"; rename before publishing.
-15. README limitations: guard coverage per driver; Windows unsupported.
+16. Retire the uv-tool pre-fusion server and the hook shim; `~/.claude.json` to `subagent-mcp` with `SUBAGENT_CONFIG`.
+17. Rename before publishing (`subagent` taken on PyPI; repo name says "claude").
+18. README: Khang's loop + goal layer + guard + any worker + measured cost; limitations (guard per driver, Windows unsupported); drop the pre-fusion benchmark section once 15 lands.
 
-Not in v2: Windows, opencode driver, any settings UI.
+Not in v2: Windows, opencode driver, omp driver merge, any settings UI.

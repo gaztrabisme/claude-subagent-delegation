@@ -68,3 +68,9 @@ Housekeeping
 18. README: Khang's loop + goal layer + guard + any worker + measured cost; limitations (guard per driver, Windows unsupported); drop the pre-fusion benchmark section once 15 lands.
 
 Not in v2: Windows, opencode driver, omp driver merge, any settings UI.
+
+## Paused (2026-09-25)
+
+Gary's decision: build his own lean coding-agent harness (a more token-efficient pi) first; `subagent` v2 waits for it. The spike that led here is at `wiki/data/spike-harness-2026-09-24.md` (verdict: wrap pi as a driver; build-own as fallback; two unverified points: prompt-prefix stability for local KV reuse, `enable_thinking` passthrough to oMLX/llama.cpp).
+
+When this resumes: item 9 in the v2 list becomes "driver for Gary's harness" (the omp-driver branch's event translator is the starting point); everything else in the list stands. State at pause: `fuse` = `origin/main` = 84732bb plus four local wiki commits; the pre-fusion uv-tool server and the hook shim are still what `~/.claude.json` runs.

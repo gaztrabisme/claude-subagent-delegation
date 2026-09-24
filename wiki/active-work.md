@@ -32,3 +32,34 @@ Reader: the next session that picks this repo up. Read with `decisions.md` (S11�
 - Open review findings: parallel mode with `max_agents = 1` (MED), hidden-test destination created by the agent (LOW).
 - Bench parsers: the claude parser fills `orch_cost_usd` but leaves `orch_tokens_*` empty (U-B1); Codex orchestrator cells need `-s danger-full-access` (M5) because its sandbox cannot bind the approval socket (U-C3), which also stops Codex children from running socket-backed tests or committing in a worktree (U-C1).
 - Not yet measured: Gemini (not installed), Grok (balance exhausted), Copilot (not installed), and the two self-hosted providers (bppc down, oMLX without a loaded model) as workers; the matrix over harnesses × providers is the next run.
+
+## v2 feature list (2026-09-24, agreed in conversation, not yet a goal file)
+
+Setup and providers
+1. `subagent provider add|list|remove|test` and `subagent use <name>`; presets from `examples/`; `--project` writes `.subagent/config.toml` for a team-shared config.
+2. `subagent init` detects installed CLIs (claude, codex, copilot, gemini, grok) and offers them as subscription providers with no keys.
+3. `auth = "login"` on the claude driver: worker runs on the user's Claude seat (agent home seeded from the parent's OAuth credential); `examples/config.claude.toml`; flat-plan pricing.
+4. Local discovery: `provider add local --url` probes `/v1/models`, oMLX `/api/status`, `/metrics`, `/slots` and fills model, health and probe blocks.
+
+Harness reach
+5. `subagent install --for claude|codex|gemini|copilot`: skill or instruction paragraph plus the `/plan` and `/goal` commands in each harness's location; MCP registration for Claude only.
+6. Natural triggering: skill description written on task shape; `[loop] auto = ask|always|never`.
+
+Outcomes
+7. `/plan` and `/goal`: `GOAL.md` with UAT rows; command rows run as server-side verification, prose rows go to the cross-family reviewer; goal file is a protected path; `uat` list in the `delegation` record and on the dashboard.
+
+Correctness (before more numbers go out)
+8. U-B4: `run` refuses while a run is live; `wait` is what the skill says; trace lands under the cell's session root.
+9. U-B1 (claude bench parser leaves orchestrator tokens empty), U-L1 (test_writer error text).
+10. Review MED parallel-mode crash; LOW hidden-test destination.
+
+Measurement
+11. Full matrix: claude, codex, grok (when funded), gemini and copilot (when installed) × glm, deepseek, bppc, omlx × cron, meeting-scribe; `business_case.py --from-report`; README benchmark section rewritten on the numbers.
+12. Concurrency cells on both self-hosted boxes (`bench/concurrency.py`).
+
+Housekeeping
+13. Retire the uv-tool pre-fusion server and the untracked hook shim; `~/.claude.json` to `subagent-mcp` with `SUBAGENT_CONFIG`.
+14. Name: `subagent` is taken on PyPI and the repo name says "claude"; rename before publishing.
+15. README limitations: guard coverage per driver; Windows unsupported.
+
+Not in v2: Windows, opencode driver, any settings UI.

@@ -42,7 +42,7 @@ Setup and providers
 4. Local discovery: `provider add local --url` probes `/v1/models`, oMLX `/api/status`, `/metrics`, `/slots` and fills model, health and probe blocks.
 
 Harness reach
-5. `subagent install --for claude|codex|gemini|copilot`: skill or instruction paragraph plus the `/plan` and `/goal` commands in each harness's location; MCP registration for Claude only.
+5. `subagent install --for claude|codex|gemini|copilot`: skill or instruction paragraph plus the `/plan` and `/goal` commands in each harness's location; MCP server registered on every harness with an add command (`claude|codex|gemini mcp add`, Copilot `/mcp add`), per-server tool timeout set where the harness has one. The skill stays the primary path for the loop; MCP is for one-shot `delegate` calls.
 6. Natural triggering: skill description written on task shape; `[loop] auto = ask|always|never`.
 
 Outcomes

@@ -589,9 +589,9 @@ class Agent:
         self.cfg = cfg or settings.provider()
         self.fallback = fallback
         self.driver = providers.for_driver(self.cfg.driver)
-        # Driver name -> its boot result (None when it can run) and the
-        # session it minted. Filled lazily: a later hop's driver is checked
-        # only when the walk gets there.
+        # Provider name -> its boot result (None when it can run) and session.
+        # Two provider configs may share a driver while carrying different
+        # gates or driver-owned session state.
         self._booted: dict[str, str | None] = {}
         self._sessions: dict[str, Session] = {}
         self.chain = list(chain) if chain else [self.cfg]
@@ -814,21 +814,21 @@ class Agent:
 
     def _boot_driver(self, driver: Any, cfg: ProviderConfig) -> str | None:
         """Boot `driver` for this agent once; the reason it cannot run, or None."""
-        if driver.name not in self._booted:
+        if cfg.name not in self._booted:
             try:
                 error, session = driver.boot(self.settings, self.agent_id, cfg)
             except NotImplementedError as exc:
                 error, session = str(exc), Session(provider=cfg.name)
-            self._booted[driver.name] = error
-            self._sessions[driver.name] = session
-        return self._booted[driver.name]
+            self._booted[cfg.name] = error
+            self._sessions[cfg.name] = session
+        return self._booted[cfg.name]
 
     def session(self) -> Session:
-        """The current driver's per-agent session state."""
-        found = self._sessions.get(self.driver.name)
+        """The current provider's per-agent session state."""
+        found = self._sessions.get(self.cfg.name)
         if found is None:
             found = Session(provider=self.cfg.name)
-            self._sessions[self.driver.name] = found
+            self._sessions[self.cfg.name] = found
         return found
 
     def _worker(self) -> None:

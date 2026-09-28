@@ -100,6 +100,40 @@ def test_agent_guard_context_contains_configured_and_driver_injected_secret_name
     assert "ANTHROPIC_AUTH_TOKEN" in names
 
 
+def test_boot_experimental_gate_is_checked_per_provider_on_the_same_driver(
+    tmp_path: Path, monkeypatch
+):
+    from subagent.providers import antigravity
+
+    monkeypatch.setattr(antigravity.shutil, "which", lambda _binary: "/fake/agy")
+    settings = make_settings(tmp_path, providers={
+        "agy_opted_in": {
+            "driver": "antigravity", "model": "gemini-test", "binary": "agy",
+            "experimental": True,
+        },
+        "agy_not_opted_in": {
+            "driver": "antigravity", "model": "gemini-test", "binary": "agy",
+            "experimental": False,
+        },
+    })
+    registry = Registry(settings, start_reaper=False)
+    try:
+        agent = registry.create_agent(
+            "t", tmp_path, "gemini-test", provider="agy_opted_in", fallback="full"
+        )
+        assert agent.wait_ready(5) is None
+
+        error = agent._boot_driver(
+            antigravity.ANTIGRAVITY_PROVIDER, settings.providers["agy_not_opted_in"]
+        )
+
+        assert error and "experimental = true" in error
+        assert agent._sessions["agy_opted_in"].provider == "agy_opted_in"
+        assert agent._sessions["agy_not_opted_in"].provider == "agy_not_opted_in"
+    finally:
+        registry.shutdown()
+
+
 def test_adopt_rejects_agent_ids_outside_the_loop_uuid4_pattern(registry, tmp_path: Path):
     with pytest.raises(RegistryError, match="loop-.*uuid4"):
         registry.adopt({

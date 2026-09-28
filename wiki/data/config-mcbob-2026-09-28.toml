@@ -54,6 +54,7 @@ driver = "omp"
 base_url = "http://192.168.1.17:8080/v1"
 model = "qwen3.8-27b"
 api_key_env = "LOCAL_API_KEY"
+api_key = "local"
 local = true
 max_agents = 1
 max_steps = 80

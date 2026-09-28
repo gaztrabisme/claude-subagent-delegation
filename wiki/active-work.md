@@ -1,28 +1,23 @@
 # Active work
 
-Reader: the next session that picks this repo up. Read with `decisions.md` (S11–S22) and `review.md`.
+Reader: the next session that picks this repo up. Read with `decisions.md` (S11–S24) and `review.md`.
 
-## State (2026-09-28, branch `lanes-int`)
+## State (2026-09-28, branch `fuse` at the `lanes` merge, nothing pushed)
 
 | Area | State |
 |---|---|
-| Repo | `origin` = github.com/gaztrabisme/claude-subagent-delegation; `lanes-int` integrates `lanes-omp` and `lanes-agy` in two merge commits. U4 acceptance is recorded in the external `int-report.md`. |
-| Smoke proxy | U6 code and offline tests cover path-preserving base URL overrides, Anthropic/OpenAI request paths, and the forbidden sampling field line. Coordinator acceptance commands are pending; no live model call was made. |
-| Package | `src/subagent/`: config (TOML, no built-in providers), providers (claude, codex, copilot, grok, Gemini/Antigravity, omp), router, health, guard (+context rules), loop (on the Registry), telemetry (trace schema 3 + `delegation` kind, cost at run end, sampler), report + HTML dashboard, cli (`init doctor detect run wait test review undo checkpoints watch report`), mcp_server (six tools, `lane=` alias), core (in-process server) |
-| Skill | `skills/delegate/SKILL.md` calls `subagent`; `install.sh` links the skill and installs the package |
-| Examples | `examples/config.{copilot,codex,glm,deepseek,llama.cpp,omlx,vllm,full}.toml`; all pass `subagent doctor --no-probe` |
-| Bench | `bench/run.py` matrix (harness × config × task × mode), `bench/harness.py` parsers for claude/codex/gemini/grok/copilot, `bench/concurrency.py`, `bench/business_case.py` + `docs/business-case.md`, task `meeting-scribe` (41 hidden tests, validated reference) |
-| Live | `doctor --provider glm --prompt` PASS; grok classifies its 402 as `grok_balance`; the autopilot loop on the cron task ended `done` (9 outline tests written by glm, 2 rounds, review refused on DeepSeek balance and reported as unverified); one bench cell with Claude orchestrating and glm workers: hidden 22/22, orchestrator $0.68, worker 70k in / 39k out / 1.0M cache-read tokens, counterfactual $1.84, wall 1065 s (`wiki/data/bench-2026-09-23/`) |
-| Bench (codex) | Codex gpt-6-luna orchestrating the fused skill built cron and passed hidden 22/22 (4,988 s, 193k/41k/10.8M orchestrator tokens); worker accounting missing (U-B4, `data/bench-2026-09-24-codex/`) |
-| Review | `review.md` includes the 2026-09-28 lanes review: U7 fixed every targeted finding with regression coverage; the owner accepted the Antigravity shared-guard gap while the driver stays experimental and sandboxed. U7 acceptance passed: 865 tests, Ruff clean, required grep empty, and `REPORT.md` absent. |
-| Servers | The prior uv tool installation still needs to be retired separately; `lanes-int` contains no old-server compatibility package. |
+| Repo | `fuse` carries the lanes run: U3 core (provider `effort`, parallel limit, node `ℹ` test counts), U1 omp driver, U2 antigravity driver, U4 lint backlog cleared, U5/U6 smoke script, U7 review fixes, U8 in-process socket path. 866 passed, 1 skipped; `ruff check src tests` clean |
+| Live server | Claude Code and Codex launch `agent-capabilities/bin/subagent-mcp`, which sources `~/.config/agent-capabilities/subagent.env` (keys only; `SAM_*` lines commented out, backup `subagent.env.bak-2026-09-28`) and runs `~/.local/bin/subagent-mcp` = editable uv tool install of this checkout (`uv tool list`: `subagent`). Config: `~/.config/subagent/config.toml` (copy of `wiki/data/config-mcbob-2026-09-28.toml`) |
+| Providers | `codex` (default; gpt-6-luna, effort xhigh), `glm`, `deepseek` (`claude -p`), `bppc` and `omlx` (omp 18.0.11, hook-guarded), `gemini` (agy 1.2.12, gemini-3.8-flash-high, effort high; experimental, `--sandbox`, no guard) |
+| Live proof | `subagent doctor --prompt` and `scripts/smoke_lanes.py` PASS on all six with the installed config (see `log.md` 2026-09-28 close) |
+| Old install | uv tool `subagent-mcp` (29ff214) is still installed and still running inside sessions opened before 17:51; its children's hook points at the untracked shim `src/subagent_mcp/`. Retire both after every session has restarted its MCP server |
 
 ## Next
 
-1. Fix U-B4 (make the orchestrator prompt and SKILL.md steer to `subagent wait`; refuse a `--tier` whose provider is closed; find why the cell's session root got no trace), U-B1, U-L1. Then run one real bench cell per installed harness (`claude`, `codex`, `grok` when its balance is back) on `cron`, then `meeting-scribe` on a local provider, and look at `bench/results/<ts>/dashboard.html`.
-2. Feed the measured rows into `bench/business_case.py --from-report` and rewrite the README's benchmark section with the fused numbers.
-3. Retire the uv-tool-installed server: `uv tool install --editable .` from this checkout and set `SUBAGENT_CONFIG=<file>` in the MCP server environment.
-4. Push `fuse` when Gary says so; open the PR against `main`.
+1. After all sessions restart the `subagent` MCP server: delete the untracked directory `src/subagent_mcp/`, run `uv tool uninstall subagent-mcp`, then `uv tool install --editable . --force` again (the uninstall can remove the shared `subagent-mcp` link).
+2. agy guard: find a deny-capable pre-tool hook format (binary has `PreToolHooks`/`HooksJson`); until then `gemini` stays experimental and sandboxed.
+3. The v2 list below stands (paused items unchanged); U-B4, U-B1, U-L1 still open.
+4. Push `fuse` when Gary says so.
 
 ## Open
 

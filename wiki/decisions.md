@@ -105,3 +105,11 @@ For `send_sampling = false`, the generated omp model disables reasoning, omits m
 **Context:** OMP needs its configured API key in its child process, while any worker tool can try to print environment variables into the persisted session log. Antigravity also needs its existing login under `HOME` but should not inherit other parent credentials.
 
 **Chosen:** build child environments from the shared allowlist; keep Antigravity's `HOME` because it is already allowlisted and agy reads its login there. Pass all configured `api_key_env` names and driver-injected key names into guard context, then deny variable expansion, named secret printing, whole-environment dumps and `/proc/.../environ` reads. This applies least privilege at process creation and blocks known child credentials at the tool boundary.
+
+## S24 — Codex Luna xhigh is the default; lanes keep their names; the live server runs this checkout (2026-09-28)
+
+**Chosen:** `[core].default_provider = "codex"` with `model = "gpt-6-luna"`, `effort = "xhigh"` (Gary). Before, the codex lane named no model and silently ran `~/.codex/config.toml` (gpt-6-sol, high). Provider names stay `codex`, `deepseek`, `glm`, `bppc`, `omlx`, plus `gemini`; `bppc` keeps its name rather than the examples' `llamacpp`. Local providers run on omp as a stand-in for Gary's own harness; GLM and DeepSeek stay on `claude -p`. Cutover by `uv tool install --editable . --force`, which relinks `~/.local/bin/subagent-mcp` without touching the old tool's venv, so servers already running keep working until restart.
+
+**Rejected:** patching the old install (work redone at retirement); lane descriptions in config (only orchestrators that do not read CLAUDE.md need them, and wiring those is v2 item 10); omlx back on `claude -p` because omp sends `preserve_thinking` (not a sampling or thinking-off field; S21).
+
+**Accepted risk:** the `gemini` provider runs agy with no guard (review HIGH, accepted by Gary under the plan's decision 3): experimental, `--sandbox`, child env from the allowlist.

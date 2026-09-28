@@ -190,3 +190,36 @@ The `SamplingProxy` logged one omp 18.0.11 chat request to oMLX; body keys were 
 - The owner accepted the Antigravity shared-guard finding: the driver remains `experimental`, runs with `--sandbox`, and agy 1.2.12 exposed no deny-capable hook format.
 - Focused OMP smoke suite: 69 passed. Acceptance: `uv run pytest -q` → 865 passed, 1 skipped, 19 subtests; `uv run ruff check src tests scripts` → all checks passed. The required source-literal grep had no matches; `REPORT.md` is absent; the review section is present.
 - No live model calls or push. Per-finding commits and tests are recorded in `wiki/review.md`; external report: `../../u7-report.md`.
+
+## 2026-09-28 — lanes run close (coordinator)
+
+Goal: `goals/2026-09-28-lanes.md`. Plan: `~/.claude/plans/plan-implementation-with-codex-functional-scott.md`. Coordinator: Claude Code (conductor). Every code unit on Codex gpt-6-luna xhigh, `-s danger-full-access`, one worktree each under `../subagent-mcp-wt/`.
+
+| Unit | Result |
+|---|---|
+| U3 core | PASS: effort key, parallel limit, `KeyError: 'counts'` baseline (node 24 `ℹ` summary). Ruff backlog (174, pre-existing) moved to U4 |
+| U1 omp | PASS: 25 tests incl. hook blocks a protected write (fake and real omp). Found and fixed `Supervisor._classify` dropping `guard_context` |
+| U2 agy | PASS: 11 tests; guard fallback — no deny-capable hook format found in agy 1.2.12, driver experimental + `--sandbox` |
+| U4 integrate | PASS: merges, ruff clean, machine config draft |
+| U5 smoke | PASS: any configured provider; no `~/.ssh/config` step on unguarded drivers (it would really run on agy) |
+| Review | 3 HIGH, 4 MED, 1 LOW (`review.md` 2026-09-28 lanes review). All fixed in U7 except the accepted agy guard gap |
+| U6 smoke proxy | shipped with one failing test (did not run its own acceptance); fixed in U7 |
+| U8 | PASS: in-process server socket path under the AF_UNIX limit |
+
+Forks decided forward: baseline failures fixed first in U3; ruff backlog cleared in U4; omlx stays on omp despite `preserve_thinking` (S21); bppc `api_key = "local"` added to the installed config (the draft lacked it; fixed in the draft too); smoke runs used `TMPDIR=/tmp` until U8 fixed the harness path; bppc llama-server started with `start-llm` for the live checks and later cycled by the efficient-pi session (one DEFERRED, rerun PASS); oMLX left idle after 17:30 at the quantizer session's request; the old-install shim `src/subagent_mcp/` kept until every session restarts its server.
+
+UAT at close (against the goal file only):
+
+| Row | Result |
+|---|---|
+| 1 | PASS: on `fuse`, 866 passed, 1 skipped; `ruff check src tests` clean |
+| 2 | PASS: grep empty |
+| 3 | PASS: 2 effort tests (`-c model_reasoning_effort=xhigh`) |
+| 4 | PASS: 2 `max_agents` tests |
+| 5 | PASS: omp tests incl. `test_hook_blocks_omp_write_to_a_protected_test_path` |
+| 6 | PASS: agy tests; guard fallback recorded here and in S24 |
+| 7 | PASS: doctor --prompt with the installed config: codex 5, glm 16, deepseek 2, gemini 319, bppc 18 tokens (installed binary, 17:5x); omlx 71 tokens (16:0x, same config) |
+| 8 | PASS: smoke_lanes on the installed config, all six `completed`; codex `model=gpt-6-luna effort=xhigh`; bppc first DEFERRED (server restarted by another session), rerun PASS |
+| 9 | PASS: omlx proxy log `forbidden fields sent: none` (only `preserve_thinking` sent) |
+| 10 | PASS: `uv tool list` shows `subagent` editable from this checkout; config `default_provider = "codex"`; `grep -c '^SAM_'` on the env file is 0 |
+| 11 | PASS: this entry, S24, active-work State, CLAUDE.md Subagent lanes |

@@ -35,3 +35,18 @@ Qwen body still contained `preserve_thinking: true` and
 `chat_template_kwargs: {preserve_thinking: true}`. omp 18.0.11's `models.yml` schema does not
 expose a `qwenPreserveThinking` override; `--thinking off`, `reasoning: false`, and
 `omitMaxOutputTokens: true` did not remove it. This remains an upstream/configuration limit.
+
+## Protocol facts retained from the implementation report
+
+- `agent_start` supplies the one `system/init`; `turn_start` begins a turn and clears the
+  accumulated assistant text so the terminal result describes the final turn.
+- `message_update` text and thinking deltas are streamed as assistant blocks. A tool call is
+  emitted at `tool_execution_start`; `tool_execution_end` becomes its tool result.
+- Usage is collected from assistant messages in `agent_end.messages[]`. The same counters can
+  recur on `message_end` and `turn_end`, so summing those events would double-count tokens.
+- omp has no native terminal `result` event. The driver creates one at process exit, combining
+  the last turn's text, usage totals, turn count, process status and captured errors.
+- `--no-session` disables omp's saved-session resume. The driver carries the last assistant
+  text in its in-memory `Session` and prepends it to the next prompt.
+- The fixture captures use a throwaway HOME with both `agent/models.yml` and `agent/config.yml`;
+  without these files omp refuses to start even when its executable is installed.

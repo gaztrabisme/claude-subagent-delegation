@@ -14,6 +14,8 @@ from subagent.loop.events import LiveLog, LogSink
 class ParseTestCounts(unittest.TestCase):
     SAMPLES = {
         "node:test": ("# tests 42\n# pass 40\n# fail 1\n# skipped 1\n# todo 0\n", (42, 40, 1, 1)),
+        "node:test spec reporter": ("ℹ tests 42\nℹ pass 40\nℹ fail 1\nℹ skipped 1\nℹ todo 0\n",
+                                    (42, 40, 1, 1)),
         "jest": ("Tests:       1 failed, 2 skipped, 5 passed, 8 total\n", (8, 5, 1, 2)),
         "vitest": ("      Tests  1 failed | 5 passed | 1 skipped (7)\n", (7, 5, 1, 1)),
         "unittest ok": ("Ran 12 tests in 0.004s\n\nOK (skipped=2)\n", (12, 10, 0, 2)),

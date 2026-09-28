@@ -14,6 +14,7 @@ providers: a config with no `[providers]` table can run nothing.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
 UNIX_SOCKET_PATH_MAX = 104
 SHORT_SOCKET_ROOT = Path("/tmp")
+_APPROVAL_SOCKET_IDS = itertools.count()
 
 # Names the child must never inherit from this server, whatever the providers
 # declare: the parent's own Claude credentials and endpoint.
@@ -64,10 +66,9 @@ class ConfigError(RuntimeError):
     """A config file this server cannot run with. The message says why."""
 
 
-def _default_approval_socket() -> str:
-    """Choose a default socket path that fits macOS's sockaddr_un limit."""
-    pid = os.getpid()
-    path = Path(tempfile.gettempdir()) / f"subagent-approval-{pid}.sock"
+def _approval_socket_path(preferred: str | Path) -> str:
+    """Use a preferred socket path or a unique short path when it is too long."""
+    path = Path(preferred)
     if len(os.fsencode(path)) < UNIX_SOCKET_PATH_MAX:
         return str(path)
 
@@ -75,10 +76,17 @@ def _default_approval_socket() -> str:
     private_dir = SHORT_SOCKET_ROOT / f"subagent-{uid}"
     private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     private_dir.chmod(0o700)
-    path = private_dir / f"a-{pid}.sock"
+    path = private_dir / f"a-{os.getpid()}-{next(_APPROVAL_SOCKET_IDS)}.sock"
     if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
         raise ConfigError("short approval socket path still exceeds the Unix socket limit")
     return str(path)
+
+
+def _default_approval_socket() -> str:
+    """Choose a default socket path that fits macOS's sockaddr_un limit."""
+    pid = os.getpid()
+    preferred = Path(tempfile.gettempdir()) / f"subagent-approval-{pid}.sock"
+    return _approval_socket_path(preferred)
 
 
 def configure_logging(level: str) -> None:

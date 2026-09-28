@@ -99,3 +99,9 @@ For `send_sampling = false`, the generated omp model disables reasoning, omits m
 **Context:** the proxy override used its origin URL alone, so omp dropped the configured `/v1` route and posted to `/chat/completions`; the Anthropic-only body check also missed OpenAI-wire requests.
 
 **Chosen:** replace only the configured base URL origin with the proxy origin, forward the resulting request path unchanged to the oMLX root, and accept `/v1/messages` or `/v1/chat/completions`. The smoke reports every sampled field and fails the oMLX sampling check only for the explicitly forbidden list. **Rejected:** adding `/v1` unconditionally; Claude-style base URLs with no path must continue producing `/v1/messages`.
+
+## S23 — Allowlist child credentials and guard secret-variable output (2026-09-28)
+
+**Context:** OMP needs its configured API key in its child process, while any worker tool can try to print environment variables into the persisted session log. Antigravity also needs its existing login under `HOME` but should not inherit other parent credentials.
+
+**Chosen:** build child environments from the shared allowlist; keep Antigravity's `HOME` because it is already allowlisted and agy reads its login there. Pass all configured `api_key_env` names and driver-injected key names into guard context, then deny variable expansion, named secret printing, whole-environment dumps and `/proc/.../environ` reads. This applies least privilege at process creation and blocks known child credentials at the tool boundary.

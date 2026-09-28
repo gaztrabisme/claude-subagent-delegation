@@ -183,3 +183,10 @@ The `SamplingProxy` logged one omp 18.0.11 chat request to oMLX; body keys were 
 - The body check accepts and names `/v1/messages` and `/v1/chat/completions`; oMLX reports all sampling fields and fails only when the forbidden field list is present.
 - Added offline tests for pathless and `/v1` overrides, OpenAI request forwarding, and the printed forbidden-fields line. Coordinator-owned pytest and Ruff acceptance commands were not run here; no live model call or push was made.
 - External task report: `../../u6-report.md`.
+
+## 2026-09-28 U7 | Fix lanes review findings
+
+- Fixed the OMP smoke provider config, Antigravity credential inheritance and provider boot cache, OMP secret-variable detection and tool mapping, hard protection for OMP guard files/config, Antigravity usage baselines after failures, failed worktree cleanup, and long-TMPDIR approval socket paths. Removed the stray top-level `REPORT.md`; moved retained OMP protocol facts to `tests/fixtures/omp/README.md`.
+- The owner accepted the Antigravity shared-guard finding: the driver remains `experimental`, runs with `--sandbox`, and agy 1.2.12 exposed no deny-capable hook format.
+- Focused OMP smoke suite: 69 passed. Acceptance: `uv run pytest -q` → 865 passed, 1 skipped, 19 subtests; `uv run ruff check src tests scripts` → all checks passed. The required source-literal grep had no matches; `REPORT.md` is absent; the review section is present.
+- No live model calls or push. Per-finding commits and tests are recorded in `wiki/review.md`; external report: `../../u7-report.md`.

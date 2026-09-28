@@ -256,3 +256,31 @@ No finding: each orchestrator parser has a malformed-output test that returns a 
 
 Outcome: open — cosmetic for the matrix (the cell is reported as failed rather than as a hidden-test result); fix scheduled with the next bench change.
 **FAIL for unattended use on a developer's machine.** A worker subprocess receives undeclared environment secrets, the HTML dashboard can execute markup supplied by a trace, and direct file tools can corrupt the loop's checkpoint refs despite the shell guard. The Registry and background-socket lifecycle also have reproducible state/path and availability failures, while benchmark and accounting defects can silently produce misleading results. The test-release ordering and several reviewed parser/config paths appear sound, but these remaining issues are enough that unattended runs are not safe until the high-severity exposures and state-integrity gaps are closed.
+
+## 2026-09-28 lanes review
+
+Scope: the numbered findings in the lanes review report, the U7 coordinator findings, and the accepted Antigravity guard limitation. Each fixed outcome names its commit and regression test.
+
+0. **OMP smoke override loses the `omlx` driver** — fixed in `163d5e9`; `test_smoke_omp_override_keeps_v1_and_prints_forbidden_fields` now writes a minimal provider config with `driver = "omp"`.
+
+1. **HIGH — Antigravity inherits ambient credentials outside the child allowlist** — fixed in `327cab4`; `test_child_environment_drops_ambient_credentials_but_keeps_agy_login` proves `GH_TOKEN` and `AWS_SECRET_ACCESS_KEY` are dropped while `HOME` remains for agy login. The child uses `Settings.base_child_env()`.
+
+2. **HIGH — OMP can print its configured API key into the raw session log** — fixed in `91b7434`; `test_secret_environment_reads_are_denied_from_guard_context`, `test_guard_secret_env_names_include_configured_keys_and_driver_injections`, and `test_agent_guard_context_contains_configured_and_driver_injected_secret_names` cover configured key names, injected driver keys, variable expansion, environment dumps, and process-environment reads.
+
+3. **MED — Unknown OMP tools lose their path before policy classification** — fixed in `e55fbe0`; `test_hook_maps_ast_edit_paths_to_multi_edit_before_classification`, `test_hook_maps_other_omp_write_tools_into_classifier_shapes`, and `test_hook_denies_unmapped_omp_tool_without_asking_supervisor` cover path-bearing writes, inline execution, and default denial before supervisor escalation.
+
+4. **MED — The OMP approval hook can be changed through an external-path escalation** — fixed in `f5877e3`; `test_omp_guard_code_and_agent_config_are_hard_protected` verifies the packaged hook, approval hook, and per-agent OMP config remain denied with `allow-escalations` enabled.
+
+5. **MED — Antigravity's experimental check can be skipped on same-driver fallback** — fixed in `1a398ae`; `test_boot_experimental_gate_is_checked_per_provider_on_the_same_driver` covers an opted-in and opted-out provider sharing the Antigravity driver.
+
+6. **MED — Antigravity can double-count cumulative usage after a failed resume** — fixed in `8b01a1a`; `test_failed_model_result_does_not_reset_cumulative_usage_baseline` replays `probe` → `bad-model` → `resumed` and reports the successful resumed delta as `19646 / 0 / 1`.
+
+7. **LOW — Failed worktree creation leaks its temporary parent directory** — fixed in `73ef094`; `test_failed_worktree_add_removes_temp_parent_and_prunes` verifies cleanup and Git worktree pruning after `worktree add` fails.
+
+8. **Coordinator — the approval socket exceeds the macOS AF_UNIX path limit under a long `TMPDIR`** — fixed in `88900b4`; `test_default_approval_socket_falls_back_when_tmpdir_path_is_too_long` verifies a short socket path and 0700 per-user directory.
+
+9. **Stray top-level `REPORT.md` from the OMP branch** — fixed in `0cf1276`; useful OMP event and fixture facts were moved to `tests/fixtures/omp/README.md`, and the top-level report was removed.
+
+10. **Review outcomes recorded** — complete in this section; fixed findings cite their implementation commits, and the accepted finding below records the owner's decision.
+
+**HIGH — Antigravity can write without the shared guard** — accepted by the owner. The driver remains experimental and passes `--sandbox`; no deny-capable hook format was found in agy 1.2.12. No change was made for this finding.

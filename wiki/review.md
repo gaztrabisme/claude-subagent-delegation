@@ -103,7 +103,7 @@ Reproduction: run a valid two-task `--parallel` manifest with `[core].max_agents
 
 Suggested fix: validate parallel task count against available agent capacity before creating worktrees, and put per-worker result initialization plus worktree/guard cleanup in `finally` paths.
 
-Outcome: open — parallel mode is not exercised by the benchmark yet; fix scheduled with the parallel-worker unit (active-work). Until then a provider with `max_agents = 1` must not be used with `--parallel`.
+Outcome: fixed in commit f6ebab1.
 **MED — a configured approval socket path breaks `run --background` after the parent exits.** [`supervisor.py:339`](../src/subagent/guard/supervisor.py#L339), [`supervisor.py:349`](../src/subagent/guard/supervisor.py#L349), [`loop.py:1109`](../src/subagent/loop/loop.py#L1109), [`cli.py:557`](../src/subagent/cli.py#L557)
 
 The parent and respawned CLI child load the same explicit `[guard].approval_socket`. The child unlinks and rebinds that pathname in `serve()`. The parent then reaches `server.stop()` and `cleanup()` unlinks the child's socket path. Subsequent hook calls fail closed because no socket is reachable, so the background worker cannot use guarded tools.

@@ -64,6 +64,8 @@ class Translator:
         self.result_event: dict[str, Any] | None = None
         self.errors: list[str] = []
         self.turn_count = 1
+        self.pending_usage_cumulative: dict[str, int] | None = None
+        self.pending_num_turns = 0
 
     def feed(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         kind = event.get("event")
@@ -161,9 +163,9 @@ class Translator:
         else:
             delta = current
             self.turn_count = max(0, num_turns) if isinstance(raw_num_turns, (int, float)) else 1
-        self.session.data["agy_usage_cumulative"] = current
-        if num_turns:
-            self.session.data["agy_num_turns"] = num_turns
+        if str(result.get("status") or "").upper() == "SUCCESS":
+            self.pending_usage_cumulative = current
+            self.pending_num_turns = num_turns
 
         cache = delta["cache_read_tokens"]
         usage = {
@@ -196,6 +198,10 @@ class Translator:
         failed = bool(event.get("is_error")) or exit_code not in (0, None)
         event["is_error"] = failed
         event["subtype"] = "error" if failed else "success"
+        if not failed and self.pending_usage_cumulative is not None:
+            self.session.data["agy_usage_cumulative"] = self.pending_usage_cumulative
+            if self.pending_num_turns:
+                self.session.data["agy_num_turns"] = self.pending_num_turns
         if failed:
             parts = [str(event.get("error") or "")]
             if exit_code not in (0, None) and not parts[0]:

@@ -94,7 +94,7 @@ class Pricing:
             raise SystemExit(f"counterfactual model {self.counterfactual!r} not in pricing")
 
     @classmethod
-    def from_settings(cls, settings) -> "Pricing":
+    def from_settings(cls, settings) -> Pricing:
         """Pricing from parsed Settings: the [pricing] table (config uses the
         `counterfactual` key; pricing.toml the older `counterfactual_model`)."""
         return cls(dict(settings.pricing))

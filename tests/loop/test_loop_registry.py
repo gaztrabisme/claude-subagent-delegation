@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from subagent.config import Settings
 from subagent.guard import supervisor as sup
-from subagent.guard.classify import ALLOW, Verdict
+from subagent.guard.classify import ALLOW, DENY, TEST_FILES_READ_ONLY, Verdict
 
 from .helpers import Sandbox, for_drivers, need
 
@@ -80,6 +80,20 @@ class GuardContext(unittest.TestCase):
             ))
         self.assertEqual(verdict.action, ALLOW)
         self.assertEqual(seen["guard_context"], {"protected": ["test/x.js"]})
+
+    def test_decide_denies_file_write_to_a_protected_test(self):
+        settings = Settings(workspace=Path("/w"), session_root=Path("/s"))
+        supervisor = sup.Supervisor(settings, registry=None)
+        verdict = asyncio.run(supervisor.decide(
+            "Write",
+            {"file_path": "tests/test_calc.py", "content": "tampered"},
+            Path("/w/proj"),
+            "a1",
+            None,
+            {"protected": ["/w/proj/tests/test_calc.py"]},
+        ))
+        self.assertEqual(verdict.action, DENY)
+        self.assertEqual(verdict.reason, TEST_FILES_READ_ONLY)
 
 
 if __name__ == "__main__":

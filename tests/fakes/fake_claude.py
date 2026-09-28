@@ -71,9 +71,8 @@ event({"type": "system", "subtype": "init", "session_id": session_id,
 script_dir = os.path.join(cwd, ".subagent")
 os.makedirs(script_dir, exist_ok=True)
 script = os.path.join(script_dir, "fake_scenario.sh")
-with open(os.environ["FAKE_SCRIPT"]) as fh:
-    with open(script, "w") as out:
-        out.write(fh.read())
+with open(os.environ["FAKE_SCRIPT"]) as fh, open(script, "w") as out:
+    out.write(fh.read())
 command = "bash .subagent/fake_scenario.sh"
 event({"type": "assistant", "session_id": session_id, "message": {"content": [
     {"type": "tool_use", "id": "call-1", "name": "Bash", "input": {"command": command}},

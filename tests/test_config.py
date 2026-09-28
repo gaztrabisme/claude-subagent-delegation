@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import shutil
+import stat
 from pathlib import Path
 
 import anyio
@@ -13,7 +16,7 @@ import pytest
 from subagent import config, health, runs
 from subagent.config import ConfigError
 from subagent.providers import claude as claude_provider
-from subagent.providers.base import Session
+from subagent.providers.base import ProviderConfig, Session
 from subagent.providers.codex import codex_env
 from subagent.providers.grok import GROK_PROVIDER
 from subagent.runs import COMPLETED, Registry
@@ -29,6 +32,55 @@ GLM = {
     "model": "glm-5.3-flash[1m]",
     "api_key_env": "GLM_API_KEY",
 }
+
+
+def test_guard_secret_env_names_include_configured_keys_and_driver_injections(tmp_path: Path):
+    settings = config.Settings(
+        workspace=tmp_path,
+        session_root=tmp_path / "sessions",
+        providers={
+            "claude": ProviderConfig(
+                name="claude", driver="claude", vendor="anthropic",
+                api_key_envs=("CUSTOM_CLAUDE_KEY",),
+            ),
+            "grok": ProviderConfig(
+                name="grok", driver="grok", vendor="grok",
+                api_key_envs=("CUSTOM_GROK_CREDENTIAL",),
+            ),
+            "omp": ProviderConfig(
+                name="omp", driver="omp", vendor="omp",
+                api_key_envs=("OMLX_API_KEY",),
+            ),
+        },
+    )
+
+    assert set(settings.guard_secret_env_names) == {
+        "ANTHROPIC_AUTH_TOKEN", "CUSTOM_CLAUDE_KEY", "CUSTOM_GROK_CREDENTIAL",
+        "OMLX_API_KEY", "SUBAGENT_OMP_API_KEY", "XAI_API_KEY",
+    }
+
+
+def test_default_approval_socket_falls_back_when_tmpdir_path_is_too_long(
+    tmp_path: Path, monkeypatch
+):
+    fallback_root = Path(__file__).resolve().parents[1] / ".t"
+    shutil.rmtree(fallback_root, ignore_errors=True)
+    monkeypatch.setattr(config, "SHORT_SOCKET_ROOT", fallback_root)
+    monkeypatch.setattr(config.tempfile, "gettempdir", lambda: "/" + "x" * 110)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    cfg_file = write_config(tmp_path / "socket.toml", {})
+
+    try:
+        settings = config.load(extra=cfg_file)
+        socket_path = Path(settings.approval_socket)
+        per_user_dir = fallback_root / f"subagent-{os.getuid()}"
+
+        assert socket_path.parent == per_user_dir
+        assert socket_path.name.startswith("a-") and socket_path.suffix == ".sock"
+        assert len(os.fsencode(socket_path)) < 104
+        assert stat.S_IMODE(per_user_dir.stat().st_mode) == 0o700
+    finally:
+        shutil.rmtree(fallback_root, ignore_errors=True)
 
 
 def _load(tmp_path: Path, tables: dict, name: str = "c.toml"):

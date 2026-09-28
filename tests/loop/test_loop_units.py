@@ -123,7 +123,10 @@ class ResultShaping(unittest.TestCase):
 
     def test_count_check(self):
         session = {}
-        t = lambda passed, total, skipped: {"passed": passed, "counts": {"total": total, "skipped": skipped}}
+
+        def t(passed, total, skipped):
+            return {"passed": passed, "counts": {"total": total, "skipped": skipped}}
+
         check = delegate._check_test_counts
         self.assertIsNone(check(session, "h1", t(False, 1, 0)))
         self.assertIsNone(check(session, "h1", t(True, 42, 0)))

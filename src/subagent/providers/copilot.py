@@ -31,7 +31,7 @@ import uuid
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-from ..config import Settings, log
+from ..config import Settings
 from ..router import COPILOT_MODEL_UNAVAILABLE, Refusal, clip
 from .base import DRIVER_COPILOT, Process, ProviderConfig, Session
 

@@ -14,6 +14,7 @@ providers: a config with no `[providers]` table can run nothing.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -28,6 +29,9 @@ from typing import Any
 
 from . import adapter
 from .providers.base import (
+    DRIVER_CLAUDE,
+    DRIVER_GROK,
+    DRIVER_OMP,
     DRIVERS,
     HealthSpec,
     PricingSpec,
@@ -43,6 +47,9 @@ APPROVAL_HOOK = Path(__file__).parent / "guard" / "approval_hook.py"
 CONFIG_ENV = "SUBAGENT_CONFIG"
 CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
+UNIX_SOCKET_PATH_MAX = 104
+SHORT_SOCKET_ROOT = Path("/tmp")
+_APPROVAL_SOCKET_IDS = itertools.count()
 
 # Names the child must never inherit from this server, whatever the providers
 # declare: the parent's own Claude credentials and endpoint.
@@ -57,6 +64,29 @@ FIXED_LEAKED_KEYS = (
 
 class ConfigError(RuntimeError):
     """A config file this server cannot run with. The message says why."""
+
+
+def _approval_socket_path(preferred: str | Path) -> str:
+    """Use a preferred socket path or a unique short path when it is too long."""
+    path = Path(preferred)
+    if len(os.fsencode(path)) < UNIX_SOCKET_PATH_MAX:
+        return str(path)
+
+    uid = getattr(os, "getuid", lambda: "user")()
+    private_dir = SHORT_SOCKET_ROOT / f"subagent-{uid}"
+    private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private_dir.chmod(0o700)
+    path = private_dir / f"a-{os.getpid()}-{next(_APPROVAL_SOCKET_IDS)}.sock"
+    if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
+        raise ConfigError("short approval socket path still exceeds the Unix socket limit")
+    return str(path)
+
+
+def _default_approval_socket() -> str:
+    """Choose a default socket path that fits macOS's sockaddr_un limit."""
+    pid = os.getpid()
+    preferred = Path(tempfile.gettempdir()) / f"subagent-approval-{pid}.sock"
+    return _approval_socket_path(preferred)
 
 
 def configure_logging(level: str) -> None:
@@ -449,6 +479,19 @@ class Settings:
         declared = {n for cfg in self.providers.values() for n in cfg.api_key_envs}
         return (*sorted(declared), *FIXED_LEAKED_KEYS)
 
+    @property
+    def guard_secret_env_names(self) -> tuple[str, ...]:
+        """Names a child guard must refuse to print from its environment."""
+        names = {name for cfg in self.providers.values() for name in cfg.api_key_envs}
+        drivers = {cfg.driver for cfg in self.providers.values()}
+        if DRIVER_CLAUDE in drivers:
+            names.add("ANTHROPIC_AUTH_TOKEN")
+        if DRIVER_GROK in drivers:
+            names.add("XAI_API_KEY")
+        if DRIVER_OMP in drivers:
+            names.add("SUBAGENT_OMP_API_KEY")
+        return tuple(sorted(names))
+
     def base_child_env(self) -> dict[str, str]:
         """Runtime allowlist plus explicitly configured non-secret child variables.
 
@@ -663,7 +706,7 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
         supervisor_timeout=float(_num(guard, "supervisor_timeout", 120.0)),
         allow_unguarded=_bool(guard, "allow_unguarded", False),
         approval_socket=_str(guard, "approval_socket", None)
-        or str(Path(tempfile.gettempdir()) / f"subagent-approval-{os.getpid()}.sock"),
+        or _default_approval_socket(),
         log_level=_str(core, "log_level", "info") or "info",
         max_steps=int(defaults["max_steps"]),
         verify_timeout=float(_num(core, "verify_timeout", 300.0)),

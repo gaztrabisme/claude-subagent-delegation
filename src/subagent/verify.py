@@ -38,7 +38,11 @@ class VerificationResult:
 
     @property
     def output_tail(self) -> str:
-        return self.output[-OUTPUT_TAIL_CHARS:] if len(self.output) > OUTPUT_TAIL_CHARS else self.output
+        return (
+            self.output[-OUTPUT_TAIL_CHARS:]
+            if len(self.output) > OUTPUT_TAIL_CHARS
+            else self.output
+        )
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {

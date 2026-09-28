@@ -81,3 +81,27 @@ Chain: the caller's primary (default glm), then the other cloud lanes in the ord
 ## S19 — Lane rules learned in this run
 
 **Chosen:** one GLM child at a time (two concurrent children trigger the z.ai 1313 throttle every time); DeepSeek for critical-path units when its balance is up; Claude agents only after GLM and DeepSeek refuse (Gary, 2026-09-22); Codex gpt-5.6-luna at xhigh for review and code once its quota returned (Gary, 2026-09-23). A unit that hits its step cap is continued in the same session with an ordered recovery (commit WIP, get the target tests green, report by a fixed step).
+
+## S20 — omp gets per-agent endpoint config and the shared approval hook (2026-09-28)
+
+**Chosen:** omp's `--hook` runs the packaged `guard/omp_hook.ts` for every tool call. The bridge passes a Claude-shaped tool call to the existing `approval_hook.py` with the same Python interpreter and agent id; absent, malformed, timed-out, or denying responses block. `models.yml` and `config.yml` are written under `session_root/agents/<agent-id>/omp-agent`, and provider credentials reach omp only through its environment. `test_hook_blocks_omp_write_to_a_protected_test_path` and `test_real_omp_hook_blocks_protected_write_against_local_stub` prove the identity and blocking path. The `Supervisor` must pass `guard_context` to `classify()` for protected-test rules to apply (`test_decide_denies_file_write_to_a_protected_test`).
+
+For `send_sampling = false`, the generated omp model disables reasoning, omits max-output tokens, and uses provider-default values for supported sampler settings; `--thinking off` prevents an inherited setting from enabling reasoning. omp 18.0.11 still sends `preserve_thinking: true` and `chat_template_kwargs: {preserve_thinking: true}` on the configured Qwen request. The installed models config schema does not expose the internal `qwenPreserveThinking` property, so this field remains a documented limit rather than an undocumented compatibility hack. See `tests/fixtures/omp/README.md` and the external `omp-report.md` for the live proxy evidence.
+
+## S21 — Keep oMLX on omp for the machine draft (2026-09-28)
+
+**Context:** The coordinator accepted U1's `preserve_thinking` finding and logged the remaining omp request fields.
+
+**Chosen:** The machine draft keeps `[providers.omlx].driver = "omp"` with `send_sampling = false`. **Rejected:** switching this provider to `claude`; the accepted finding documents a known request behavior and does not change the selected driver.
+
+## S22 — Preserve the provider base path through the smoke proxy (2026-09-28)
+
+**Context:** the proxy override used its origin URL alone, so omp dropped the configured `/v1` route and posted to `/chat/completions`; the Anthropic-only body check also missed OpenAI-wire requests.
+
+**Chosen:** replace only the configured base URL origin with the proxy origin, forward the resulting request path unchanged to the oMLX root, and accept `/v1/messages` or `/v1/chat/completions`. The smoke reports every sampled field and fails the oMLX sampling check only for the explicitly forbidden list. **Rejected:** adding `/v1` unconditionally; Claude-style base URLs with no path must continue producing `/v1/messages`.
+
+## S23 — Allowlist child credentials and guard secret-variable output (2026-09-28)
+
+**Context:** OMP needs its configured API key in its child process, while any worker tool can try to print environment variables into the persisted session log. Antigravity also needs its existing login under `HOME` but should not inherit other parent credentials.
+
+**Chosen:** build child environments from the shared allowlist; keep Antigravity's `HOME` because it is already allowlisted and agy reads its login there. Pass all configured `api_key_env` names and driver-injected key names into guard context, then deny variable expansion, named secret printing, whole-environment dumps and `/proc/.../environ` reads. This applies least privilege at process creation and blocks known child credentials at the tool boundary.

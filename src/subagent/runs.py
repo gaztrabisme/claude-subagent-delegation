@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import adapter, health, providers, router
-from .config import Settings, log
+from .config import APPROVAL_HOOK, Settings, log
 from .guard.classify import protect
 from .lane_state import LaneState
 from .providers.base import ProviderConfig, Session
@@ -35,6 +35,7 @@ from .providers.claude import (  # noqa: F401
     classify_exit,
     exit_event,
 )
+from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
@@ -588,9 +589,9 @@ class Agent:
         self.cfg = cfg or settings.provider()
         self.fallback = fallback
         self.driver = providers.for_driver(self.cfg.driver)
-        # Driver name -> its boot result (None when it can run) and the
-        # session it minted. Filled lazily: a later hop's driver is checked
-        # only when the walk gets there.
+        # Provider name -> its boot result (None when it can run) and session.
+        # Two provider configs may share a driver while carrying different
+        # gates or driver-owned session state.
         self._booted: dict[str, str | None] = {}
         self._sessions: dict[str, Session] = {}
         self.chain = list(chain) if chain else [self.cfg]
@@ -598,9 +599,11 @@ class Agent:
         self._provider_load = provider_load
         # Called for every parsed event of every turn, as it arrives.
         self.on_event = on_event
-        # Guard context the classifier receives alongside each verdict: the
-        # loop sets {"protected": [...], "state_allow": [...]} before a run.
-        self.guard_context: dict[str, Any] = {}
+        # Guard context carries configured child-secret names even before the
+        # loop adds its protected tests and state allowlist.
+        self.guard_context: dict[str, Any] = {
+            "secret_env_names": list(settings.guard_secret_env_names),
+        }
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -811,21 +814,21 @@ class Agent:
 
     def _boot_driver(self, driver: Any, cfg: ProviderConfig) -> str | None:
         """Boot `driver` for this agent once; the reason it cannot run, or None."""
-        if driver.name not in self._booted:
+        if cfg.name not in self._booted:
             try:
                 error, session = driver.boot(self.settings, self.agent_id, cfg)
             except NotImplementedError as exc:
                 error, session = str(exc), Session(provider=cfg.name)
-            self._booted[driver.name] = error
-            self._sessions[driver.name] = session
-        return self._booted[driver.name]
+            self._booted[cfg.name] = error
+            self._sessions[cfg.name] = session
+        return self._booted[cfg.name]
 
     def session(self) -> Session:
-        """The current driver's per-agent session state."""
-        found = self._sessions.get(self.driver.name)
+        """The current provider's per-agent session state."""
+        found = self._sessions.get(self.cfg.name)
         if found is None:
             found = Session(provider=self.cfg.name)
-            self._sessions[self.driver.name] = found
+            self._sessions[self.cfg.name] = found
         return found
 
     def _worker(self) -> None:
@@ -1392,6 +1395,8 @@ class Registry:
             interval=settings.sample_seconds,
         )
         protect(settings.session_root)
+        protect(APPROVAL_HOOK)
+        protect(OMP_HOOK)
         self.lane_state = LaneState(settings.session_root)
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()
@@ -1565,7 +1570,8 @@ class Registry:
         if expected_home is None:
             if recorded_home not in (None, ""):
                 raise RegistryError(
-                    f"session record agent_home {recorded_home!r} is not expected for {chosen.driver}"
+                    f"session record agent_home {recorded_home!r} is not expected "
+                    f"for {chosen.driver}"
                 )
         else:
             try:
@@ -1577,7 +1583,8 @@ class Registry:
                 home_matches = False
             if not home_matches:
                 raise RegistryError(
-                    f"session record agent_home {recorded_home!r} does not match expected {expected_home}"
+                    f"session record agent_home {recorded_home!r} does not match "
+                    f"expected {expected_home}"
                 )
         agents_root = (self.settings.session_root / "agents").resolve()
         if expected_home is not None and not expected_home.resolve().is_relative_to(agents_root):

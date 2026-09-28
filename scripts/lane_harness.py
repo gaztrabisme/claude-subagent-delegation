@@ -42,6 +42,9 @@ from subagent.core import InProcessServer as _CoreServer  # noqa: E402
 SAMPLING_FIELDS = (
     "temperature", "top_p", "top_k", "min_p", "typical_p", "presence_penalty",
     "frequency_penalty", "repetition_penalty", "repeat_penalty", "seed",
+    "max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort",
+    "thinking", "thinking_budget", "reasoning_budget", "enable_thinking",
+    "preserve_thinking", "chat_template_kwargs",
 )
 
 
@@ -156,7 +159,10 @@ class SamplingProxy:
                        else http.client.HTTPConnection)
                 conn = cls(proxy.upstream_host, proxy.upstream_port, timeout=3600)
                 try:
-                    conn.request(self.command, proxy.upstream_prefix + self.path,
+                    # Keep the caller's full request target (including /v1 and
+                    # the query) intact; oMLX is configured as an origin root.
+                    upstream_path = proxy.upstream_prefix + self.path
+                    conn.request(self.command, upstream_path,
                                  body=raw if raw or self.command in ("POST", "PUT", "PATCH")
                                  else None, headers=headers)
                     resp = conn.getresponse()

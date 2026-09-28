@@ -25,3 +25,12 @@ Reader: the coordinator and the build lanes for this run.
 - Parent transcripts carry no subagent session id; the MCP server gets no parent session id in its env. The cost join keys on run_id found in the parent's tool_result.
 
 Grounded: G and D wikis and code, report.md, ~/.claude.json lane env, live probes → one server with two child drivers (`claude -p`, `codex exec`); four of five lanes run through G's guarded runtime; Codex runs in its own sandbox.
+
+# Grounded — 2026-09-28 — lanes
+
+- Live server: uv tool install of 29ff214 (`subagent_mcp`, lanes.py: codex model None → copies ~/.codex/config.toml = gpt-6-sol/high). Launched by agent-capabilities/bin/subagent-mcp for Claude Code and Codex.
+- fuse: no effort key anywhere; codex.py:324-326 drops user effort once `model` is set; mcp_server lists providers from config. Parallel-mode crash open (review.md:98-106). Baseline 4 failing tests (`counts`).
+- omp-driver: c9698e6 + f73563c apply; 7531144 (Windows) conflicts on one import and is out of scope. Driver claims no hook; omp 18.0.11 has `--hook` with a blocking `tool_call` event. No endpoint wiring; omp refuses without models.yml.
+- agy 1.2.12: stream-json = init / step_update (per step usage, tool_info) / result (status, response, usage). Probe fixture in session scratchpad. Hook support present in binary, format unknown.
+- SAM_* → TOML map: review in plan; none migrates automatically; `supervisor="agent"` needs `supervisor_cmd`; oMLX key now `OMLX_API_KEY` env.
+Grounded: live package lanes.py/health.py, fuse config.py/codex.py/mcp_server.py, omp-driver branch, agy probe, subagent.env → effort key and endpoint wiring are prerequisites; baseline must be made green first.

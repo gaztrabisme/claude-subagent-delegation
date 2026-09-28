@@ -89,6 +89,17 @@ def test_completed_verbatim_under_cap(registry, tmp_path: Path):
     assert "--dangerously-skip-permissions" in argv
 
 
+def test_agent_guard_context_contains_configured_and_driver_injected_secret_names(
+    registry, tmp_path: Path
+):
+    agent = registry.create_agent("t", tmp_path, "glm-5.3[1m]")
+
+    names = agent.guard_context["secret_env_names"]
+
+    assert "OMLX_API_KEY" in names
+    assert "ANTHROPIC_AUTH_TOKEN" in names
+
+
 def test_adopt_rejects_agent_ids_outside_the_loop_uuid4_pattern(registry, tmp_path: Path):
     with pytest.raises(RegistryError, match="loop-.*uuid4"):
         registry.adopt({

@@ -598,9 +598,11 @@ class Agent:
         self._provider_load = provider_load
         # Called for every parsed event of every turn, as it arrives.
         self.on_event = on_event
-        # Guard context the classifier receives alongside each verdict: the
-        # loop sets {"protected": [...], "state_allow": [...]} before a run.
-        self.guard_context: dict[str, Any] = {}
+        # Guard context carries configured child-secret names even before the
+        # loop adds its protected tests and state allowlist.
+        self.guard_context: dict[str, Any] = {
+            "secret_env_names": list(settings.guard_secret_env_names),
+        }
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace

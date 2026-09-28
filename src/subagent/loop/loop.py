@@ -212,6 +212,7 @@ class Worker:
         return {
             "protected": protected,
             "state_allow": [f"{STATE_DIR}/result.json", f"{STATE_DIR}/test_change_request.md"],
+            "secret_env_names": list(self.registry.settings.guard_secret_env_names),
         }
 
     def run_round(self, candidates, fallback, prompt):
@@ -983,14 +984,17 @@ found by the
     if previous_record and previous_record.get("agent_id"):
         agent = server.registry.adopt(previous_record, workspace=root, on_event=live.feed)
         copilot_driver.allow_loop_agent(agent.agent_id)
-        run = agent.follow_up(prompt, verification="true", on_event=live.feed, distill=False)
     else:
         agent = server.registry.create_agent(
             None, root, provider=target.provider, model=target.model, fallback="none",
             on_event=live.feed, agent_id=_new_loop_agent_id(),
         )
-        run = agent.delegate(prompt, "true", on_event=live.feed, distill=False)
     agent.guard_context = {"protected": [], "state_allow": [f"{STATE_DIR}/test_writer_result.json"]}
+    agent.guard_context["secret_env_names"] = list(server.settings.guard_secret_env_names)
+    if previous_record and previous_record.get("agent_id"):
+        run = agent.follow_up(prompt, verification="true", on_event=live.feed, distill=False)
+    else:
+        run = agent.delegate(prompt, "true", on_event=live.feed, distill=False)
     if not run.done.wait(agent.cfg.run_timeout):
         agent.close("run deadline exceeded", kind="timeout")
     run.done.wait()
@@ -1658,6 +1662,7 @@ Returns a result dict."""
                 f"{STATE_DIR}/review/result.json",
                 f"{STATE_DIR}/review/tests_result.json",
             ],
+            "secret_env_names": list(server.settings.guard_secret_env_names),
         }
         run = agent.delegate(text, "true", on_event=live.feed, distill=False)
         if not run.done.wait(agent.cfg.run_timeout):

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import adapter, health, providers, router
-from .config import Settings, log
+from .config import APPROVAL_HOOK, Settings, log
 from .guard.classify import protect
 from .lane_state import LaneState
 from .providers.base import ProviderConfig, Session
@@ -35,6 +35,7 @@ from .providers.claude import (  # noqa: F401
     classify_exit,
     exit_event,
 )
+from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
@@ -1394,6 +1395,8 @@ class Registry:
             interval=settings.sample_seconds,
         )
         protect(settings.session_root)
+        protect(APPROVAL_HOOK)
+        protect(OMP_HOOK)
         self.lane_state = LaneState(settings.session_root)
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()

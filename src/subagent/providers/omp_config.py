@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from ..config import APPROVAL_HOOK, Settings
+from ..guard.classify import protect
 from .base import ProviderConfig
 
 OMP_HOOK = Path(__file__).parent.parent / "guard" / "omp_hook.ts"
@@ -47,6 +48,7 @@ def write_agent_config(
         raise ValueError(f"omp provider {cfg.name!r} requires base_url and model")
     home = settings.session_root / "agents" / agent_id / "omp-agent"
     home.mkdir(parents=True, exist_ok=True)
+    protect(home)
     key_name, _ = _key_binding(cfg)
     reference = _model_reference(cfg.name, selected)
     model_id = _model_id(cfg.name, selected)

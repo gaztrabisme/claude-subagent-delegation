@@ -185,6 +185,25 @@ def test_extract_sampling_top_level_only():
     assert harness.extract_sampling(["temperature"]) == {}
 
 
+def test_extract_sampling_includes_generation_limits_and_thinking_controls():
+    body = {
+        "max_tokens": 4096,
+        "reasoning_effort": "high",
+        "enable_thinking": True,
+        "preserve_thinking": True,
+        "chat_template_kwargs": {"preserve_thinking": True},
+        "temperature": 0.7,
+    }
+    assert harness.extract_sampling(body) == {
+        "max_tokens": 4096,
+        "reasoning_effort": "high",
+        "enable_thinking": True,
+        "preserve_thinking": True,
+        "chat_template_kwargs": {"preserve_thinking": True},
+        "temperature": 0.7,
+    }
+
+
 def test_request_record_keys_and_non_json():
     raw = json.dumps({"model": "m", "messages": [], "top_p": 1}).encode()
     rec = harness.request_record("POST", "/v1/messages", raw)
@@ -731,4 +750,3 @@ def test_reopen_lane_reads_the_settings_when_no_root_is_given(tmp_path, monkeypa
     assert "glm: closed until" in capsys.readouterr().out
     assert reopener.main(["omlx"]) == 0
     assert "omlx: was not closed" in capsys.readouterr().out
-

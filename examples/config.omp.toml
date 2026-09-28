@@ -1,0 +1,44 @@
+# Oh My Pi (`omp`) running local models behind llama.cpp and oMLX. The driver
+# writes an isolated models.yml and config.yml under each agent's session root.
+
+[core]
+default_provider = "omlx"
+
+[providers.bppc]
+driver = "omp"
+base_url = "http://llama.cpp-host:8080/v1"
+model = "qwen3.8-27b"
+local = true
+max_agents = 1
+api_key = "local"
+
+[providers.bppc.health]
+kind = "llamacpp"
+candidates = ["http://llama.cpp-host:8080"]
+warm = true
+cold_load_seconds = 600
+
+[providers.bppc.pricing]
+kind = "local"
+usd = 0
+
+[providers.omlx]
+driver = "omp"
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = "OMLX_API_KEY"
+model = "Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B"
+local = true
+send_sampling = false
+max_agents = 1
+
+[providers.omlx.health]
+kind = "omlx"
+url = "http://127.0.0.1:8000/api/status"
+cold_load_seconds = 120
+
+[providers.omlx.probe]
+host_cmd = ["mac"]
+
+[providers.omlx.pricing]
+kind = "local"
+usd = 0

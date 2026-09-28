@@ -1,0 +1,6 @@
+Model "omlx/does-not-exist" not found
+
+Set an API key environment variable:
+  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.
+
+Or create /Users/GaryT/Documents/Work/tools/mcp/subagent-omp/.capture-home/refused/.omp/agent/models.yml

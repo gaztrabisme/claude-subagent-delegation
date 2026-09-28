@@ -10,6 +10,7 @@ from .base import (
     DRIVER_COPILOT,
     DRIVER_GEMINI,
     DRIVER_GROK,
+    DRIVER_OMP,
     DRIVERS,
     HealthSpec,
     PricingSpec,
@@ -42,6 +43,8 @@ def for_driver(name: str) -> Any:
         from .gemini import GEMINI_PROVIDER as provider
     elif name == DRIVER_GROK:
         from .grok import GROK_PROVIDER as provider
+    elif name == DRIVER_OMP:
+        from .omp import OMP_PROVIDER as provider
     else:
         raise KeyError(f"unknown driver {name!r}; expected one of {', '.join(DRIVERS)}")
     _CACHE[name] = provider
@@ -52,6 +55,7 @@ __all__ = [
     "DRIVERS",
     "DRIVER_CLAUDE",
     "DRIVER_CODEX",
+    "DRIVER_OMP",
     "HealthSpec",
     "PricingSpec",
     "ProbeSpec",

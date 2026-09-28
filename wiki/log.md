@@ -80,8 +80,7 @@ Goal: `goals/2026-09-22-fuse-delegation.md`. Plan: `~/.claude/plans/open-a-new-b
 | 07:26 | P0 | Claude agent | PASS a20cfc6: 481 tests; grep subagent_mcp empty; cli detect JSON; mcp import ok. Fast-forwarded to fuse, worktree removed. Agent ran install.sh once, repointing ~/.claude/skills/delegate, restored |
 | 07:3x | deepseek | coordinator | Gary: DeepSeek back online. Lane reopened on disk; live probe PASS (4 s, 8.5k tokens, verified) |
 | 07:3x | P1a | DeepSeek a4 | dispatched run-3042be26bc1f in worktree p1a (config, ProviderConfig, claude/codex providers, runs). Transcript again blank mid-run (U-T2 confirmed on a second lane) |
-| 07:5x | P1a | DeepSeek a4 | cancelled at 297 s, 17 steps, 111k tokens, no edits. Root cause found in the child's own session log: every tool call returned "PreToolUse hook error: can't open file src/subagent_mcp/runtime/approval_hook.py". The running MCP server computed the hook path at import, before P0 moved the hook; the fast-forward of `fuse` in the checkout the server runs from removed the file, so every child call failed closed from that moment. Also the same cause for the GLM run being blank (a1 ran after the ff? no: a1 ran before the ff, so U-T2 stands on its own). Finding U-H1: the hook path must not depend on the checkout the server started from (copy the hook into the session root at startup, or restart the server after a layout change). The child also probed `~/.claude/settings.json` and `~/.claude.json` with no-op Edits while blocked; denied by the failed hook, but recorded (child behaviour under blanket denial). |
-| 07:5x | fix | coordinator | untracked shim at `src/subagent_mcp/runtime/approval_hook.py` forwarding to `src/subagent/guard/approval_hook.py` (excluded via .git/info/exclude); hook probe on deepseek PASS (Read, Bash, Write, verified, 9 s) |
+| 07:5x | P1a | DeepSeek a4 | cancelled at 297 s, 17 steps, 111k tokens, no edits. Root cause found in the child's own session log: every tool call returned "PreToolUse hook error: can't open file approval_hook.py". The running MCP server computed the hook path at import, before P0 moved the hook; the fast-forward of `fuse` in the checkout the server runs from removed the file, so every child call failed closed from that moment. Also the same cause for the GLM run being blank (a1 ran after the ff? no: a1 ran before the ff, so U-T2 stands on its own). Finding U-H1: the hook path must not depend on the checkout the server started from (copy the hook into the session root at startup, or restart the server after a layout change). The child also probed `~/.claude/settings.json` and `~/.claude.json` with no-op Edits while blocked; denied by the failed hook, but recorded (child behaviour under blanket denial). |
 | 07:5x | P1a | DeepSeek a6 | re-dispatched run-41026a1c1690 in worktree p1a |
 | 08:4x | P1a | DeepSeek a6 | FAILED `loop` after 2798 s, 263 steps, 11.3M tokens (10.2M cache reads), zero edits on disk, no commit. Finding U-D1: deepseek-v4-pro read the tree for 47 minutes and never edited; the loop killer fired on the 8th identical Read. Rerouted to a Claude agent (lane plan fallback). |
 | 09:0x | rule | Gary | "Next time retry with GLM and DeepSeek": a unit that fails on one lane goes to GLM, then DeepSeek, before a Claude agent. Applies from P1b onward; P1a stays on the Claude agent already mid-edit. |
@@ -164,3 +163,30 @@ Goal: `goals/2026-09-22-fuse-delegation.md`. Plan: `~/.claude/plans/open-a-new-b
 - U-L2 `subagent detect` started the approval server (fixed in M5).
 - U-C1 a Codex child cannot `git add` in a worktree (gitdir under the parent's .git/worktrees is outside its sandbox); U-C2 a timed-out Codex agent cannot be continued; U-C3 the Codex sandbox cannot bind sockets, so socket-backed tests and the loop's approval socket fail inside it (bench cells use `-s danger-full-access` since M5).
 - U-B1 the claude bench parser fills cost but not `orch_tokens_*`; U-B2 the bench did not install the skill or PATH for non-Claude orchestrators (fixed in M5); U-B4 the Codex-orchestrated cell has no worker accounting (see `data/bench-2026-09-24-codex/README.md`).
+
+## 2026-09-28 — U1 omp driver on `lanes-omp`
+
+Cherry-picked P1a `c9698e6` and P1b `f73563c` as `11903ba` and `b978783`; skipped Windows commit `7531144`. Added isolated per-agent omp model/settings files, API-key environment wiring, a TypeScript `--hook` bridge to the shared approval hook, and `bppc`/`omlx` example providers. Fixed `Supervisor._classify` dropping `guard_context`; without that fix the protected test-path test returned `allow`.
+
+Verification: `uv run pytest tests/test_providers_omp.py -q` → 25 passed, including fake and real omp 18.0.11 hook checks; `uv run pytest -q` → 824 passed, 1 skipped, 19 subtests; wheel build includes `subagent/guard/omp_hook.ts`; `SUBAGENT_CONFIG=examples/config.omp.toml uv run subagent doctor --no-probe` exits 0; source machine-literal grep prints nothing; Ruff passes on all changed Python files. `uv run ruff check src tests` remains red with 168 findings in untouched files.
+
+The `SamplingProxy` logged one omp 18.0.11 chat request to oMLX; body keys were `chat_template_kwargs`, `messages`, `model`, `preserve_thinking`, `stream`, `stream_options`, `tools`. It had no temperature/top-p/top-k/min-p, penalties, seed, max token, reasoning, or thinking-effort fields. It did include `preserve_thinking=true` and `chat_template_kwargs={"preserve_thinking":true}`; the installed schema has no documented switch. `OMLX_API_KEY` was unset, `/api/status` returned HTTP 401 (`API key required`), and the attempted prompt yielded zero output tokens. Evidence and open items are in `omp-report.md`.
+## 2026-09-28 U4 | Integrate omp and Antigravity, clear lint, draft machine config
+- Merged `lanes-omp` and `lanes-agy` into `lanes-int`; both drivers and vendor mappings are registered.
+- Added the mcbob machine config draft at `wiki/data/config-mcbob-2026-09-28.toml`; oMLX remains on omp per S21.
+- `uv run pytest -q`: 835 passed, 1 skipped, 19 subtests; `uv run ruff check src tests`: all checks passed.
+- Machine draft doctor exits 0 with six configured providers. The required source grep prints nothing, and `git diff --check` is clean.
+- External report with merge details, config decisions, and live-test limitations: `int-report.md`.
+
+## 2026-09-28 U6 | Preserve smoke proxy paths for omp/OpenAI wire
+- Proxy base URL overrides now preserve the configured endpoint path; SamplingProxy forwards `/v1` request targets to the configured upstream origin unchanged.
+- The body check accepts and names `/v1/messages` and `/v1/chat/completions`; oMLX reports all sampling fields and fails only when the forbidden field list is present.
+- Added offline tests for pathless and `/v1` overrides, OpenAI request forwarding, and the printed forbidden-fields line. Coordinator-owned pytest and Ruff acceptance commands were not run here; no live model call or push was made.
+- External task report: `../../u6-report.md`.
+
+## 2026-09-28 U7 | Fix lanes review findings
+
+- Fixed the OMP smoke provider config, Antigravity credential inheritance and provider boot cache, OMP secret-variable detection and tool mapping, hard protection for OMP guard files/config, Antigravity usage baselines after failures, failed worktree cleanup, and long-TMPDIR approval socket paths. Removed the stray top-level `REPORT.md`; moved retained OMP protocol facts to `tests/fixtures/omp/README.md`.
+- The owner accepted the Antigravity shared-guard finding: the driver remains `experimental`, runs with `--sandbox`, and agy 1.2.12 exposed no deny-capable hook format.
+- Focused OMP smoke suite: 69 passed. Acceptance: `uv run pytest -q` → 865 passed, 1 skipped, 19 subtests; `uv run ruff check src tests scripts` → all checks passed. The required source-literal grep had no matches; `REPORT.md` is absent; the review section is present.
+- No live model calls or push. Per-finding commits and tests are recorded in `wiki/review.md`; external report: `../../u7-report.md`.

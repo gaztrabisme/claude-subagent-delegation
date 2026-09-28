@@ -9,8 +9,16 @@ import time
 from .common import STATE_DIR, read_json, tail
 
 JS_TEST_GLOBS = [
-    "**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/test/**", "**/tests/**",
-    "**/jest.config.*", "**/jest.setup.*", "**/vitest.config.*", "**/vitest.setup.*", "**/.mocharc*",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/__tests__/**",
+    "**/test/**",
+    "**/tests/**",
+    "**/jest.config.*",
+    "**/jest.setup.*",
+    "**/vitest.config.*",
+    "**/vitest.setup.*",
+    "**/.mocharc*",
 ]
 PY_TEST_GLOBS = ["**/test_*.py", "**/*_test.py", "**/conftest.py", "**/tests/**", "pytest.ini"]
 
@@ -87,8 +95,14 @@ def _detect_rust(root):
 
 def _detect_make(root):
     makefile = root / "Makefile"
-    if makefile.exists() and any(l.startswith("test:") for l in makefile.read_text(errors="ignore").splitlines()):
-        return {"framework": "make", "test_cmd": "make test", "test_globs": ["**/tests/**", "**/test/**"]}
+    if makefile.exists() and any(
+        line.startswith("test:") for line in makefile.read_text(errors="ignore").splitlines()
+    ):
+        return {
+            "framework": "make",
+            "test_cmd": "make test",
+            "test_globs": ["**/tests/**", "**/test/**"],
+        }
     return None
 
 
@@ -126,23 +140,31 @@ def parse_test_counts(output):
     text = re.sub(r"\x1b\[[0-9;]*m", "", output)
 
     # node:test (TAP summary)
-    if re.search(r"^# tests \d+", text, re.M):
-        total = _num(r"^# tests (\d+)", text, re.M)
-        skipped = (_num(r"^# skipped (\d+)", text, re.M) or 0) + (_num(r"^# todo (\d+)", text, re.M) or 0)
-        return {"total": total, "passed": _num(r"^# pass (\d+)", text, re.M) or 0,
-                "failed": _num(r"^# fail (\d+)", text, re.M) or 0, "skipped": skipped}
+    # Node 24's default spec reporter uses ℹ instead of TAP's # for summary lines.
+    node_summary = r"^(?:#|ℹ) "
+    if re.search(node_summary + r"tests \d+", text, re.M):
+        total = _num(node_summary + r"tests (\d+)", text, re.M)
+        skipped = (_num(node_summary + r"skipped (\d+)", text, re.M) or 0) + (
+            _num(node_summary + r"todo (\d+)", text, re.M) or 0
+        )
+        return {"total": total, "passed": _num(node_summary + r"pass (\d+)", text, re.M) or 0,
+                "failed": _num(node_summary + r"fail (\d+)", text, re.M) or 0, "skipped": skipped}
     # jest: "Tests:       1 failed, 2 skipped, 5 passed, 8 total"
     m = re.search(r"^Tests:\s+(.*\d+ total)", text, re.M)
     if m:
         part = m.group(1)
-        get = lambda k: int((re.search(rf"(\d+) {k}", part) or [0, 0])[1])
+        def get(k):
+            return int((re.search(rf"(\d+) {k}", part) or [0, 0])[1])
+
         return {"total": get("total"), "passed": get("passed"), "failed": get("failed"),
                 "skipped": get("skipped") + get("todo")}
     # vitest: "Tests  1 failed | 5 passed | 1 skipped (7)"
     m = re.search(r"^\s*Tests\s+(.*)\((\d+)\)\s*$", text, re.M)
     if m:
         part = m.group(1)
-        get = lambda k: int((re.search(rf"(\d+) {k}", part) or [0, 0])[1])
+        def get(k):
+            return int((re.search(rf"(\d+) {k}", part) or [0, 0])[1])
+
         return {"total": int(m.group(2)), "passed": get("passed"), "failed": get("failed"),
                 "skipped": get("skipped") + get("todo")}
     # unittest: "Ran 12 tests in 0.01s" + "OK (skipped=2)" / "FAILED (failures=1, errors=1)"
@@ -150,15 +172,23 @@ def parse_test_counts(output):
     if m:
         total = int(m.group(1))
         verdict = (re.search(r"^(OK|FAILED)\b.*$", text[m.end():], re.M) or [""])[0]
-        get = lambda k: int((re.search(rf"{k}=(\d+)", verdict) or [0, 0])[1])
+        def get(k):
+            return int((re.search(rf"{k}=(\d+)", verdict) or [0, 0])[1])
+
         failed, skipped = get("failures") + get("errors"), get("skipped")
-        return {"total": total, "passed": max(0, total - failed - skipped - get("expected failures")),
-                "failed": failed, "skipped": skipped}
+        return {
+            "total": total,
+            "passed": max(0, total - failed - skipped - get("expected failures")),
+            "failed": failed,
+            "skipped": skipped,
+        }
     # pytest: "3 failed, 10 passed, 2 skipped in 0.12s"
     m = re.search(r"^[=\s]*((?:\d+ \w+(?: \w+)?, )*\d+ \w+(?: \w+)?) in [\d.]+s", text, re.M)
     if m and re.search(r"\d+ (passed|failed|error)", m.group(1)):
         part = m.group(1)
-        get = lambda k: int((re.search(rf"(\d+) {k}", part) or [0, 0])[1])
+        def get(k):
+            return int((re.search(rf"(\d+) {k}", part) or [0, 0])[1])
+
         passed, failed = get("passed"), get("failed") + get("errors?")
         skipped = get("skipped") + get("xfailed") + get("deselected")
         return {"total": passed + failed + skipped + get("xpassed"), "passed": passed,
@@ -168,27 +198,51 @@ def parse_test_counts(output):
         passed = _num(r"^\s+(\d+) passing", text, re.M) or 0
         failed = _num(r"^\s+(\d+) failing", text, re.M) or 0
         skipped = _num(r"^\s+(\d+) pending", text, re.M) or 0
-        return {"total": passed + failed + skipped, "passed": passed, "failed": failed, "skipped": skipped}
+        return {
+            "total": passed + failed + skipped,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+        }
     # cargo: "test result: ok. 5 passed; 0 failed; 1 ignored;" (one line per test binary)
     if re.search(r"^test result:", text, re.M):
         passed = _num(r"^test result:.*? (\d+) passed", text, re.M) or 0
         failed = _num(r"^test result:.*? (\d+) failed", text, re.M) or 0
         skipped = _num(r"^test result:.*? (\d+) ignored", text, re.M) or 0
-        return {"total": passed + failed + skipped, "passed": passed, "failed": failed, "skipped": skipped}
+        return {
+            "total": passed + failed + skipped,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+        }
     # go test -v: "--- PASS: TestX", "--- FAIL: TestX", "--- SKIP: TestX"
     if re.search(r"^\s*--- (PASS|FAIL|SKIP):", text, re.M):
         passed = len(re.findall(r"^\s*--- PASS:", text, re.M))
         failed = len(re.findall(r"^\s*--- FAIL:", text, re.M))
         skipped = len(re.findall(r"^\s*--- SKIP:", text, re.M))
-        return {"total": passed + failed + skipped, "passed": passed, "failed": failed, "skipped": skipped}
+        return {
+            "total": passed + failed + skipped,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+        }
     return None
 
 
 def run_tests(root, test_cmd, log_dir=None, label="test"):
     """Run the test command; returns {passed, exit_code, cmd, counts, output_tail?, log?}."""
     env = {**os.environ, "CI": "1"}  # keeps vitest/jest out of watch mode
-    proc = subprocess.run(test_cmd, shell=True, cwd=root, env=env, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    proc = subprocess.run(
+        test_cmd,
+        shell=True,
+        cwd=root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+    )
     result = {"passed": proc.returncode == 0, "exit_code": proc.returncode, "cmd": test_cmd,
               "counts": parse_test_counts(proc.stdout)}
     if log_dir is not None:
@@ -250,10 +304,16 @@ def restore_config_fragment(root, key, original):
             pkg.pop(part, None)
         else:
             pkg[part] = value
-        indent = len(re.match(r"\{\s*\n(\s*)", text).group(1)) if re.match(r"\{\s*\n(\s*)", text) else 2
+        indent = (
+            len(re.match(r"\{\s*\n(\s*)", text).group(1)) if re.match(r"\{\s*\n(\s*)", text) else 2
+        )
         path.write_text(json.dumps(pkg, indent=indent) + ("\n" if text.endswith("\n") else ""))
     else:
-        header = {"pyproject.toml": r"^\[tool\.pytest", "setup.cfg": r"^\[tool:pytest\]", "tox.ini": r"^\[pytest\]"}[name]
+        header = {
+            "pyproject.toml": r"^\[tool\.pytest",
+            "setup.cfg": r"^\[tool:pytest\]",
+            "tox.ini": r"^\[pytest\]",
+        }[name]
         text = path.read_text(errors="ignore")
         current = _ini_section(text, header)
         if current:
@@ -261,4 +321,3 @@ def restore_config_fragment(root, key, original):
         else:
             text = text.rstrip("\n") + "\n\n" + original
         path.write_text(text)
-

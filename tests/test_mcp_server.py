@@ -49,6 +49,8 @@ def test_instructions_name_only_the_configured_providers(instructions_module):
     assert "glm (driver claude)" in text
     assert "deepseek (driver claude)" in text
     assert "llamacpp (driver claude, local)" in text
+    for name in instructions_module.settings.providers:
+        assert f"- {name} (" in text
     # Providers that are not configured are not named.
     for other in ("codex", "copilot", "grok", "gemini", "omlx", "vllm"):
         assert other not in text

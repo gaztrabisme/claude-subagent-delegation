@@ -321,6 +321,129 @@ def test_hook_blocks_omp_write_to_a_protected_test_path(
     assert any(event.get("type") == "result" for event in events)
 
 
+def test_hook_maps_ast_edit_paths_to_multi_edit_before_classification(
+    fake_omp, tmp_path: Path
+):
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("Bun is needed to execute the packaged omp TypeScript hook")
+
+    workspace = _workspace(tmp_path)
+    protected = workspace / "tests" / "test_ast_edit.py"
+    protected.parent.mkdir()
+    protected.write_text("# protected\n")
+    settings = make_settings(
+        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
+    )
+    context = {"protected": [str(protected)], "state_allow": []}
+    hook_record = tmp_path / "hook-result.json"
+    process = omp_driver.OMP_PROVIDER.spawn(
+        _configured_omp_cfg(binary=fake_omp.path), settings, "ast-agent", "edit",
+        workspace, Session(provider="omlx"), None,
+    )
+    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
+        "toolName": "ast_edit",
+        "input": {"paths": ["tests/test_ast_edit.py"], "ops": []},
+    })
+    process.env["FAKE_OMP_BUN"] = bun
+    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+
+    with _classification_socket(Path(settings.approval_socket), workspace, context) as requests:
+        events = list(process.events())
+
+    assert json.loads(hook_record.read_text())["block"] is True
+    assert len(requests) == 1
+    assert requests[0]["tool_name"] == "MultiEdit"
+    assert requests[0]["tool_input"] == {
+        "edits": [{"file_path": "tests/test_ast_edit.py"}],
+    }
+    assert any(event.get("type") == "result" for event in events)
+
+
+def test_hook_denies_unmapped_omp_tool_without_asking_supervisor(
+    fake_omp, tmp_path: Path
+):
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("Bun is needed to execute the packaged omp TypeScript hook")
+
+    workspace = _workspace(tmp_path)
+    settings = make_settings(
+        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
+    )
+    hook_record = tmp_path / "hook-result.json"
+    process = omp_driver.OMP_PROVIDER.spawn(
+        _configured_omp_cfg(binary=fake_omp.path), settings, "unknown-agent", "edit",
+        workspace, Session(provider="omlx"), None,
+    )
+    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
+        "toolName": "future_write_tool",
+        "input": {"path": "tests/test_guard_classifier.py"},
+    })
+    process.env["FAKE_OMP_BUN"] = bun
+    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+
+    events = list(process.events())
+
+    decision = json.loads(hook_record.read_text())
+    assert decision["block"] is True
+    assert "unmapped" in decision["reason"].lower()
+    assert any(event.get("type") == "result" for event in events)
+
+
+@pytest.mark.parametrize(("event", "expected_tool"), [
+    pytest.param({
+        "toolName": "lsp",
+        "input": {
+            "action": "rename_file", "file": "tests/test_lsp.py", "new_name": "src/new.py",
+        },
+    }, "MultiEdit", id="lsp-rename-file"),
+    pytest.param({
+        "toolName": "eval",
+        "input": {
+            "language": "javascript",
+            "code": "writeFileSync('tests/test_eval.py', 'tampered')",
+        },
+    }, "Bash", id="eval-inline-code"),
+])
+def test_hook_maps_other_omp_write_tools_into_classifier_shapes(
+    fake_omp, tmp_path: Path, event: dict, expected_tool: str
+):
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("Bun is needed to execute the packaged omp TypeScript hook")
+
+    workspace = _workspace(tmp_path)
+    protected_name = "test_lsp.py" if event["toolName"] == "lsp" else "test_eval.py"
+    protected = workspace / "tests" / protected_name
+    protected.parent.mkdir()
+    protected.write_text("# protected\n")
+    settings = make_settings(
+        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
+    )
+    context = {"protected": [str(protected)], "state_allow": []}
+    hook_record = tmp_path / "hook-result.json"
+    process = omp_driver.OMP_PROVIDER.spawn(
+        _configured_omp_cfg(binary=fake_omp.path), settings, "mapped-agent", "edit",
+        workspace, Session(provider="omlx"), None,
+    )
+    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps(event)
+    process.env["FAKE_OMP_BUN"] = bun
+    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+
+    with _classification_socket(Path(settings.approval_socket), workspace, context) as requests:
+        events = list(process.events())
+
+    assert json.loads(hook_record.read_text())["block"] is True
+    assert len(requests) == 1
+    assert requests[0]["tool_name"] == expected_tool
+    if event["toolName"] == "eval":
+        assert "node -e" in requests[0]["tool_input"]["command"]
+    else:
+        assert requests[0]["tool_input"]["edits"][0]["file_path"] == "tests/test_lsp.py"
+    assert any(event.get("type") == "result" for event in events)
+
+
 def test_real_omp_hook_blocks_protected_write_against_local_stub(
     tmp_path: Path, monkeypatch
 ):

@@ -1,32 +1,44 @@
-# Oh My Pi (`omp`) running a local model behind a llama.cpp server on this
-# machine. The worker is `omp -p --mode json --no-session`: one-shot JSON per
-# turn, model picked from omp's own config (~/.omp/agent/models.yml) unless
-# `model` says otherwise.
+# Oh My Pi (`omp`) running local models behind llama.cpp and oMLX. The driver
+# writes an isolated models.yml and config.yml under each agent's session root.
 
 [core]
-default_provider = "local"
+default_provider = "omlx"
 
-[providers.local]
+[providers.bppc]
 driver = "omp"
-model = "local/qwen3.6-35b-a3b"
+base_url = "http://llama.cpp-host:8080/v1"
+model = "qwen3.8-27b"
 local = true
 max_agents = 1
+api_key = "local"
 
-[providers.local.health]
-# The llama.cpp server is not always up: its candidate base URLs are probed
-# before dispatch, and a cold load (model weights from disk) can take a while.
+[providers.bppc.health]
 kind = "llamacpp"
-candidates = ["http://127.0.0.1:8080"]
+candidates = ["http://llama.cpp-host:8080"]
 warm = true
 cold_load_seconds = 600
 
-[providers.local.pricing]
-# Local compute: free per token, the wall clock is the cost.
+[providers.bppc.pricing]
 kind = "local"
 usd = 0
 
-[guard]
-# omp has no PreToolUse hook the guard can attach to, so a child on this
-# provider runs unguarded. The gate in boot() refuses it for a plain MCP
-# delegation unless this is set; the delegate loop lifts it itself.
-allow_unguarded = true
+[providers.omlx]
+driver = "omp"
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = "OMLX_API_KEY"
+model = "Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B"
+local = true
+send_sampling = false
+max_agents = 1
+
+[providers.omlx.health]
+kind = "omlx"
+url = "http://127.0.0.1:8000/api/status"
+cold_load_seconds = 120
+
+[providers.omlx.probe]
+host_cmd = ["mac"]
+
+[providers.omlx.pricing]
+kind = "local"
+usd = 0

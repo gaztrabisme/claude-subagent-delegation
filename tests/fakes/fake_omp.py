@@ -12,6 +12,7 @@ it. Options:
 
 import json
 import os
+import subprocess
 import sys
 
 argv = sys.argv[1:]
@@ -27,6 +28,35 @@ record = {
 }
 with open(os.environ["FAKE_OMP_RECORD"], "a") as fh:
     fh.write(json.dumps(record) + "\n")
+
+# When asked, behave like omp dispatching one native tool_call to the installed
+# extension. Bun loads the real TypeScript adapter; the adapter then invokes
+# the real approval_hook.py process, just as omp does through its hook API.
+if os.environ.get("FAKE_OMP_TOOL_EVENT"):
+    hook = argv[argv.index("--hook") + 1]
+    harness = r"""
+import { pathToFileURL } from "node:url";
+const loaded = await import(pathToFileURL(process.env.FAKE_OMP_HOOK_PATH).href);
+let callback;
+const pi = { on(name, fn) { if (name === "tool_call") callback = fn; } };
+await loaded.default(pi);
+if (typeof callback !== "function") throw new Error("hook did not register tool_call");
+const event = JSON.parse(process.env.FAKE_OMP_TOOL_EVENT);
+const result = await callback(event, {});
+process.stdout.write(JSON.stringify(result ?? null));
+"""
+    hooked = subprocess.run(
+        [os.environ["FAKE_OMP_BUN"], "-e", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "FAKE_OMP_HOOK_PATH": hook},
+    )
+    if hooked.returncode:
+        sys.stderr.write(hooked.stderr)
+        sys.exit(hooked.returncode)
+    with open(os.environ["FAKE_OMP_HOOK_RECORD"], "w") as fh:
+        fh.write(json.dumps(json.loads(hooked.stdout)))
 
 with open(os.environ["FAKE_OMP_FIXTURE"]) as fh:
     for line in fh:

@@ -42,6 +42,9 @@ from subagent.core import InProcessServer as _CoreServer  # noqa: E402
 SAMPLING_FIELDS = (
     "temperature", "top_p", "top_k", "min_p", "typical_p", "presence_penalty",
     "frequency_penalty", "repetition_penalty", "repeat_penalty", "seed",
+    "max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort",
+    "thinking", "thinking_budget", "reasoning_budget", "enable_thinking",
+    "preserve_thinking", "chat_template_kwargs",
 )
 
 

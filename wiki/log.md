@@ -164,3 +164,11 @@ Goal: `goals/2026-09-22-fuse-delegation.md`. Plan: `~/.claude/plans/open-a-new-b
 - U-L2 `subagent detect` started the approval server (fixed in M5).
 - U-C1 a Codex child cannot `git add` in a worktree (gitdir under the parent's .git/worktrees is outside its sandbox); U-C2 a timed-out Codex agent cannot be continued; U-C3 the Codex sandbox cannot bind sockets, so socket-backed tests and the loop's approval socket fail inside it (bench cells use `-s danger-full-access` since M5).
 - U-B1 the claude bench parser fills cost but not `orch_tokens_*`; U-B2 the bench did not install the skill or PATH for non-Claude orchestrators (fixed in M5); U-B4 the Codex-orchestrated cell has no worker accounting (see `data/bench-2026-09-24-codex/README.md`).
+
+## 2026-09-28 — U1 omp driver on `lanes-omp`
+
+Cherry-picked P1a `c9698e6` and P1b `f73563c` as `11903ba` and `b978783`; skipped Windows commit `7531144`. Added isolated per-agent omp model/settings files, API-key environment wiring, a TypeScript `--hook` bridge to the shared approval hook, and `bppc`/`omlx` example providers. Fixed `Supervisor._classify` dropping `guard_context`; without that fix the protected test-path test returned `allow`.
+
+Verification: `uv run pytest tests/test_providers_omp.py -q` → 25 passed, including fake and real omp 18.0.11 hook checks; `uv run pytest -q` → 824 passed, 1 skipped, 19 subtests; wheel build includes `subagent/guard/omp_hook.ts`; `SUBAGENT_CONFIG=examples/config.omp.toml uv run subagent doctor --no-probe` exits 0; source machine-literal grep prints nothing; Ruff passes on all changed Python files. `uv run ruff check src tests` remains red with 168 findings in untouched files.
+
+The `SamplingProxy` logged one omp 18.0.11 chat request to oMLX; body keys were `chat_template_kwargs`, `messages`, `model`, `preserve_thinking`, `stream`, `stream_options`, `tools`. It had no temperature/top-p/top-k/min-p, penalties, seed, max token, reasoning, or thinking-effort fields. It did include `preserve_thinking=true` and `chat_template_kwargs={"preserve_thinking":true}`; the installed schema has no documented switch. `OMLX_API_KEY` was unset, `/api/status` returned HTTP 401 (`API key required`), and the attempted prompt yielded zero output tokens. Evidence and open items are in `omp-report.md`.

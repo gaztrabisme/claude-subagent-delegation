@@ -14,12 +14,15 @@ The recorded streams in ``tests/fixtures/omp`` are the reference.
 omp reads a piped stdin to EOF before it starts, so the child gets /dev/null
 as stdin: inheriting the server's would hand it the MCP transport.
 
-omp has no PreToolUse hook, so this driver installs no guard: the child runs
-unguarded. That is only acceptable when the server itself said so --
-``boot()`` refuses for a plain MCP delegation unless
-``[guard].allow_unguarded`` is true; the delegate loop (which does its own
-test-file and checkpoint protection around the child) lifts the gate by
-setting the provider's ``extra["loop"]`` flag.
+omp's ``--hook`` loads a TypeScript hook. This driver installs the packaged
+``guard/omp_hook.ts`` on every run; it translates omp's tool events to the
+Claude-shaped JSON consumed by ``guard/approval_hook.py``. The per-agent
+``models.yml`` and settings overlay live in the session root, outside the
+workspace; the configured API key is passed only through the child environment.
+When ``send_sampling`` is false, the generated model omits the output-token cap and
+sets omp's sampling defaults to provider-default values with thinking disabled. In
+18.0.11, Qwen requests still include ``preserve_thinking: true`` in the body; the
+installed config schema exposes no switch for that compatibility field.
 
 Sessions: omp runs with ``--no-session``, so nothing is persisted between
 turns and ``--resume`` is off the table. A resume turn instead re-issues the
@@ -33,7 +36,6 @@ records; omp itself never sees it.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import uuid
@@ -43,13 +45,22 @@ from typing import TYPE_CHECKING, Any
 from ..config import Settings
 from ..router import COPILOT_MODEL_UNAVAILABLE, Refusal, clip
 from .base import DRIVER_OMP, Process, ProviderConfig, Session
+from .omp_config import OMP_HOOK, write_agent_config
+from .omp_config import child_env as omp_child_env
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pathlib import Path
 
-GUARD = "none"
+GUARD = "hook"
 
 DEFAULT_BINARY = "omp"
+
+_NO_SAMPLING_ARGS = frozenset({
+    "--thinking", "--external-thinking", "--temperature", "--top-p", "--top-k",
+    "--min-p", "--typical-p", "--presence-penalty", "--frequency-penalty",
+    "--repetition-penalty", "--repeat-penalty", "--seed", "--max-tokens",
+    "--max-output-tokens",
+})
 
 # The line that marks a resume turn for a backend with no saved session to
 # reopen (omp runs --no-session, so its own --resume is disabled).
@@ -86,6 +97,19 @@ def _extra_list(cfg: ProviderConfig, key: str) -> list[str]:
     if isinstance(raw, str):
         return [raw] if raw.strip() else []
     return [str(v) for v in raw]
+
+
+def _extra_arg_conflicts(cfg: ProviderConfig) -> list[str]:
+    """CLI overrides that could replace the endpoint, hook, or sampling policy."""
+    args = _extra_list(cfg, "extra_args")
+    forbidden = {
+        "--model", "--provider", "--api-key", "--config", "--profile",
+        "--hook", "--extension", "-e", "--no-extensions", "--auto-approve",
+        "--approval-mode",
+    }
+    if not cfg.send_sampling:
+        forbidden.update(_NO_SAMPLING_ARGS)
+    return [arg for arg in args if arg.split("=", 1)[0] in forbidden]
 
 
 class Translator:
@@ -316,14 +340,16 @@ def _spawn_omp(argv: list[str], env: dict[str, str], cwd: str, session: Session)
 
 
 class OmpProvider:
-    """Runs a turn as ``omp -p --mode json``. No guard hook exists to attach."""
+    """Runs ``omp -p --mode json`` with isolated config and the approval hook."""
 
     name = DRIVER_OMP
-    needs_api_key = False  # omp logs in / owns its model config itself
+    # Local OpenAI-compatible endpoints may be keyless. When a key is named,
+    # the generated models.yml points at that environment variable.
+    needs_api_key = False
     prompt_on_stdin = False
 
     def guard(self, settings: Settings, cfg: ProviderConfig | None = None) -> str:
-        """The omp CLI offers no PreToolUse hook; nothing guards the child."""
+        """The packaged omp tool_call hook reaches the server-side classifier."""
         return GUARD
 
     def binary(self, cfg: ProviderConfig) -> str:
@@ -332,23 +358,25 @@ class OmpProvider:
     def boot(
         self, settings: Settings, agent_id: str, cfg: ProviderConfig
     ) -> tuple[str | None, Session]:
-        """Mint the session id (event tagging only); the reason omp cannot
-        run, or None.
-
-        A plain MCP delegation may not run an unguarded child unless
-        ``[guard].allow_unguarded`` is true. The delegate loop, which does its
-        own protection around the child, lifts this by setting the provider's
-        ``extra["loop"]`` flag.
-        """
+        """Write this agent's omp configuration and verify the binary."""
         session = Session(provider=cfg.name)
         if not session.session_id:
             session.session_id = str(uuid.uuid4())
-        if not settings.allow_unguarded and not cfg.extra.get("loop"):
-            return (
-                "omp runs without a guard hook (--no-session, no PreToolUse hook); set "
-                "[guard].allow_unguarded = true to use it from the MCP tools "
-                "(the delegate loop lifts this itself)"
-            ), session
+        session.home = settings.session_root / "agents" / agent_id / "omp-agent"
+        try:
+            write_agent_config(settings, agent_id, cfg, cfg.model)
+        except (OSError, ValueError) as exc:
+            return f"omp configuration failed: {type(exc).__name__}: {exc}", session
+        if not OMP_HOOK.is_file():
+            return f"omp approval hook is missing: {OMP_HOOK}", session
+        conflicts = _extra_arg_conflicts(cfg)
+        if conflicts:
+            message = "omp extra_args conflict with agent configuration or hook"
+            if not cfg.send_sampling and any(
+                arg.split("=", 1)[0] in _NO_SAMPLING_ARGS for arg in conflicts
+            ):
+                message = "omp send_sampling = false conflicts with extra_args"
+            return f"{message}: {conflicts}", session
         binary = self.binary(cfg)
         if shutil.which(binary) is None:
             return f"{binary!r} is not on PATH; install Oh My Pi (omp)", session
@@ -386,9 +414,19 @@ class OmpProvider:
             "--no-session",
             "--cwd",
             str(cwd),
+            "--hook",
+            str(OMP_HOOK),
+            "--config",
+            str(
+                (session.home or settings.session_root / "agents" / agent_id / "omp-agent")
+                / "config.yml"
+            ),
         ]
         if model:
-            argv.extend(["--model", model])
+            reference = model if model.startswith(f"{cfg.name}/") else f"{cfg.name}/{model}"
+            argv.extend(["--model", reference])
+        if not cfg.send_sampling:
+            argv.extend(["--thinking", "off"])
         argv.extend(_extra_list(cfg, "extra_args"))
         argv.append(prompt)
         return argv
@@ -397,10 +435,11 @@ class OmpProvider:
         self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,
         model: str | None = None,
     ) -> dict[str, str]:
-        """The parent's environment, with this server's own keys removed."""
-        env = {k: v for k, v in os.environ.items() if v is not None}
-        for leaked in settings.leaked_keys:
-            env.pop(leaked, None)
+        """An allowlisted environment, including only the selected provider key."""
+        env = omp_child_env(settings, agent_id, cfg)
+        env["PI_CODING_AGENT_DIR"] = str(
+            session.home or settings.session_root / "agents" / agent_id / "omp-agent"
+        )
         return env
 
     def translator(self, session: Session) -> Translator:
@@ -419,6 +458,8 @@ class OmpProvider:
     ) -> OmpProcess:
         if not session.session_id:
             session.session_id = str(uuid.uuid4())
+        session.home = settings.session_root / "agents" / agent_id / "omp-agent"
+        write_agent_config(settings, agent_id, cfg, model or cfg.model)
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session, model)
         return _spawn_omp(argv, env, str(cwd), session)

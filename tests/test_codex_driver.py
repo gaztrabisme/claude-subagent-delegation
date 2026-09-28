@@ -102,6 +102,36 @@ def test_no_model_means_no_m_flag(fake_codex, registry, tmp_path: Path):
     assert "-m" not in fake_codex.calls()[0]["argv"]
 
 
+def test_codex_effort_is_passed_as_config_override(fake_codex, tmp_path: Path):
+    providers = default_providers()
+    providers["codex"]["model"] = "gpt-5.6-luna"
+    providers["codex"]["effort"] = "xhigh"
+    settings = make_settings(tmp_path, providers=providers)
+    registry = Registry(settings, start_reaper=False)
+    try:
+        agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
+        _run(agent)
+        second = agent.follow_up("continue")
+        assert second.done.wait(10)
+        argv = fake_codex.calls()[1]["argv"]
+        assert argv[argv.index("-m") + 1] == "gpt-5.6-luna"
+        override = argv.index("-c")
+        assert argv[override + 1] == "model_reasoning_effort=xhigh"
+        assert argv.index("-m") < override < argv.index("resume")
+    finally:
+        registry.shutdown()
+
+
+def test_codex_effort_unset_leaves_argv_unchanged(fake_codex, registry, tmp_path: Path):
+    ws = _workspace(tmp_path)
+    agent = registry.create_agent("c", ws, provider="codex")
+    _run(agent)
+    assert fake_codex.calls()[0]["argv"] == [
+        "exec", "--json", "-C", str(ws), "-s", "workspace-write", "--skip-git-repo-check",
+        "--ignore-rules", "--dangerously-bypass-hook-trust", "-",
+    ]
+
+
 def test_resume_passes_thread_id(fake_codex, registry, tmp_path: Path):
     agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     _run(agent)

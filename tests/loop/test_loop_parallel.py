@@ -71,6 +71,17 @@ class Parallel(Sandbox):
         code, r = self.delegate("run", "--parallel", ".subagent/parallel.json", cwd=root, scenario="par")
         self.assertEqual(r["status"], "unsupported")
 
+    def test_max_agents_queues_tasks_and_cleans_worktrees(self):
+        root = self.project({"ab.test.js": AB_TEST})
+        self.config.write_text(self.config.read_text().replace(
+            "[core]\n", "[core]\nmax_agents = 1\n", 1))
+        code, result = self.delegate("run", "--parallel", ".subagent/parallel.json", cwd=root, scenario="par")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["status"], "done", result)
+        self.assertEqual([task["status"] for task in result["tasks"]], ["done", "done"])
+        self.assertEqual(result["changed_files"], ["src/a.js", "src/b.js"])
+        self.assertEqual(self.worktrees(root), 1)
+
 
 for_drivers(Parallel)
 

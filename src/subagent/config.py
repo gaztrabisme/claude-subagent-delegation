@@ -221,7 +221,7 @@ def _pricing(table: Mapping[str, Any]) -> PricingSpec:
 
 
 _PROVIDER_KEYS = frozenset({
-    "driver", "vendor", "base_url", "model", "api_key_env", "api_key", "local",
+    "driver", "vendor", "base_url", "model", "effort", "api_key_env", "api_key", "local",
     "send_sampling", "max_agents", "compact_window", "max_steps", "run_timeout",
     "idle_timeout", "adapter", "binary", "experimental", "health", "probe",
     "pricing",
@@ -261,6 +261,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         vendor=_str(table, "vendor", None) or derive_vendor(driver, base_url),
         base_url=base_url,
         model=_str(table, "model", None),
+        effort=_str(table, "effort", None),
         api_key_envs=_strings(table, "api_key_env"),
         api_key_default=_str(table, "api_key", None),
         local=_bool(table, "local", False),

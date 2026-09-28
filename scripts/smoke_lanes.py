@@ -21,7 +21,10 @@ must complete, write hello.txt, and record non-zero tokens.
 For providers using oMLX also: metrics.jsonl has a "sample" row, the trace has a
 "run_summary", and the provider was pointed at a logging proxy whose log
 (<out>/omlx_request_log.jsonl) holds the request bodies' top-level keys and
-sampling fields. The script prints "sampling fields sent: <list or none>".
+sampling fields. The proxy accepts Anthropic /v1/messages and OpenAI
+/v1/chat/completions requests, retaining the configured base URL path. The
+script prints all "sampling fields sent" and separately lists any forbidden
+sampling fields (which fail the oMLX smoke).
 
 Exit 3 prints "DEFERRED: <provider> <code> <message>" when the provider
 refused before any work (z.ai 1313/1308/1310, empty balance, usage limit,
@@ -62,6 +65,12 @@ from subagent.providers import for_driver  # noqa: E402
 
 OMLX_UPSTREAM = "http://127.0.0.1:8000"
 PROXY_LOG = "omlx_request_log.jsonl"
+FORBIDDEN_SAMPLING_FIELDS = (
+    "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+    "repetition_penalty", "seed", "max_tokens", "max_completion_tokens", "thinking_budget",
+    "chat_template_kwargs.enable_thinking",
+)
+PROXY_ENDPOINTS = {"/v1/messages", "/v1/chat/completions"}
 
 EXIT_PASS, EXIT_FAIL, EXIT_DEFERRED = 0, 1, 3
 
@@ -117,6 +126,27 @@ def _ssh_config_deny(verdict: Mapping[str, Any], ssh_config: str) -> bool:
     if str(facts.get("sensitive_path") or "") == ssh_config:
         return True
     return ".ssh/config" in json.dumps(facts) or ".ssh/config" in str(verdict.get("reason"))
+
+
+def _forbidden_sampling_fields(records: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Forbidden sampling fields present in proxy records, in report order."""
+    present: set[str] = set()
+    for record in records:
+        sampling = record.get("sampling") or {}
+        if not isinstance(sampling, Mapping):
+            continue
+        present.update(name for name in FORBIDDEN_SAMPLING_FIELDS
+                       if name in sampling and name != "chat_template_kwargs.enable_thinking")
+        template = sampling.get("chat_template_kwargs")
+        if isinstance(template, Mapping) and "enable_thinking" in template:
+            present.add("chat_template_kwargs.enable_thinking")
+    return [name for name in FORBIDDEN_SAMPLING_FIELDS if name in present]
+
+
+def _proxy_base_url(proxy: Any, configured_base_url: str | None) -> str:
+    """Keep the provider's endpoint path when replacing its origin with the proxy."""
+    path = urlsplit(configured_base_url or "").path.rstrip("/")
+    return f"{proxy.url}{path}"
 
 
 def deferred_reason(provider: str, run: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -201,11 +231,23 @@ def evaluate(
         checks.append(("metrics sample rows", bool(samples), f"{len(samples)} sample row(s)"))
         summaries = lane_harness.records_for(trace, kind="run_summary", run_ids={run_id})
         checks.append(("run_summary record", bool(summaries), f"{len(summaries)} record(s)"))
-        logged = [r for r in proxy_log or [] if str(r.get("path", "")).startswith("/v1/messages")
-                  and "count_tokens" not in str(r.get("path"))]
-        checks.append(("proxy logged /v1/messages bodies", bool(logged),
-                       f"{len(logged)} request(s); sampling fields sent: "
-                       f"{lane_harness.sampling_summary(logged)}"))
+        logged = [r for r in proxy_log or []
+                  if r.get("method") in {"POST", "PUT", "PATCH"}
+                  and urlsplit(str(r.get("path", ""))).path in PROXY_ENDPOINTS]
+        paths: dict[str, int] = {}
+        for record in logged:
+            path = urlsplit(str(record.get("path", ""))).path
+            paths[path] = paths.get(path, 0) + 1
+        paths_seen = (", ".join(f"{path} ({count})" for path, count in sorted(paths.items()))
+                      or "none")
+        body_label = "request body" if len(logged) == 1 else "request bodies"
+        checks.append(("proxy logged request bodies", bool(logged),
+                       f"{len(logged)} {body_label}; paths seen: {paths_seen}; "
+                       f"sampling fields sent: {lane_harness.sampling_summary(logged)}"))
+        if provider == "omlx":
+            forbidden = _forbidden_sampling_fields(proxy_log or [])
+            checks.append(("forbidden sampling fields absent", not forbidden,
+                           ", ".join(forbidden) if forbidden else "none"))
 
     passed = all(ok for _, ok, _ in checks)
     state = run.get("state")
@@ -300,7 +342,8 @@ def main(argv: list[str] | None = None) -> int:
     if proxy is not None:
         if overrides is None:
             overrides = {}
-        overrides.setdefault("providers", {})[provider] = {"base_url": proxy.url}
+        overrides.setdefault("providers", {})[provider] = {
+            "base_url": _proxy_base_url(proxy, cfg_for_proxy.base_url)}
 
     print(f"scratch: {scratch}")
     print(f"out: {out}")
@@ -361,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {detail}")
     if proxy is not None:
         print(f"sampling fields sent: {lane_harness.sampling_summary(proxy_log or [])}")
+        forbidden = _forbidden_sampling_fields(proxy_log or [])
+        print(f"forbidden fields sent: {', '.join(forbidden) if forbidden else 'none'}")
         print(f"request log: {proxy_log_path}")
     print(f"trace: {out / 'trace.jsonl'}")
     print(outcome.headline)

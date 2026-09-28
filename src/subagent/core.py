@@ -14,9 +14,8 @@ from __future__ import annotations
 import dataclasses
 import threading
 from pathlib import Path
-from typing import Any
 
-from .config import Settings
+from .config import Settings, _approval_socket_path
 from .guard.classify import protect_provider_homes
 from .guard.supervisor import Supervisor
 from .runs import Registry, Run
@@ -29,13 +28,12 @@ class InProcessServer:
                  approval_socket: str | None = None):
         self.session_root = Path(session_root)
         self.session_root.mkdir(parents=True, exist_ok=True)
-        # A unix socket path must stay under ~104 bytes on macOS, so it lives
-        # beside the session root rather than in the shared tmpdir.
+        preferred_socket = self.session_root / "approval.sock"
         self.settings = dataclasses.replace(
             settings,
             session_root=self.session_root,
             approval_socket=approval_socket
-            or str(self.session_root / "approval.sock"),
+            or _approval_socket_path(preferred_socket),
         )
         protect_provider_homes(self.settings)
         self.registry = Registry(self.settings, start_reaper=False)

@@ -350,7 +350,8 @@ def prepare_home(
 
 
 def codex_argv(
-    workspace: Path, model: str | None, resume: str | None, binary: str | None = None
+    workspace: Path, model: str | None, resume: str | None, binary: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """argv for one turn. The prompt goes on stdin (the trailing `-`)."""
     argv = [
@@ -367,6 +368,8 @@ def codex_argv(
     ]
     if model:
         argv.extend(["-m", model])
+    if effort:
+        argv.extend(["-c", f"model_reasoning_effort={effort}"])
     if resume:
         argv.extend(["resume", resume])
     argv.append("-")
@@ -426,7 +429,7 @@ class CodexProvider:
         session: Session,
         model: str | None,
     ) -> list[str]:
-        return codex_argv(cwd, model or None, session.session_id, self.binary(cfg))
+        return codex_argv(cwd, model or None, session.session_id, self.binary(cfg), cfg.effort)
 
     def env(
         self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,

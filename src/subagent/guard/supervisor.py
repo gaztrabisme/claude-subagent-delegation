@@ -49,9 +49,8 @@ from .classify import ALLOW, DENY, ESCALATE, Verdict, classify
 
 
 def _classify(tool_name, tool_input, workspace, cwd=None, guard_context=None):
-    """`classify()` has no guard-context parameter yet (P2b adds the rules);
-    this seam is where the supervisor passes it, so tests can observe it."""
-    return classify(tool_name, tool_input, workspace, cwd)
+    """Classify a request using the agent's protected-path context."""
+    return classify(tool_name, tool_input, workspace, cwd, context=guard_context)
 
 TIER_UNRESOLVED = "unresolved"
 TIER_AGENT = "agent"

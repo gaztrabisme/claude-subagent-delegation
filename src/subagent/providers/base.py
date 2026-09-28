@@ -31,11 +31,16 @@ DRIVER_CODEX = "codex"
 DRIVER_COPILOT = "copilot"
 DRIVER_GEMINI = "gemini"
 DRIVER_GROK = "grok"
+DRIVER_OMP = "omp"
+DRIVER_ANTIGRAVITY = "antigravity"
 
 # Every driver name the config file accepts. The ones with no module yet
 # refuse at boot, not at load: a config naming one is valid, it just cannot
 # run on this build.
-DRIVERS = (DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK)
+DRIVERS = (
+    DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK,
+    DRIVER_ANTIGRAVITY, DRIVER_OMP,
+)
 
 NOT_PORTED = "driver not yet ported"
 
@@ -45,6 +50,8 @@ VENDOR_BY_DRIVER = {
     DRIVER_CODEX: "codex",
     DRIVER_COPILOT: "copilot",
     DRIVER_GROK: "grok",
+    DRIVER_OMP: "omp",
+    DRIVER_ANTIGRAVITY: "gemini",
 }
 VENDOR_BY_HOST = {
     "api.z.ai": "zai",
@@ -141,6 +148,7 @@ class ProviderConfig:
     # Drivers read their own extras from it: copilot's builtin_mcps, loop and
     # extra_args, grok's hooks.
     extra: dict[str, Any] = field(default_factory=dict)
+    effort: str | None = None
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         """The first set key in `api_key_envs`, else `api_key_default`."""
@@ -169,6 +177,7 @@ class ProviderConfig:
             "vendor": self.vendor,
             "base_url": self.base_url,
             "model": self.model,
+            "effort": self.effort,
             "local": self.local,
             "available": self.unavailable() is None,
             "api_key_envs": list(self.api_key_envs),
@@ -264,12 +273,22 @@ class Process:
         self.prompt = prompt
         self._proc: subprocess.Popen[str] | None = None
 
-    def _start(self, stdin: bool = False) -> subprocess.Popen[str]:
+    def _start(self, stdin: bool = False, *, closed_stdin: bool = False) -> subprocess.Popen[str]:
+        """Start the child. `stdin` opens a pipe to write the prompt on;
+        `closed_stdin` hands it /dev/null (for a CLI that would otherwise
+        read the parent's stdin -- the MCP transport -- to EOF); neither
+        inherits the parent's."""
+        if stdin:
+            child_stdin: int | None = subprocess.PIPE
+        elif closed_stdin:
+            child_stdin = subprocess.DEVNULL
+        else:
+            child_stdin = None
         self._proc = subprocess.Popen(
             self.argv,
             cwd=self.cwd,
             env=self.env,
-            stdin=subprocess.PIPE if stdin else None,
+            stdin=child_stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

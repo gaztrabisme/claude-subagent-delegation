@@ -1,0 +1,9 @@
+[core]
+default_provider = "gemini"
+
+[providers.gemini]
+driver = "antigravity"
+vendor = "gemini"
+model = "gemini-3.8-flash-high"
+effort = "high"
+experimental = true

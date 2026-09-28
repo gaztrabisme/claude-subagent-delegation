@@ -38,7 +38,9 @@ class TestGuard:
 
     def lock(self):
         for rel in self.protected:
-            os.chmod(self.root / rel, self.modes[rel] & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+            os.chmod(
+                self.root / rel, self.modes[rel] & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+            )
 
     def release(self):
         """Restore protected files and test config. Returns (violations, changed_files).
@@ -54,7 +56,9 @@ class TestGuard:
         for rel in self.protected:
             path = self.root / rel
             if not path.exists() or file_hash(path) != self.before[rel]:
-                violations.append({"file": rel, "change": "deleted" if not path.exists() else "modified"})
+                violations.append(
+                    {"file": rel, "change": "deleted" if not path.exists() else "modified"}
+                )
                 if path.exists():
                     os.chmod(path, stat.S_IWUSR | stat.S_IRUSR)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +89,9 @@ def protected_paths(root, globs):
 
 def protected_hash(root, globs):
     root = Path(root)
-    return _hash_items([(rel, file_hash(root / rel)) for rel in walk_files(root) if matches(rel, globs)])
+    return _hash_items(
+        [(rel, file_hash(root / rel)) for rel in walk_files(root) if matches(rel, globs)]
+    )
 
 
 def _hash_items(items):

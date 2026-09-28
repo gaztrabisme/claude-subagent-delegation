@@ -45,7 +45,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import ConfigError, load as config_load
+from .config import ConfigError
+from .config import load as config_load
 from .telemetry.cost import DEFAULT_TRACES, M, Pricing, lane_rows, print_table, provider_costs
 
 TEMPLATE = Path(__file__).with_name("report_template.html")
@@ -341,7 +342,10 @@ def _delegation_row(d: Mapping[str, Any], provider_usd: float | None,
     tokens = _num(usage_total.get("total"))
     if tokens is None:
         tokens = _sum_or_none(
-            [_num(usage_total.get(k)) or 0 for k in ("input", "output", "cache_read", "cache_write")]
+            [
+                _num(usage_total.get(k)) or 0
+                for k in ("input", "output", "cache_read", "cache_write")
+            ]
         )
     if tokens is not None:
         tokens = int(tokens)

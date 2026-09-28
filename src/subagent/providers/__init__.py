@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import (
+    DRIVER_ANTIGRAVITY,
     DRIVER_CLAUDE,
     DRIVER_CODEX,
     DRIVER_COPILOT,
@@ -42,6 +43,8 @@ def for_driver(name: str) -> Any:
         from .gemini import GEMINI_PROVIDER as provider
     elif name == DRIVER_GROK:
         from .grok import GROK_PROVIDER as provider
+    elif name == DRIVER_ANTIGRAVITY:
+        from .antigravity import ANTIGRAVITY_PROVIDER as provider
     else:
         raise KeyError(f"unknown driver {name!r}; expected one of {', '.join(DRIVERS)}")
     _CACHE[name] = provider
@@ -52,6 +55,7 @@ __all__ = [
     "DRIVERS",
     "DRIVER_CLAUDE",
     "DRIVER_CODEX",
+    "DRIVER_ANTIGRAVITY",
     "HealthSpec",
     "PricingSpec",
     "ProbeSpec",

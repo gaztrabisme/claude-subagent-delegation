@@ -44,6 +44,7 @@ DRIVER_BINARY = {
     "copilot": "copilot",
     "gemini": "gemini",
     "grok": "grok",
+    "antigravity": "agy",
 }
 
 
@@ -308,7 +309,9 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
 
     from .core import InProcessServer
 
-    tmp = Path(tempfile.mkdtemp(prefix="subagent-doctor-"))
+    # A short prefix leaves room for the per-probe Unix socket on macOS, even
+    # when TMPDIR points inside a deeply nested worktree.
+    tmp = Path(tempfile.mkdtemp(prefix="d-"))
     workspace = tmp / "workspace"
     workspace.mkdir()
     server = InProcessServer(tmp / "sessions", settings)

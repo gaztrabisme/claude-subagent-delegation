@@ -32,11 +32,15 @@ DRIVER_COPILOT = "copilot"
 DRIVER_GEMINI = "gemini"
 DRIVER_GROK = "grok"
 DRIVER_OMP = "omp"
+DRIVER_ANTIGRAVITY = "antigravity"
 
 # Every driver name the config file accepts. The ones with no module yet
 # refuse at boot, not at load: a config naming one is valid, it just cannot
 # run on this build.
-DRIVERS = (DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK, DRIVER_OMP)
+DRIVERS = (
+    DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK,
+    DRIVER_ANTIGRAVITY, DRIVER_OMP,
+)
 
 NOT_PORTED = "driver not yet ported"
 
@@ -47,6 +51,7 @@ VENDOR_BY_DRIVER = {
     DRIVER_COPILOT: "copilot",
     DRIVER_GROK: "grok",
     DRIVER_OMP: "omp",
+    DRIVER_ANTIGRAVITY: "gemini",
 }
 VENDOR_BY_HOST = {
     "api.z.ai": "zai",

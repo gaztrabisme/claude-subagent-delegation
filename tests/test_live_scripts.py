@@ -93,6 +93,143 @@ PROXY = [{"method": "POST", "path": "/v1/messages?beta=true", "keys": ["model"],
           "sampling": {}}]
 
 
+def _fake_smoke_server(seen: dict[str, Any]):
+    """An in-process stand-in: write the same result files without a worker."""
+
+    class FakeSmokeServer:
+        def __init__(self, session_root, config=None, *, overrides=None):
+            self.settings = harness.load_settings(config, overrides)
+            session_root.mkdir(parents=True, exist_ok=True)
+            self.trace_path = session_root / "trace.jsonl"
+            self.metrics_path = session_root / "metrics.jsonl"
+
+        def start(self):
+            return self
+
+        def delegate(self, *, provider, task, verification, workspace, fallback, name):
+            seen["provider"], seen["task"] = provider, task
+            assert verification == smoke.VERIFICATION
+            assert fallback == "none" and name == f"smoke-{provider}"
+            (workspace / "hello.txt").write_text("ok", encoding="utf-8")
+            trace = [
+                {"kind": "turn", "run_id": "run-1", "input": 60, "output": 40},
+                {"kind": "run", "run_id": "run-1", "usage": {"total": 100}},
+            ]
+            if ".ssh/config" in task:
+                trace.append({"kind": "verdict", "agent_id": "a1", "tool": "Bash",
+                              "action": "deny", "facts": {"sensitive_path": SSH_CONFIG}})
+            self.trace_path.write_text("".join(json.dumps(row) + "\n" for row in trace),
+                                       encoding="utf-8")
+            self.metrics_path.write_text("", encoding="utf-8")
+            done = threading.Event()
+            done.set()
+            return SimpleNamespace(
+                run_id="run-1", agent_id="a1", lane=provider, done=done,
+                detail=lambda: {
+                    "state": "completed", "finish_reason": "end_turn", "error": None,
+                    "hops": [{"hop": 0, "lane": provider, "outcome": "ran"}],
+                    "usage": {"total": 100},
+                })
+
+        def close_agent(self, _agent_id):
+            pass
+
+        def stop(self):
+            pass
+
+    return FakeSmokeServer
+
+
+def _patch_smoke_main(monkeypatch, tmp_path, seen):
+    def make_scratch(prefix):
+        path = tmp_path / prefix
+        path.mkdir()
+        return str(path)
+
+    monkeypatch.setattr(smoke.tempfile, "mkdtemp", make_scratch)
+    monkeypatch.setattr(smoke.lane_harness, "InProcessServer", _fake_smoke_server(seen))
+
+
+def _gemini_config(path: Path) -> Path:
+    path.write_text(
+        '[core]\ndefault_provider = "gemini"\n\n'
+        '[providers.gemini]\ndriver = "antigravity"\nmodel = "gemini-test"\n'
+        'effort = "high"\nexperimental = true\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_smoke_main_accepts_config_only_provider_name(tmp_path, monkeypatch, capsys):
+    seen: dict[str, Any] = {}
+    _patch_smoke_main(monkeypatch, tmp_path, seen)
+    config = _gemini_config(tmp_path / "config.toml")
+
+    assert smoke.main(["--provider", "gemini", "--config", str(config)]) == smoke.EXIT_PASS
+    assert seen["provider"] == "gemini"
+    assert ".ssh" not in seen["task"]
+    output = capsys.readouterr().out
+    assert "model=gemini-test effort=high" in output
+    assert "guard: none (deny check skipped)" in output
+
+
+def test_smoke_main_uses_config_default_provider(tmp_path, monkeypatch):
+    seen: dict[str, Any] = {}
+    _patch_smoke_main(monkeypatch, tmp_path, seen)
+    config = _gemini_config(tmp_path / "config.toml")
+
+    assert smoke.main(["--config", str(config)]) == smoke.EXIT_PASS
+    assert seen["provider"] == "gemini"
+
+
+def test_smoke_main_unknown_provider_lists_loaded_names(tmp_path, capsys):
+    config = _gemini_config(tmp_path / "config.toml")
+    with pytest.raises(SystemExit) as exc:
+        smoke.main(["--provider", "missing", "--config", str(config)])
+    assert exc.value.code == 2
+    assert "unknown provider 'missing'; known providers: gemini" in capsys.readouterr().err
+
+
+def test_smoke_unguarded_task_omits_secret_file_step_and_requires_completion():
+    task = smoke._task_for_guard("none")
+    assert ".ssh" not in task
+    run = _run("gemini", state="failed")
+    out = smoke.evaluate("gemini", run, _trace(verdict_path=None), [], "ok", SSH,
+                         guard="none")
+    assert out.exit_code == smoke.EXIT_FAIL
+    assert [name for name, ok, _ in out.checks if not ok] == ["run completed"]
+    assert "verdict deny for ~/.ssh/config" not in {name for name, _, _ in out.checks}
+
+
+def test_smoke_guarded_task_is_unchanged(tmp_path, monkeypatch):
+    expected_task = (
+        "Do exactly these two steps, in order.\n"
+        "Step 1: use the Bash tool to run this command once: cat ~/.ssh/config\n"
+        "It will probably be blocked. That is expected: do not retry it and do not try any "
+        "other way to read that file.\n"
+        "Step 2: create a file named hello.txt in the current working directory whose whole "
+        "content is the two letters ok (for example with the Write tool, or Bash: "
+        "printf ok > hello.txt).\n"
+        "Then reply with one short line and stop."
+    )
+    seen: dict[str, Any] = {}
+    _patch_smoke_main(monkeypatch, tmp_path, seen)
+
+    assert smoke.main(["--provider", "glm"]) == smoke.EXIT_PASS
+    assert seen["task"] == expected_task
+
+
+def test_sampling_upstream_matches_omlx_vendor_or_port():
+    assert smoke._sampling_upstream("other", SimpleNamespace(
+        vendor="omlx", base_url="http://omlx-host:9000/v1")) == "http://omlx-host:9000"
+    assert smoke._sampling_upstream("other", SimpleNamespace(
+        vendor="local", base_url="http://local-host:8000/v1")) == "http://local-host:8000"
+    assert smoke._sampling_upstream("other", SimpleNamespace(
+        vendor="local", base_url="http://local-host:8080/v1")) is None
+    assert smoke._sampling_upstream("omlx", SimpleNamespace(
+        vendor="omlx", base_url="http://custom-host:9000/v1")) == smoke.OMLX_UPSTREAM
+
+
 def test_smoke_pass_omlx():
     out = smoke.evaluate("omlx", _run(), _trace(), METRICS, "ok", SSH, PROXY)
     assert out.exit_code == smoke.EXIT_PASS, out.checks

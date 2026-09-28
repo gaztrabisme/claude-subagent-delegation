@@ -223,6 +223,39 @@ def test_resumed_fixture_reports_per_turn_usage_delta():
     assert first_out[-1]["usage"]["input_tokens"] == 17510
 
 
+def test_failed_model_result_does_not_reset_cumulative_usage_baseline():
+    session = Session(provider="gemini")
+    probe, probe_out = _translate("probe", session)
+    probe.finish(0)
+    assert probe_out[-1]["usage"]["input_tokens"] == 17510
+
+    bad_model, bad_out = _translate("bad-model", session)
+    bad_result = bad_model.finish(1, (FIXTURES / "bad-model.stderr.txt").read_text())
+    assert bad_result["is_error"] is True
+    assert bad_result["usage"] == {
+        "input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+    }
+    assert bad_out[-1] is bad_result
+    assert session.data["agy_usage_cumulative"] == {
+        "input_tokens": 41916,
+        "output_tokens": 430,
+        "thinking_tokens": 0,
+        "cache_read_tokens": 24406,
+    }
+
+    resumed, resumed_out = _translate("resumed", session)
+    resumed_result = resumed_out[-1]
+    assert resumed_result["usage"] == {
+        "input_tokens": 19646,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    }
+    assert resumed_result["num_turns"] == 1
+    assert resumed.finish(0) is resumed_result
+
+
 def test_refusal_classifies_quota_and_auth_errors():
     classify = agy_driver.ANTIGRAVITY_PROVIDER.refusal
     assert classify(_cfg(), [{"type": "result", "is_error": True, "error": "HTTP 429 quota exceeded"}]).code == "antigravity_quota"

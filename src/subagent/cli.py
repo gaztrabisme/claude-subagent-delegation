@@ -470,7 +470,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def _loop_parsers(subparsers: argparse._SubParsersAction) -> None:
     run = subparsers.add_parser("run", help="one worker round (or autopilot) on a plan")
     run.add_argument("--plan", metavar="FILE", help="the plan file (single-round mode)")
-    run.add_argument("--parallel", metavar="MANIFEST", help="a manifest of parts, one worktree each")
+    run.add_argument(
+        "--parallel", metavar="MANIFEST", help="a manifest of parts, one worktree each"
+    )
     run.add_argument("--auto", action="store_true", help="retry/repair until done or stuck")
     run.add_argument("--continue", dest="continue_session", action="store_true",
                      help="continue the previous worker session")
@@ -479,10 +481,16 @@ def _loop_parsers(subparsers: argparse._SubParsersAction) -> None:
     run.add_argument("--tier", choices=("normal", "hard"), default="normal")
     run.add_argument("--model", metavar="MODEL", help="override the tier's model")
     run.add_argument("--provider", metavar="NAME", help="override the tier's provider")
-    run.add_argument("--test-outline", metavar="FILE", help="write tests from this outline (--auto)")
-    run.add_argument("--background", action="store_true", help="start and return; collect with `wait`")
+    run.add_argument(
+        "--test-outline", metavar="FILE", help="write tests from this outline (--auto)"
+    )
+    run.add_argument(
+        "--background", action="store_true", help="start and return; collect with `wait`"
+    )
     run.add_argument("--wait", metavar="SECONDS", type=float, help="background, then wait up to S")
-    run.add_argument("--run-id", metavar="ID", help="the run id (a background child reuses its parent's)")
+    run.add_argument(
+        "--run-id", metavar="ID", help="the run id (a background child reuses its parent's)"
+    )
 
     wait = subparsers.add_parser("wait", help="wait for the current run")
     wait.add_argument("--timeout", metavar="SECONDS", type=float, default=540.0)
@@ -492,13 +500,19 @@ def _loop_parsers(subparsers: argparse._SubParsersAction) -> None:
 
     review = subparsers.add_parser("review", help="review the work (or the tests) so far")
     review.add_argument("--tier", choices=("normal", "hard"), default="normal")
-    review.add_argument("--base", metavar="ID", help="checkpoint to diff against (default: task start)")
-    review.add_argument("--tests", action="store_true", help="review the tests against the plan/spec")
+    review.add_argument(
+        "--base", metavar="ID", help="checkpoint to diff against (default: task start)"
+    )
+    review.add_argument(
+        "--tests", action="store_true", help="review the tests against the plan/spec"
+    )
     review.add_argument("--plan", metavar="FILE", help="the plan file (for --tests)")
     review.add_argument("--model", metavar="MODEL", help="override the reviewer's model")
 
     undo = subparsers.add_parser("undo", help="restore the working tree to a checkpoint")
-    undo.add_argument("--to", metavar="ID", help="checkpoint to restore (default: before last round)")
+    undo.add_argument(
+        "--to", metavar="ID", help="checkpoint to restore (default: before last round)"
+    )
 
     subparsers.add_parser("checkpoints", help="list checkpoints")
 
@@ -514,7 +528,9 @@ def _parser() -> argparse.ArgumentParser:
         prog="subagent",
         description="Delegate coding work to a subagent, and inspect its configuration.",
     )
-    parser.add_argument("--root", metavar="PATH", help="the project root (default: current directory)")
+    parser.add_argument(
+        "--root", metavar="PATH", help="the project root (default: current directory)"
+    )
     sub = parser.add_subparsers(dest="command")
 
     init = sub.add_parser("init", help="write a starter config from the examples")

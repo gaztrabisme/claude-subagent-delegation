@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -1104,10 +1105,8 @@ def _under_folded(path: Path, roots: frozenset[Path]) -> bool:
     if not roots:
         return False
     candidates = [Path(os.path.normpath(str(path)))]
-    try:
+    with suppress(OSError, RuntimeError):
         candidates.append(path.resolve())
-    except (OSError, RuntimeError):
-        pass
     root_parts = [_folded_parts(root) for root in roots]
     for candidate in candidates:
         parts = _folded_parts(candidate)

@@ -2,7 +2,8 @@
 """The plan-build-test-review loop and its CLI commands.
 
 Claude writes the plan + tests; the worker implements; the worker may run tests but may NOT change
-them. Every round is checkpointed (undo-able), test files and test config are guarded, and the runner
+them. Every round is checkpointed (undo-able), test files and test config are guarded, and the \
+runner
 re-runs the test suite itself (server-side, through `verify.run_verification`) after the worker
 finishes. Workers run on whatever providers the config declares, through the provider `Registry`.
 
@@ -19,8 +20,10 @@ Subcommands (all print one JSON object to stdout):
   wait [--timeout S]               wait for the current run; {"status": "running"} if still going
   test                             run the test suite
   review [--tier T] [--base ID]    review of everything changed since the task started
-  review --tests [--plan FILE]     review Claude's tests against the plan/spec (autopilot does this first)
-  undo [--to ID]                   restore the working tree to a checkpoint (default: before last round)
+  review --tests [--plan FILE]     review Claude's tests against the plan/spec (autopilot does \
+this first)
+  undo [--to ID]                   restore the working tree to a checkpoint (default: before \
+last round)
   checkpoints                      list checkpoints
   watch [--log FILE | --run ID]    follow the live log (run it in another terminal)
 """
@@ -36,6 +39,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -102,22 +106,36 @@ def resolve_tier(settings, tier, explicit_provider=None, explicit_model=None):
 def build_prompt(plan, feedback, info, protected_files, parallel=None):
     shown = protected_files[:50]
     more = f"\n  ... and {len(protected_files) - 50} more" if len(protected_files) > 50 else ""
-    feedback_block = f"\n## Feedback from the reviewer on your previous attempt\n{feedback}\n" if feedback else ""
-    test_cmd = info["test_cmd"] or "(none detected - verify by reasoning and any checks you can run)"
+    feedback_block = (
+        f"\n## Feedback from the reviewer on your previous attempt\n{feedback}\n"
+        if feedback
+        else ""
+    )
+    test_cmd = (
+        info["test_cmd"] or "(none detected - verify by reasoning and any checks you can run)"
+    )
     parallel_block = ""
     if parallel:
-        others = "\n".join(f"   - {t['name']}: {', '.join(t['files'])}" for t in parallel["others"]) or "   (none)"
-        own_tests = parallel.get("test_cmd") or f"`{test_cmd}` (other parts may still fail in your copy)"
+        others = (
+            "\n".join(f"   - {t['name']}: {', '.join(t['files'])}" for t in parallel["others"])
+            or "   (none)"
+        )
+        own_tests = (
+            parallel.get("test_cmd") or f"`{test_cmd}` (other parts may still fail in your copy)"
+        )
         parallel_block = f"""
 ## Parallel work
-You are worker "{parallel['name']}", one of several workers running at the same time, each in its own
-copy of the repository. Only create or modify files matching: {', '.join(parallel['files'])}
+You are worker "{parallel["name"]}", one of several workers running at the same time, each in \
+its own
+copy of the repository. Only create or modify files matching: {", ".join(parallel["files"])}
 Changes to any other file are discarded. Other workers are building:
 {others}
-Their code is not in your copy. Code against the interfaces described in the plan. Test your part with:
+Their code is not in your copy. Code against the interfaces described in the plan. Test your \
+part with:
 {own_tests}
 """
-    return f"""You are implementing a task in this repository. Work autonomously; nobody will answer questions during this run.
+    return f"""You are implementing a task in this repository. Work autonomously; nobody will \
+answer questions during this run.
 
 ## Task plan
 {plan}
@@ -126,10 +144,12 @@ Their code is not in your copy. Code against the interfaces described in the pla
 1. Implement the plan. The test command is: `{test_cmd}`
    Run it yourself and keep iterating until it passes.
 2. Test files are READ-ONLY and owned by the reviewer. Do NOT modify, delete, rename, skip,
-   or add test files or test configuration. Protected globs: {", ".join(info["test_globs"]) or "(none)"}
+   or add test files or test configuration. Protected globs: \
+{", ".join(info["test_globs"]) or "(none)"}
    Protected files:
   {chr(10).join("  " + f for f in shown) or "  (none yet)"}{more}
-   Any change to them is automatically reverted and your run is marked as a violation. Protected files
+   Any change to them is automatically reverted and your run is marked as a violation. \
+Protected files
    are also denied by the guard hook: writes to them fail before they run.
 3. If you believe a test is wrong (contradicts the plan, or has a bug), do NOT work around it.
    Write `.subagent/test_change_request.md` with: the test file and test name, why it is wrong,
@@ -274,10 +294,15 @@ def _new_log(root, name):
 
 
 def _feedback(args):
-    """--feedback text plus --feedback-file contents ("-" reads stdin). Files avoid shell quoting issues."""
+    """--feedback text plus --feedback-file contents ("-" reads stdin). \
+Files avoid shell quoting issues."""
     text = args.feedback or ""
     if args.feedback_file:
-        source = sys.stdin.read() if args.feedback_file == "-" else Path(args.feedback_file).read_text(encoding="utf-8")
+        source = (
+            sys.stdin.read()
+            if args.feedback_file == "-"
+            else Path(args.feedback_file).read_text(encoding="utf-8")
+        )
         text = f"{text}\n{source}" if text else source
     return text
 
@@ -291,7 +316,8 @@ def _save_session(root, data):
 
 
 def _check_test_counts(session_data, tests_hash, tests):
-    """Flag a passing suite that runs fewer tests (or skips more) than seen before for the same tests."""
+    """Flag a passing suite that runs fewer tests (or skips more) than seen before \
+for the same tests."""
     if session_data.get("tests_hash") != tests_hash:
         session_data["tests_hash"], session_data["best_counts"] = tests_hash, None
     counts = (tests or {}).get("counts")
@@ -301,9 +327,15 @@ def _check_test_counts(session_data, tests_hash, tests):
     problem = None
     if tests["passed"] and best:
         if counts["total"] < best["total"]:
-            problem = f"the suite passed but ran {counts['total']} tests, fewer than the {best['total']} seen before"
+            problem = (
+                f"the suite passed but ran {counts['total']} tests, "
+                f"fewer than the {best['total']} seen before"
+            )
         elif counts["skipped"] > best["skipped"]:
-            problem = f"the suite passed but skipped {counts['skipped']} tests, more than the {best['skipped']} before"
+            problem = (
+                f"the suite passed but skipped {counts['skipped']} tests, "
+                f"more than the {best['skipped']} before"
+            )
     if not best or counts["total"] > best["total"] or (
             counts["total"] == best["total"] and counts["skipped"] < best["skipped"]):
         session_data["best_counts"] = {"total": counts["total"], "skipped": counts["skipped"]}
@@ -322,7 +354,8 @@ def _tests_summary(tests):
 
 
 def _tests_from_verification(verification, state):
-    """The {passed, cmd, counts, output_tail} dict for a run_verification result; writes its full log."""
+    """The {passed, cmd, counts, output_tail} dict for a run_verification result; \
+writes its full log."""
     if verification is None or verification.exit_code is None:
         return None
     tests = {"passed": verification.passed, "cmd": verification.command}
@@ -381,7 +414,7 @@ def _run_block(run, model=None, phase=None):
 
 
 def _usage_sum(usages):
-    total = {key: 0 for key in _USAGE_FIELDS}
+    total = dict.fromkeys(_USAGE_FIELDS, 0)
     for usage in usages:
         if not isinstance(usage, dict):
             continue
@@ -399,7 +432,9 @@ def _cost_sum(costs):
     counterfactual = sum(
         float(c.get("counterfactual_usd") or 0) for c in costs if isinstance(c, dict)
     )
-    provider_usd = None if not provider or any(p is None for p in provider) else float(sum(provider))
+    provider_usd = (
+        None if not provider or any(p is None for p in provider) else float(sum(provider))
+    )
     return {"provider_usd": provider_usd, "counterfactual_usd": counterfactual}
 
 
@@ -494,7 +529,9 @@ def run_round(root, server, args, live_view=True):
     feedback = _feedback(args)
 
     record = _load_session(root) if args.continue_session else {}
-    cp = checkpoint.create(root, f"before round ({'retry' if args.continue_session else 'new task'})")
+    cp = checkpoint.create(
+        root, f"before round ({'retry' if args.continue_session else 'new task'})"
+    )
     record.setdefault("base_checkpoint", cp["id"])
 
     for leftover in ("result.json", "test_change_request.md"):
@@ -504,7 +541,9 @@ def run_round(root, server, args, live_view=True):
     sink = LogSink(log)
     sink.write(f"=== subagent run {time.strftime('%Y-%m-%d %H:%M:%S')} · tier {args.tier} · "
                f"{'continue' if args.continue_session else 'new'} session · checkpoint {cp['id']}")
-    live_view_error = open_live_view(settings.loop, root, RUNNER, ["--log", log]) if live_view else None
+    live_view_error = (
+        open_live_view(settings.loop, root, RUNNER, ["--log", log]) if live_view else None
+    )
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
 
     guard = TestGuard(root, info["test_globs"])
@@ -574,7 +613,9 @@ def run_round(root, server, args, live_view=True):
 
     credits_val = run.usage.credits if run is not None else None
     credits = f" · AI credits {credits_val:.2f}" if credits_val is not None else ""
-    sink.write(f"{END_MARKER}: {status} · {result['seconds']}s · {len(changed)} files changed{credits}")
+    sink.write(
+        f"{END_MARKER}: {status} · {result['seconds']}s · {len(changed)} files changed{credits}"
+    )
     live.close()
     sink.close()
     if worker.agent is not None:
@@ -593,13 +634,20 @@ def run_round(root, server, args, live_view=True):
 def run_parallel(root, server, args, live_view=True):
     manifest = read_json(args.parallel)
     tasks = (manifest or {}).get("tasks") or []
-    if len(tasks) < 2 or any(not t.get("name") or not t.get("plan") or not t.get("files") for t in tasks):
-        return {"status": "bad_manifest",
-                "error": 'manifest needs 2+ tasks, each with "name", "plan" (file) and "files" (globs)'}
+    if len(tasks) < 2 or any(
+        not t.get("name") or not t.get("plan") or not t.get("files") for t in tasks
+    ):
+        return {
+            "status": "bad_manifest",
+            "error": 'manifest needs 2+ tasks, each with "name", "plan" (file) and "files" (globs)',
+        }
     if len({t["name"] for t in tasks}) != len(tasks):
         return {"status": "bad_manifest", "error": "task names must be unique"}
     if git_prefix(root) is None:
-        return {"status": "unsupported", "error": "parallel rounds need a git repository; run the tasks one by one"}
+        return {
+            "status": "unsupported",
+            "error": "parallel rounds need a git repository; run the tasks one by one",
+        }
 
     state_dir(root)
     info = detect(root, server.settings.loop)
@@ -613,13 +661,17 @@ def run_parallel(root, server, args, live_view=True):
     sink = LogSink(log)
     sink.write(f"=== subagent parallel run {time.strftime('%Y-%m-%d %H:%M:%S')} · "
                f"{len(tasks)} workers · checkpoint {cp['id']}")
-    live_view_error = open_live_view(server.settings.loop, root, RUNNER, ["--log", log]) if live_view else None
+    live_view_error = (
+        open_live_view(server.settings.loop, root, RUNNER, ["--log", log]) if live_view else None
+    )
 
     return _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, sink,
                           live_view_error)
 
 
-def _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, sink, live_view_error):
+def _parallel_work(
+    root, server, args, tasks, info, feedback, record, cp, log, sink, live_view_error
+):
     settings = server.settings
     state = root / STATE_DIR
     workers = []
@@ -811,14 +863,20 @@ def _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, s
 
 # ---------------------------------------------------------------- test writer (outline mode)
 
-TEST_WRITER_PROMPT = """You are writing a TEST SUITE from an outline. The code under test does not exist yet; another
-agent will implement it later against your tests. Do NOT write or change implementation code: only the
+TEST_WRITER_PROMPT = """You are writing a TEST SUITE from an outline. The code under test does \
+not exist yet; another
+agent will implement it later against your tests. Do NOT write or change implementation code: \
+only the
 test files named in the outline.
 
-Read the outline in `{outline}` and the plan in `.subagent/review/plan.md` (and any spec it references).
-For every case in the outline, write one test that checks exactly the stated input and expected result.
-Use the project's test framework and conventions (test command: `{test_cmd}`). Put each test in the file
-named by the outline heading it is listed under. Keep tests plain and direct: no helpers that compute
+Read the outline in `{outline}` and the plan in `.subagent/review/plan.md` (and any spec it \
+references).
+For every case in the outline, write one test that checks exactly the stated input and \
+expected result.
+Use the project's test framework and conventions (test command: `{test_cmd}`). Put each test \
+in the file
+named by the outline heading it is listed under. Keep tests plain and direct: no helpers that \
+compute
 expected values, no skipped tests.
 
 The tests will fail until the code exists; that is expected. Only check that each test file is
@@ -852,13 +910,16 @@ def _write_review_plan(root, plan_paths):
             continue
     review_dir = state_dir(root) / "review"
     review_dir.mkdir(exist_ok=True)
-    (review_dir / "plan.md").write_text("\n\n".join(parts) or "(no plan file; use the spec files in the repository)")
+    (review_dir / "plan.md").write_text(
+        "\n\n".join(parts) or "(no plan file; use the spec files in the repository)"
+    )
 
 
 def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None):
     """Turn Claude's test outline into test files with a separate worker session (test files only).
 
-    Skipped when the outline is unchanged and its files exist, unless `issues` (wrong tests found by the
+    Skipped when the outline is unchanged and its files exist, unless `issues` (wrong tests \
+found by the
     test review) ask for a fix pass.
     """
     state = state_dir(root)
@@ -868,34 +929,56 @@ def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None
         return {"status": "bad_outline", "error": f"cannot read the outline: {exc}"}
     declared = _outline_files(outline)
     if not declared:
-        return {"status": "bad_outline",
-                "error": "the outline needs one '## path/to/test_file' heading per test file, cases below it"}
+        return {
+            "status": "bad_outline",
+            "error": (
+                "the outline needs one '## path/to/test_file' heading per test file, "
+                "cases below it"
+            ),
+        }
     outline_hash = hashlib.sha256(outline.encode()).hexdigest()
     record = read_json(state / "test_writer.json") or {}
-    if not issues and record.get("outline_hash") == outline_hash and all((root / f).exists() for f in declared):
+    if (
+        not issues
+        and record.get("outline_hash") == outline_hash
+        and all((root / f).exists() for f in declared)
+    ):
         return {"status": "skipped", "note": "outline unchanged; tests already written"}
 
     info = detect(root, server.settings.loop)
     _write_review_plan(root, plan_paths)
     feedback = ""
     if issues:
-        listed = "\n".join(f"- {i.get('file', '?')}:{i.get('line', '?')}: {i.get('issue', '')}" for i in issues)
-        feedback = ("\n## Fix pass\nAn independent review found these wrong tests:\n" + listed +
-                    "\nFix them. Where the outline itself contradicts the plan or spec, follow the spec and "
-                    "explain each such deviation in `notes`.\n")
-    prompt = TEST_WRITER_PROMPT.format(outline=Path(outline_path).as_posix(),
-                                       test_cmd=info["test_cmd"] or "(use the project's test setup)",
-                                       feedback=feedback)
+        listed = "\n".join(
+            f"- {i.get('file', '?')}:{i.get('line', '?')}: {i.get('issue', '')}" for i in issues
+        )
+        feedback = (
+            "\n## Fix pass\nAn independent review found these wrong tests:\n"
+            + listed
+            + (
+                "\nFix them. Where the outline itself contradicts the plan or spec, "
+                "follow the spec and explain each such deviation in `notes`.\n"
+            )
+        )
+    prompt = TEST_WRITER_PROMPT.format(
+        outline=Path(outline_path).as_posix(),
+        test_cmd=info["test_cmd"] or "(use the project's test setup)",
+        feedback=feedback,
+    )
     target = server.settings.loop.test_writer
     cp = checkpoint.create(root, "before test writing")
     before = hash_tree(root)
     (state / "test_writer_result.json").unlink(missing_ok=True)
     log = _new_log(root, "tests")
     sink = LogSink(log)
-    sink.write(f"=== subagent test writer {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(declared)} files"
-               f" · model {target.model or 'default'}" + (" · fix pass" if issues else ""))
+    sink.write(
+        f"=== subagent test writer {time.strftime('%Y-%m-%d %H:%M:%S')} · {len(declared)} files"
+        f" · model {target.model or 'default'}" + (" · fix pass" if issues else "")
+    )
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
-    previous_record = record.get("session") if issues and isinstance(record.get("session"), dict) else None
+    previous_record = (
+        record.get("session") if issues and isinstance(record.get("session"), dict) else None
+    )
     agent = None
     if previous_record and previous_record.get("agent_id"):
         agent = server.registry.adopt(previous_record, workspace=root, on_event=live.feed)
@@ -933,19 +1016,29 @@ def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None
     else:
         status = "done"
     if status == "done":
-        files = sorted(set(record.get("files", [])) | set(written) | {f for f in declared if (root / f).exists()})
-        write_json(state / "test_writer.json",
-                   {"outline_hash": outline_hash, "session": session.record_for(agent), "files": files})
+        files = sorted(
+            set(record.get("files", []))
+            | set(written)
+            | {f for f in declared if (root / f).exists()}
+        )
+        write_json(
+            state / "test_writer.json",
+            {"outline_hash": outline_hash, "session": session.record_for(agent), "files": files},
+        )
     result = {
         "status": status,
         "model": used,
         "files": written or None,
         "cases": report.get("cases"),
-        "outline_cases": sum(1 for line in outline.splitlines() if line.lstrip().startswith(("- ", "* "))),
+        "outline_cases": sum(
+            1 for line in outline.splitlines() if line.lstrip().startswith(("- ", "* "))
+        ),
         "notes": report.get("notes") or None,
         "reverted_files": reverted or None,
         "worker_credits": round(run.usage.credits, 2) if run.usage.credits is not None else None,
-        "log_tail": tail(log.read_text(errors="ignore"), 30) if status == "test_writer_error" else None,
+        "log_tail": tail(log.read_text(errors="ignore"), 30)
+        if status == "test_writer_error"
+        else None,
         "_runs": [_run_block(run, used, phase="test_writer")],
     }
     credits = f" · AI credits {run.usage.credits:.2f}" if run.usage.credits is not None else ""
@@ -966,8 +1059,15 @@ def _prepare_tests(root, server, args):
     `extras["blocks"]` are the setup runs (test writer, test review) tagged
     with their phase; the delegation record sums them into its totals.
     """
-    plans = [args.plan] if args.plan else [t.get("plan") for t in (read_json(args.parallel) or {}).get("tasks", [])
-                                           if t.get("plan")]
+    plans = (
+        [args.plan]
+        if args.plan
+        else [
+            t.get("plan")
+            for t in (read_json(args.parallel) or {}).get("tasks", [])
+            if t.get("plan")
+        ]
+    )
     extras = {"test_writer": None, "test_review": None, "credits": [], "blocks": []}
     writer = None
     if args.test_outline:
@@ -976,8 +1076,11 @@ def _prepare_tests(root, server, args):
         extras["credits"].append(writer.get("worker_credits"))
         extras["blocks"].extend(writer.get("_runs") or [])
         if writer["status"] not in ("done", "skipped"):
-            return {"status": writer["status"], "summary": writer.get("error") or "the test writer failed",
-                    "test_writer": writer}, extras
+            return {
+                "status": writer["status"],
+                "summary": writer.get("error") or "the test writer failed",
+                "test_writer": writer,
+            }, extras
     if not (server.settings.loop.review_tests or args.test_outline):
         return None, extras
     review_plans = plans + ([args.test_outline] if args.test_outline else [])
@@ -1001,45 +1104,80 @@ def _prepare_tests(root, server, args):
             wrong = _wrong_tests(review)
     extras["test_review"] = review
     if wrong:
-        return {"status": "tests_questioned",
-                "summary": f"The test review found {len(wrong)} wrong test(s); no worker round was run.",
-                "test_review": _brief_test_review(review),
-                "test_writer": _brief_writer(writer)}, extras
+        return {
+            "status": "tests_questioned",
+            "summary": (
+                f"The test review found {len(wrong)} wrong test(s); "
+                "no worker round was run."
+            ),
+            "test_review": _brief_test_review(review),
+            "test_writer": _brief_writer(writer),
+        }, extras
     return None, extras
 
 
 def _brief_writer(writer):
     if not writer or writer.get("status") == "skipped":
         return None
-    return {k: v for k, v in writer.items() if k in ("model", "files", "cases", "outline_cases", "notes",
-                                                     "reverted_files", "fix_pass")}
+    return {
+        k: v
+        for k, v in writer.items()
+        if k in ("model", "files", "cases", "outline_cases", "notes", "reverted_files", "fix_pass")
+    }
 
 
 # ---------------------------------------------------------------- autopilot
 
 # Statuses the autopilot cannot handle itself: they need Claude (test ownership) or a setup fix.
-AUTO_HAND_BACK = {"needs_test_change", "backend_error", "runner_error", "unsupported", "bad_manifest"}
+AUTO_HAND_BACK = {
+    "needs_test_change",
+    "backend_error",
+    "runner_error",
+    "unsupported",
+    "bad_manifest",
+}
 
 
 def _combined_plan(root, manifest_path):
     """One plan for follow-up rounds after a parallel round: all parts' plans together."""
     manifest = read_json(manifest_path) or {}
-    parts = [f"## Part: {t['name']} (files: {', '.join(t['files'])})\n\n{Path(t['plan']).read_text()}"
-             for t in manifest.get("tasks", [])]
+    parts = [
+        f"## Part: {t['name']} (files: {', '.join(t['files'])})\n\n{Path(t['plan']).read_text()}"
+        for t in manifest.get("tasks", [])
+    ]
     path = state_dir(root) / "auto_plan.md"
-    path.write_text("# Integration plan\n\nSeveral workers built these parts in parallel. The merged "
-                    "result now needs fixing; you may change any of these files.\n\n" + "\n\n".join(parts))
+    path.write_text(
+        "# Integration plan\n\nSeveral workers built these parts in parallel. The merged "
+        "result now needs fixing; you may change any of these files.\n\n" + "\n\n".join(parts)
+    )
     return str(path)
 
 
 def _round_brief(number, result):
     counts = (result.get("tests") or {}).get("counts")
-    tests = f"{counts['passed']}/{counts['total']}" if counts else (
-        None if result.get("tests") is None else ("passed" if result["tests"]["passed"] else "failed"))
-    models = result.get("model") or ", ".join(sorted({t.get("model") for t in result.get("tasks", [])
-                                                      if t.get("model")})) or None
-    brief = {"round": number, "status": result["status"], "tier": result.get("tier"), "model": models,
-             "tests": tests, "credits": result.get("worker_credits"), "checkpoint": result.get("checkpoint")}
+    tests = (
+        f"{counts['passed']}/{counts['total']}"
+        if counts
+        else (
+            None
+            if result.get("tests") is None
+            else ("passed" if result["tests"]["passed"] else "failed")
+        )
+    )
+    models = (
+        result.get("model")
+        or ", ".join(sorted({t.get("model") for t in result.get("tasks", []) if t.get("model")}))
+        or None
+    )
+    brief = {
+        "round": number,
+        "status": result["status"],
+        "tier": result.get("tier"),
+        "model": models,
+        "tests": tests,
+        "credits": result.get("worker_credits"),
+        "checkpoint": result.get("checkpoint"),
+    }
     return {k: v for k, v in brief.items() if v is not None}
 
 
@@ -1062,22 +1200,28 @@ def _brief_test_review(review):
 
 def _review_feedback(issues):
     lines = [f"- {i.get('file', '?')}:{i.get('line', '?')}: {i.get('issue', '')}" for i in issues]
-    return ("An independent code review found these high-severity problems. Fix them and keep the whole "
-            "test suite passing:\n" + "\n".join(lines))
+    return (
+        "An independent code review found these high-severity problems. Fix them and keep the "
+        "whole test suite passing:\n" + "\n".join(lines)
+    )
 
 
 def autopilot(root, server, args, run_id):
     """Run rounds until the tests pass and the review has no high-severity issues, or until stuck.
 
-    Failing tests and high-severity review issues go back to the worker automatically, so Claude only
+    Failing tests and high-severity review issues go back to the worker automatically, so \
+Claude only
     sees the final result (or a problem only Claude can solve, like a disputed test).
     """
     settings = server.settings
     started = time.time()
     _set_delegation_id(server, run_id)
-    live_view_error = open_live_view(settings.loop, root, RUNNER, ["--run", run_id, "--since", time.time()])
+    live_view_error = open_live_view(
+        settings.loop, root, RUNNER, ["--run", run_id, "--since", time.time()]
+    )
 
-    # Tests first: write them from the outline (outline mode), then check them against the plan/spec.
+    # Tests first: write them from the outline (outline mode), then check them against
+    # the plan/spec.
     hand_back, extras = _prepare_tests(root, server, args)
     test_review = extras["test_review"]
     if hand_back:
@@ -1092,9 +1236,15 @@ def autopilot(root, server, args, run_id):
         ))
         return {k: v for k, v in hand_back.items() if v is not None}
 
-    first = run_parallel(root, server, args, live_view=False) if args.parallel else run_round(root, server, args, False)
+    first = (
+        run_parallel(root, server, args, live_view=False)
+        if args.parallel
+        else run_round(root, server, args, False)
+    )
     rounds, reviews = [first], []
-    fix_plan = args.plan or (_combined_plan(root, args.parallel) if first["status"] not in AUTO_HAND_BACK else None)
+    fix_plan = args.plan or (
+        _combined_plan(root, args.parallel) if first["status"] not in AUTO_HAND_BACK else None
+    )
     tier, failed_in_row, escalated, stop, reviewed_round = args.tier, 0, False, None, 0
     while True:
         last = rounds[-1]
@@ -1123,22 +1273,38 @@ def autopilot(root, server, args, run_id):
             if sum(1 for r in rounds if r["status"] == "violated_tests") >= 2:
                 stop = "repeated_violations"
                 break
-            feedback = ("Your changes to tests or test configuration were reverted: "
-                        + json.dumps(last.get("violations")) + "\nDo not modify tests or test settings. "
-                        "If a test is wrong, use .subagent/test_change_request.md.")
+            feedback = (
+                "Your changes to tests or test configuration were reverted: "
+                + json.dumps(last.get("violations"))
+                + "\nDo not modify tests or test settings. "
+                "If a test is wrong, use .subagent/test_change_request.md."
+            )
         else:  # tests_failed, failed, no_report, timeout, partial
             failed_in_row += 1
             output = (last.get("tests") or {}).get("output_tail")
-            feedback = (f"The test suite fails:\n{output}" if output else
-                        f"The previous round ended with status {status}: {last.get('summary') or 'no summary'}. "
-                        "Finish the task and make the tests pass.")
+            feedback = (
+                f"The test suite fails:\n{output}"
+                if output
+                else (
+                    f"The previous round ended with status {status}: "
+                    f"{last.get('summary') or 'no summary'}. "
+                    "Finish the task and make the tests pass."
+                )
+            )
         if len(rounds) >= settings.loop.auto_max_rounds:
             stop = "max_rounds"
             break
         if tier == "normal" and failed_in_row >= 2 and not args.model:
             tier, escalated = "hard", True
-        next_args = SimpleNamespace(plan=fix_plan, feedback=feedback, feedback_file=None, continue_session=True,
-                                    tier=tier, model=args.model, provider=args.provider)
+        next_args = SimpleNamespace(
+            plan=fix_plan,
+            feedback=feedback,
+            feedback_file=None,
+            continue_session=True,
+            tier=tier,
+            model=args.model,
+            provider=args.provider,
+        )
         rounds.append(run_round(root, server, next_args, live_view=False))
 
     last = rounds[-1]
@@ -1149,9 +1315,13 @@ def autopilot(root, server, args, run_id):
         final = "review_concerns"  # high issues remain and no rounds were left to fix them
     base = checkpoint.get(root, first.get("checkpoint")) if first.get("checkpoint") else None
     changed = [p for _, p in checkpoint.changes(root, base)] if base else last.get("changed_files")
-    credits = [r.get("worker_credits") for r in rounds + reviews if r.get("worker_credits") is not None]
+    credits = [
+        r.get("worker_credits") for r in rounds + reviews if r.get("worker_credits") is not None
+    ]
     credits += [c for c in extras["credits"] if c is not None]
-    summary = last.get("summary") or "; ".join(f"{t['name']}: {t.get('summary', '')}" for t in last.get("tasks", []))
+    summary = last.get("summary") or "; ".join(
+        f"{t['name']}: {t.get('summary', '')}" for t in last.get("tasks", [])
+    )
     result = {
         "status": final,
         "stopped_because": None if stop == "done" else stop,
@@ -1171,18 +1341,35 @@ def autopilot(root, server, args, run_id):
             "issues": latest_review.get("issues") or None, "cycles": len(reviews),
             "note": latest_review.get("note")}.items() if v is not None}
         if latest_review.get("verdict") not in ("ok", "concerns"):
-            result["review"]["unverified"] = "the reviewer returned no verdict (twice); the final code was not reviewed"
+            result["review"]["unverified"] = (
+                "the reviewer returned no verdict (twice); the final code was not reviewed"
+            )
         elif not final_code_reviewed:
-            result["review"]["unverified"] = "the issues above were sent back to the worker, but the final " \
-                                             "code was not re-reviewed (auto_review_cycles or auto_max_rounds reached)"
+            result["review"]["unverified"] = (
+                "the issues above were sent back to the worker, but the final "
+                "code was not re-reviewed (auto_review_cycles or auto_max_rounds reached)"
+            )
     if test_review and not test_review.get("skipped"):
         result["test_review"] = _brief_test_review(test_review)
     if _brief_writer(extras["test_writer"]):
         result["test_writer"] = _brief_writer(extras["test_writer"])
     if args.parallel:
-        result["parallel_tasks"] = [{k: v for k, v in t.items() if k in (
-            "name", "status", "out_of_scope_files", "conflicts", "violations")} for t in first.get("tasks", [])]
-    for key in ("test_change_request", "violations", "log_tail", "error", "model_fallback", "warning"):
+        result["parallel_tasks"] = [
+            {
+                k: v
+                for k, v in t.items()
+                if k in ("name", "status", "out_of_scope_files", "conflicts", "violations")
+            }
+            for t in first.get("tasks", [])
+        ]
+    for key in (
+        "test_change_request",
+        "violations",
+        "log_tail",
+        "error",
+        "model_fallback",
+        "warning",
+    ):
         if last.get(key):
             result[key] = last[key]
     all_blocks = [b for r in rounds for b in (r.get("_runs") or [])]
@@ -1222,7 +1409,10 @@ def _child_argv(argv):
 def cmd_run(root, server, args, raw):
     active = _active_run(root)
     if active and active["run_id"] != args.run_id:
-        return {"status": "busy", "error": f"run {active['run_id']} is still in progress; use `wait`"}, 2
+        return {
+            "status": "busy",
+            "error": f"run {active['run_id']} is still in progress; use `wait`",
+        }, 2
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     state = state_dir(root)
 
@@ -1231,17 +1421,31 @@ def cmd_run(root, server, args, raw):
     if args.background or args.wait is not None:
         out = state / "logs" / f"runner-{run_id}.out"
         with open(out, "w") as fh:
-            proc = subprocess.Popen([*RUNNER, *_child_argv(raw), "--run-id", run_id],
-                                    cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-        write_json(state / "current.json", {"run_id": run_id, "pid": proc.pid, "started": time.time(),
-                                             "runner_output": str(out.relative_to(root))})
+            proc = subprocess.Popen(
+                [*RUNNER, *_child_argv(raw), "--run-id", run_id],
+                cwd=os.getcwd(),
+                stdin=subprocess.DEVNULL,
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        write_json(
+            state / "current.json",
+            {
+                "run_id": run_id,
+                "pid": proc.pid,
+                "started": time.time(),
+                "runner_output": str(out.relative_to(root)),
+            },
+        )
         if args.wait is not None:
             return cmd_wait(root, server, SimpleNamespace(timeout=args.wait))
         return {"status": "started", "run_id": run_id, "next": "wait --timeout 540"}, 0
 
     if not args.run_id:  # a background child's record was written by its parent
-        write_json(state / "current.json", {"run_id": run_id, "pid": os.getpid(), "started": time.time()})
+        write_json(
+            state / "current.json", {"run_id": run_id, "pid": os.getpid(), "started": time.time()}
+        )
     try:
         if args.auto:
             result = autopilot(root, server, args, run_id)
@@ -1288,8 +1492,11 @@ def cmd_wait(root, server, args):
             if result:
                 return result, STATUS_EXIT.get(result["status"], 2)
             out = root / current.get("runner_output", "")
-            return {"status": "crashed", "run_id": current["run_id"],
-                    "log_tail": tail(out.read_text(errors="ignore"), 30) if out.is_file() else None}, 2
+            return {
+                "status": "crashed",
+                "run_id": current["run_id"],
+                "log_tail": tail(out.read_text(errors="ignore"), 30) if out.is_file() else None,
+            }, 2
         if time.time() >= deadline:
             return {"status": "running", "run_id": current["run_id"],
                     "elapsed_seconds": round(time.time() - current["started"]),
@@ -1331,22 +1538,30 @@ def cmd_undo(root, server, args):
         return {"status": "no_checkpoint", "error": "no matching checkpoint"}, 2
     safety = checkpoint.create(root, f"before undo to {record['id']}")
     undone = checkpoint.restore(root, record)
-    return {"status": "undone", "restored_to": record, "changes_undone": [f"{s} {p}" for s, p in undone],
-            "redo_checkpoint": safety["id"]}, 0
+    return {
+        "status": "undone",
+        "restored_to": record,
+        "changes_undone": [f"{s} {p}" for s, p in undone],
+        "redo_checkpoint": safety["id"],
+    }, 0
 
 
 def cmd_checkpoints(root, server, args):
     return {"checkpoints": checkpoint.list_all(root)}, 0
 
 
-REVIEW_PROMPT = """You are a code reviewer. Do NOT modify any file except `.subagent/review/result.json`.
+REVIEW_PROMPT = """You are a code reviewer. Do NOT modify any file except \
+`.subagent/review/result.json`.
 
-The patch in `.subagent/review/diff.patch` contains all implementation changes made by another agent for
+The patch in `.subagent/review/diff.patch` contains all implementation changes made by another \
+agent for
 this task (tests excluded; the tests pass). You may read other files in the repository for context.
 
 Report only issues that matter:
-- security problems (injection, path traversal, unsafe deserialization, secrets, missing auth checks)
-- clearly wrong behavior the tests might not catch (crashes on valid input, data loss, wrong results)
+- security problems (injection, path traversal, unsafe deserialization, secrets, missing auth \
+checks)
+- clearly wrong behavior the tests might not catch (crashes on valid input, data loss, wrong \
+results)
 - code that games tests (hardcoded expected values, special-casing test inputs)
 Do not report style, naming, or minor improvements.
 
@@ -1356,18 +1571,23 @@ Write `.subagent/review/result.json` exactly as:
 Use "ok" with an empty list when there is nothing that matters.
 """
 
-TEST_REVIEW_PROMPT = """You are checking a TEST SUITE before the code under test is written. Do NOT modify any
+TEST_REVIEW_PROMPT = """You are checking a TEST SUITE before the code under test is written. \
+Do NOT modify any
 file except `.subagent/review/tests_result.json`.
 
 The tests were written from the plan in `.subagent/review/plan.md`. Read it, and any spec file it
-references (for example TASK.md). The test files are listed in `.subagent/review/test_files.txt`. The
+references (for example TASK.md). The test files are listed in \
+`.subagent/review/test_files.txt`. The
 code under test may not exist yet: do not run the tests.
 
-Your main job is to find WRONG tests: assertions whose expected value, error type or input contradicts
-the plan or spec. Go through the assertions one by one and work out each expected value yourself from
+Your main job is to find WRONG tests: assertions whose expected value, error type or input \
+contradicts
+the plan or spec. Go through the assertions one by one and work out each expected value \
+yourself from
 the spec (compute dates, weekdays, numbers, strings step by step). Also check the tests against each
 other: two assertions that imply different rules for the same situation mean one of them is wrong.
-Where the spec is silent, the standard behavior of the domain applies (e.g. how cron, HTTP, SQL work).
+Where the spec is silent, the standard behavior of the domain applies (e.g. how cron, HTTP, \
+SQL work).
 Report each wrong test with severity "high" and the correct expectation.
 
 Secondary: requirements of the plan or spec with no test at all ("missing_test"), always severity
@@ -1383,8 +1603,11 @@ Use "ok" with an empty list when every assertion is right.
 
 
 def _retry_prompt(result_file):
-    return (f"\nYour previous attempt did not produce a verdict. Write the JSON to `{result_file}` with your "
-            "file tool; if you cannot, make your final message exactly that JSON object and nothing else.\n")
+    return (
+        f"\nYour previous attempt did not produce a verdict. Write the JSON to `{result_file}` "
+        "with your file tool; if you cannot, make your final message exactly that JSON object "
+        "and nothing else.\n"
+    )
 
 
 def _verdict_from_text(text):
@@ -1405,7 +1628,8 @@ def _review_target(settings, tier, explicit=None):
 
 
 def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
-    """Run a read-only reviewer; retry once without a verdict; undo any edits. Returns a result dict."""
+    """Run a read-only reviewer; retry once without a verdict; undo any edits. \
+Returns a result dict."""
     result_path = root / STATE_DIR / "review" / result_name
     result_path.unlink(missing_ok=True)
     cp = checkpoint.create(root, "before review")
@@ -1413,7 +1637,10 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
     log = _new_log(root, "review")
     sink = LogSink(log)
     provider, model = target
-    sink.write(f"=== subagent {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} · {detail} · model {model or 'default'}")
+    sink.write(
+        f"=== subagent {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} · {detail} "
+        f"· model {model or 'default'}"
+    )
     live = LiveLog(sink, log.with_suffix(".jsonl"), root)
     review, credits, attempts, used, errored, timed_out = {}, 0.0, 0, model, False, False
     review_runs = []
@@ -1427,7 +1654,10 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
         )
         agent.guard_context = {
             "protected": [],
-            "state_allow": [f"{STATE_DIR}/review/result.json", f"{STATE_DIR}/review/tests_result.json"],
+            "state_allow": [
+                f"{STATE_DIR}/review/result.json",
+                f"{STATE_DIR}/review/tests_result.json",
+            ],
         }
         run = agent.delegate(text, "true", on_event=live.feed, distill=False)
         if not run.done.wait(agent.cfg.run_timeout):
@@ -1457,23 +1687,32 @@ def _run_reviewer(root, server, target, prompt, result_name, kind, detail):
         "_runs": [_run_block(r, model) for r in review_runs],
     }
     tail_credits = f" · AI credits {credits:.2f}" if credits else ""
-    sink.write(f"{END_MARKER}: {kind} {result['verdict']} · {len(result['issues'])} issues{tail_credits}")
+    sink.write(
+        f"{END_MARKER}: {kind} {result['verdict']} · {len(result['issues'])} issues{tail_credits}"
+    )
     live.close()
     sink.close()
     return result
 
 
 def do_review(root, server, tier="normal", model=None, base_id=None):
-    """Review everything changed since the task started (tests excluded) with a model of another family."""
+    """Review everything changed since the task started (tests excluded) with a model \
+of another family."""
     state = state_dir(root)
     session_data = _load_session(root)
     base = checkpoint.get(root, base_id or session_data.get("base_checkpoint"))
     if not base:
         return {"verdict": "error", "issues": [], "error": "no base checkpoint; pass --base ID"}
     info = detect(root, server.settings.loop)
-    changes = [(s, p) for s, p in checkpoint.changes(root, base) if not matches(p, info["test_globs"])]
+    changes = [
+        (s, p) for s, p in checkpoint.changes(root, base) if not matches(p, info["test_globs"])
+    ]
     if not changes:
-        return {"verdict": "ok", "issues": [], "note": "no implementation changes since the base checkpoint"}
+        return {
+            "verdict": "ok",
+            "issues": [],
+            "note": "no implementation changes since the base checkpoint",
+        }
 
     parts = []
     for status, rel in changes:
@@ -1490,9 +1729,18 @@ def do_review(root, server, tier="normal", model=None, base_id=None):
     truncated = len(patch) > limit
     review_dir = state / "review"
     review_dir.mkdir(exist_ok=True)
-    (review_dir / "diff.patch").write_text(patch[:limit] + ("\n... (truncated)\n" if truncated else ""))
-    result = _run_reviewer(root, server, _review_target(server.settings, tier, model), REVIEW_PROMPT,
-                           "result.json", "review", f"{len(changes)} files")
+    (review_dir / "diff.patch").write_text(
+        patch[:limit] + ("\n... (truncated)\n" if truncated else "")
+    )
+    result = _run_reviewer(
+        root,
+        server,
+        _review_target(server.settings, tier, model),
+        REVIEW_PROMPT,
+        "result.json",
+        "review",
+        f"{len(changes)} files",
+    )
     result["reviewed_files"] = [p for _, p in changes]
     result["truncated_diff"] = truncated or None
     return {k: v for k, v in result.items() if v is not None}
@@ -1515,11 +1763,20 @@ def do_test_review(root, server, tier, plan_paths, model=None, force=False):
         return {"skipped": "tests unchanged since the last test review"}
     _write_review_plan(root, plan_paths)
     (state / "review" / "test_files.txt").write_text("\n".join(test_files) + "\n")
-    result = _run_reviewer(root, server, _review_target(server.settings, tier, model), TEST_REVIEW_PROMPT,
-                           "tests_result.json", "test review", f"{len(test_files)} test files")
+    result = _run_reviewer(
+        root,
+        server,
+        _review_target(server.settings, tier, model),
+        TEST_REVIEW_PROMPT,
+        "tests_result.json",
+        "test review",
+        f"{len(test_files)} test files",
+    )
     result["test_files"] = test_files
     if result["verdict"] in ("ok", "concerns"):
-        write_json(state / "test_review.json", {"tests_hash": tests_hash, "verdict": result["verdict"]})
+        write_json(
+            state / "test_review.json", {"tests_hash": tests_hash, "verdict": result["verdict"]}
+        )
     return {k: v for k, v in result.items() if v is not None}
 
 
@@ -1536,10 +1793,8 @@ def cmd_review(root, server, args):
 
 def _hold(args):
     if args.hold:
-        try:
+        with suppress(EOFError):
             input("\nRun finished. Press Enter to close.")
-        except EOFError:
-            pass
 
 
 def cmd_watch(root, server, args):
@@ -1549,10 +1804,13 @@ def cmd_watch(root, server, args):
         _hold(args)
         return None, 0
     if args.run:
-        # Follow every log of one (autopilot) run in order, round after round, until its result is written.
+        # Follow every log of one (autopilot) run in order, round after round,
+        # until its result is written.
         done = root / STATE_DIR / "runs" / f"{args.run}.json"
         current = read_json(root / STATE_DIR / "current.json") or {}
-        since = args.since or (current.get("started", 0) if current.get("run_id") == args.run else 0)
+        since = args.since or (
+            current.get("started", 0) if current.get("run_id") == args.run else 0
+        )
         seen = set()
         while True:
             fresh = sorted((p for p in latest.parent.glob("*.log")

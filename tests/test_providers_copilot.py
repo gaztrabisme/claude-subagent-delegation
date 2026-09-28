@@ -9,7 +9,6 @@ FAKE_COPILOT_RECORD (one JSON line per call).
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sys
 import uuid

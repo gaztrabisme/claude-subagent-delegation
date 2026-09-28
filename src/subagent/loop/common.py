@@ -69,7 +69,9 @@ def hash_tree(root):
 
 
 def changed_between(before, after):
-    return sorted([f for f in after if before.get(f) != after[f]] + [f for f in before if f not in after])
+    return sorted(
+        [f for f in after if before.get(f) != after[f]] + [f for f in before if f not in after]
+    )
 
 
 def tail(text, n=TAIL_LINES):
@@ -85,15 +87,21 @@ GIT_IDENTITY = {
 
 
 def git(root, *args, env=None, check=True, text=True):
-    proc = subprocess.run(["git", *args], cwd=root, env={**os.environ, **GIT_IDENTITY, **(env or {})},
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text)
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        env={**os.environ, **GIT_IDENTITY, **(env or {})},
+        capture_output=True,
+        text=text,
+    )
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.stdout.strip() if text else proc.stdout
 
 
 def git_prefix(root):
-    """Path of root inside its git work tree ('' at the top level, 'pkg/app/' in a monorepo), or None."""
+    """Path of root inside its git work tree ('' at the top level, 'pkg/app/' in a monorepo), \
+or None."""
     try:
         if git(root, "rev-parse", "--is-inside-work-tree") != "true":
             return None

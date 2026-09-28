@@ -7,9 +7,16 @@ import signal
 import subprocess
 import threading
 import time
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 
 END_MARKER = "=== end"
+
+
+@contextmanager
+def _append_file(path):
+    with open(path, "a", buffering=1) as stream:
+        yield stream
 
 
 def _truncate(text, limit=160):
@@ -40,8 +47,12 @@ def render(event):
                 name = block.get("name", "?")
                 args = block.get("input") or {}
                 if isinstance(args, dict):
-                    detail = args.get("command") or args.get("file_path") or args.get("path") or next(
-                        (v for v in args.values() if isinstance(v, str)), "")
+                    detail = (
+                        args.get("command")
+                        or args.get("file_path")
+                        or args.get("path")
+                        or next((v for v in args.values() if isinstance(v, str)), "")
+                    )
                 else:
                     detail = str(args).strip().splitlines()[0] if str(args).strip() else ""
                 lines.append(f"▸ {name} {_truncate(detail)}")
@@ -74,7 +85,8 @@ class LogSink:
 
     def __init__(self, path):
         self.path = Path(path)
-        self.fh = open(self.path, "a", buffering=1)
+        self._files = ExitStack()
+        self.fh = self._files.enter_context(_append_file(self.path))
         self.lock = threading.Lock()
 
     def write(self, text):
@@ -82,7 +94,7 @@ class LogSink:
             self.fh.write(text + "\n")
 
     def close(self):
-        self.fh.close()
+        self._files.close()
 
 
 class LiveLog:
@@ -90,21 +102,28 @@ class LiveLog:
 
     def __init__(self, sink, raw_path, root, prefix=""):
         self.sink = sink
-        self.raw = open(raw_path, "a", buffering=1)
+        self._files = ExitStack()
+        self.raw = self._files.enter_context(_append_file(raw_path))
         self.prefix = f"[{prefix}] " if prefix else ""
         self.credits = None
-        self.last_message = ""  # the worker's last chat message (fallback when it forgets to write a file)
+        self.last_message = (
+            ""  # the worker's last chat message (fallback when it forgets to write a file)
+        )
 
     def write(self, text):
         self.sink.write(self.prefix + text)
 
     def close(self):
-        self.raw.close()
+        self._files.close()
 
     def _note(self, event):
         if event.get("type") == "assistant":
             for block in (event.get("message") or {}).get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "text" and (block.get("text") or "").strip():
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and (block.get("text") or "").strip()
+                ):
                     self.last_message = str(block["text"]).strip()
         elif event.get("type") == "result":
             usage = event.get("usage") or {}
@@ -112,7 +131,8 @@ class LiveLog:
                 self.credits = usage["credits"]
 
     def feed(self, event):
-        """Never raises: one malformed event must not stop the stream (usage and completion come last)."""
+        """Never raises: one malformed event must not stop the stream (usage and completion come \
+last)."""
         try:
             if not isinstance(event, dict):
                 return
@@ -130,10 +150,8 @@ def _kill_group(proc):
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=10)
     except (ProcessLookupError, subprocess.TimeoutExpired):
-        try:
+        with suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         proc.wait()
 
 
@@ -150,7 +168,8 @@ TERMINALS = [
 
 
 def open_live_view(cfg, root, runner, watch_args):
-    """Open a terminal running `watch <watch_args> --hold` (config "live_view"). Returns an error or None."""
+    """Open a terminal running `watch <watch_args> --hold` (config "live_view"). \
+Returns an error or None."""
     setting = cfg.live_view
     if not setting or setting == "off" or os.environ.get("SUBAGENT_LIVE_VIEW") == "off":
         return None
@@ -158,7 +177,8 @@ def open_live_view(cfg, root, runner, watch_args):
     if isinstance(setting, list):
         argv = [arg for part in setting for arg in (watch if part == "{cmd}" else [part])]
     elif os.environ.get("TMUX") and shutil.which("tmux"):
-        # Separate arguments: tmux runs them directly, not through the user's shell (fish, zsh, ...).
+        # Separate arguments: tmux runs them directly, not through the user's shell
+        # (fish, zsh, ...).
         argv = ["tmux", "split-window", "-d", "-h", *watch]
     elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         user_term = os.environ.get("TERMINAL")

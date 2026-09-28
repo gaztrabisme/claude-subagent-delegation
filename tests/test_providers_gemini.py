@@ -12,8 +12,6 @@ import json
 import shutil
 from pathlib import Path
 
-import pytest
-
 from subagent.providers import gemini as gemini_driver
 from subagent.providers.base import ProviderConfig, Session
 

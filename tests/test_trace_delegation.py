@@ -28,7 +28,7 @@ def _read_trace(session_root: Path) -> list[dict]:
 
 
 def _usage_sum(usages) -> dict[str, int]:
-    total = {key: 0 for key in TOKEN_FIELDS}
+    total = dict.fromkeys(TOKEN_FIELDS, 0)
     for usage in usages:
         if not isinstance(usage, dict):
             continue

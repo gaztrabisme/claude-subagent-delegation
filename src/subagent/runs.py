@@ -1565,7 +1565,8 @@ class Registry:
         if expected_home is None:
             if recorded_home not in (None, ""):
                 raise RegistryError(
-                    f"session record agent_home {recorded_home!r} is not expected for {chosen.driver}"
+                    f"session record agent_home {recorded_home!r} is not expected "
+                    f"for {chosen.driver}"
                 )
         else:
             try:
@@ -1577,7 +1578,8 @@ class Registry:
                 home_matches = False
             if not home_matches:
                 raise RegistryError(
-                    f"session record agent_home {recorded_home!r} does not match expected {expected_home}"
+                    f"session record agent_home {recorded_home!r} does not match "
+                    f"expected {expected_home}"
                 )
         agents_root = (self.settings.session_root / "agents").resolve()
         if expected_home is not None and not expected_home.resolve().is_relative_to(agents_root):

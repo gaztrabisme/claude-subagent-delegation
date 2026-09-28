@@ -12,13 +12,19 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import sys
+import threading
+import time
 import uuid
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
 from subagent import router
+from subagent.guard.classify import classify
 from subagent.providers import omp as omp_driver
 from subagent.providers.base import ProviderConfig, Session
 from subagent.runs import COMPLETED, Registry
@@ -33,6 +39,21 @@ MODEL = "Qwen3.8-Flash-Next-REAP-384-oQ4e-BF16-MTP-PLE"
 
 def _omp_cfg(**extra) -> ProviderConfig:
     return ProviderConfig(name="local", driver="omp", vendor="omp", extra=extra)
+
+
+def _configured_omp_cfg(**patch) -> ProviderConfig:
+    values = {
+        "name": "omlx",
+        "driver": "omp",
+        "vendor": "omlx",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "model": "Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B",
+        "api_key_envs": ("OMLX_API_KEY",),
+        "local": True,
+        "send_sampling": False,
+    }
+    values.update(patch)
+    return ProviderConfig(**values)
 
 
 def _load(name: str) -> list[dict]:
@@ -76,7 +97,7 @@ def test_argv_first_turn_shape(tmp_path: Path):
     assert argv[argv.index("--mode") + 1] == "json"
     assert "--no-session" in argv
     assert argv[argv.index("--cwd") + 1] == str(ws)
-    assert argv[argv.index("--model") + 1] == f"omlx/{MODEL}"
+    assert argv[argv.index("--model") + 1] == f"local/omlx/{MODEL}"
     assert argv[-3:] == ["--thinking", "low", "do it"]  # extras, then the prompt verbatim
     assert "--resume" not in argv and "--continue" not in argv
 
@@ -114,38 +135,279 @@ def test_argv_binary_comes_from_config(tmp_path: Path):
     assert argv[0] == "/opt/bin/omp"
 
 
+def test_spawn_writes_agent_scoped_config_and_passes_the_key_only_in_env(
+    tmp_path: Path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    cfg = _configured_omp_cfg(binary="/fake/omp")
+    secret = "test-omp-secret-never-on-disk"
+    monkeypatch.setenv("OMLX_API_KEY", secret)
+    workspace = _workspace(tmp_path)
+
+    first = omp_driver.OMP_PROVIDER.spawn(
+        cfg, settings, "agent-one", "reply OK", workspace,
+        Session(provider="omlx"), cfg.model,
+    )
+    agent_home = settings.session_root / "agents" / "agent-one" / "omp-agent"
+    config_path = Path(first.argv[first.argv.index("--config") + 1])
+    assert config_path == agent_home / "config.yml"
+    assert config_path.is_file()
+    assert Path(first.env["PI_CODING_AGENT_DIR"]) == agent_home
+    assert agent_home.is_relative_to(settings.session_root / "agents")
+    assert not config_path.is_relative_to(workspace)
+
+    models_path = agent_home / "models.yml"
+    assert models_path.is_file()
+    generated = "\n".join(path.read_text() for path in agent_home.rglob("*") if path.is_file())
+    assert cfg.base_url in generated
+    assert cfg.model in generated
+    assert "OMLX_API_KEY" in generated
+    assert secret not in generated
+    assert first.env.get("OMLX_API_KEY") == secret
+    assert secret not in " ".join(first.argv)
+
+    second = omp_driver.OMP_PROVIDER.spawn(
+        cfg, settings, "agent-two", "reply OK", workspace,
+        Session(provider="omlx"), cfg.model,
+    )
+    second_home = Path(second.env["PI_CODING_AGENT_DIR"])
+    assert second_home == settings.session_root / "agents" / "agent-two" / "omp-agent"
+    assert second_home != agent_home
+
+
+@contextmanager
+def _classification_socket(path: Path, workspace: Path, context: dict):
+    """One-shot approval socket that answers with the real deterministic classifier."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(1)
+    listener.settimeout(25)
+    received: list[dict] = []
+
+    def serve_once():
+        connection, _ = listener.accept()
+        with connection:
+            chunks = []
+            while b"\n" not in b"".join(chunks):
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            request = json.loads(b"".join(chunks).split(b"\n", 1)[0])
+            received.append(request)
+            verdict = classify(
+                request["tool_name"], request["tool_input"], workspace,
+                cwd=request.get("cwd"), context=context,
+            )
+            response = {"action": verdict.action, "reason": verdict.reason}
+            connection.sendall(json.dumps(response).encode() + b"\n")
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    try:
+        yield received
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+        path.unlink(missing_ok=True)
+
+
+@contextmanager
+def _openai_tool_stub():
+    """Local streaming OpenAI stub: request one write, then return a final answer."""
+    requests: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            requests.append(json.loads(self.rfile.read(length)))
+            call = len(requests) == 1
+            if call:
+                delta = {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_protected_write",
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": json.dumps({
+                                "path": "tests/test_protected.py", "content": "tampered",
+                            }),
+                        },
+                    }],
+                }
+                finish = "tool_calls"
+            else:
+                delta = {"content": "The protected write was blocked."}
+                finish = "stop"
+            chunks = [
+                {"id": "chatcmpl-stub", "object": "chat.completion.chunk", "created": int(time.time()),
+                 "model": "qwen-stub", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+                {"id": "chatcmpl-stub", "object": "chat.completion.chunk", "created": int(time.time()),
+                 "model": "qwen-stub", "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
+            ]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            for chunk in chunks:
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_hook_blocks_omp_write_to_a_protected_test_path(
+    fake_omp, tmp_path: Path, monkeypatch
+):
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("Bun is needed to execute the packaged omp TypeScript hook")
+
+    workspace = _workspace(tmp_path)
+    protected = workspace / "tests" / "test_guard_classifier.py"
+    protected.parent.mkdir()
+    protected.write_text("# protected test\n")
+    settings = make_settings(
+        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
+    )
+    cfg = _configured_omp_cfg(binary=fake_omp.path)
+    agent_id = "hook-agent"
+    context = {"protected": [str(protected)], "state_allow": []}
+    socket_path = Path(settings.approval_socket)
+    hook_record = tmp_path / "hook-result.json"
+    process = omp_driver.OMP_PROVIDER.spawn(
+        cfg, settings, agent_id, "write a test", workspace,
+        Session(provider="omlx"), cfg.model,
+    )
+    # The fake CLI invokes the real extension, which starts the actual Python
+    # PreToolUse hook. That hook reaches this socket and gets a classifier verdict.
+    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
+        "toolName": "write",
+        "input": {"path": "tests/test_guard_classifier.py", "content": "tampered"},
+    })
+    process.env["FAKE_OMP_BUN"] = bun
+    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+    assert process.env["SUBAGENT_GUARD_PYTHON"] == sys.executable
+    assert Path(process.env["SUBAGENT_GUARD_HOOK"]).name == "approval_hook.py"
+    assert process.env["SUBAGENT_GUARD_AGENT_ID"] == agent_id
+    assert Path(process.env["SUBAGENT_APPROVAL_SOCKET"]) == socket_path
+    with _classification_socket(socket_path, workspace, context) as requests:
+        events = list(process.events())
+
+    assert "--hook" in process.argv
+    assert Path(process.argv[process.argv.index("--hook") + 1]).name == "omp_hook.ts"
+    assert hook_record.is_file()
+    response = json.loads(hook_record.read_text())
+    assert response["block"] is True
+    assert "protected" in response["reason"].lower() or "test" in response["reason"].lower()
+    assert len(requests) == 1
+    assert requests[0]["agent_id"] == agent_id
+    assert requests[0]["tool_name"] == "Write"
+    assert requests[0]["tool_input"]["file_path"] == "tests/test_guard_classifier.py"
+    assert any(event.get("type") == "result" for event in events)
+
+
+def test_real_omp_hook_blocks_protected_write_against_local_stub(
+    tmp_path: Path, monkeypatch
+):
+    omp = shutil.which("omp")
+    if omp is None:
+        pytest.skip("omp is not installed")
+    if shutil.which("bun") is None:
+        pytest.skip("Bun is needed to load the omp TypeScript hook")
+
+    workspace = _workspace(tmp_path)
+    protected = workspace / "tests" / "test_protected.py"
+    protected.parent.mkdir()
+    protected.write_text("# protected\n")
+    settings = make_settings(
+        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    context = {"protected": [str(protected)], "state_allow": []}
+    socket_path = Path(settings.approval_socket)
+
+    with _openai_tool_stub() as (base_url, requests):
+        cfg = _configured_omp_cfg(binary=omp, base_url=base_url, model="qwen-stub")
+        process = omp_driver.OMP_PROVIDER.spawn(
+            cfg, settings, "real-hook-agent", "write the protected test file", workspace,
+            Session(provider="omlx"), cfg.model,
+        )
+        with _classification_socket(socket_path, workspace, context) as decisions:
+            events = list(process.events())
+
+    assert protected.read_text() == "# protected\n"
+    assert len(decisions) == 1
+    assert decisions[0]["agent_id"] == "real-hook-agent"
+    assert decisions[0]["tool_name"] == "Write"
+    assert decisions[0]["tool_input"]["file_path"] == "tests/test_protected.py"
+    assert len(requests) >= 2
+    prohibited = {
+        "temperature", "top_p", "top_k", "min_p", "presence_penalty",
+        "frequency_penalty", "repetition_penalty", "repeat_penalty", "seed",
+        "max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort",
+        "thinking", "thinking_budget", "reasoning_budget", "enable_thinking",
+    }
+    assert not prohibited.intersection(requests[0])
+    # omp's Qwen compatibility layer still sends this undocumented control;
+    # we have not found a supported models.yml switch for qwenPreserveThinking.
+    assert requests[0].get("preserve_thinking") is True
+    assert requests[0].get("chat_template_kwargs") == {"preserve_thinking": True}
+    assert any(event.get("type") == "result" for event in events)
+
+
 # --- boot: guard gate and the minted session ----------------------------------
 
 
-def test_guard_label_is_none(tmp_path: Path):
-    assert omp_driver.OMP_PROVIDER.guard(make_settings(tmp_path), _omp_cfg()) == "none"
+def test_guard_label_is_hook(tmp_path: Path):
+    assert omp_driver.OMP_PROVIDER.guard(make_settings(tmp_path), _omp_cfg()) == "hook"
 
 
 def test_boot_mints_a_session_id(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda b: "/fake/omp")
-    settings = make_settings(tmp_path, allow_unguarded=True)
-    error, session = omp_driver.OMP_PROVIDER.boot(settings, "a1", _omp_cfg())
+    settings = make_settings(tmp_path)
+    error, session = omp_driver.OMP_PROVIDER.boot(settings, "a1", _configured_omp_cfg())
     assert error is None
     uuid.UUID(session.session_id)  # tags the records; omp never sees it
 
 
-def test_boot_refuses_unguarded_unless_loop_or_allow_unguarded(tmp_path: Path, monkeypatch):
+def test_boot_does_not_require_allow_unguarded_when_hook_is_installed(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setattr(shutil, "which", lambda b: "/fake/omp")
     settings = make_settings(tmp_path)  # allow_unguarded defaults off
-    error, _ = omp_driver.OMP_PROVIDER.boot(settings, "a1", _omp_cfg())
-    assert error and "allow_unguarded" in error
-    error, _ = omp_driver.OMP_PROVIDER.boot(settings, "a1", _omp_cfg(loop=True))
-    assert error is None
-    permissive = make_settings(tmp_path, allow_unguarded=True)
-    error, _ = omp_driver.OMP_PROVIDER.boot(permissive, "a1", _omp_cfg())
+    error, _ = omp_driver.OMP_PROVIDER.boot(settings, "a1", _configured_omp_cfg())
     assert error is None
 
 
 def test_boot_checks_the_binary(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda b: None)
-    settings = make_settings(tmp_path, allow_unguarded=True)
-    error, _ = omp_driver.OMP_PROVIDER.boot(settings, "a1", _omp_cfg())
+    settings = make_settings(tmp_path)
+    error, _ = omp_driver.OMP_PROVIDER.boot(settings, "a1", _configured_omp_cfg())
     assert error and "not on PATH" in error
+
+
+def test_boot_rejects_sampling_cli_overrides_when_sampling_is_disabled(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(shutil, "which", lambda b: "/fake/omp")
+    cfg = _configured_omp_cfg(extra={"extra_args": ["--temperature=0.5"]})
+    error, _ = omp_driver.OMP_PROVIDER.boot(make_settings(tmp_path), "a1", cfg)
+    assert error and "send_sampling = false" in error
 
 
 # --- the translator on the recorded streams -----------------------------------
@@ -345,6 +607,7 @@ def fake_omp(tmp_path: Path, monkeypatch):
 def test_run_completes_and_resumes_through_the_prompt(fake_omp, tmp_path: Path):
     # The stock providers stay declared so their keys count as leaked.
     providers = {**default_providers(), "local": {"driver": "omp", "binary": fake_omp.path}}
+    providers["local"].update({"base_url": "http://127.0.0.1:8000/v1", "model": "fixture-model"})
     settings = make_settings(tmp_path, providers=providers, allow_unguarded=True, run_timeout=30)
     reg = Registry(settings, start_reaper=False)
     try:
@@ -368,7 +631,7 @@ def test_run_completes_and_resumes_through_the_prompt(fake_omp, tmp_path: Path):
         first, then = fake_omp.calls()[:2]
         assert first["argv"][-1] == "make hello.txt"
         assert first["argv"][first["argv"].index("--cwd") + 1] == str(ws)
-        assert "--model" not in first["argv"]  # the agent named no model
+        assert first["argv"][first["argv"].index("--model") + 1] == "local/fixture-model"
         # The resume turn carries the previous turn's final text in the prompt.
         assert then["argv"][-1].startswith(omp_driver.RESUME_PREFIX)
         assert "Created `hello.txt` containing `hi`." in then["argv"][-1]
@@ -385,7 +648,10 @@ def test_run_completes_and_resumes_through_the_prompt(fake_omp, tmp_path: Path):
 def test_run_refused_connection_fails_without_closing_the_lane(fake_omp, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("FAKE_OMP_FIXTURE", str(FIXTURES / "refused.jsonl"))
     monkeypatch.setenv("FAKE_OMP_EXIT", "1")
-    providers = {"local": {"driver": "omp", "binary": fake_omp.path}}
+    providers = {"local": {
+        "driver": "omp", "binary": fake_omp.path,
+        "base_url": "http://127.0.0.1:8000/v1", "model": "fixture-model",
+    }}
     settings = make_settings(tmp_path, providers=providers, allow_unguarded=True, run_timeout=30)
     reg = Registry(settings, start_reaper=False)
     try:

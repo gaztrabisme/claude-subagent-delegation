@@ -13,7 +13,6 @@ the driver remains behind the `experimental = true` opt-in.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 from collections.abc import Iterator
@@ -338,11 +337,8 @@ class AntigravityProvider:
         session: Session,
         model: str | None = None,
     ) -> dict[str, str]:
-        """Keep agy's own login while removing the server's configured secrets."""
-        env = {key: value for key, value in os.environ.items() if value is not None}
-        for leaked in settings.leaked_keys:
-            env.pop(leaked, None)
-        return env
+        """Use the child allowlist; HOME lets agy find its own user login."""
+        return settings.base_child_env()
 
     def translator(self, session: Session) -> Translator:
         return Translator(session)

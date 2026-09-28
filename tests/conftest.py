@@ -135,6 +135,7 @@ TELEMETRY_KEYS = ("sample_seconds",)
 # these here, in the test fixture, instead of baking test-only names into src.
 TEST_CHILD_ENV_PASSTHROUGH = (
     "FAKE_SCRIPT", "FAKE_MODEL", "FAKE_PROMPT", "FAKE_FAIL_MODEL",
+    "FAKE_AGY_STDOUT", "FAKE_AGY_RECORD",
     "FAKE_CODEX_RECORD", "FAKE_CODEX_FIXTURE",
     "FAKE_OMP_RECORD", "FAKE_OMP_FIXTURE", "FAKE_OMP_STDERR", "FAKE_OMP_EXIT",
     "FAKE_GROK_RECORD", "FAKE_GROK_FIXTURE",

@@ -83,6 +83,25 @@ def test_guard_is_none_and_stays_sandboxed(tmp_path: Path):
     assert "--sandbox" in argv
 
 
+def test_child_environment_drops_ambient_credentials_but_keeps_agy_login(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("GH_TOKEN", "parent-gh-token")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "parent-aws-secret")
+    monkeypatch.setenv("PATH", "/fake/bin")
+    monkeypatch.setenv("HOME", str(tmp_path / "login-home"))
+    settings = make_settings(tmp_path)
+
+    env = agy_driver.ANTIGRAVITY_PROVIDER.env(
+        settings, "a1", _cfg(experimental=True), Session(provider="gemini")
+    )
+
+    assert env["HOME"] == str(tmp_path / "login-home")
+    assert env["PATH"] == "/fake/bin"
+    assert "GH_TOKEN" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+
+
 def test_boot_requires_experimental_and_an_available_binary(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda binary: "/fake/agy")
     settings = make_settings(tmp_path)

@@ -8,7 +8,14 @@ from typing import Any
 
 import pytest
 
-from subagent.runs import CANCELLED, COMPLETED, COMPLETED_UNVERIFIED, FAILED, Registry, RegistryError
+from subagent.runs import (
+    CANCELLED,
+    COMPLETED,
+    COMPLETED_UNVERIFIED,
+    FAILED,
+    Registry,
+    RegistryError,
+)
 
 from .conftest import make_settings
 

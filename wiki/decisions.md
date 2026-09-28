@@ -87,3 +87,9 @@ Chain: the caller's primary (default glm), then the other cloud lanes in the ord
 **Chosen:** omp's `--hook` runs the packaged `guard/omp_hook.ts` for every tool call. The bridge passes a Claude-shaped tool call to the existing `approval_hook.py` with the same Python interpreter and agent id; absent, malformed, timed-out, or denying responses block. `models.yml` and `config.yml` are written under `session_root/agents/<agent-id>/omp-agent`, and provider credentials reach omp only through its environment. `test_hook_blocks_omp_write_to_a_protected_test_path` and `test_real_omp_hook_blocks_protected_write_against_local_stub` prove the identity and blocking path. The `Supervisor` must pass `guard_context` to `classify()` for protected-test rules to apply (`test_decide_denies_file_write_to_a_protected_test`).
 
 For `send_sampling = false`, the generated omp model disables reasoning, omits max-output tokens, and uses provider-default values for supported sampler settings; `--thinking off` prevents an inherited setting from enabling reasoning. omp 18.0.11 still sends `preserve_thinking: true` and `chat_template_kwargs: {preserve_thinking: true}` on the configured Qwen request. The installed models config schema does not expose the internal `qwenPreserveThinking` property, so this field remains a documented limit rather than an undocumented compatibility hack. See `tests/fixtures/omp/README.md` and the external `omp-report.md` for the live proxy evidence.
+
+## S21 — Keep oMLX on omp for the machine draft (2026-09-28)
+
+**Context:** The coordinator accepted U1's `preserve_thinking` finding and logged the remaining omp request fields.
+
+**Chosen:** The machine draft keeps `[providers.omlx].driver = "omp"` with `send_sampling = false`. **Rejected:** switching this provider to `claude`; the accepted finding documents a known request behavior and does not change the selected driver.

@@ -79,7 +79,7 @@ class TestReview(Sandbox):
     def test_can_be_disabled(self):
         root = self.node_project()
         self.write_config(review_tests=False)
-        r = self.run_auto(root)
+        self.run_auto(root)
         self.assertEqual(self.calls(root), ["worker", "code_review"])
 
     def test_by_hand(self):

@@ -1,0 +1,97 @@
+# Machine config draft for mcbob, 2026-09-28.
+# The coordinator installs this at ~/.config/subagent/config.toml.
+# Provider keys are named by environment variable only; values stay in the environment.
+
+[core]
+default_provider = "codex"
+max_agents = 4
+loop_strikes = 8
+session_root = "/Users/GaryT/.subagent-mcp/sessions"
+
+[guard]
+supervisor = "agent"
+supervisor_cmd = "claude -p --model sonnet --setting-sources \"\""
+
+[fallback]
+chain = ["codex", "deepseek", "glm"]
+
+[providers.codex]
+driver = "codex"
+model = "gpt-6-luna"
+effort = "xhigh"
+
+[providers.glm]
+driver = "claude"
+base_url = "https://api.z.ai/api/anthropic"
+model = "glm-5.3-flash[1m]"
+api_key_env = ["GLM_API_KEY", "ZAI_API_KEY"]
+vendor = "zai"
+max_steps = 80
+run_timeout = 3600
+
+[providers.glm.pricing]
+kind = "flat_plan"
+monthly_usd = 80
+
+[providers.deepseek]
+driver = "claude"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+vendor = "deepseek"
+max_steps = 120
+run_timeout = 5400
+idle_timeout = 1800
+
+[providers.deepseek.pricing]
+kind = "per_token"
+input = 1.32
+output = 3.96
+cache_read = 0.044
+
+[providers.bppc]
+driver = "omp"
+base_url = "http://192.168.1.17:8080/v1"
+model = "qwen3.8-27b"
+api_key_env = "LOCAL_API_KEY"
+local = true
+max_agents = 1
+max_steps = 80
+
+[providers.bppc.health]
+kind = "llamacpp"
+candidates = ["http://192.168.1.17:8080", "http://100.106.185.34:8080"]
+warm = true
+cold_load_seconds = 180
+
+[providers.bppc.pricing]
+kind = "local"
+usd = 0
+
+[providers.omlx]
+driver = "omp"
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = "OMLX_API_KEY"
+model = "Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B"
+local = true
+send_sampling = false
+max_agents = 1
+
+[providers.omlx.health]
+kind = "omlx"
+url = "http://127.0.0.1:8000/api/status"
+cold_load_seconds = 120
+
+[providers.omlx.probe]
+host_cmd = ["mac"]
+
+[providers.omlx.pricing]
+kind = "local"
+usd = 0
+
+[providers.gemini]
+driver = "antigravity"
+vendor = "gemini"
+model = "gemini-3.8-flash-high"
+effort = "high"
+experimental = true

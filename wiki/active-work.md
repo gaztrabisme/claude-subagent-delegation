@@ -1,26 +1,26 @@
 # Active work
 
-Reader: the next session that picks this repo up. Read with `decisions.md` (S11–S19) and `review.md`.
+Reader: the next session that picks this repo up. Read with `decisions.md` (S11–S21) and `review.md`.
 
-## State (2026-09-24, branch `fuse` at 61114ac, nothing pushed)
+## State (2026-09-28, branch `lanes-int`)
 
 | Area | State |
 |---|---|
-| Repo | `origin` = github.com/gaztrabisme/claude-subagent-delegation; `fuse` carries both histories (this server's and the delegation loop's) plus P0–P4; `master` is the pre-fusion server. 805 tests pass (`uv run pytest -q`) |
-| Package | `src/subagent/`: config (TOML, no built-in providers), providers (claude, codex, copilot, grok, gemini-experimental), router, health, guard (+context rules), loop (on the Registry), telemetry (trace schema 3 + `delegation` kind, cost at run end, sampler), report + HTML dashboard, cli (`init doctor detect run wait test review undo checkpoints watch report`), mcp_server (six tools, `lane=` alias), core (in-process server) |
+| Repo | `origin` = github.com/gaztrabisme/claude-subagent-delegation; `lanes-int` integrates `lanes-omp` and `lanes-agy` in two merge commits. U4 acceptance is recorded in the external `int-report.md`. |
+| Package | `src/subagent/`: config (TOML, no built-in providers), providers (claude, codex, copilot, grok, Gemini/Antigravity, omp), router, health, guard (+context rules), loop (on the Registry), telemetry (trace schema 3 + `delegation` kind, cost at run end, sampler), report + HTML dashboard, cli (`init doctor detect run wait test review undo checkpoints watch report`), mcp_server (six tools, `lane=` alias), core (in-process server) |
 | Skill | `skills/delegate/SKILL.md` calls `subagent`; `install.sh` links the skill and installs the package |
 | Examples | `examples/config.{copilot,codex,glm,deepseek,llama.cpp,omlx,vllm,full}.toml`; all pass `subagent doctor --no-probe` |
 | Bench | `bench/run.py` matrix (harness × config × task × mode), `bench/harness.py` parsers for claude/codex/gemini/grok/copilot, `bench/concurrency.py`, `bench/business_case.py` + `docs/business-case.md`, task `meeting-scribe` (41 hidden tests, validated reference) |
 | Live | `doctor --provider glm --prompt` PASS; grok classifies its 402 as `grok_balance`; the autopilot loop on the cron task ended `done` (9 outline tests written by glm, 2 rounds, review refused on DeepSeek balance and reported as unverified); one bench cell with Claude orchestrating and glm workers: hidden 22/22, orchestrator $0.68, worker 70k in / 39k out / 1.0M cache-read tokens, counterfactual $1.84, wall 1065 s (`wiki/data/bench-2026-09-23/`) |
 | Bench (codex) | Codex gpt-6-luna orchestrating the fused skill built cron and passed hidden 22/22 (4,988 s, 193k/41k/10.8M orchestrator tokens); worker accounting missing (U-B4, `data/bench-2026-09-24-codex/`) |
 | Review | `review.md` 2026-09-23: 2 HIGH + 13 MED + 1 LOW; both HIGH and 12 MED fixed (F1a, F1b, M5, M6); 1 MED (parallel mode crash) and 1 LOW open with reasons |
-| Servers | The MCP servers Claude Code currently runs are a uv tool install of the pre-fusion package (`~/.local/share/uv/tools/subagent-mcp`); this checkout carries an untracked shim at `src/subagent_mcp/runtime/approval_hook.py` so their children's hook still works. Switch `~/.claude.json` to `subagent-mcp` from this checkout with `SUBAGENT_CONFIG` when convenient |
+| Servers | The prior uv tool installation still needs to be retired separately; `lanes-int` contains no old-server compatibility package. |
 
 ## Next
 
 1. Fix U-B4 (make the orchestrator prompt and SKILL.md steer to `subagent wait`; refuse a `--tier` whose provider is closed; find why the cell's session root got no trace), U-B1, U-L1. Then run one real bench cell per installed harness (`claude`, `codex`, `grok` when its balance is back) on `cron`, then `meeting-scribe` on a local provider, and look at `bench/results/<ts>/dashboard.html`.
 2. Feed the measured rows into `bench/business_case.py --from-report` and rewrite the README's benchmark section with the fused numbers.
-3. Retire the uv-tool-installed server: `uv tool install --editable .` from this checkout, `~/.claude.json` env `SUBAGENT_CONFIG=<file>`; then delete the shim.
+3. Retire the uv-tool-installed server: `uv tool install --editable .` from this checkout and set `SUBAGENT_CONFIG=<file>` in the MCP server environment.
 4. Push `fuse` when Gary says so; open the PR against `main`.
 
 ## Open
@@ -63,7 +63,7 @@ Measurement (replaces the plain matrix)
 15. Task ladder: single function, cron, meeting-scribe, change inside an existing codebase, protocol/parser with a subtle spec. Models: bppc 27B, oMLX, GLM, DeepSeek, Codex Luna, Claude. Three runs per cell; knobs A/B on two tasks x three models, local and GLM first, winners confirmed on SOTA. Output: per model class, knob -> tokens saved and pass-rate change; `business_case.py --from-report`; README rewritten on the numbers.
 
 Housekeeping
-16. Retire the uv-tool pre-fusion server and the hook shim; `~/.claude.json` to `subagent-mcp` with `SUBAGENT_CONFIG`.
+16. Retire the uv-tool pre-fusion server; set `SUBAGENT_CONFIG` in its MCP environment.
 17. Rename before publishing (`subagent` taken on PyPI; repo name says "claude").
 18. README: Khang's loop + goal layer + guard + any worker + measured cost; limitations (guard per driver, Windows unsupported); drop the pre-fusion benchmark section once 15 lands.
 
@@ -73,7 +73,7 @@ Not in v2: Windows, opencode driver, omp driver merge, any settings UI.
 
 Gary's decision: build his own lean coding-agent harness (a more token-efficient pi) first; `subagent` v2 waits for it. The spike that led here is at `wiki/data/spike-harness-2026-09-24.md` (verdict: wrap pi as a driver; build-own as fallback; two unverified points: prompt-prefix stability for local KV reuse, `enable_thinking` passthrough to oMLX/llama.cpp).
 
-When this resumes: item 9 in the v2 list becomes "driver for Gary's harness" (the omp-driver branch's event translator is the starting point); everything else in the list stands. State at pause: `fuse` = `origin/main` = 84732bb plus four local wiki commits; the pre-fusion uv-tool server and the hook shim are still what `~/.claude.json` runs.
+When this resumes: item 9 in the v2 list becomes "driver for Gary's harness" (the omp-driver branch's event translator is the starting point); everything else in the list stands. State at pause: `fuse` = `origin/main` = 84732bb plus four local wiki commits; the pre-fusion uv-tool server is still what `~/.claude.json` runs.
 
 ## Harness serve-mode contract (2026-09-25)
 

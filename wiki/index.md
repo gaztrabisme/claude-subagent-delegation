@@ -23,4 +23,5 @@ Every child tool call passes a guard (a classifier plus a reviewer agent) before
 - `goals/` — goal files with their acceptance checks.
 - `grounded.md` — what was read and probed before the build.
 - `data/` — benchmark CSVs and the oMLX request log.
+- [data/config-mcbob-2026-09-28.toml](data/config-mcbob-2026-09-28.toml) — machine config draft for coordinator installation.
 - `inherited/` — glm-subagent's wiki as it was at 96933a2.

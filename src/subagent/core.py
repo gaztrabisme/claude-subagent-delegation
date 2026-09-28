@@ -14,7 +14,6 @@ from __future__ import annotations
 import dataclasses
 import threading
 from pathlib import Path
-from typing import Any
 
 from .config import Settings
 from .guard.classify import protect_provider_homes

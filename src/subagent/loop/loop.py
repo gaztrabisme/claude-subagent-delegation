@@ -33,17 +33,28 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 from ..providers import copilot as copilot_driver
 from ..verify import run_verification
 from . import checkpoint, session
-from .common import (DEPENDENCY_DIRS, STATE_DIR, changed_between, git_prefix, hash_tree,
-                    matches, read_json, state_dir, tail, walk_files, write_json)
+from .common import (
+    DEPENDENCY_DIRS,
+    STATE_DIR,
+    changed_between,
+    git_prefix,
+    hash_tree,
+    matches,
+    read_json,
+    state_dir,
+    tail,
+    walk_files,
+    write_json,
+)
 from .detect import detect
 from .events import END_MARKER, LiveLog, LogSink, follow, open_live_view
 from .testguard import TestGuard, protected_hash
@@ -604,135 +615,198 @@ def run_parallel(root, server, args, live_view=True):
                f"{len(tasks)} workers · checkpoint {cp['id']}")
     live_view_error = open_live_view(server.settings.loop, root, RUNNER, ["--log", log]) if live_view else None
 
-    try:
-        return _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, sink,
-                              live_view_error)
-    except BaseException:
-        sink.close()
-        raise
+    return _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, sink,
+                          live_view_error)
 
 
 def _parallel_work(root, server, args, tasks, info, feedback, record, cp, log, sink, live_view_error):
     settings = server.settings
     state = root / STATE_DIR
     workers = []
-    for task in tasks:
-        worktree, proj = checkpoint.worktree_add(root, cp)
-        for dep in DEPENDENCY_DIRS:
-            if (root / dep).exists() and not (proj / dep).exists():
-                (proj / dep).symlink_to(root / dep)
-        guard = TestGuard(proj, info["test_globs"])
-        guard.lock()
-        others = [{"name": t["name"], "files": t["files"]} for t in tasks if t is not task]
-        prompt = build_prompt(Path(task["plan"]).read_text(), task.get("feedback") or feedback, info,
-                              guard.protected, {"name": task["name"], "files": task["files"],
-                                                "others": others, "test_cmd": task.get("test_cmd")})
-        live = LiveLog(sink, log.with_name(f"{log.stem}-{task['name']}.jsonl"), proj, task["name"])
-        worker = Worker(server, proj, "true", guard, live)
-        workers.append({"task": task, "worktree": worktree, "proj": proj, "guard": guard,
-                        "worker": worker, "live": live, "prompt": prompt,
-                        "tier": task.get("tier", args.tier)})
-
-    def work(w):
-        wrec = record["parallel"].get(w["task"]["name"]) if args.continue_session else None
-        if isinstance(wrec, dict) and wrec.get("agent_id"):
-            w["worker"].follow_up(wrec, w["prompt"])
-        else:
-            candidates = resolve_tier(settings, w["tier"], args.provider, args.model)
-            w["worker"].run_round(candidates, settings.loop.fallback, w["prompt"])
-        w["run"] = w["worker"].run
-        w["model"] = w["worker"].model
-        w["fallback_note"] = w["worker"].fallback_note
-
     started = time.time()
-    threads = [threading.Thread(target=work, args=(w,)) for w in workers]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    try:
+        candidate_sets = [
+            resolve_tier(settings, t.get("tier", args.tier), args.provider, args.model)
+            for t in tasks
+        ]
+        live_agents = [agent for agent in server.registry.agents() if not agent.closed]
+        limits = [settings.max_agents - len(live_agents)]
+        for candidates in candidate_sets:
+            provider_name = candidates[0][0] or settings.default_provider
+            cfg = settings.providers.get(provider_name)
+            if cfg is not None:
+                on_provider = sum(agent.cfg.name == cfg.name for agent in live_agents)
+                limits.append(cfg.max_agents - on_provider)
+        max_workers = max(1, min(len(tasks), *limits))
 
-    applied, results, all_violations = {}, [], []
-    for w in workers:
-        task, proj = w["task"], w["proj"]
-        run = w["run"]
-        if run is not None and run.pre_verify_result is not None:
-            violations = run.pre_verify_result.get("violations", [])
-            changed = run.pre_verify_result.get("changed_files", [])
-        else:
-            violations, changed = w["guard"].release()
-        owned = [f for f in changed if matches(f, task["files"])]
-        out_of_scope = [f for f in changed if f not in owned]
-        conflicts = [f for f in owned if f in applied]
-        for rel in owned:
-            if rel in conflicts:
-                continue
-            src, dst = proj / rel, root / rel
-            if src.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+        for task, candidates in zip(tasks, candidate_sets, strict=True):
+            worktree, proj = checkpoint.worktree_add(root, cp)
+            w = {"task": task, "worktree": worktree, "proj": proj, "guard": None,
+                 "worker": None, "live": None, "prompt": None, "candidates": candidates,
+                 "run": None, "model": None, "fallback_note": None, "error": None,
+                 "session_record": None}
+            # Track the worktree before any later setup can fail, so finally can remove it.
+            workers.append(w)
+            for dep in DEPENDENCY_DIRS:
+                if (root / dep).exists() and not (proj / dep).exists():
+                    (proj / dep).symlink_to(root / dep)
+            guard = TestGuard(proj, info["test_globs"])
+            w["guard"] = guard
+            guard.lock()
+            others = [{"name": t["name"], "files": t["files"]} for t in tasks if t is not task]
+            prompt = build_prompt(
+                Path(task["plan"]).read_text(), task.get("feedback") or feedback, info,
+                guard.protected, {"name": task["name"], "files": task["files"],
+                                  "others": others, "test_cmd": task.get("test_cmd")},
+            )
+            w["prompt"] = prompt
+            live_path = log.with_name(f"{log.stem}-{task['name']}.jsonl")
+            live = LiveLog(sink, live_path, proj, task["name"])
+            w["live"] = live
+            w["worker"] = Worker(server, proj, "true", guard, live)
+
+        def work(w):
+            try:
+                wrec = record["parallel"].get(w["task"]["name"]) if args.continue_session else None
+                if isinstance(wrec, dict) and wrec.get("agent_id"):
+                    w["worker"].follow_up(wrec, w["prompt"])
+                else:
+                    w["worker"].run_round(w["candidates"], settings.loop.fallback, w["prompt"])
+            except Exception as exc:  # a task failure belongs in its result, not in the runner
+                w["error"] = f"{type(exc).__name__}: {exc}"
+                w["live"].write(f"! worker failed: {w['error']}")
+            finally:
+                worker = w["worker"]
+                w["run"] = worker.run
+                w["model"] = worker.model
+                w["fallback_note"] = worker.fallback_note
+                if worker.agent is not None:
+                    try:
+                        w["session_record"] = session.record_for(worker.agent)
+                    except Exception as exc:  # preserve the task error and still release its agent
+                        w["error"] = w["error"] or f"{type(exc).__name__}: {exc}"
+                    finally:
+                        try:
+                            worker.agent.close("parallel task finished")
+                        except Exception as exc:
+                            w["error"] = w["error"] or f"{type(exc).__name__}: {exc}"
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(work, w) for w in workers]
+            for future in futures:
+                future.result()
+
+        applied, results, all_violations = {}, [], []
+        for w in workers:
+            task, proj = w["task"], w["proj"]
+            run = w["run"]
+            if run is not None and run.pre_verify_result is not None:
+                violations = run.pre_verify_result.get("violations", [])
+                changed = run.pre_verify_result.get("changed_files", [])
             else:
-                dst.unlink(missing_ok=True)
-            applied[rel] = task["name"]
-        report = read_json(proj / STATE_DIR / "result.json") or {}
-        request = proj / STATE_DIR / "test_change_request.md"
-        timed_out = run is not None and run.state == "failed" and run.finish_reason == "timeout"
-        failed = run is not None and run.state == "failed" and not timed_out
-        entry = {
-            "name": task["name"],
-            "status": _status(violations, timed_out, failed, report, None),
-            "summary": report.get("summary"),
-            "model": w["model"],
-            "applied_files": [f for f in owned if f not in conflicts],
-            "out_of_scope_files": out_of_scope or None,
-            "conflicts": [f"{f} (already changed by {applied[f]})" for f in conflicts] or None,
-            "violations": violations or None,
-            "model_fallback": w["fallback_note"],
-            "worker_credits": round(run.usage.credits, 2) if run is not None and run.usage.credits is not None else None,
-            "test_change_request": request.read_text()[:4000] if request.exists() else None,
+                violations, changed = w["guard"].release()
+            owned = [f for f in changed if matches(f, task["files"])]
+            out_of_scope = [f for f in changed if f not in owned]
+            conflicts = [f for f in owned if f in applied]
+            for rel in owned:
+                if rel in conflicts:
+                    continue
+                src, dst = proj / rel, root / rel
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                else:
+                    dst.unlink(missing_ok=True)
+                applied[rel] = task["name"]
+            report = read_json(proj / STATE_DIR / "result.json") or {}
+            request = proj / STATE_DIR / "test_change_request.md"
+            timed_out = run is not None and run.state == "failed" and run.finish_reason == "timeout"
+            failed = w["error"] is not None or (
+                run is not None and run.state == "failed" and not timed_out
+            )
+            entry = {
+                "name": task["name"],
+                "status": _status(violations, timed_out, failed, report, None),
+                "summary": report.get("summary"),
+                "error": w["error"],
+                "model": w["model"],
+                "applied_files": [f for f in owned if f not in conflicts],
+                "out_of_scope_files": out_of_scope or None,
+                "conflicts": [f"{f} (already changed by {applied[f]})" for f in conflicts] or None,
+                "violations": violations or None,
+                "model_fallback": w["fallback_note"],
+                "worker_credits": (round(run.usage.credits, 2)
+                                   if run is not None and run.usage.credits is not None else None),
+                "test_change_request": request.read_text()[:4000] if request.exists() else None,
+            }
+            results.append({k: v for k, v in entry.items() if v is not None})
+            all_violations += violations
+            if w["session_record"] is not None:
+                record["parallel"][task["name"]] = w["session_record"]
+
+        tests = None
+        if info["test_cmd"]:
+            sink.write("=== runner: running the full test suite on the merged result")
+            verification = run_verification(info["test_cmd"], root, settings)
+            tests = _tests_from_verification(verification, state)
+        count_problem = (_check_test_counts(record, protected_hash(root, info["test_globs"]), tests)
+                         if settings.loop.count_tests else None)
+
+        statuses = {r["status"] for r in results}
+        if all_violations or count_problem:
+            status = "violated_tests"
+        elif "needs_test_change" in statuses:
+            status = "needs_test_change"
+        elif statuses & {"backend_error", "failed", "no_report", "partial", "timeout"}:
+            status = "partial"
+        elif tests is not None:
+            status = "done" if tests["passed"] else "tests_failed"
+        else:
+            status = "done" if statuses == {"done"} else "partial"
+        credits = [r["worker_credits"] for r in results if "worker_credits" in r]
+        result = {
+            "status": status,
+            "tasks": results,
+            "tests": _tests_summary(tests),
+            "seconds": round(time.time() - started),
+            "checkpoint": cp["id"],
+            "log": str(log.relative_to(root)),
+            "worker_credits": round(sum(credits), 2) if credits else None,
+            "violations": ([{"file": "(test run)", "change": count_problem}]
+                           if count_problem else None),
+            "live_view_error": live_view_error,
         }
-        results.append({k: v for k, v in entry.items() if v is not None})
-        all_violations += violations
-        if w["worker"].agent is not None:
-            record["parallel"][task["name"]] = session.record_for(w["worker"].agent)
-        w["live"].close()
-        checkpoint.worktree_remove(root, w["worktree"])
-
-    tests = None
-    if info["test_cmd"]:
-        sink.write("=== runner: running the full test suite on the merged result")
-        tests = _tests_from_verification(run_verification(info["test_cmd"], root, settings), state)
-    count_problem = (_check_test_counts(record, protected_hash(root, info["test_globs"]), tests)
-                     if settings.loop.count_tests else None)
-
-    statuses = {r["status"] for r in results}
-    if all_violations or count_problem:
-        status = "violated_tests"
-    elif "needs_test_change" in statuses:
-        status = "needs_test_change"
-    elif tests is not None:
-        status = "done" if tests["passed"] else "tests_failed"
-    else:
-        status = "done" if statuses == {"done"} else "partial"
-    credits = [r["worker_credits"] for r in results if "worker_credits" in r]
-    result = {
-        "status": status,
-        "tasks": results,
-        "tests": _tests_summary(tests),
-        "seconds": round(time.time() - started),
-        "checkpoint": cp["id"],
-        "log": str(log.relative_to(root)),
-        "worker_credits": round(sum(credits), 2) if credits else None,
-        "violations": ([{"file": "(test run)", "change": count_problem}] if count_problem else None),
-        "live_view_error": live_view_error,
-    }
-    total = f" · AI credits {sum(credits):.2f}" if credits else ""
-    sink.write(f"{END_MARKER}: {status} · {result['seconds']}s · {len(applied)} files applied{total}")
-    sink.close()
-    _save_session(root, record)
-    checkpoint.prune(root, settings.loop.keep_checkpoints or 0)
-    result["changed_files"] = sorted(applied) or None
-    result["_runs"] = [_run_block(w["run"], w["model"]) for w in workers if w["run"] is not None]
-    return {k: v for k, v in result.items() if v is not None}
+        total = f" · AI credits {sum(credits):.2f}" if credits else ""
+        sink.write(
+            f"{END_MARKER}: {status} · {result['seconds']}s · {len(applied)} files applied{total}"
+        )
+        _save_session(root, record)
+        checkpoint.prune(root, settings.loop.keep_checkpoints or 0)
+        result["changed_files"] = sorted(applied) or None
+        result["_runs"] = [
+            _run_block(w["run"], w["model"]) for w in workers if w["run"] is not None
+        ]
+        return {k: v for k, v in result.items() if v is not None}
+    finally:
+        cleanup_errors = []
+        for w in workers:
+            try:
+                if w["guard"] is not None:
+                    w["guard"].release()
+            except Exception as exc:
+                cleanup_errors.append(f"guard {w['task']['name']}: {exc}")
+            try:
+                if w["live"] is not None:
+                    w["live"].close()
+            except Exception as exc:
+                cleanup_errors.append(f"live log {w['task']['name']}: {exc}")
+            try:
+                checkpoint.worktree_remove(root, w["worktree"])
+            except Exception as exc:
+                cleanup_errors.append(f"worktree {w['task']['name']}: {exc}")
+        sink.close()
+        if cleanup_errors and sys.exc_info()[0] is None:
+            raise RuntimeError("parallel cleanup failed: " + "; ".join(cleanup_errors))
 
 
 # ---------------------------------------------------------------- test writer (outline mode)

@@ -126,11 +126,15 @@ def parse_test_counts(output):
     text = re.sub(r"\x1b\[[0-9;]*m", "", output)
 
     # node:test (TAP summary)
-    if re.search(r"^# tests \d+", text, re.M):
-        total = _num(r"^# tests (\d+)", text, re.M)
-        skipped = (_num(r"^# skipped (\d+)", text, re.M) or 0) + (_num(r"^# todo (\d+)", text, re.M) or 0)
-        return {"total": total, "passed": _num(r"^# pass (\d+)", text, re.M) or 0,
-                "failed": _num(r"^# fail (\d+)", text, re.M) or 0, "skipped": skipped}
+    # Node 24's default spec reporter uses ℹ instead of TAP's # for summary lines.
+    node_summary = r"^(?:#|ℹ) "
+    if re.search(node_summary + r"tests \d+", text, re.M):
+        total = _num(node_summary + r"tests (\d+)", text, re.M)
+        skipped = (_num(node_summary + r"skipped (\d+)", text, re.M) or 0) + (
+            _num(node_summary + r"todo (\d+)", text, re.M) or 0
+        )
+        return {"total": total, "passed": _num(node_summary + r"pass (\d+)", text, re.M) or 0,
+                "failed": _num(node_summary + r"fail (\d+)", text, re.M) or 0, "skipped": skipped}
     # jest: "Tests:       1 failed, 2 skipped, 5 passed, 8 total"
     m = re.search(r"^Tests:\s+(.*\d+ total)", text, re.M)
     if m:
@@ -261,4 +265,3 @@ def restore_config_fragment(root, key, original):
         else:
             text = text.rstrip("\n") + "\n\n" + original
         path.write_text(text)
-

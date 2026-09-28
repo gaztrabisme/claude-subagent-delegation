@@ -172,7 +172,12 @@ def worktree_add(root, record):
         raise RuntimeError("worktrees need a git repository")
     base = Path(tempfile.mkdtemp(prefix="delegate-wt-"))
     worktree = base / "wt"
-    git(root, "worktree", "add", "--detach", str(worktree), record["commit"])
+    try:
+        git(root, "worktree", "add", "--detach", str(worktree), record["commit"])
+    except BaseException:
+        shutil.rmtree(base, ignore_errors=True)
+        git(root, "worktree", "prune", check=False)
+        raise
     return worktree, worktree / (git_prefix(root) or "")
 
 

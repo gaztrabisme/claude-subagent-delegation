@@ -148,6 +148,10 @@ SECRET_ENV = re.compile(
     r"|DEEPSEEK_API_KEY|OPENAI_API_KEY|SUBAGENT_[A-Z0-9_]*API_KEY"
     r"|CLAUDE_CODE_OAUTH_TOKEN)\b"
 )
+SECRET_ENV_NAMES = frozenset({
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "GLM_API_KEY", "ZAI_API_KEY",
+    "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+})
 
 # Directories this server writes its own per-agent settings, hook config and
 # session transcripts into. A child that can write there can rewrite its own
@@ -496,7 +500,7 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
     argv = [t for t in tokens if not _is_operator(t)]
     if not argv:
         return Verdict(ALLOW, "empty command", facts)
-    if SECRET_ENV.search(command):
+    if SECRET_ENV.search(command) or _reads_secret_environment(command, tokens, context):
         return Verdict(DENY, "refused: reads the child's API key from its environment", facts)
 
     segments, unsupported = _split(tokens)
@@ -609,6 +613,44 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
     if runner is not None:
         return Verdict(ALLOW, runner, facts)
     return Verdict(ESCALATE, f"`{base}` is not on the read-only list", facts)
+
+
+def _reads_secret_environment(command: str, tokens: list[str], context: dict | None) -> bool:
+    """Catch configured key references and shell commands that print the environment."""
+    names = set(SECRET_ENV_NAMES)
+    if context:
+        names.update(
+            name for name in context.get("secret_env_names", ())
+            if isinstance(name, str) and NAME.fullmatch(name)
+        )
+    escaped = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    if escaped and re.search(
+        rf"\$\{{(?:{escaped})(?:[^}}]*)\}}|\$(?:{escaped})(?![A-Za-z0-9_])", command
+    ):
+        return True
+
+    for _, segment in _split(tokens)[0]:
+        words, _ = _strip_prefixes([token for token in segment if not _is_operator(token)])
+        if not words:
+            continue
+        head = PurePosixPath(words[0]).name
+        args = words[1:]
+        if head == "printenv" and (not args or any(arg in names for arg in args)):
+            return True
+        if head == "env":
+            operands = [
+                arg for arg in args
+                if not arg.startswith("-") and not ASSIGNMENT.match(arg)
+            ]
+            if not operands or operands[0] in names:
+                return True
+        if head == "set" and not args:
+            return True
+        if head == "export" and (not args or "-p" in args):
+            return True
+        if any("/proc/" in arg and re.search(r"/environ(?:$|/)", arg) for arg in args):
+            return True
+    return False
 
 
 def _dangerous_head(

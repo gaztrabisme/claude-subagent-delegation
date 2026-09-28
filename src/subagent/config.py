@@ -28,6 +28,9 @@ from typing import Any
 
 from . import adapter
 from .providers.base import (
+    DRIVER_CLAUDE,
+    DRIVER_GROK,
+    DRIVER_OMP,
     DRIVERS,
     HealthSpec,
     PricingSpec,
@@ -448,6 +451,19 @@ class Settings:
         """Key variables this server holds that no child may inherit."""
         declared = {n for cfg in self.providers.values() for n in cfg.api_key_envs}
         return (*sorted(declared), *FIXED_LEAKED_KEYS)
+
+    @property
+    def guard_secret_env_names(self) -> tuple[str, ...]:
+        """Names a child guard must refuse to print from its environment."""
+        names = {name for cfg in self.providers.values() for name in cfg.api_key_envs}
+        drivers = {cfg.driver for cfg in self.providers.values()}
+        if DRIVER_CLAUDE in drivers:
+            names.add("ANTHROPIC_AUTH_TOKEN")
+        if DRIVER_GROK in drivers:
+            names.add("XAI_API_KEY")
+        if DRIVER_OMP in drivers:
+            names.add("SUBAGENT_OMP_API_KEY")
+        return tuple(sorted(names))
 
     def base_child_env(self) -> dict[str, str]:
         """Runtime allowlist plus explicitly configured non-secret child variables.

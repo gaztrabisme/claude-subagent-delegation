@@ -13,7 +13,7 @@ import pytest
 from subagent import config, health, runs
 from subagent.config import ConfigError
 from subagent.providers import claude as claude_provider
-from subagent.providers.base import Session
+from subagent.providers.base import ProviderConfig, Session
 from subagent.providers.codex import codex_env
 from subagent.providers.grok import GROK_PROVIDER
 from subagent.runs import COMPLETED, Registry
@@ -29,6 +29,32 @@ GLM = {
     "model": "glm-5.3-flash[1m]",
     "api_key_env": "GLM_API_KEY",
 }
+
+
+def test_guard_secret_env_names_include_configured_keys_and_driver_injections(tmp_path: Path):
+    settings = config.Settings(
+        workspace=tmp_path,
+        session_root=tmp_path / "sessions",
+        providers={
+            "claude": ProviderConfig(
+                name="claude", driver="claude", vendor="anthropic",
+                api_key_envs=("CUSTOM_CLAUDE_KEY",),
+            ),
+            "grok": ProviderConfig(
+                name="grok", driver="grok", vendor="grok",
+                api_key_envs=("CUSTOM_GROK_CREDENTIAL",),
+            ),
+            "omp": ProviderConfig(
+                name="omp", driver="omp", vendor="omp",
+                api_key_envs=("OMLX_API_KEY",),
+            ),
+        },
+    )
+
+    assert set(settings.guard_secret_env_names) == {
+        "ANTHROPIC_AUTH_TOKEN", "CUSTOM_CLAUDE_KEY", "CUSTOM_GROK_CREDENTIAL",
+        "OMLX_API_KEY", "SUBAGENT_OMP_API_KEY", "XAI_API_KEY",
+    }
 
 
 def _load(tmp_path: Path, tables: dict, name: str = "c.toml"):

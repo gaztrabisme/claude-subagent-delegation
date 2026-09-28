@@ -228,6 +228,11 @@ def test_config_provider_knobs_default_to_core(tmp_path: Path):
     assert (slow.max_steps, slow.run_timeout, slow.max_agents) == (7, 60.0, 1)
 
 
+def test_config_provider_effort_round_trips(tmp_path: Path):
+    settings = _load(tmp_path, {"providers": {"codex": {"driver": "codex", "effort": "xhigh"}}})
+    assert settings.provider("codex").effort == "xhigh"
+
+
 def test_config_health_probe_and_pricing_blocks_are_read(tmp_path: Path):
     settings = _load(tmp_path, {"providers": {"local": {
         "driver": "claude",

@@ -141,6 +141,7 @@ class ProviderConfig:
     # Drivers read their own extras from it: copilot's builtin_mcps, loop and
     # extra_args, grok's hooks.
     extra: dict[str, Any] = field(default_factory=dict)
+    effort: str | None = None
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         """The first set key in `api_key_envs`, else `api_key_default`."""
@@ -169,6 +170,7 @@ class ProviderConfig:
             "vendor": self.vendor,
             "base_url": self.base_url,
             "model": self.model,
+            "effort": self.effort,
             "local": self.local,
             "available": self.unavailable() is None,
             "api_key_envs": list(self.api_key_envs),

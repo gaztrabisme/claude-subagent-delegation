@@ -245,7 +245,12 @@ def test_smoke_omp_override_keeps_v1_and_prints_forbidden_fields(
     seen: dict[str, Any] = {}
     _patch_smoke_main(monkeypatch, tmp_path, seen)
     config = tmp_path / "omp.toml"
-    config.write_text("", encoding="utf-8")
+    config.write_text(
+        '[core]\ndefault_provider = "omlx"\n\n'
+        '[providers.omlx]\ndriver = "omp"\nmodel = "test-model"\n'
+        'base_url = "http://127.0.0.1:8000/v1"\n',
+        encoding="utf-8",
+    )
     cfg = SimpleNamespace(name="omlx", driver="omp", model="test-model", effort="low",
                           base_url="http://127.0.0.1:8000/v1", vendor="omlx")
     settings = SimpleNamespace(default_provider="omlx", providers={"omlx": cfg})

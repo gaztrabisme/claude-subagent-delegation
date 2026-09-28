@@ -177,3 +177,9 @@ The `SamplingProxy` logged one omp 18.0.11 chat request to oMLX; body keys were 
 - `uv run pytest -q`: 835 passed, 1 skipped, 19 subtests; `uv run ruff check src tests`: all checks passed.
 - Machine draft doctor exits 0 with six configured providers. The required source grep prints nothing, and `git diff --check` is clean.
 - External report with merge details, config decisions, and live-test limitations: `int-report.md`.
+
+## 2026-09-28 U6 | Preserve smoke proxy paths for omp/OpenAI wire
+- Proxy base URL overrides now preserve the configured endpoint path; SamplingProxy forwards `/v1` request targets to the configured upstream origin unchanged.
+- The body check accepts and names `/v1/messages` and `/v1/chat/completions`; oMLX reports all sampling fields and fails only when the forbidden field list is present.
+- Added offline tests for pathless and `/v1` overrides, OpenAI request forwarding, and the printed forbidden-fields line. Coordinator-owned pytest and Ruff acceptance commands were not run here; no live model call or push was made.
+- External task report: `../../u6-report.md`.

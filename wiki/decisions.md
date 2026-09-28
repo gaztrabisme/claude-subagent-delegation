@@ -93,3 +93,9 @@ For `send_sampling = false`, the generated omp model disables reasoning, omits m
 **Context:** The coordinator accepted U1's `preserve_thinking` finding and logged the remaining omp request fields.
 
 **Chosen:** The machine draft keeps `[providers.omlx].driver = "omp"` with `send_sampling = false`. **Rejected:** switching this provider to `claude`; the accepted finding documents a known request behavior and does not change the selected driver.
+
+## S22 — Preserve the provider base path through the smoke proxy (2026-09-28)
+
+**Context:** the proxy override used its origin URL alone, so omp dropped the configured `/v1` route and posted to `/chat/completions`; the Anthropic-only body check also missed OpenAI-wire requests.
+
+**Chosen:** replace only the configured base URL origin with the proxy origin, forward the resulting request path unchanged to the oMLX root, and accept `/v1/messages` or `/v1/chat/completions`. The smoke reports every sampled field and fails the oMLX sampling check only for the explicitly forbidden list. **Rejected:** adding `/v1` unconditionally; Claude-style base URLs with no path must continue producing `/v1/messages`.

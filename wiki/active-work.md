@@ -1,12 +1,13 @@
 # Active work
 
-Reader: the next session that picks this repo up. Read with `decisions.md` (S11–S21) and `review.md`.
+Reader: the next session that picks this repo up. Read with `decisions.md` (S11–S22) and `review.md`.
 
 ## State (2026-09-28, branch `lanes-int`)
 
 | Area | State |
 |---|---|
 | Repo | `origin` = github.com/gaztrabisme/claude-subagent-delegation; `lanes-int` integrates `lanes-omp` and `lanes-agy` in two merge commits. U4 acceptance is recorded in the external `int-report.md`. |
+| Smoke proxy | U6 code and offline tests cover path-preserving base URL overrides, Anthropic/OpenAI request paths, and the forbidden sampling field line. Coordinator acceptance commands are pending; no live model call was made. |
 | Package | `src/subagent/`: config (TOML, no built-in providers), providers (claude, codex, copilot, grok, Gemini/Antigravity, omp), router, health, guard (+context rules), loop (on the Registry), telemetry (trace schema 3 + `delegation` kind, cost at run end, sampler), report + HTML dashboard, cli (`init doctor detect run wait test review undo checkpoints watch report`), mcp_server (six tools, `lane=` alias), core (in-process server) |
 | Skill | `skills/delegate/SKILL.md` calls `subagent`; `install.sh` links the skill and installs the package |
 | Examples | `examples/config.{copilot,codex,glm,deepseek,llama.cpp,omlx,vllm,full}.toml`; all pass `subagent doctor --no-probe` |

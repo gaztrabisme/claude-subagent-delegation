@@ -99,6 +99,7 @@ def _fake_smoke_server(seen: dict[str, Any]):
     class FakeSmokeServer:
         def __init__(self, session_root, config=None, *, overrides=None):
             self.settings = harness.load_settings(config, overrides)
+            seen["overrides"] = overrides
             session_root.mkdir(parents=True, exist_ok=True)
             self.trace_path = session_root / "trace.jsonl"
             self.metrics_path = session_root / "metrics.jsonl"
@@ -230,11 +231,93 @@ def test_sampling_upstream_matches_omlx_vendor_or_port():
         vendor="omlx", base_url="http://custom-host:9000/v1")) == smoke.OMLX_UPSTREAM
 
 
+@pytest.mark.parametrize(("configured", "expected"), [
+    ("http://127.0.0.1:8000", "http://127.0.0.1:9000"),
+    ("http://127.0.0.1:8000/v1", "http://127.0.0.1:9000/v1"),
+])
+def test_proxy_base_url_preserves_configured_path(configured, expected):
+    proxy = SimpleNamespace(url="http://127.0.0.1:9000")
+    assert smoke._proxy_base_url(proxy, configured) == expected
+
+
+def test_smoke_omp_override_keeps_v1_and_prints_forbidden_fields(
+        tmp_path, monkeypatch, capsys):
+    seen: dict[str, Any] = {}
+    _patch_smoke_main(monkeypatch, tmp_path, seen)
+    config = tmp_path / "omp.toml"
+    config.write_text("", encoding="utf-8")
+    cfg = SimpleNamespace(name="omlx", driver="omp", model="test-model", effort="low",
+                          base_url="http://127.0.0.1:8000/v1", vendor="omlx")
+    settings = SimpleNamespace(default_provider="omlx", providers={"omlx": cfg})
+    monkeypatch.setattr(smoke.lane_harness, "load_settings", lambda *_args, **_kwargs: settings)
+
+    class FakeProxy:
+        url = "http://127.0.0.1:9000"
+
+        def __init__(self, upstream, log_path):
+            assert upstream == smoke.OMLX_UPSTREAM
+            self.log_path = log_path
+
+        def start(self):
+            self.log_path.write_text(json.dumps({
+                "method": "POST", "path": "/v1/chat/completions",
+                "sampling": {"temperature": 0.2,
+                              "chat_template_kwargs": {"enable_thinking": True}},
+            }) + "\n", encoding="utf-8")
+            return self
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(smoke.lane_harness, "SamplingProxy", FakeProxy)
+    assert smoke.main(["--provider", "omlx", "--config", str(config)]) == smoke.EXIT_FAIL
+    assert seen["overrides"]["providers"]["omlx"]["base_url"] == f"{FakeProxy.url}/v1"
+    output = capsys.readouterr().out
+    assert ('sampling fields sent: chat_template_kwargs={"enable_thinking": true}, '
+            "temperature=0.2") in output
+    assert "forbidden fields sent: temperature, chat_template_kwargs.enable_thinking" in output
+
+
 def test_smoke_pass_omlx():
     out = smoke.evaluate("omlx", _run(), _trace(), METRICS, "ok", SSH, PROXY)
     assert out.exit_code == smoke.EXIT_PASS, out.checks
     assert out.headline.startswith("PASS")
     assert any("sampling fields sent: none" in d for _, _, d in out.checks)
+
+
+def test_smoke_passes_and_names_openai_proxy_route():
+    proxy = [{"method": "POST", "path": "/v1/chat/completions?stream=true",
+              "sampling": {}}]
+    out = smoke.evaluate("omlx", _run(), _trace(), METRICS, "ok", SSH, proxy)
+    assert out.exit_code == smoke.EXIT_PASS, out.checks
+    body_check = next(detail for name, _, detail in out.checks
+                      if name == "proxy logged request bodies")
+    assert "1 request body" in body_check
+    assert "/v1/chat/completions (1)" in body_check
+
+
+def test_smoke_omlx_fails_only_for_listed_sampling_fields():
+    allowed_sampling = {
+        "typical_p": 0.8, "repeat_penalty": 1.1, "reasoning": "high",
+        "reasoning_effort": "high", "thinking": {"type": "enabled"},
+        "reasoning_budget": 1000, "enable_thinking": True, "preserve_thinking": True,
+        "chat_template_kwargs": {"preserve_thinking": True},
+    }
+    proxy = [{"method": "POST", "path": "/v1/chat/completions",
+              "sampling": allowed_sampling}]
+    out = smoke.evaluate("omlx", _run(), _trace(), METRICS, "ok", SSH, proxy)
+    assert out.exit_code == smoke.EXIT_PASS, out.checks
+
+    forbidden_sampling = {name: True for name in smoke.FORBIDDEN_SAMPLING_FIELDS
+                          if name != "chat_template_kwargs.enable_thinking"}
+    forbidden_sampling["chat_template_kwargs"] = {"enable_thinking": False}
+    out = smoke.evaluate("omlx", _run(), _trace(), METRICS, "ok", SSH,
+                         [{"method": "POST", "path": "/v1/chat/completions",
+                           "sampling": forbidden_sampling}])
+    check = next((ok, detail) for name, ok, detail in out.checks
+                 if name == "forbidden sampling fields absent")
+    assert check == (False, ", ".join(smoke.FORBIDDEN_SAMPLING_FIELDS))
+    assert out.exit_code == smoke.EXIT_FAIL
 
 
 def test_smoke_pass_cloud_lane_needs_no_metrics():
@@ -287,7 +370,7 @@ def test_smoke_unavailable_lane_is_a_failure_not_deferred():
     ({"trace": _trace(run_tokens=0)}, "run record with tokens"),
     ({"metrics": []}, "metrics sample rows"),
     ({"trace": _trace(summary=False)}, "run_summary record"),
-    ({"proxy": []}, "proxy logged /v1/messages bodies"),
+    ({"proxy": []}, "proxy logged request bodies"),
 ])
 def test_smoke_fail_names_the_check(change, failed_check):
     args = {"trace": _trace(), "metrics": METRICS, "hello": "ok", "proxy": PROXY, **change}
@@ -359,6 +442,7 @@ def test_sampling_summary():
 
 def test_proxy_forwards_streams_and_logs_without_headers(tmp_path, mock_endpoint):
     mock_endpoint.routes["/up/v1/messages"] = (200, {"ok": True})
+    mock_endpoint.routes["/up/v1/chat/completions"] = (200, {"wire": "openai"})
     log = tmp_path / "log.jsonl"
     proxy = harness.SamplingProxy(mock_endpoint.url("up"), log).start()
     try:
@@ -369,15 +453,23 @@ def test_proxy_forwards_streams_and_logs_without_headers(tmp_path, mock_endpoint
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=5) as resp:
             assert json.loads(resp.read()) == {"ok": True}
+        openai_req = urllib.request.Request(
+            f"{proxy.url}/v1/chat/completions", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with opener.open(openai_req, timeout=5) as resp:
+            assert json.loads(resp.read()) == {"wire": "openai"}
     finally:
         proxy.stop()
     sent = {k.lower(): v for k, v in mock_endpoint.headers["/up/v1/messages"].items()}
     assert sent["authorization"] == "Bearer secret-key-123"
     text = log.read_text()
     assert "secret-key-123" not in text and "uthorization" not in text
-    (record,) = harness.read_jsonl(log)
+    records = harness.read_jsonl(log)
+    record = records[0]
     assert record["sampling"] == {"temperature": 0.2}
     assert record["keys"] == ["messages", "model", "temperature"]
+    assert records[1]["path"] == "/v1/chat/completions"
+    assert mock_endpoint.hits["/up/v1/chat/completions"] == 1
 
 
 # --- bench aggregation and recommendation ----------------------------------------

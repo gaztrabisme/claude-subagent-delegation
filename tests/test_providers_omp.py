@@ -24,9 +24,11 @@ from pathlib import Path
 import pytest
 
 from subagent import router
+from subagent.config import APPROVAL_HOOK
 from subagent.guard.classify import classify
 from subagent.providers import omp as omp_driver
 from subagent.providers.base import ProviderConfig, Session
+from subagent.providers.omp_config import OMP_HOOK, write_agent_config
 from subagent.runs import COMPLETED, Registry
 
 from .conftest import default_providers, make_settings
@@ -498,6 +500,23 @@ def test_real_omp_hook_blocks_protected_write_against_local_stub(
 
 def test_guard_label_is_hook(tmp_path: Path):
     assert omp_driver.OMP_PROVIDER.guard(make_settings(tmp_path), _omp_cfg()) == "hook"
+
+
+def test_omp_guard_code_and_agent_config_are_hard_protected(tmp_path: Path):
+    settings = make_settings(tmp_path, supervisor="allow-escalations")
+    cfg = _configured_omp_cfg()
+    config_path = write_agent_config(settings, "protected-agent", cfg)
+    registry = Registry(settings, start_reaper=False)
+    targets = [APPROVAL_HOOK, OMP_HOOK, config_path, config_path.parent / "models.yml"]
+    try:
+        for target in targets:
+            verdict = classify("Write", {"file_path": str(target)}, _workspace(tmp_path))
+            assert verdict.action == "deny", (target, verdict.action, verdict.reason)
+            assert "server" in verdict.reason.lower() or "guard" in verdict.reason.lower(), (
+                target, verdict.reason
+            )
+    finally:
+        registry.shutdown()
 
 
 def test_boot_mints_a_session_id(tmp_path: Path, monkeypatch):

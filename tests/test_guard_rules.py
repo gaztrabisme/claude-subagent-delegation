@@ -215,6 +215,21 @@ def test_reads_and_test_runs_are_allowed(command, ws, ctx):
     assert classify("Bash", {"command": command}, ws, context=ctx).action == ALLOW, command
 
 
+@pytest.mark.parametrize("command", [
+    "echo $OMLX_API_KEY",
+    "echo ${CUSTOM_BACKEND_CREDENTIAL}",
+    "printenv OMLX_API_KEY",
+    "env",
+    "set",
+    "export -p",
+    "cat /proc/self/environ",
+])
+def test_secret_environment_reads_are_denied_from_guard_context(command, ws, ctx):
+    context = {**ctx, "secret_env_names": ["OMLX_API_KEY", "CUSTOM_BACKEND_CREDENTIAL"]}
+    verdict = classify("Bash", {"command": command}, ws, context=context)
+    assert verdict.action == DENY, (command, verdict.reason)
+
+
 def test_ordinary_writes_stay_allowed_with_a_context(ws, ctx):
     assert classify("Write", {"file_path": "src/add.js"}, ws, context=ctx).action == ALLOW
     assert classify("Bash", {"command": "echo x > notes.txt"}, ws, context=ctx).action == ALLOW

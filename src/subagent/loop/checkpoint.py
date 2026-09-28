@@ -1,7 +1,9 @@
-"""Checkpoints of the project's working tree, taken before every worker round, so a round can be undone.
+"""Checkpoints of the project's working tree, taken before every worker round, \
+so a round can be undone.
 
 In a git repository a checkpoint is a commit object built from a temporary index (the user's branch,
-index and stash are never touched), kept alive by a ref under refs/subagent/checkpoints/. Outside git
+index and stash are never touched), kept alive by a ref under \
+refs/subagent/checkpoints/. Outside git
 it is a tarball in .subagent/checkpoints/. Ignored files (.gitignore, or SKIP_DIRS without git) and
 .subagent/ itself are not part of checkpoints.
 """
@@ -48,7 +50,9 @@ def create(root, label):
     if git_prefix(root) is not None:
         tree = _snapshot_tree(root)
         parent = git(root, "rev-parse", "-q", "--verify", "HEAD", check=False)
-        args = ["commit-tree", tree, "-m", f"delegate checkpoint: {label}"] + (["-p", parent] if parent else [])
+        args = ["commit-tree", tree, "-m", f"delegate checkpoint: {label}"] + (
+            ["-p", parent] if parent else []
+        )
         commit = git(root, *args)
         git(root, "update-ref", f"refs/subagent/checkpoints/{record['id']}", commit)
         record.update(kind="git", commit=commit)
@@ -75,7 +79,9 @@ def get(root, checkpoint_id=None):
         return None
     if checkpoint_id is None:
         return records[-1]
-    return next((r for r in records if r["id"] == checkpoint_id or r["id"].startswith(checkpoint_id)), None)
+    return next(
+        (r for r in records if r["id"] == checkpoint_id or r["id"].startswith(checkpoint_id)), None
+    )
 
 
 def _tar_members(root, record):
@@ -88,9 +94,13 @@ def changes(root, record):
     root = Path(root)
     if record["kind"] == "git":
         tree = _snapshot_tree(root)
-        out = git(root, "diff", "--name-status", "--no-renames", "--relative", record["commit"], tree)
+        out = git(
+            root, "diff", "--name-status", "--no-renames", "--relative", record["commit"], tree
+        )
         return [tuple(line.split("\t", 1)) for line in out.splitlines() if line]
-    members = {name: hashlib.sha256(data).hexdigest() for name, data in _tar_members(root, record).items()}
+    members = {
+        name: hashlib.sha256(data).hexdigest() for name, data in _tar_members(root, record).items()
+    }
     current = {rel: file_hash(root / rel) for rel in walk_files(root)}
     result = [("A", p) for p in current if p not in members]
     result += [("D", p) for p in members if p not in current]
@@ -109,7 +119,8 @@ def file_at(root, record, path):
 
 
 def restore(root, record):
-    """Make the working tree match the checkpoint again. Returns the list of (status, path) undone."""
+    """Make the working tree match the checkpoint again. Returns the list \
+of (status, path) undone."""
     root = Path(root)
     diff = changes(root, record)
     for status, rel in diff:
@@ -161,7 +172,12 @@ def worktree_add(root, record):
         raise RuntimeError("worktrees need a git repository")
     base = Path(tempfile.mkdtemp(prefix="delegate-wt-"))
     worktree = base / "wt"
-    git(root, "worktree", "add", "--detach", str(worktree), record["commit"])
+    try:
+        git(root, "worktree", "add", "--detach", str(worktree), record["commit"])
+    except BaseException:
+        shutil.rmtree(base, ignore_errors=True)
+        git(root, "worktree", "prune", check=False)
+        raise
     return worktree, worktree / (git_prefix(root) or "")
 
 
@@ -169,4 +185,3 @@ def worktree_remove(root, worktree):
     git(root, "worktree", "remove", "--force", str(worktree), check=False)
     shutil.rmtree(Path(worktree).parent, ignore_errors=True)
     git(root, "worktree", "prune", check=False)
-

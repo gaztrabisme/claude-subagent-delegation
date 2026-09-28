@@ -46,6 +46,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lane_harness  # noqa: E402
+
 from subagent.providers import Session, for_driver  # noqa: E402
 
 COMMAND = "echo hi > x"

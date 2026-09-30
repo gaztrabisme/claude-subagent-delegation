@@ -123,3 +123,15 @@ For `send_sampling = false`, the generated omp model disables reasoning, omits m
 **Rejected:** waiting for the harness before any v2 work (17 of 18 items do not depend on it).
 
 **Consequence:** worker-side numbers measured on omp and `claude -p` (items 13 to 15) are provisional and are rerun when the harness driver lands.
+
+## S26 — v2 design choices made during the build (2026-09-30)
+
+**Chosen (coordinator, decided forward; Gary can reverse any):**
+- Goal rows: a check that is exactly one backticked span is a command; a check with any other backtick is rejected (`mixed command and prose check`); no backtick means prose for the reviewer. The harness contract (efficient-pi `subagent-mcp-mapping.md`) did not define the split and needs the same rule.
+- Goal commands take the job `verification` path unchanged: only an ALLOW verdict runs; ESCALATE and DENY are blocked without a supervisor and fail the row. The classifier allowlist was not widened, so linters and builds (`uv run ruff check`, `uv build`) cannot be goal command rows. Open for Gary.
+- `auth = "login"` uses the owner's Claude config directory, because a login child did not authenticate with an isolated `CLAUDE_CONFIG_DIR` on this Mac (two probes, "Not logged in"). The directory is protected against worker reads and writes for the run; worker sessions land in the owner's Claude history; doctor and README say so.
+- Per-turn `source_usage` estimates characters the process can see, with an `unmeasured` list per turn; no driver reports usage by source.
+- `[loop].parallel_tool_calls` means the worker batching independent tool calls in one turn; loop concurrency stays `max_agents`.
+- The packaged `src/subagent/skills/` is the single source of the skill files; repository-root `skills/*` are relative links to it.
+
+**Rejected:** silent reclassification of mixed goal rows; widening the verification allowlist inside this run; copying Claude credentials into an isolated directory; two copies of the skill files.

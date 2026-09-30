@@ -309,3 +309,37 @@ The fix itself (a new run lock and a redaction module) has not been read by a se
 ### Spec (wiki/v2-spec.md at 7a134e0)
 
 Cold review before build: 4 CRITICAL, 9 WARNING, 2 ADVISORY (`../subagent-mcp-wt/v2-briefs/review-spec.md`). The spec went back for one revision; the coordinator's decisions on the four CRITICAL findings are in `log.md` (2026-09-30, "Forks decided forward").
+
+### Wave B, runtime (diff 4856ad0..88f5065 on the runtime paths: items 12 to 14, plus the wave A lock and redaction fix)
+
+Reviewer: Gemini. Fixes in `fd7e49f` (merged as `f6727fe`).
+
+1. **HIGH — a configured credential split across lines escapes redaction.** Outcome: fixed; `test_review_b1_redacts_wrapped_credentials`.
+2. **HIGH — MCP `delegate` fails on any goal given as a file (`TestGuard.release()` returns a tuple).** Outcome: fixed; `test_review_b1_mcp_delegate_accepts_goal_file_release_result`.
+3. **HIGH — MCP `continue` skips the goal guard and checks.** Outcome: fixed; `test_review_b1_mcp_continue_relocks_and_releases_goal_guard`.
+4. **HIGH — the CLI's goal result overwrites security-violation and runtime-error statuses.** Outcome: fixed; goal failures only demote `done`; `test_review_b1_apply_goal_preserves_failure_statuses`.
+5. **MED — the run lock stays held when writing the result raises.** Outcome: fixed; `test_review_b1_run_lock_closes_when_result_write_fails`.
+6. **MED — whitespace-only environment values corrupt redaction.** Outcome: fixed; `test_review_b1_ignores_whitespace_only_secret_values`.
+7. **MED — autopilot evaluates goal commands with a spent time budget.** Outcome: fixed; `test_review_b1_autopilot_goal_uses_verification_budget`.
+8. **MED — a symlinked goal file escapes the test guard.** Outcome: fixed; `test_review_b1_protects_and_restores_replaced_symlink_goal`.
+9. **MED — `delegate_test_writer = false` still uses the configured test writer.** Outcome: not real; that was the behaviour before the knob existed, and the spec keeps today's behaviour when the knob is off (`test_knobs_delegate_test_writer_uses_configured_provider`).
+10. **LOW — boot and hop error messages bypass redaction.** Outcome: fixed; `test_review_b1_boot_and_hop_errors_redact_provider_keys`.
+11. **LOW — a misleading variable name in `_make_source_usage`.** Outcome: fixed (renamed).
+12. **LOW — goal and knob tests lean on mocks.** Outcome: fixed; fake-provider integration tests for MCP `delegate` and `continue` with goal files.
+
+Also in `fd7e49f`: the non-secret key marker S3 used to pass login providers through the run's API-key gate is replaced by a login exception in the gate itself; the report labels flat-plan usage with no monthly price as "plan usage, cash price unknown".
+
+### Wave B, commands and config (diff 70e46fc..ed79b86 on cli, config, goal parser, commands, installer, claude driver, guard, cost, skills, examples)
+
+Reviewer, attempt 1: Gemini, stopped by its quota before writing. Attempt 2: GLM (glm-5.3-flash). No HIGH. Fixes in `ce31558`.
+
+1. **MED — in login mode a custom Claude config directory is protected against writes only.** Outcome: fixed; the login root is sensitive for reads too; `test_review_b2_login_config_root_blocks_read_tools_and_bash`.
+2. **MED — the installer follows a planted or dangling symlink out of its target.** Outcome: fixed; `test_review_b2_install_rejects_dangling_registration_symlink`.
+3. **MED — provider commands rewrite the whole TOML file and drop comments.** Outcome: fixed; only the edited assignment or table changes; `test_review_b2_provider_edit_preserves_comments_and_arrays`.
+4. **MED — `install` fails from an installed wheel.** Outcome: fixed; skill files ship under `subagent/skills/`; `test_review_b2_installer_skill_sources_are_packaged`.
+5. **LOW — the goal parser mislabels digit-leading prose and shifts row numbers after a gap.** Outcome: fixed; `test_review_b2_goal_parser_tracks_prose_and_consecutive_rows`.
+6. **LOW — `provider list --json` echoes secret-named keys.** Outcome: fixed; `test_review_b2_provider_list_redacts_secret_named_keys`.
+7. **LOW — `install --force` leaves stale sub-tables.** Outcome: fixed; `test_review_b2_install_force_removes_stale_subagent_subtables`.
+8. **LOW — `test_loop_auto_never_does_not_start_run` proves nothing.** Outcome: fixed; replaced by `test_review_b2_loop_auto_skill_gate_covers_never_and_bad_json`.
+
+The fix commits themselves were not read by a second reviewer.

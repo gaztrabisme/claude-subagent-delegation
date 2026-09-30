@@ -164,6 +164,8 @@ class ProviderConfig:
 
     def unavailable(self) -> str | None:
         """Why this build cannot run a child on this provider, or None."""
+        if self.extra.get("auth") == "login":
+            return None
         if self.driver != DRIVER_CLAUDE:
             # codex, copilot, grok and gemini CLIs own their own connection;
             # their drivers check the binary at boot.
@@ -174,7 +176,7 @@ class ProviderConfig:
 
     def as_dict(self) -> dict[str, object]:
         """Public view for `list`. Names the key variables, never their values."""
-        return {
+        view = {
             "name": self.name,
             "driver": self.driver,
             "vendor": self.vendor,
@@ -194,6 +196,9 @@ class ProviderConfig:
             "adapter": self.adapter,
             "experimental": self.experimental,
         }
+        if self.extra.get("auth") == "login":
+            view["auth"] = "login"
+        return view
 
 
 @dataclass

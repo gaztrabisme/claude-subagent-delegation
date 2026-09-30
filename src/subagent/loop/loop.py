@@ -653,7 +653,12 @@ def _apply_goal(result, goal, root, server, budget=None, tier="normal"):
     )
     uat = evaluate_goal(goal, root, server.settings, reviewer=reviewer, budget=budget)
     result["uat"] = uat
-    if any(row["kind"] == "command" and row["passed"] is not True for row in uat):
+    failed = any(row["kind"] == "command" and row["passed"] is not True for row in uat)
+    goal_changed = bool(
+        goal.path
+        and any(row.get("file") == goal.path for row in result.get("violations", []))
+    )
+    if result.get("status") == "done" and (failed or goal_changed):
         result["status"] = "completed_unverified"
     return result
 
@@ -1587,8 +1592,6 @@ Claude only
             }
             for t in first.get("tasks", [])
         ]
-    if goal is not None:
-        _apply_goal(result, goal, root, server, budget=last.get("_goal_budget"), tier=tier)
     for key in (
         "test_change_request",
         "violations",
@@ -1600,6 +1603,15 @@ Claude only
     ):
         if last.get(key):
             result[key] = last[key]
+    if goal is not None:
+        violations = list(result.get("violations") or [])
+        for round_result in rounds:
+            for violation in round_result.get("violations") or []:
+                if violation.get("file") == goal.path and violation not in violations:
+                    violations.append(violation)
+        if violations:
+            result["violations"] = violations
+        _apply_goal(result, goal, root, server, budget=settings.verify_timeout, tier=tier)
     all_blocks = [b for r in rounds for b in (r.get("_runs") or [])]
     all_blocks += [b for rev in reviews for b in (rev.get("_runs") or [])]
     _write_delegation(server, _delegation_record(
@@ -1734,9 +1746,12 @@ def cmd_run(root, server, args, raw):
                 )
                 mode = "single"
             blocks = result.pop("_runs", []) or []
-            budget = result.pop("_goal_budget", None)
+            result.pop("_goal_budget", None)
             if goal is not None:
-                _apply_goal(result, goal, root, server, budget=budget, tier=args.tier)
+                _apply_goal(
+                    result, goal, root, server,
+                    budget=server.settings.verify_timeout, tier=args.tier,
+                )
             _write_delegation(server, _delegation_record(
                 mode=mode,
                 status=result.get("status"),
@@ -1752,8 +1767,10 @@ def cmd_run(root, server, args, raw):
     except Exception as exc:  # the result file must always be written, or `wait` reports a crash
         result = {"status": "runner_error", "error": f"{type(exc).__name__}: {exc}"}
     result["run_id"] = run_id
-    write_json(state / "runs" / f"{run_id}.json", result)
-    run_lock.close()
+    try:
+        write_json(state / "runs" / f"{run_id}.json", result)
+    finally:
+        run_lock.close()
     return result, STATUS_EXIT.get(result["status"], 2)
 
 

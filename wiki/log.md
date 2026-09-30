@@ -223,3 +223,52 @@ UAT at close (against the goal file only):
 | 9 | PASS: omlx proxy log `forbidden fields sent: none` (only `preserve_thinking` sent) |
 | 10 | PASS: `uv tool list` shows `subagent` editable from this checkout; config `default_provider = "codex"`; `grep -c '^SAM_'` on the env file is 0 |
 | 11 | PASS: this entry, S24, active-work State, CLAUDE.md Subagent lanes |
+
+## 2026-09-30 — v2 run (coordinator; in progress)
+
+Goal: `goals/2026-09-30-v2.md`. Decision: S25. Coordinator: Claude Code (conductor). Code and spec units on Codex gpt-6-luna xhigh, `-s danger-full-access`, one worktree each under `../subagent-mcp-wt/`, branch `v2` off `fuse` 6ae599a. Reviews on Gemini through the `subagent` MCP server in detached worktrees. Unit reports are beside the worktrees (`../subagent-mcp-wt/v2-<unit>-report.md`), briefs and reviews in `../subagent-mcp-wt/v2-briefs/`.
+
+### Run ledger
+
+| Unit | Lane | Result |
+|---|---|---|
+| A3 pricing, old env import (item 4) | Codex | PASS, merged e364d4b. Coordinator ran: `-k packaged_pricing` 2 passed; wheel lists `subagent/pricing.toml`; `SAM_`/`from-env` grep empty; ruff clean |
+| A2 provider error text (item 2, U-L1) | Codex | PASS, merged a51cc92. Coordinator ran: `-k provider_error_text` 5 passed; ruff clean; result object shows `provider_error` with message, refusal code, finish reason |
+| A1 run/wait, bench (items 1, 2, 3) | Codex | PASS, merged 4856ad0. Coordinator ran: `-k run_refuses_live`, `cell_session_root`, `orch_tokens`, `hidden_dest` each pass; ruff clean. The unit wrote a `wiki/log.md` entry against its brief; folded into this ledger. The cause it fixed for U-B4 (the orchestrator's tool shell dropping `SUBAGENT_CONFIG`, so the cell config is now written to the project's `.subagent/config.toml`) is a hypothesis: the recorded cell kept no evidence, and no live bench cell was replayed |
+| Wave A on `v2` | coordinator | 878 passed, 1 skipped; ruff clean; machine-value grep empty |
+| Review A, attempt 1 | Gemini | FAILED after 319 s: loop watchdog, "identical tool call repeated 8 times" on `view_file` (finding U-A1 below). Worktree unchanged |
+| Review A, attempt 2 | Gemini | 4 HIGH, 4 MED, 2 LOW (`review.md`, 2026-09-30 v2 review). Reads done through distinct shell commands |
+| SPEC | Codex | `wiki/v2-spec.md` 7a134e0 on `v2-spec`: nine item sections, build units, key decisions |
+| Spec cold review | Gemini | 4 CRITICAL, 9 WARNING, 2 ADVISORY; spec sent back for one revision (SPEC2) |
+| A-FIX wave A findings | Codex | 8 fixed, 2 judged not real (outcomes in `review.md`); merged 4924ab6. Coordinator ran: `-k review_a` 9 passed, wave A selectors 13 passed, ruff clean; full suite on `v2` 885 passed, 1 skipped |
+| SPEC2 | Codex | All 15 findings accepted; merged 70e46fc. Two live `claude -p` probes with an isolated `CLAUDE_CONFIG_DIR` returned "Not logged in" (exit 1), so item 7 uses the owner's config directory with a warning. Found from source: an escalated verification command is blocked before execution and never reaches a supervisor, so goal command rows are limited to what the classifier allows |
+| S1 interfaces | Codex | PASS, merged 829104d. Coordinator ran: `-k loop_auto` 23 passed; goal parser 18, goal CLI 6, registrations 6, config knobs 26 passed; ruff clean; `provider add` stub exits 2 "not implemented" |
+| S2 provider commands (items 5, 8) | Codex | PASS after S2b, merged 753c676. Coordinator ran: `tests/test_cli_provider.py` 16 passed; `provider --help`, `use --help` exit 0; `-k add_local` 7 passed; ruff clean; `provider add myglm --from glm` into a scratch `XDG_CONFIG_HOME` wrote the preset table with `api_key_env` names and no key value |
+| S2b | Codex | S1's registration test still asserted the provider stub; decided forward: the unit that fills a command group updates that group's assertions. 5 passed |
+| R1 goal runtime (item 12) | Codex | PASS, merged 25a7ac4. Coordinator ran: `tests/test_goal.py` 14 passed; `-k goal_protected` 1; `tests/test_trace_schema.py` 5; `-k goal_no_command_rows` 1; ruff clean. Sample `uat` row: `{"row": 1, "label": "exists", "kind": "command", "command": "test -f marker.txt", "passed": true, "output_tail": ""}` |
+| I installer, skill text (items 10, 11) | Codex | Code PASS: `tests/test_install.py` 22 passed, `install --help` names the four harnesses, skill `description:` present. S1's stub test for `install` then ran the real installer: once in the unit's run, once in the coordinator's acceptance run, each writing four installer files into the unit's worktree; the coordinator removed its four. Follow-up Ib moves those assertions to a temporary target |
+| Ib | Codex | PASS; merged with I as 2934586. `tests/test_command_registrations.py` passes and leaves the worktree clean; full suite on `v2` 998 passed, 1 skipped |
+| R2 source records, knobs (items 13, 14) | Codex | PASS, merged 88f5065. Coordinator ran: `-k turn_source` 4 passed; `tests/test_trace_schema.py` 9; `tests/test_knobs.py` 7; ruff clean. The output sample is a direct call of `make_source_usage`, not a trace record from a run |
+| S3 Claude login, init detection (items 7, 6) | Codex | PASS, merged ed79b86. Coordinator ran: `-k init_detect` 4 passed; `-k auth_login` 9; `examples/config.claude.toml` exists; `tests/test_guard.py` 162; ruff clean. The unit let login providers through the run's API-key gate with a non-secret marker because `runs.py` was not its file; removal is in B-FIX. Merge conflict in `tests/test_command_registrations.py` (each unit had removed its own group from the stub list): the coordinator removed the empty stub test |
+| Review B, runtime | Gemini | 4 HIGH, 5 MED, 3 LOW (`../subagent-mcp-wt/v2-briefs/review-b1.md`); the most serious: MCP `delegate` fails on any goal given as a file (`TestGuard.release()` returns a tuple). Fixes in B-FIX |
+| Review B, commands and config, attempt 1 | Gemini | FAILED after 569 s: "Individual quota reached … Resets in 2h2m38s" (429 RESOURCE_EXHAUSTED); nothing written. Rerouted to GLM (another family than the Codex author) |
+| Review B, commands and config, attempt 2 | GLM | 0 HIGH, 4 MED, 4 LOW in 1,356 s (`../subagent-mcp-wt/v2-briefs/review-b2.md`): login config readable when it is a custom directory; installer follows planted symlinks; provider commands drop comments from the TOML file; `install` fails from an installed wheel (skills read from the checkout). Fixes in C-FIX, in parallel with B-FIX on disjoint files |
+| B-FIX runtime findings | Codex | 11 fixed, 1 judged not real; login key marker replaced by a login exception in the run gate; flat-plan report label. Merged f6727fe. Coordinator ran: `-k review_b1` 10 passed; `-k auth_login` 9; marker grep empty; goal, knob, trace-schema suites 30; ruff clean |
+| C-FIX command-and-config findings | Codex | 8 fixed. Coordinator ran: `-k review_b2` 8 passed; install, provider, guard, goal-parser suites 225; a wheel built into the scratchpad lists `subagent/skills/{delegate,plan,goal}/SKILL.md`; ruff clean. The fix copied the skill files into the package, leaving two copies |
+| C-FIX2 single skill source | Codex | Root `skills/{delegate,plan,goal}` are relative links to `src/subagent/skills/…`; the bench copies the file contents (test added). Merged with C-FIX as bba6219. Coordinator ran: install and bench suites 80 passed; `~/.claude/skills/delegate/SKILL.md` still resolves |
+| DOC README (item 18) | Codex | PASS, merged 5d48826. Coordinator ran: the four-term grep counts 9 lines; machine-value grep empty; read the goal, limits and opening sections against the code |
+| Item 16 retirement | coordinator | `ps` showed every running `subagent-mcp` process on the `subagent` tool venv (this checkout), none on the old `subagent-mcp` tool. Removed the untracked shim `src/subagent_mcp/` (21 files, each listed first), `uv tool uninstall subagent-mcp`, then `uv tool install --editable . --force`; `~/.local/bin/subagent-mcp` resolves to the `subagent` tool. `SUBAGENT_CONFIG` was not set: the server reads `~/.config/subagent/config.toml` by default |
+
+### Forks decided forward
+
+- Goal-row kind (item 12): the harness contract does not say how a command row is told from a prose row. Decided: a check that is exactly one backticked span is a command; a check with a backtick that is not exactly that is rejected (`mixed command and prose check`); no backtick means prose. The efficient-pi mapping needs the same rule.
+- Goal commands take the same guard path as the job's `verification` command; the classifier allowlist is not widened in this run, so a goal command such as a linter call is handled as an escalated verification command is today. Open for Gary: whether to widen it.
+- Login mode (item 7): the login child's config directory is a protected root for the run; isolated directory if a login child authenticates with one (live probe in SPEC2), otherwise the owner's directory with a plain warning.
+- Source buckets (item 13): character counts passed from the loop, plus an `unmeasured` list per turn, because no driver reports usage by source.
+- `parallel_tool_calls` (item 14) is read as the worker model batching tool calls in one turn, not loop concurrency (that is `max_agents`). This is the coordinator's reading of the v2 list's wording.
+- The spec's two build units are replaced by six (S1, then S2→S3, R1→R2 and I in parallel), each sized for one 90-minute run.
+- `rm -rf` and `git restore --worktree` are blocked by the machine's safety hook for the coordinator and for Codex; wheel checks build into the session scratchpad instead.
+
+### Findings
+
+- U-A1 The `gemini` (Antigravity) lane is killed by the loop watchdog on read-heavy work: `view_file` calls count as identical. Cause not confirmed; the trace does not record tool arguments. Same class as the Codex fix 6ae599a. Workaround in briefs: read with distinct shell commands.

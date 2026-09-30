@@ -28,7 +28,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from . import config
+from .commands import init as init_command
+from .commands import install as install_command
+from .commands import providers as providers_command
 from .config import ConfigError, Settings
+from .goal import Goal, GoalError, parse_goal
 from .health import check as health_check
 from .loop import loop
 from .providers.base import ProviderConfig
@@ -140,159 +144,6 @@ def _needed_exports(settings: Settings) -> list[str]:
     return lines
 
 
-def _write_config(data: Mapping[str, Any], dest: Path, force: bool) -> Settings:
-    if dest.exists() and not force:
-        raise ConfigError(
-            f"{dest} already exists; use --force to overwrite, or --path to choose another file"
-        )
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(_render_toml(data), encoding="utf-8")
-    return config.load(extra=dest)
-
-
-def _write_example(src: Path, dest: Path, force: bool) -> Settings:
-    if dest.exists() and not force:
-        raise ConfigError(
-            f"{dest} already exists; use --force to overwrite, or --path to choose another file"
-        )
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    return config.load(extra=dest)
-
-
-def _report_written(settings: Settings, dest: Path) -> None:
-    print(f"wrote {dest}")
-    for line in _needed_exports(settings):
-        print(line)
-
-
-def _from_env_data() -> dict[str, Any]:
-    """The providers the old SAM_*/key environment stands for."""
-    providers: dict[str, Any] = {}
-    if os.environ.get("GLM_API_KEY") or os.environ.get("ZAI_API_KEY"):
-        key_env = "GLM_API_KEY" if os.environ.get("GLM_API_KEY") else "ZAI_API_KEY"
-        providers["glm"] = {
-            "driver": "claude",
-            "base_url": os.environ.get("SAM_GLM_BASE_URL") or "https://api.z.ai/api/anthropic",
-            "model": os.environ.get("SAM_GLM_MODEL") or "glm-5.3-flash[1m]",
-            "api_key_env": key_env,
-            "vendor": "zai",
-            "pricing": {"kind": "flat_plan", "monthly_usd": 80},
-        }
-    if os.environ.get("DEEPSEEK_API_KEY"):
-        providers["deepseek"] = {
-            "driver": "claude",
-            "base_url": "https://api.deepseek.com/anthropic",
-            "model": "deepseek-v4-pro",
-            "api_key_env": "DEEPSEEK_API_KEY",
-            "vendor": "deepseek",
-            "pricing": {"kind": "per_token", "input": 1.32, "output": 3.96,
-                        "cache_read": 0.044},
-        }
-    codex_bin = os.environ.get("SAM_CODEX_BIN")
-    if codex_bin or shutil.which("codex"):
-        codex: dict[str, Any] = {"driver": "codex"}
-        if codex_bin:
-            codex["binary"] = codex_bin
-        codex["pricing"] = {"kind": "flat_plan"}
-        providers["codex"] = codex
-    core: dict[str, Any] = {}
-    if providers:
-        core["default_provider"] = next(iter(providers))
-    return {"core": core, "providers": providers}
-
-
-def _wizard(seed: dict[str, Any] | None, args: argparse.Namespace) -> int:
-    """Ask which examples to merge, which providers to keep, and write them."""
-    names = _example_names()
-    if seed is None:
-        print("examples:", ", ".join(names))
-        choice = input("pick one or more examples (comma-separated) [full]: ").strip() or "full"
-        chosen = [n.strip() for n in choice.split(",") if n.strip()]
-        merged: dict[str, Any] = {}
-        for name in chosen:
-            if name not in names:
-                print(f"error: unknown example {name!r}", file=sys.stderr)
-                return 2
-            merged = _merge_dict(merged, _load_example(name))
-    else:
-        merged = dict(seed)
-
-    providers = merged.get("providers") or {}
-    if not isinstance(providers, dict):
-        providers = {}
-    keep = input(f"provider names to keep [{', '.join(providers)}]: ").strip()
-    if keep:
-        wanted = [n.strip() for n in keep.split(",") if n.strip()]
-        providers = {n: providers[n] for n in wanted if n in providers}
-
-    # Ask which env var holds each key -- never the value.
-    for name, table in list(providers.items()):
-        if not isinstance(table, dict):
-            continue
-        envs = table.get("api_key_env")
-        if isinstance(envs, str):
-            envs = [envs]
-        envs = [e for e in (envs or []) if isinstance(e, str)]
-        if not envs:
-            continue
-        answer = input(f"key for provider {name!r} [{envs[0]}]: ").strip()
-        if answer:
-            table["api_key_env"] = answer
-        elif isinstance(table.get("api_key_env"), list):
-            table["api_key_env"] = envs[0]
-
-    default = next(iter(providers), "")
-    if providers:
-        answer = input(f"default_provider [{default}]: ").strip()
-        default = answer or default
-    merged["providers"] = providers
-    merged.setdefault("core", {})
-    merged["core"]["default_provider"] = default
-
-    dest = _dest_path(args.path)
-    settings = _write_config(merged, dest, args.force)
-    _report_written(settings, dest)
-    return 0
-
-
-def cmd_init(args: argparse.Namespace) -> int:
-    try:
-        if args.from_env:
-            if args.from_example:
-                print("--from-env and --from are mutually exclusive", file=sys.stderr)
-                return 2
-            dest = _dest_path(args.path)
-            settings = _write_config(_from_env_data(), dest, args.force)
-            _report_written(settings, dest)
-            return 0
-
-        if args.from_example:
-            src = _example_path(args.from_example)
-            if not src.is_file():
-                print(
-                    f"unknown example {args.from_example!r}; "
-                    f"examples: {', '.join(_example_names()) or '(none)'}",
-                    file=sys.stderr,
-                )
-                return 2
-            if args.yes:
-                dest = _dest_path(args.path)
-                settings = _write_example(src, dest, args.force)
-                _report_written(settings, dest)
-                return 0
-            return _wizard(tomllib.loads(src.read_text(encoding="utf-8")), args)
-
-        if args.yes:
-            print("--yes needs --from <example-name>", file=sys.stderr)
-            return 2
-
-        return _wizard(None, args)
-    except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-
 # --- doctor ---------------------------------------------------------------------
 
 
@@ -362,6 +213,16 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         "binary_ok": path is not None,
         "api_key_envs": _key_envs(cfg),
     }
+    warning = _thinking_warning(cfg)
+    if cfg.extra.get("auth") == "login":
+        login_warning = (
+            f"warning: provider {cfg.name!r} uses the owner's Claude login and plan quota; "
+            "worker sessions are written into the owner's Claude history, and the owner's "
+            "global instructions, commands and skills may load"
+        )
+        warning = f"{warning}\n{login_warning}" if warning else login_warning
+    if warning:
+        row["warning"] = warning
     if not args.no_probe:
         if path is None:
             hard = True
@@ -385,6 +246,38 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
             if not result.get("ok"):
                 hard = True
     return row, hard
+
+
+def _thinking_warning(cfg: ProviderConfig) -> str | None:
+    thinking = cfg.thinking
+    if thinking is None:
+        return None
+    supported = (
+        (cfg.driver == "omp" and thinking in ("off", "low"))
+        or (cfg.driver in ("codex", "antigravity") and thinking == "low")
+    )
+    if supported:
+        return None
+    return (
+        f"warning: provider {cfg.name!r} driver {cfg.driver!r} does not support thinking = "
+        f"'{thinking}'; provider default used."
+    )
+
+
+def _goal_cli_errors(exc: GoalError) -> list[str]:
+    if exc.block:
+        return [f"error: goal block is invalid: {problem}" for problem in exc.problems]
+    return [f"error: {problem}" for problem in exc.problems]
+
+
+def _report_goal_error(exc: GoalError, *, json_mode: bool) -> int:
+    messages = _goal_cli_errors(exc)
+    if json_mode:
+        print(json.dumps({"errors": messages}))
+    else:
+        for message in messages:
+            print(message, file=sys.stderr)
+    return 1
 
 
 def _print_table(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
@@ -430,6 +323,14 @@ def _print_table(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    goal: Goal | None = None
+    if args.goal is not None:
+        workspace = Path(args.root or ".").expanduser().resolve()
+        try:
+            goal = parse_goal(args.goal, workspace)
+        except GoalError as exc:
+            return _report_goal_error(exc, json_mode=args.json)
+
     try:
         settings = config.load()
         settings.require_providers()
@@ -456,10 +357,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         rows.append(row)
         hard = hard or failed
 
+    goal_warning = (
+        "warning: goal has no command rows; completion has no server-side goal check "
+        "when it contains only prose"
+        if goal is not None and not any(row.kind == "command" for row in goal.rows)
+        else None
+    )
     if args.json:
-        print(json.dumps({"ok": not hard, "providers": rows}, indent=2))
+        response: dict[str, Any] = {
+            "ok": not hard,
+            "providers": rows,
+            "loop_auto": settings.loop.auto,
+        }
+        if goal is not None:
+            response["goal"] = {
+                "rows": len(goal.rows),
+                "command_rows": sum(row.kind == "command" for row in goal.rows),
+            }
+        if goal_warning:
+            response["warnings"] = [goal_warning]
+        print(json.dumps(response, indent=2))
     else:
         _print_table(rows, args)
+        for row in rows:
+            if row.get("warning"):
+                print(row["warning"], file=sys.stderr)
+        if goal_warning:
+            print(goal_warning, file=sys.stderr)
+        elif goal is not None:
+            print(f"goal block valid: {len(goal.rows)} rows")
 
     return 1 if hard else 0
 
@@ -470,6 +396,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def _loop_parsers(subparsers: argparse._SubParsersAction) -> None:
     run = subparsers.add_parser("run", help="one worker round (or autopilot) on a plan")
     run.add_argument("--plan", metavar="FILE", help="the plan file (single-round mode)")
+    run.add_argument("--goal", metavar="VALUE", help="goal-block text or workspace GOAL.md")
     run.add_argument(
         "--parallel", metavar="MANIFEST", help="a manifest of parts, one worktree each"
     )
@@ -533,17 +460,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    init = sub.add_parser("init", help="write a starter config from the examples")
-    init.add_argument("--from", dest="from_example", metavar="EXAMPLE",
-                      help="seed the wizard with one example")
-    init.add_argument("--yes", action="store_true",
-                      help="write --from EXAMPLE non-interactively")
-    init.add_argument("--from-env", action="store_true",
-                      help="convert the old SAM_*/GLM_API_KEY/DEEPSEEK_API_KEY environment")
-    init.add_argument("--force", action="store_true",
-                      help="overwrite an existing config file")
-    init.add_argument("--path", metavar="PATH",
-                      help="write to PATH instead of $XDG_CONFIG_HOME/subagent/config.toml")
+    init_command.register(sub)
 
     doctor = sub.add_parser("doctor", help="check the configured providers")
     doctor.add_argument("--provider", metavar="NAME", help="check only this provider")
@@ -552,9 +469,13 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--no-probe", action="store_true",
                         help="only validate the file and check binaries")
     doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    doctor.add_argument("--goal", metavar="VALUE", help="validate goal-block text or GOAL.md")
 
     sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",
                    add_help=False)
+
+    providers_command.register(sub)
+    install_command.register(sub)
 
     _loop_parsers(sub)
     return parser
@@ -613,11 +534,19 @@ def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
         server.stop()
 
 
+def _project_config_root(root: Path) -> Path:
+    """Use the nearest ancestor that owns a project config, if there is one."""
+    for candidate in (root, *root.parents):
+        if (candidate / config.PROJECT_DIR / config.CONFIG_NAME).is_file():
+            return candidate
+    return root
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "report":
         try:
-            settings = config.load()
+            settings = config.load(project_root=_project_config_root(Path.cwd().resolve()))
             settings.require_providers()
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -626,17 +555,24 @@ def main(argv: list[str] | None = None) -> int:
 
         return report_main(raw[1:])
     args = _parser().parse_args(raw)
-    if args.command == "init":
-        return cmd_init(args)
     if args.command == "doctor":
         return cmd_doctor(args)
+    handler = getattr(args, "command_handler", None)
+    if handler is not None:
+        return handler(args)
     if args.command not in loop.LOOP_COMMANDS:
         _parser().print_help()
         return 2
 
     root = Path(args.root or ".").expanduser().resolve()
+    if args.command == "run" and args.goal is not None:
+        try:
+            parse_goal(args.goal, root)
+        except GoalError as exc:
+            return _report_goal_error(exc, json_mode=False)
     try:
-        settings = config.load(project_root=root)
+        project_root = root if args.root else _project_config_root(root)
+        settings = config.load(project_root=project_root)
         settings.require_providers()
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)

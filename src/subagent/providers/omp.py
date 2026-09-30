@@ -425,7 +425,9 @@ class OmpProvider:
         if model:
             reference = model if model.startswith(f"{cfg.name}/") else f"{cfg.name}/{model}"
             argv.extend(["--model", reference])
-        if not cfg.send_sampling:
+        if cfg.thinking is not None:
+            argv.extend(["--thinking", cfg.thinking])
+        elif not cfg.send_sampling:
             argv.extend(["--thinking", "off"])
         argv.extend(_extra_list(cfg, "extra_args"))
         argv.append(prompt)

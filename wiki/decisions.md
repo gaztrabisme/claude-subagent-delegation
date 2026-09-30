@@ -113,3 +113,25 @@ For `send_sampling = false`, the generated omp model disables reasoning, omits m
 **Rejected:** patching the old install (work redone at retirement); lane descriptions in config (only orchestrators that do not read CLAUDE.md need them, and wiring those is v2 item 10); omlx back on `claude -p` because omp sends `preserve_thinking` (not a sampling or thinking-off field; S21).
 
 **Accepted risk:** the `gemini` provider runs agy with no guard (review HIGH, accepted by Gary under the plan's decision 3): experimental, `--sandbox`, child env from the allowlist.
+
+## S25 — The v2 build resumes; omp stands in for item 9 (2026-09-30)
+
+**Context:** v2 was paused on 2026-09-25 until Gary's harness (efficient-pi) existed. The harness core is built but has no serve mode, and only item 9 of the v2 list (the lean worker driver, redefined as the driver for that harness) depends on it.
+
+**Chosen:** (Gary) the pause is lifted. The v2 list in `active-work.md` goes ahead; item 9 is deferred until the harness has serve mode, and the merged omp driver keeps serving the local providers (`bppc`, `omlx`) in its place. GLM and DeepSeek stay on `claude -p`.
+
+**Rejected:** waiting for the harness before any v2 work (17 of 18 items do not depend on it).
+
+**Consequence:** worker-side numbers measured on omp and `claude -p` (items 13 to 15) are provisional and are rerun when the harness driver lands.
+
+## S26 — v2 design choices made during the build (2026-09-30)
+
+**Chosen (coordinator, decided forward; Gary can reverse any):**
+- Goal rows: a check that is exactly one backticked span is a command; a check with any other backtick is rejected (`mixed command and prose check`); no backtick means prose for the reviewer. The harness contract (efficient-pi `subagent-mcp-mapping.md`) did not define the split and needs the same rule.
+- Goal commands take the job `verification` path unchanged: only an ALLOW verdict runs; ESCALATE and DENY are blocked without a supervisor and fail the row. The classifier allowlist was not widened, so linters and builds (`uv run ruff check`, `uv build`) cannot be goal command rows. Open for Gary.
+- `auth = "login"` uses the owner's Claude config directory, because a login child did not authenticate with an isolated `CLAUDE_CONFIG_DIR` on this Mac (two probes, "Not logged in"). The directory is protected against worker reads and writes for the run; worker sessions land in the owner's Claude history; doctor and README say so.
+- Per-turn `source_usage` estimates characters the process can see, with an `unmeasured` list per turn; no driver reports usage by source.
+- `[loop].parallel_tool_calls` means the worker batching independent tool calls in one turn; loop concurrency stays `max_agents`.
+- The packaged `src/subagent/skills/` is the single source of the skill files; repository-root `skills/*` are relative links to it.
+
+**Rejected:** silent reclassification of mixed goal rows; widening the verification allowlist inside this run; copying Claude credentials into an isolated directory; two copies of the skill files.

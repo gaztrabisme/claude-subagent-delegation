@@ -6,7 +6,8 @@ Reader: the next session that picks this repo up. Read with `decisions.md` (S11�
 
 | Area | State |
 |---|---|
-| Repo | `fuse` carries the lanes run: U3 core (provider `effort`, parallel limit, node `ℹ` test counts), U1 omp driver, U2 antigravity driver, U4 lint backlog cleared, U5/U6 smoke script, U7 review fixes, U8 in-process socket path. 866 passed, 1 skipped; `ruff check src tests` clean |
+| Repo (2026-10-01) | `fuse` carries the v2 run (merged from branch `v2`; see "Resumed" below), on top of the lanes run |
+| Repo (2026-09-28) | `fuse` carries the lanes run: U3 core (provider `effort`, parallel limit, node `ℹ` test counts), U1 omp driver, U2 antigravity driver, U4 lint backlog cleared, U5/U6 smoke script, U7 review fixes, U8 in-process socket path. 866 passed, 1 skipped; `ruff check src tests` clean |
 | Live server | Claude Code and Codex launch `agent-capabilities/bin/subagent-mcp`, which sources `~/.config/agent-capabilities/subagent.env` (keys only; `SAM_*` lines commented out, backup `subagent.env.bak-2026-09-28`) and runs `~/.local/bin/subagent-mcp` = editable uv tool install of this checkout (`uv tool list`: `subagent`). Config: `~/.config/subagent/config.toml` (copy of `wiki/data/config-mcbob-2026-09-28.toml`) |
 | Providers | `codex` (default; gpt-6-luna, effort xhigh), `glm`, `deepseek` (`claude -p`), `bppc` and `omlx` (omp 18.0.11, hook-guarded), `gemini` (agy 1.2.12, gemini-3.8-flash-high, effort high; experimental, `--sandbox`, no guard) |
 | Live proof | `subagent doctor --prompt` and `scripts/smoke_lanes.py` PASS on all six with the installed config (see `log.md` 2026-09-28 close) |
@@ -64,6 +65,29 @@ Housekeeping
 18. README: Khang's loop + goal layer + guard + any worker + measured cost; limitations (guard per driver, Windows unsupported); drop the pre-fusion benchmark section once 15 lands.
 
 Not in v2: Windows, opencode driver, omp driver merge, any settings UI.
+
+## Resumed (2026-09-30)
+
+Gary lifted the pause below (`decisions.md` S25): the v2 list goes ahead, item 9 deferred with omp as the stand-in. Grounding and the lane check are in `grounded.md` (2026-09-30).
+
+**v2 run 2026-09-30/10-01** (goal `goals/2026-09-30-v2.md`, ledger in `log.md`, reviews in `review.md`, choices in `decisions.md` S26). State per v2 item:
+
+| Items | State |
+|---|---|
+| 1–4 correctness (U-B4, U-B1, U-L1, hidden-test destination, pricing in package, no `SAM_*`) | done; U-B4's cause is a hypothesis, no live bench cell replayed |
+| 5–8 provider commands, `init` detection, Claude login worker, local discovery | done |
+| 9 lean driver / harness driver | deferred until efficient-pi has serve mode; omp stands in |
+| 10–11 `install --for`, `[loop] auto` and skill trigger text | done |
+| 12 goal layer | done; mixed rows rejected; goal commands limited to what the verification classifier allows |
+| 13–14 per-turn source records, token knobs | done |
+| 15 benchmark (task ladder, knob A/B) | not run: bppc, oMLX and DeepSeek were closed; a separate run |
+| 16 retire pre-fusion install | done (shim deleted, old uv tool uninstalled) |
+| 17 rename before publishing | not done; needs a name from Gary |
+| 18 README | done; benchmark section kept until item 15 |
+
+**Next:** Gary restarts the `subagent` MCP server in open sessions (`/mcp` → reconnect) to pick up v2; push `fuse` when Gary says so; decide the verification allowlist for goal commands (S26); tell efficient-pi the goal-row rule (S26) and that `uat` rows carry `command`; item 15 once bppc, oMLX and DeepSeek are up; item 17 name.
+
+**Open from this run:** U-A1 (the gemini lane's loop watchdog cannot tell `view_file` calls apart; reviews must read through shell commands); Gemini's individual quota ran out mid-run (resets about two hours later); review-fix commits were not second-read.
 
 ## Paused (2026-09-25)
 

@@ -144,6 +144,9 @@ class ProviderConfig:
     health: HealthSpec = field(default_factory=HealthSpec)
     probe: ProbeSpec = field(default_factory=ProbeSpec)
     pricing: PricingSpec = field(default_factory=PricingSpec)
+    # An optional native thinking override; each driver defines its supported
+    # value mapping while unsupported values retain its ordinary default.
+    thinking: str | None = None
     # Every key in the provider's config table this module does not recognise.
     # Drivers read their own extras from it: copilot's builtin_mcps, loop and
     # extra_args, grok's hooks.
@@ -161,6 +164,8 @@ class ProviderConfig:
 
     def unavailable(self) -> str | None:
         """Why this build cannot run a child on this provider, or None."""
+        if self.extra.get("auth") == "login":
+            return None
         if self.driver != DRIVER_CLAUDE:
             # codex, copilot, grok and gemini CLIs own their own connection;
             # their drivers check the binary at boot.
@@ -171,13 +176,14 @@ class ProviderConfig:
 
     def as_dict(self) -> dict[str, object]:
         """Public view for `list`. Names the key variables, never their values."""
-        return {
+        view = {
             "name": self.name,
             "driver": self.driver,
             "vendor": self.vendor,
             "base_url": self.base_url,
             "model": self.model,
             "effort": self.effort,
+            "thinking": self.thinking,
             "local": self.local,
             "available": self.unavailable() is None,
             "api_key_envs": list(self.api_key_envs),
@@ -190,6 +196,9 @@ class ProviderConfig:
             "adapter": self.adapter,
             "experimental": self.experimental,
         }
+        if self.extra.get("auth") == "login":
+            view["auth"] = "login"
+        return view
 
 
 @dataclass

@@ -197,6 +197,25 @@ def _int(table: Mapping[str, Any], key: str, default: int | None,
     return None if value is None else int(value)
 
 
+def _positive_int_knob(
+    table: Mapping[str, Any], key: str, where: str, default: int | None = None
+) -> int | None:
+    """Read an optional positive integer knob without truncating floats."""
+    value = table.get(key, default)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{where} must be a positive integer")
+    return value
+
+
+def _knob_bool(table: Mapping[str, Any], key: str) -> bool:
+    value = table.get(key, False)
+    if not isinstance(value, bool):
+        raise ConfigError(f"[loop].{key} must be a boolean")
+    return value
+
+
 def _strings(table: Mapping[str, Any], key: str) -> tuple[str, ...]:
     """A key given either as one string or as a list of strings."""
     raw = table.get(key)
@@ -254,7 +273,7 @@ _PROVIDER_KEYS = frozenset({
     "driver", "vendor", "base_url", "model", "effort", "api_key_env", "api_key", "local",
     "send_sampling", "max_agents", "compact_window", "max_steps", "run_timeout",
     "idle_timeout", "adapter", "binary", "experimental", "health", "probe",
-    "pricing",
+    "pricing", "thinking",
 })
 
 
@@ -279,12 +298,24 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
             f"provider {name!r} has unknown driver {driver!r}; "
             f"expected one of {', '.join(DRIVERS)}"
         )
+    auth = table.get("auth")
+    if auth is not None and auth != "login":
+        raise ConfigError(f"provider {name!r} auth must be 'login'")
+    if auth == "login" and driver != DRIVER_CLAUDE:
+        raise ConfigError(f"provider {name!r} auth = 'login' requires driver = 'claude'")
+    if auth == "login" and "api_key_env" in table:
+        raise ConfigError(f"provider {name!r} auth = 'login' cannot set api_key_env")
     base_url = _str(table, "base_url", None)
     if base_url:
         base_url = base_url.rstrip("/")
     adapter_name = _str(table, "adapter", None)
     if adapter_name and adapter_name.lower() in ("none", "off"):
         adapter_name = None
+    thinking = table.get("thinking")
+    if thinking is not None and thinking not in ("off", "low"):
+        raise ConfigError(f"provider {name!r} thinking must be 'off' or 'low'")
+    api_key_envs = _strings(table, "api_key_env")
+    api_key_default = None if auth == "login" else _str(table, "api_key", None)
     return ProviderConfig(
         name=name,
         driver=driver,
@@ -292,12 +323,15 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         base_url=base_url,
         model=_str(table, "model", None),
         effort=_str(table, "effort", None),
-        api_key_envs=_strings(table, "api_key_env"),
-        api_key_default=_str(table, "api_key", None),
+        api_key_envs=api_key_envs,
+        api_key_default=api_key_default,
         local=_bool(table, "local", False),
         send_sampling=_bool(table, "send_sampling", True),
         max_agents=int(_int(table, "max_agents", core["max_agents"])),
-        compact_window=int(_int(table, "compact_window", core["compact_window"])),
+        compact_window=int(_positive_int_knob(
+            table, "compact_window", f"[providers.{name}].compact_window",
+            core["compact_window"],
+        )),
         max_steps=int(_int(table, "max_steps", core["max_steps"])),
         run_timeout=float(_num(table, "run_timeout", core["run_timeout"])),
         idle_timeout=float(_num(table, "idle_timeout", core["idle_timeout"])),
@@ -307,6 +341,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         health=_health(table),
         probe=_probe(table),
         pricing=_pricing(table),
+        thinking=thinking,
         extra={k: v for k, v in table.items() if k not in _PROVIDER_KEYS},
     )
 
@@ -324,6 +359,11 @@ class LoopSettings:
     """The parsed `[loop]` table. Defaults mirror the schema in plan-architecture."""
 
     fallback: str = "none"
+    auto: str = "ask"
+    test_output_cap: int | None = None
+    parallel_tool_calls: bool = False
+    no_narration: bool = False
+    delegate_test_writer: bool = False
     auto_max_rounds: int = 4
     auto_review: bool = True
     auto_review_cycles: int = 2
@@ -355,8 +395,18 @@ def _loop_settings(loop: Mapping[str, Any]) -> LoopSettings:
         if isinstance(table, Mapping)
     }
     review = _table(loop, "review")
+    auto = loop.get("auto", "ask")
+    if auto not in ("ask", "always", "never"):
+        raise ConfigError("[loop].auto must be 'ask', 'always' or 'never'")
     return LoopSettings(
         fallback=_str(loop, "fallback", "none") or "none",
+        auto=auto,
+        test_output_cap=_positive_int_knob(
+            loop, "test_output_cap", "[loop].test_output_cap"
+        ),
+        parallel_tool_calls=_knob_bool(loop, "parallel_tool_calls"),
+        no_narration=_knob_bool(loop, "no_narration"),
+        delegate_test_writer=_knob_bool(loop, "delegate_test_writer"),
         auto_max_rounds=int(_int(loop, "auto_max_rounds", 4)),
         auto_review=_bool(loop, "auto_review", True),
         auto_review_cycles=int(_int(loop, "auto_review_cycles", 2)),
@@ -538,16 +588,18 @@ class Settings:
                     }
                 ]
             }
+        env = {
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(cfg.compact_window),
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "API_TIMEOUT_MS": "3000000",
+        }
+        if cfg.extra.get("auth") != "login":
+            env["ANTHROPIC_BASE_URL"] = adapter.child_base_url(cfg) or ""
         payload = {
-            "env": {
-                "ANTHROPIC_BASE_URL": adapter.child_base_url(cfg) or "",
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(cfg.compact_window),
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                "API_TIMEOUT_MS": "3000000",
-            },
+            "env": env,
             "hooks": hooks,
             "autoCompactWindow": cfg.compact_window,
         }
@@ -567,11 +619,9 @@ class Settings:
         # Start from the runtime allowlist; provider credentials are added only
         # below after mapping the selected provider's key to Claude's name.
         env = self.base_child_env()
-        key = cfg.api_key() or ""
+        login = cfg.extra.get("auth") == "login"
+        key = "" if login else (cfg.api_key() or "")
         env.update({
-            "CLAUDE_CONFIG_DIR": str(self.agent_home(agent_id)),
-            "ANTHROPIC_BASE_URL": adapter.child_base_url(cfg) or "",
-            "ANTHROPIC_AUTH_TOKEN": key,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
@@ -585,6 +635,24 @@ class Settings:
             "SUBAGENT_APPROVAL_SOCKET": self.approval_socket,
             "SUBAGENT_HOOK_TIMEOUT": str(self.supervisor_timeout + 20),
         })
+        if login:
+            parent_config = os.environ.get("CLAUDE_CONFIG_DIR")
+            config_dir = (
+                Path(parent_config).expanduser()
+                if parent_config
+                else Path.home() / ".claude"
+            )
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir.resolve())
+            env.pop("ANTHROPIC_BASE_URL", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        else:
+            env.update({
+                "CLAUDE_CONFIG_DIR": str(self.agent_home(agent_id)),
+                "ANTHROPIC_BASE_URL": adapter.child_base_url(cfg) or "",
+                "ANTHROPIC_AUTH_TOKEN": key,
+            })
         return env
 
     def workspace_refusal(self, workspace: Path) -> str | None:
@@ -636,6 +704,11 @@ def _validate(settings: Settings, loop: LoopSettings) -> None:
             )
     if settings.supervisor == "agent" and not (settings.supervisor_cmd or "").strip():
         raise ConfigError('[guard].supervisor = "agent" needs [guard].supervisor_cmd')
+    if loop.delegate_test_writer and (not loop.test_writer.provider or not loop.review_tests):
+        raise ConfigError(
+            "[loop].delegate_test_writer requires [loop.test_writer].provider and "
+            "[loop].review_tests = true"
+        )
 
 
 def _loop_targets(loop: LoopSettings) -> list[tuple[str, LoopTarget]]:
@@ -662,7 +735,9 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
 
     defaults = {
         "max_agents": _int(core, "max_agents", 4),
-        "compact_window": _int(core, "compact_window", 1_000_000),
+        "compact_window": _positive_int_knob(
+            core, "compact_window", "[core].compact_window", 1_000_000
+        ),
         "max_steps": _int(core, "max_steps", 40),
         "run_timeout": _num(core, "run_timeout", 1800.0),
         "idle_timeout": _num(core, "idle_timeout", 900.0),
@@ -674,7 +749,9 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
             raise ConfigError(f"[providers.{name}] must be a table")
         cfg = _provider(str(name), table, defaults)
         providers[cfg.name] = cfg
-        if cfg.api_key_envs:
+        if cfg.extra.get("auth") == "login":
+            pass
+        elif cfg.api_key_envs:
             if not cfg.api_key():
                 warnings.append(
                     f"provider {cfg.name}: no API key in this server's environment; "

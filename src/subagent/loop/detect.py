@@ -6,7 +6,7 @@ import re
 import subprocess
 import time
 
-from .common import STATE_DIR, read_json, tail
+from .common import STATE_DIR, read_json
 
 JS_TEST_GLOBS = [
     "**/*.test.*",
@@ -229,7 +229,7 @@ def parse_test_counts(output):
     return None
 
 
-def run_tests(root, test_cmd, log_dir=None, label="test"):
+def run_tests(root, test_cmd, log_dir=None, label="test", test_output_cap=None):
     """Run the test command; returns {passed, exit_code, cmd, counts, output_tail?, log?}."""
     env = {**os.environ, "CI": "1"}  # keeps vitest/jest out of watch mode
     proc = subprocess.run(
@@ -250,8 +250,15 @@ def run_tests(root, test_cmd, log_dir=None, label="test"):
         log.write_text(proc.stdout)
         result["log"] = str(log.relative_to(root))
     if proc.returncode != 0:
-        result["output_tail"] = tail(proc.stdout)
+        result["output_tail"] = feedback_output(proc.stdout, test_output_cap)
     return result
+
+
+def feedback_output(output, cap=None):
+    """The worker feedback tail, capped by characters when configured."""
+    if type(cap) is int and cap > 0:
+        return output[-cap:]
+    return "\n".join(output.splitlines()[-30:])
 
 
 # ---------------------------------------------------------------- test config fragments

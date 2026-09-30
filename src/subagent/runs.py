@@ -23,6 +23,8 @@ from typing import Any
 
 from . import adapter, health, providers, router
 from .config import APPROVAL_HOOK, Settings, log
+from .goal import Goal
+from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import protect
 from .lane_state import LaneState
 from .providers.base import ProviderConfig, Session
@@ -37,8 +39,10 @@ from .providers.claude import (  # noqa: F401
 )
 from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
+from .secrets import redact_secrets
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
+from .telemetry.source_usage import INPUT_SOURCES, make_source_usage
 from .telemetry.trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
 
@@ -277,6 +281,39 @@ def _max_fields(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
     return {key: max(a.get(key, 0), b.get(key, 0)) for key in _USAGE_KEYS}
 
 
+def _tool_result_text_chars(event: dict[str, Any]) -> tuple[int, bool]:
+    """Count text in normalized tool-result events, or flag an unknown shape."""
+    try:
+        return _tool_result_text_chars_unchecked(event)
+    except Exception:  # noqa: BLE001 - malformed source events are unmeasured
+        return 0, False
+
+
+def _tool_result_text_chars_unchecked(event: dict[str, Any]) -> tuple[int, bool]:
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return 0, content in (None, "")
+    chars = 0
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        value = block.get("content")
+        if isinstance(value, str):
+            chars += len(value)
+        elif isinstance(value, list):
+            for part in value:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        chars += len(text)
+                    else:
+                        return chars, False
+        elif value is not None:
+            return chars, False
+    return chars, True
+
+
 class _Meter:
     """Token and timing accounting for one attempt, fed every event as it arrives.
 
@@ -311,6 +348,8 @@ class _Meter:
         # own message_delta (which carries its usage and stop_reason), and
         # that delta still belongs to the message that started the stream.
         self._stream: str | None = None
+        self._pending_tool_result_chars = 0
+        self._pending_source_unmeasured: set[str] = set()
 
     def _turn(self, message_id: Any, now: float, model: Any = None) -> dict[str, Any]:
         key = str(message_id) if message_id else (self._current or f"attempt-{self.attempt}")
@@ -326,7 +365,11 @@ class _Meter:
                 "tool_calls": [],
                 "tool_ids": set(),
                 "stop_reason": None,
+                "source_tool_result_chars": self._pending_tool_result_chars,
+                "source_unmeasured": set(self._pending_source_unmeasured),
             }
+            self._pending_tool_result_chars = 0
+            self._pending_source_unmeasured.clear()
             self.turns[key] = turn
         if isinstance(model, str) and model:
             turn["model"] = model
@@ -393,6 +436,16 @@ class _Meter:
             return
         if kind == "user":
             # A tool result: the next message's request goes out now.
+            chars, observed = _tool_result_text_chars(event)
+            target = self.turns.get(self._current) if self._current is not None else None
+            if target is None:
+                self._pending_tool_result_chars += chars
+                if not observed:
+                    self._pending_source_unmeasured.add("tool_results")
+            else:
+                target["source_tool_result_chars"] += chars
+                if not observed:
+                    target["source_unmeasured"].add("tool_results")
             self._mark = now
             self._current = None
             return
@@ -421,6 +474,9 @@ class _Meter:
             and not any(any(t["usage"].values()) for t in turns)
         ):
             turns[-1]["usage"] = dict(self.result_usage)
+        if turns and self._pending_tool_result_chars:
+            turns[-1]["source_tool_result_chars"] += self._pending_tool_result_chars
+            turns[-1]["source_unmeasured"].update(self._pending_source_unmeasured)
         out = []
         for turn in turns:
             out.append({
@@ -433,6 +489,8 @@ class _Meter:
                 **turn["usage"],
                 "tool_calls": list(turn["tool_calls"]),
                 "stop_reason": turn["stop_reason"],
+                "_source_tool_result_chars": turn["source_tool_result_chars"],
+                "_source_unmeasured": list(turn["source_unmeasured"]),
             })
         return out
 
@@ -449,6 +507,8 @@ class Run:
     verification: str | None = None
     # Where `verification` came from, when the caller did not pass it.
     verification_note: str | None = None
+    goal: Goal | None = None
+    uat: list[dict[str, Any]] | None = None
     state: str = WORKING
     phase: str = PHASE_QUEUED
     created_at: float = field(default_factory=_now)
@@ -502,12 +562,17 @@ class Run:
     # Caller hooks: `pre_verify()` runs in a finally before verification (the
     # loop's test-guard release) and also on cancel/timeout; its return
     # (`violations`, `changed_files`) lands in `pre_verify_result`. `on_event`
-    # overrides the agent-level watcher for this run only.
+    # overrides the agent-level watcher for this run only. `pre_run()` runs
+    # immediately before routing or continuing the child turn.
+    pre_run: Callable[[], None] | None = None
     pre_verify: Callable[[], dict] | None = None
     on_event: Callable[[dict[str, Any]], None] | None = None
     pre_verify_result: dict | None = None
     # Guard denials the supervisor recorded for this run (the loop drains them).
     guard_verdicts: list[dict[str, Any]] = field(default_factory=list)
+    # Known lengths for source-tagged prompt text; absent metadata means the
+    # entire submitted prompt is treated as harness text.
+    source_chars: dict[str, int] | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -541,6 +606,8 @@ class Run:
             out["verification"] = self.verification_result.as_dict()
         if self.verification_note:
             out["verification_note"] = self.verification_note
+        if self.goal is not None:
+            out["uat"] = self.uat or []
         if self.hops:
             out["hops"] = list(self.hops)
         if self.cold_load:
@@ -580,6 +647,8 @@ class Agent:
         provider_load: Callable[[str, Agent], int] | None = None,
         telemetry: Telemetry | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        goal: Goal | None = None,
+        goal_reviewer: GoalReviewer | None = None,
     ):
         self.trace = trace
         self.telemetry = telemetry
@@ -599,6 +668,8 @@ class Agent:
         self._provider_load = provider_load
         # Called for every parsed event of every turn, as it arrives.
         self.on_event = on_event
+        self.goal = goal
+        self.goal_reviewer = goal_reviewer
         # Guard context carries configured child-secret names even before the
         # loop adds its protected tests and state allowlist.
         self.guard_context: dict[str, Any] = {
@@ -653,9 +724,11 @@ class Agent:
         note: str | None = None,
         route: bool = False,
         parent: dict[str, Any] | None = None,
+        pre_run: Callable[[], None] | None = None,
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
+        source_chars: dict[str, int] | None = None,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -663,8 +736,15 @@ class Agent:
             run_id=f"run-{uuid.uuid4().hex[:12]}",
             agent_id=self.agent_id,
             prompt=prompt,
+            source_chars=(
+                dict(source_chars)
+                if source_chars is not None
+                else {"harness_prompt": len(prompt), "plan": 0, "test_output": 0}
+            ),
             verification=verification,
             verification_note=note,
+            goal=self.goal,
+            uat=pending_uat(self.goal) if self.goal is not None else None,
             lane=self.cfg.name,
             fallback=self.fallback,
             provider=self.cfg.vendor,
@@ -672,6 +752,7 @@ class Agent:
             guard=self.driver.guard(self.settings, self.cfg),
             route=route,
             parent=parent or None,
+            pre_run=pre_run,
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
@@ -690,23 +771,33 @@ class Agent:
         prompt: str,
         verification: str,
         parent: dict[str, Any] | None = None,
+        pre_run: Callable[[], None] | None = None,
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
+        goal: Goal | None = None,
+        reviewer: GoalReviewer | None = None,
+        source_chars: dict[str, int] | None = None,
     ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
         This run walks the lane chain; continues stay on the lane it ran on.
         """
         self.delegate_verification = verification
+        if goal is not None:
+            self.goal = goal
+        if reviewer is not None:
+            self.goal_reviewer = reviewer
         return self.submit(
             prompt,
             verification=verification,
             route=True,
             parent=parent,
+            pre_run=pre_run,
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
+            source_chars=source_chars,
         )
 
     def follow_up(
@@ -714,9 +805,11 @@ class Agent:
         message: str,
         verification: str | None = None,
         parent: dict[str, Any] | None = None,
+        pre_run: Callable[[], None] | None = None,
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
+        source_chars: dict[str, int] | None = None,
     ) -> Run:
         """A continue. Omitting `verification` reuses the delegate's; "" skips it.
 
@@ -735,9 +828,11 @@ class Agent:
                     f"`{_clip(self.delegate_verification, 200)}`. Pass "
                     'verification="" to skip it.'
                 ),
+                pre_run=pre_run,
                 pre_verify=pre_verify,
                 on_event=on_event,
                 distill=distill,
+                source_chars=source_chars,
             )
         if verification is not None and not verification.strip():
             return self.submit(
@@ -745,17 +840,21 @@ class Agent:
                 verification=None,
                 parent=parent,
                 note='verification="" given: skipped, so this run reports completed_unverified',
+                pre_run=pre_run,
                 pre_verify=pre_verify,
                 on_event=on_event,
                 distill=distill,
+                source_chars=source_chars,
             )
         return self.submit(
             message,
             verification=verification,
             parent=parent,
+            pre_run=pre_run,
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
+            source_chars=source_chars,
         )
 
     def get_run(self, run_id: str) -> Run | None:
@@ -819,7 +918,9 @@ class Agent:
                 error, session = driver.boot(self.settings, self.agent_id, cfg)
             except NotImplementedError as exc:
                 error, session = str(exc), Session(provider=cfg.name)
-            self._booted[cfg.name] = error
+            self._booted[cfg.name] = (
+                redact_secrets(error, self.settings.leaked_keys) if error else None
+            )
             self._sessions[cfg.name] = session
         return self._booted[cfg.name]
 
@@ -846,8 +947,11 @@ class Agent:
                 self._execute(run)
             except Exception as exc:  # noqa: BLE001
                 log.warning("run %s crashed", run.run_id, exc_info=True)
+                self._run_pre_verify(run)
                 run.state = FAILED
-                run.error = f"{type(exc).__name__}: {exc}"
+                run.error = redact_secrets(
+                    f"{type(exc).__name__}: {exc}", self.settings.leaked_keys
+                )
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
                 run.done.set()
@@ -866,16 +970,24 @@ class Agent:
         run.deadline = run.started_at + self.cfg.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
+        if run.pre_run is not None:
+            run.pre_run()
         if run.route:
             if not self._route(run):
+                self._run_pre_verify(run)
                 self._finish(run)
                 return
         else:
-            if self.driver.needs_api_key and not self.cfg.api_key():
+            if (
+                self.driver.needs_api_key
+                and self.cfg.extra.get("auth") != "login"
+                and not self.cfg.api_key()
+            ):
                 run.state = FAILED
                 run.error = self._missing_key(self.cfg)
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
+                self._run_pre_verify(run)
                 run.done.set()
                 return
             self._turn(run, run.prompt, resume=self.session_id)
@@ -897,6 +1009,16 @@ class Agent:
             budget=remaining,
         )
 
+        if run.goal is not None:
+            remaining = (run.deadline - _now()) if run.deadline else None
+            run.uat = evaluate_goal(
+                run.goal,
+                self.workspace,
+                self.settings,
+                reviewer=self.goal_reviewer,
+                budget=remaining,
+            )
+
         if run.distill and len(run.final_response) > self.settings.result_cap_chars:
             run.phase = PHASE_DISTILLING
             distilled = self._distill(run)
@@ -912,7 +1034,19 @@ class Agent:
         if run.trip:
             self._finish(run)
             return
-        if run.verification_result.passed:
+        goal_failed = any(
+            row["kind"] == "command" and row["passed"] is not True
+            for row in (run.uat or [])
+        )
+        goal_changed = bool(
+            run.goal is not None
+            and run.goal.path
+            and any(
+                row.get("file") == run.goal.path
+                for row in (run.pre_verify_result or {}).get("violations", [])
+            )
+        )
+        if run.verification_result.passed and not goal_failed and not goal_changed:
             run.state = COMPLETED
         else:
             run.state = COMPLETED_UNVERIFIED
@@ -937,6 +1071,8 @@ class Agent:
         return f"missing API key for provider {cfg.name!r}: set one of {names}"
 
     def _hop(self, run: Run, hop: router.Hop) -> None:
+        if hop.message:
+            hop.message = redact_secrets(hop.message, self.settings.leaked_keys)
         run.hops.append(hop.as_dict())
         run.note(f"hop {hop.index}: {hop.lane} {hop.outcome}"
                  + (f" ({hop.code})" if hop.code else ""))
@@ -966,7 +1102,12 @@ class Agent:
             hop = router.Hop(index, cfg.name, cfg.vendor, model, router.HOP_UNAVAILABLE,
                              driver=driver.name, guard=driver.guard(self.settings, cfg))
             reason = cfg.unavailable()
-            if reason is None and driver.needs_api_key and not cfg.api_key():
+            if (
+                reason is None
+                and driver.needs_api_key
+                and cfg.extra.get("auth") != "login"
+                and not cfg.api_key()
+            ):
                 reason = self._missing_key(cfg)
             if (
                 reason is None
@@ -1055,7 +1196,8 @@ class Agent:
                 return True
             hop.outcome = router.HOP_REFUSED
             hop.code = refusal.code
-            hop.message = refusal.message
+            message = redact_secrets(refusal.message, self.settings.leaked_keys)
+            hop.message = message
             hop.reset_at = refusal.reset_at
             until = router.close_until(
                 refusal,
@@ -1063,10 +1205,10 @@ class Agent:
                 throttle_close_minutes=self.settings.throttle_close_minutes,
             )
             if until is not None and self.lane_state is not None:
-                self.lane_state.close(cfg.name, until, refusal.code, refusal.message)
+                self.lane_state.close(cfg.name, until, refusal.code, message)
                 hop.closed_until = until
             self._hop(run, hop)
-            last_refusal = refusal.message
+            last_refusal = message
         if self._closing:
             return False
         tried = "; ".join(
@@ -1229,6 +1371,29 @@ class Agent:
         if run.ttft_seconds is None and meter.first_assistant is not None:
             run.ttft_seconds = round(meter.first_assistant - meter.spawned_at, 3)
         for turn in meter.records():
+            try:
+                tool_result_chars = turn.pop("_source_tool_result_chars", 0)
+                source_unknown = set(turn.pop("_source_unmeasured", ()))
+                if self.driver.name == "codex":
+                    source_unknown.add("tool_results")
+                source_chars = dict(run.source_chars or {})
+                source_chars["tool_results"] = tool_result_chars
+                source_usage, unmeasured = make_source_usage(
+                    source_chars,
+                    output_tokens=turn["output"],
+                    reasoning_tokens=turn["reasoning"],
+                    chars_per_token=self.settings.chars_per_token,
+                    unmeasured=tuple(source_unknown),
+                )
+            except Exception:  # noqa: BLE001 - source accounting cannot fail the worker
+                turn.pop("_source_tool_result_chars", None)
+                turn.pop("_source_unmeasured", None)
+                source_usage, unmeasured = make_source_usage(
+                    None,
+                    output_tokens=turn.get("output", 0),
+                    reasoning_tokens=turn.get("reasoning", 0),
+                    unmeasured=INPUT_SOURCES,
+                )
             record = {
                 "run_id": run.run_id,
                 "agent_id": self.agent_id,
@@ -1237,6 +1402,8 @@ class Agent:
                 "turn": len(run.turn_log),
                 **turn,
                 "model": turn["model"] or self.model,
+                "source_usage": source_usage,
+                "unmeasured": unmeasured,
             }
             run.turn_log.append(record)
             if self.trace is not None:
@@ -1350,6 +1517,10 @@ class Agent:
             run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
             run.error = reason
             run.finish_reason = kind
+        if run.error:
+            run.error = redact_secrets(run.error, self.settings.leaked_keys)
+        if run.error_detail:
+            run.error_detail = redact_secrets(run.error_detail, self.settings.leaked_keys)
         run.phase = PHASE_DONE
         run.finished_at = _now()
         try:
@@ -1495,6 +1666,8 @@ class Registry:
         fallback: str = "full",
         on_event: Callable[[dict[str, Any]], None] | None = None,
         agent_id: str | None = None,
+        goal: Goal | None = None,
+        goal_reviewer: GoalReviewer | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -1529,6 +1702,8 @@ class Registry:
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,
+                goal=goal,
+                goal_reviewer=goal_reviewer,
             )
             self._agents[claimed] = agent
             return agent

@@ -223,3 +223,9 @@ UAT at close (against the goal file only):
 | 9 | PASS: omlx proxy log `forbidden fields sent: none` (only `preserve_thinking` sent) |
 | 10 | PASS: `uv tool list` shows `subagent` editable from this checkout; config `default_provider = "codex"`; `grep -c '^SAM_'` on the env file is 0 |
 | 11 | PASS: this entry, S24, active-work State, CLAUDE.md Subagent lanes |
+
+## 2026-09-30 — Unit A1 run/wait accounting and bench fixes
+
+- Fixed the live-run refusal message and background-child identity check; the delegate skill now directs a `running` result to `subagent wait`.
+- Cell configs now live at `.subagent/config.toml`, so the project loader selects the cell session root even when a tool shell does not preserve `SUBAGENT_CONFIG`. Claude `modelUsage` now accepts direct camelCase token fields, and hidden-test destinations created by the worker are moved aside before trusted tests are copied in.
+- Verification: the four requested focused pytest selections pass; full suite is 873 passed, 1 skipped, 19 subtests; `uv run ruff check src tests` passes. Details and exact command output: [v2-a1-report.md](../v2-a1-report.md).

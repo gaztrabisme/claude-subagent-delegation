@@ -1463,10 +1463,15 @@ def _child_argv(argv):
 
 def cmd_run(root, server, args, raw):
     active = _active_run(root)
-    if active and active["run_id"] != args.run_id:
+    is_background_child = (
+        active is not None
+        and active["run_id"] == args.run_id
+        and active["pid"] == os.getpid()
+    )
+    if active and not is_background_child:
         return {
             "status": "busy",
-            "error": f"run {active['run_id']} is still in progress; use `wait`",
+            "error": f"run {active['run_id']} is still in progress; use `subagent wait`",
         }, 2
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     state = state_dir(root)

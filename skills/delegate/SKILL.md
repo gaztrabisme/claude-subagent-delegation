@@ -1,6 +1,6 @@
 ---
 name: delegate
-description: Delegate implementation work to a cheaper coding agent to save Claude tokens. Claude writes the plan and the tests, the worker implements on a configured provider (Codex, Copilot, GLM, DeepSeek, Grok, Gemini, or a local model), and Claude verifies by running the tests. Use when the user says /delegate or asks to hand implementation off to a subagent.
+description: Delegate implementation work to a cheaper coding agent for tasks expected to span about 200 or more lines, touch three or more files, or involve non-trivial branching, I/O, parsing, state, or security behavior. Use when the user says /delegate or asks to hand implementation off to a subagent; check loop.auto in subagent doctor --json to decide whether to ask, delegate, or keep work with the orchestrator.
 ---
 
 # Delegate implementation to a worker agent
@@ -17,6 +17,22 @@ a plain command with literal arguments. No `$(...)`, no `VAR=value cmd` prefixes
 **Feedback always goes through a file**: write it with your file-writing tool to
 `.subagent/feedback.md` (overwrite each time), then pass `--feedback-file .subagent/feedback.md`.
 Never put test output or other free text in a quoted command-line argument.
+
+## Trigger and loop.auto
+
+Recognize a task for this workflow when it is expected to span about 200 or more lines, touch
+three or more files, or involve non-trivial branching, I/O, parsing, state, or security behavior.
+Before starting the workflow for a matching task, run `DELEGATE doctor --json` and read its
+`loop_auto` field:
+
+- `ask`: request the user's approval before delegating. A direct `/delegate` request is explicit
+  approval to start the delegation workflow.
+- `always`: enter the existing workflow without an extra approval prompt.
+- `never`: keep the work with the orchestrator and do not start a worker.
+
+If the command fails, its output is not valid JSON, `loop_auto` is missing, or its value is not
+`ask`, `always`, or `never`, report a configuration error and stop before delegation. Never infer
+`always` from missing or malformed output.
 
 ## Workflow
 

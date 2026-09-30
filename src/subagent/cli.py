@@ -144,114 +144,6 @@ def _needed_exports(settings: Settings) -> list[str]:
     return lines
 
 
-def _write_config(data: Mapping[str, Any], dest: Path, force: bool) -> Settings:
-    if dest.exists() and not force:
-        raise ConfigError(
-            f"{dest} already exists; use --force to overwrite, or --path to choose another file"
-        )
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(_render_toml(data), encoding="utf-8")
-    return config.load(extra=dest)
-
-
-def _write_example(src: Path, dest: Path, force: bool) -> Settings:
-    if dest.exists() and not force:
-        raise ConfigError(
-            f"{dest} already exists; use --force to overwrite, or --path to choose another file"
-        )
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    return config.load(extra=dest)
-
-
-def _report_written(settings: Settings, dest: Path) -> None:
-    print(f"wrote {dest}")
-    for line in _needed_exports(settings):
-        print(line)
-
-
-def _wizard(seed: dict[str, Any] | None, args: argparse.Namespace) -> int:
-    """Ask which examples to merge, which providers to keep, and write them."""
-    names = _example_names()
-    if seed is None:
-        print("examples:", ", ".join(names))
-        choice = input("pick one or more examples (comma-separated) [full]: ").strip() or "full"
-        chosen = [n.strip() for n in choice.split(",") if n.strip()]
-        merged: dict[str, Any] = {}
-        for name in chosen:
-            if name not in names:
-                print(f"error: unknown example {name!r}", file=sys.stderr)
-                return 2
-            merged = _merge_dict(merged, _load_example(name))
-    else:
-        merged = dict(seed)
-
-    providers = merged.get("providers") or {}
-    if not isinstance(providers, dict):
-        providers = {}
-    keep = input(f"provider names to keep [{', '.join(providers)}]: ").strip()
-    if keep:
-        wanted = [n.strip() for n in keep.split(",") if n.strip()]
-        providers = {n: providers[n] for n in wanted if n in providers}
-
-    # Ask which env var holds each key -- never the value.
-    for name, table in list(providers.items()):
-        if not isinstance(table, dict):
-            continue
-        envs = table.get("api_key_env")
-        if isinstance(envs, str):
-            envs = [envs]
-        envs = [e for e in (envs or []) if isinstance(e, str)]
-        if not envs:
-            continue
-        answer = input(f"key for provider {name!r} [{envs[0]}]: ").strip()
-        if answer:
-            table["api_key_env"] = answer
-        elif isinstance(table.get("api_key_env"), list):
-            table["api_key_env"] = envs[0]
-
-    default = next(iter(providers), "")
-    if providers:
-        answer = input(f"default_provider [{default}]: ").strip()
-        default = answer or default
-    merged["providers"] = providers
-    merged.setdefault("core", {})
-    merged["core"]["default_provider"] = default
-
-    dest = _dest_path(args.path)
-    settings = _write_config(merged, dest, args.force)
-    _report_written(settings, dest)
-    return 0
-
-
-def cmd_init(args: argparse.Namespace) -> int:
-    try:
-        if args.from_example:
-            src = _example_path(args.from_example)
-            if not src.is_file():
-                print(
-                    f"unknown example {args.from_example!r}; "
-                    f"examples: {', '.join(_example_names()) or '(none)'}",
-                    file=sys.stderr,
-                )
-                return 2
-            if args.yes:
-                dest = _dest_path(args.path)
-                settings = _write_example(src, dest, args.force)
-                _report_written(settings, dest)
-                return 0
-            return _wizard(tomllib.loads(src.read_text(encoding="utf-8")), args)
-
-        if args.yes:
-            print("--yes needs --from <example-name>", file=sys.stderr)
-            return 2
-
-        return _wizard(None, args)
-    except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-
 # --- doctor ---------------------------------------------------------------------
 
 
@@ -322,6 +214,13 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         "api_key_envs": _key_envs(cfg),
     }
     warning = _thinking_warning(cfg)
+    if cfg.extra.get("auth") == "login":
+        login_warning = (
+            f"warning: provider {cfg.name!r} uses the owner's Claude login and plan quota; "
+            "worker sessions are written into the owner's Claude history, and the owner's "
+            "global instructions, commands and skills may load"
+        )
+        warning = f"{warning}\n{login_warning}" if warning else login_warning
     if warning:
         row["warning"] = warning
     if not args.no_probe:
@@ -656,8 +555,6 @@ def main(argv: list[str] | None = None) -> int:
 
         return report_main(raw[1:])
     args = _parser().parse_args(raw)
-    if args.command == "init":
-        return cmd_init(args)
     if args.command == "doctor":
         return cmd_doctor(args)
     handler = getattr(args, "command_handler", None)

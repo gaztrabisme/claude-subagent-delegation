@@ -2,32 +2,10 @@
 
 from __future__ import annotations
 
-import argparse
-import importlib
 from pathlib import Path
-
-import pytest
 
 from subagent import config
 from subagent.cli import main
-
-
-@pytest.mark.parametrize(
-    "module_name",
-    [
-        "subagent.commands.init",
-    ],
-)
-def test_command_registration_stubs_are_importable_and_exit_two(
-    module_name: str, capsys
-) -> None:
-    module = importlib.import_module(module_name)
-
-    assert module.run(argparse.Namespace()) == 2
-    captured = capsys.readouterr()
-    lines = (captured.out + captured.err).strip().splitlines()
-    assert len(lines) == 1
-    assert "not implemented" in lines[0].lower()
 
 
 def test_command_registration_routes_cli_to_install(

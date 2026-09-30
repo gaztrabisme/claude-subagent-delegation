@@ -9,6 +9,7 @@ orchestrator runs under Codex's sandbox.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,34 @@ def test_run_wait_review_still_start_the_server(
     assert main(["--root", str(root), "wait", "--timeout", "0"]) == 2
     assert stub_server == ["start", "stop"]  # started, and stopped on the way out
     assert json.loads(capsys.readouterr().out)["status"] == "no_run"
+
+
+def test_run_refuses_live_run_and_points_to_subagent_wait(
+        tmp_path, monkeypatch, capsys, home, stub_server):
+    root = _project(tmp_path)
+    monkeypatch.setenv(config.CONFIG_ENV, str(_agent_config(tmp_path)))
+    plan = tmp_path / "plan.md"
+    plan.write_text("Implement the task.\n", encoding="utf-8")
+    state = root / ".subagent"
+    (state / "runs").mkdir(parents=True)
+    live_id = "live-run-123"
+    (state / "current.json").write_text(
+        json.dumps({"run_id": live_id, "pid": os.getpid(), "started": 1}),
+        encoding="utf-8",
+    )
+
+    def no_new_process(*args, **kwargs):
+        pytest.fail("a second run was spawned while the first run was live")
+
+    monkeypatch.setattr("subagent.loop.loop.subprocess.Popen", no_new_process)
+    code = main(["--root", str(root), "run", "--plan", str(plan), "--wait", "540"])
+
+    captured = capsys.readouterr()
+    assert code != 0
+    assert json.loads(captured.out) == {
+        "status": "busy",
+        "error": f"run {live_id} is still in progress; use `subagent wait`",
+    }
 
 
 def test_the_read_only_handlers_still_see_the_settings(

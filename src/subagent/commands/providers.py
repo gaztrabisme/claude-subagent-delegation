@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import tomllib
 from collections.abc import Mapping
@@ -48,12 +49,181 @@ def _target_data(path: Path) -> dict[str, Any]:
         raise ConfigError(f"{path}: {exc}") from exc
 
 
-def _write_target(path: Path, data: Mapping[str, Any]) -> None:
+def _table_path(line: str) -> tuple[str, ...] | None:
+    if not line.lstrip().startswith("["):
+        return None
+    try:
+        document = tomllib.loads(line)
+    except tomllib.TOMLDecodeError:
+        return None
+
+    def empty_table(value: Any, prefix: tuple[str, ...] = ()) -> tuple[str, ...] | None:
+        if isinstance(value, dict):
+            if not value:
+                return prefix
+            for key, item in value.items():
+                found = empty_table(item, (*prefix, str(key)))
+                if found is not None:
+                    return found
+        elif isinstance(value, list) and value and isinstance(value[0], dict):
+            return empty_table(value[0], prefix)
+        return None
+
+    return empty_table(document)
+
+
+def _comment_suffix(line: str, quote: str | None) -> tuple[str | None, str | None]:
+    index = 0
+    while index < len(line):
+        if quote:
+            if len(quote) == 3 and line.startswith(quote, index):
+                quote = None
+                index += 3
+                continue
+            if len(quote) == 1 and line[index] == quote:
+                quote = None
+            elif quote[0] == '"' and line[index] == "\\":
+                index += 2
+                continue
+            index += 1
+            continue
+        if line[index] == "#":
+            return line[index:], quote
+        if line[index] in ('"', "'"):
+            quote = line[index] * (3 if line.startswith(line[index] * 3, index) else 1)
+            index += len(quote)
+            continue
+        index += 1
+    return None, quote
+
+
+def _assignment_path(expression: str) -> tuple[str, ...] | None:
+    try:
+        document = tomllib.loads(f"{expression}.__subagent_marker = true")
+    except tomllib.TOMLDecodeError:
+        return None
+
+    def marker_path(value: Any, prefix: tuple[str, ...] = ()) -> tuple[str, ...] | None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "__subagent_marker":
+                    return prefix
+                found = marker_path(item, (*prefix, str(key)))
+                if found is not None:
+                    return found
+        return None
+
+    return marker_path(document)
+
+
+def _with_separator(raw: str, addition: str) -> str:
+    if not raw:
+        return addition
+    if raw.endswith("\n\n") or raw.endswith("\r\n\r\n"):
+        return raw + addition
+    if raw.endswith(("\n", "\r")):
+        return raw + "\n" + addition
+    return raw + "\n\n" + addition
+
+
+def _write_text(path: Path, text: str) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_cli()._render_toml(data), encoding="utf-8")
-    except (OSError, ConfigError, TypeError, ValueError) as exc:
+        tomllib.loads(text)
+        path.write_text(text, encoding="utf-8")
+    except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"cannot write config {str(path)!r}: {exc}") from exc
+
+
+def _write_provider(path: Path, name: str, provider: Mapping[str, Any] | None) -> None:
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        tomllib.loads(raw)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+
+    lines = raw.splitlines(keepends=True)
+    kept: list[str] = []
+    comments: list[str] = []
+    active: tuple[str, ...] = ()
+    quote: str | None = None
+    for line in lines:
+        header = _table_path(line)
+        if header is not None:
+            active = header
+        remove = len(active) >= 2 and active[:2] == ("providers", name)
+        if not remove and active == ("providers",):
+            assignment = re.match(r"^\s*(.+?)\s*=", line)
+            key_path = _assignment_path(assignment.group(1)) if assignment else None
+            remove = bool(key_path and key_path[0] == name)
+        comment, quote = _comment_suffix(line, quote)
+        if remove:
+            if comment:
+                comments.append(comment)
+        else:
+            kept.append(line)
+
+    updated = "".join(kept)
+    comment_text = "".join(comments)
+    if provider is not None and comment_text and not comment_text.endswith(("\n", "\r")):
+        comment_text += "\n"
+    addition = comment_text
+    if provider is not None:
+        addition += _cli()._render_toml({"providers": {name: dict(provider)}})
+    if addition:
+        updated = _with_separator(updated, addition)
+    _write_text(path, updated)
+
+
+def _write_default_provider(path: Path, name: str) -> None:
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        document = tomllib.loads(raw)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+
+    lines = raw.splitlines(keepends=True)
+    core_header: int | None = None
+    active: tuple[str, ...] = ()
+    assignment_index: int | None = None
+    for index, line in enumerate(lines):
+        header = _table_path(line)
+        if header is not None:
+            active = header
+            if header == ("core",):
+                core_header = index
+            continue
+        if active == ("core",) and re.match(r"^\s*default_provider\s*=", line):
+            assignment_index = index
+
+    if core_header is None and isinstance(document.get("core"), Mapping):
+        raise ConfigError(f"cannot edit inline [core] table in {str(path)!r}")
+
+    rendered_value = json.dumps(name, ensure_ascii=False)
+    if assignment_index is not None:
+        line = lines[assignment_index]
+        newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        body = line[:-len(newline)] if newline else line
+        comment, _ = _comment_suffix(body, None)
+        comment_at = len(body) - len(comment) if comment else len(body)
+        comment = comment or ""
+        before = body[:comment_at]
+        prefix = re.match(r"^(\s*default_provider\s*=\s*)", before)
+        assert prefix is not None
+        tail = before[prefix.end():]
+        trailing_space = tail[len(tail.rstrip(" \t")):]
+        lines[assignment_index] = (
+            prefix.group(1) + rendered_value + trailing_space + comment + newline
+        )
+        updated = "".join(lines)
+    elif core_header is not None:
+        line_ending = "\r\n" if lines[core_header].endswith("\r\n") else "\n"
+        lines.insert(core_header + 1, f"default_provider = {rendered_value}{line_ending}")
+        updated = "".join(lines)
+    else:
+        section = f"[core]\ndefault_provider = {rendered_value}\n"
+        updated = _with_separator(raw, section)
+    _write_text(path, updated)
 
 
 def _tables(data: Mapping[str, Any], key: str) -> dict[str, Any]:
@@ -68,7 +238,15 @@ def _tables(data: Mapping[str, Any], key: str) -> dict[str, Any]:
 def _redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
-            key: "<redacted>" if key == "api_key" else _redact(item)
+            key: (
+                "<redacted>"
+                if str(key).casefold() not in {"api_key_env", "api_key_envs"}
+                and any(
+                    marker in str(key).casefold()
+                    for marker in ("key", "token", "secret", "password")
+                )
+                else _redact(item)
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -240,8 +418,6 @@ def _provider_add(args: argparse.Namespace, root: Path) -> int:
 
     path = _destination(args, root)
     try:
-        target = _target_data(path)
-        target_providers = _tables(target, "providers")
         effective = config.read_config(project_root=root)
         effective_providers = _tables(effective, "providers")
     except (ConfigError, OSError) as exc:
@@ -274,9 +450,7 @@ def _provider_add(args: argparse.Namespace, root: Path) -> int:
         assert provider is not None
 
     try:
-        target_providers[name] = provider
-        target["providers"] = target_providers
-        _write_target(path, target)
+        _write_provider(path, name, provider)
     except (ConfigError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -307,12 +481,7 @@ def _provider_remove(args: argparse.Namespace, root: Path) -> int:
         if args.name not in providers:
             print(f"error: provider {args.name!r} is not in {str(path)!r}", file=sys.stderr)
             return 1
-        del providers[args.name]
-        if providers:
-            data["providers"] = providers
-        else:
-            data.pop("providers", None)
-        _write_target(path, data)
+        _write_provider(path, args.name, None)
     except (ConfigError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -327,11 +496,7 @@ def _use(args: argparse.Namespace, root: Path) -> int:
             print(f"error: unknown provider {args.name!r}", file=sys.stderr)
             return 1
         path = _destination(args, root)
-        data = _target_data(path)
-        core = _tables(data, "core")
-        core["default_provider"] = args.name
-        data["core"] = core
-        _write_target(path, data)
+        _write_default_provider(path, args.name)
     except (ConfigError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

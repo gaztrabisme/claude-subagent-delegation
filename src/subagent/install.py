@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
 INSTALL_ROOT_ENV = "SUBAGENT_INSTALL_ROOT"
@@ -34,10 +36,9 @@ def resolve_target(target_dir: str | None, root: str | None) -> Path:
 
 
 def _source_skills() -> dict[str, str]:
-    source_root = Path(__file__).resolve().parents[2] / "skills"
     contents: dict[str, str] = {}
     for name in ("delegate", *PROMPT_NAMES):
-        path = source_root / name / "SKILL.md"
+        path = resources.files("subagent").joinpath("skills", name, "SKILL.md")
         try:
             contents[name] = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -247,7 +248,16 @@ def _toml_registration(path: Path, timeout: int | float, force: bool) -> str:
     )
     header = re.search(r"(?m)^\[mcp_servers\.subagent\]\s*(?:#.*)?\r?$", raw)
     if header:
-        next_header = re.search(r"(?m)^\[[^\]]+\]\s*(?:#.*)?\r?$", raw[header.end():])
+        next_header = None
+        for candidate in re.finditer(
+            r"(?m)^\[{1,2}[^\]\r\n]+\]{1,2}\s*(?:#.*)?\r?$",
+            raw[header.end():],
+        ):
+            table_name = candidate.group(0).split("#", 1)[0].strip().strip("[]")
+            if table_name.startswith("mcp_servers.subagent."):
+                continue
+            next_header = candidate
+            break
         end = header.end() + next_header.start() if next_header else len(raw)
         updated = raw[:header.start()] + section + raw[end:]
     elif "subagent" in servers:
@@ -287,8 +297,29 @@ def _cannot_write(path: Path, reason: OSError, written: list[Path]) -> InstallEr
     return InstallError(message)
 
 
-def _write(path: Path, content: str) -> None:
+def _ensure_no_symlinks(target: Path, path: Path) -> None:
+    try:
+        parts = path.relative_to(target).parts
+    except ValueError as exc:
+        raise InstallError(f"error: path '{path}' is outside install target '{target}'") from exc
+    current = target
+    for part in ("", *parts):
+        if part:
+            current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise InstallError(f"error: cannot inspect '{current}': {exc}") from exc
+        if stat.S_ISLNK(mode):
+            raise InstallError(f"error: file '{current}' is a symlink")
+
+
+def _write(target: Path, path: Path, content: str) -> None:
+    _ensure_no_symlinks(target, path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_no_symlinks(target, path)
     path.write_text(content, encoding="utf-8")
 
 
@@ -307,6 +338,9 @@ def install(
         else ".mcp.json"
     )
 
+    for path in (*files, registration):
+        _ensure_no_symlinks(target, path)
+
     if not force:
         for path in files:
             if path.exists():
@@ -320,12 +354,12 @@ def install(
     written: list[Path] = []
     for path, content in files.items():
         try:
-            _write(path, content)
+            _write(target, path, content)
         except OSError as exc:
             raise _cannot_write(path, exc, written) from exc
         written.append(path)
     try:
-        _write(registration, registration_content)
+        _write(target, registration, registration_content)
     except OSError as exc:
         raise _cannot_write(registration, exc, written) from exc
     written.append(registration)

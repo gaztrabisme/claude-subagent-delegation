@@ -72,6 +72,8 @@ def test_auth_login_is_opt_in(tmp_path: Path, monkeypatch) -> None:
     assert login.extra["auth"] == "login"
     assert login.api_key_envs == ()
     assert login.api_key_default is None
+    assert login.api_key() is None
+    assert login.as_dict()["auth"] == "login"
     assert login.as_dict()["has_api_key"] is False
     assert login.base_url is None
     assert login.unavailable() is None

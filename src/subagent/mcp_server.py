@@ -128,6 +128,32 @@ def _parent_context(ctx: Context | None) -> dict[str, Any] | None:
     return out or None
 
 
+def _goal_guard_hooks(agent):
+    """Create per-run hooks that lock and verify this agent's goal file."""
+    goal = getattr(agent, "goal", None)
+    if goal is None or not goal.path:
+        return None, None
+
+    from .loop.testguard import TestGuard
+
+    active = {}
+
+    def lock_goal():
+        guard = TestGuard(agent.workspace, (), protected_paths=(goal.path,))
+        guard.lock()
+        active["guard"] = guard
+        agent.guard_context["protected"] = list(guard.protected)
+
+    def release_goal():
+        guard = active.pop("guard", None)
+        if guard is None:
+            return {"violations": [], "changed_files": []}
+        violations, changed = guard.release()
+        return {"violations": violations, "changed_files": changed}
+
+    return lock_goal, release_goal
+
+
 async def _wait_for(run: Run, seconds: float, ctx: Context | None = None) -> None:
     """Block for up to `seconds`, reporting progress while we wait.
 
@@ -287,23 +313,18 @@ async def delegate(
     if start_error is not None:
         raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
     prompt = f"{instructions.strip()}\n\n---\n\n{task}" if instructions else task
-    goal_guard = None
-    if parsed_goal is not None and parsed_goal.path:
-        from .loop.testguard import TestGuard
-
-        goal_guard = TestGuard(resolved, (), protected_paths=(parsed_goal.path,))
-        goal_guard.lock()
-        agent.guard_context["protected"] = list(goal_guard.protected)
+    pre_run, pre_verify = _goal_guard_hooks(agent)
     try:
         run = agent.delegate(
             prompt,
             verification,
             parent=_parent_context(ctx),
-            pre_verify=goal_guard.release if goal_guard is not None else None,
+            pre_run=pre_run,
+            pre_verify=pre_verify,
         )
     except Exception:
-        if goal_guard is not None:
-            goal_guard.release()
+        if pre_verify is not None:
+            pre_verify()
         raise
     await _wait_for(run, wait_seconds, ctx)
     out = _result(run)
@@ -363,7 +384,14 @@ async def continue_agent(
     if ctx is not None:
         supervisor.bind(ctx.session)
     agent = registry.agent(agent_id)
-    run = agent.follow_up(message, verification, parent=_parent_context(ctx))
+    pre_run, pre_verify = _goal_guard_hooks(agent)
+    run = agent.follow_up(
+        message,
+        verification,
+        parent=_parent_context(ctx),
+        pre_run=pre_run,
+        pre_verify=pre_verify,
+    )
     await _wait_for(run, wait_seconds, ctx)
     return _result(run)
 

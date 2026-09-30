@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from subagent import config
 from subagent.config import LoopSettings, LoopTarget
@@ -88,6 +89,25 @@ class LiveLogFormatting(unittest.TestCase):
 
 
 class ResultShaping(unittest.TestCase):
+    def test_review_a_provider_error_text_redacts_configured_and_common_keys(self):
+        settings = SimpleNamespace(leaked_keys=("REVIEW_A_PROVIDER_KEY",))
+        fake_key = "sk-" + "a" * 24
+        run = SimpleNamespace(
+            error=("HTTP 401 invalid key unit-test-secret; Authorization: Bearer "
+                   f"bearer-value-123; {fake_key}"),
+            error_detail=None,
+            finish_reason="auth",
+            hops=[],
+        )
+        with patch.dict("os.environ", {"REVIEW_A_PROVIDER_KEY": "unit-test-secret"}):
+            error = delegate._provider_error(run, settings)
+
+        assert error == {
+            "message": "HTTP 401 invalid key [REDACTED]; Authorization: Bearer "
+                       "[REDACTED]; [REDACTED]",
+            "finish_reason": "auth",
+        }
+
     def test_provider_error_text_is_bounded(self):
         run = SimpleNamespace(error="e" * 600, error_detail=None, finish_reason="r" * 100, hops=[])
         error = delegate._provider_error(run)

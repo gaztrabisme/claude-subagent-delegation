@@ -174,6 +174,17 @@ def _move_hidden_destination(target: Path) -> None:
     target.rename(aside)
 
 
+def _run_hidden_suite(cmd, work):
+    return subprocess.run(
+        cmd, cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, errors="replace", timeout=300,
+    )
+
+
+def _text(value):
+    return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
+
+
 def run_hidden_tests(task, work):
     """Copy the hidden tests in (only now, after the agent finished) and run them."""
     hidden = BENCH / "tasks" / task / "hidden"
@@ -187,13 +198,26 @@ def run_hidden_tests(task, work):
         target = work / ".hidden"
         _move_hidden_destination(target)
         shutil.copytree(hidden, target)
-        cmd = ["node", "--test",
-               *sorted(str(p.relative_to(work)) for p in target.glob("*.test.js"))]
+        test_files = sorted(
+            str(p.relative_to(work))
+            for suffix in ("js", "cjs", "mjs")
+            for p in target.glob(f"*.test.{suffix}")
+        )
+        if not test_files:
+            return {"total": 0, "passed": 0}, "No hidden Node test files found.\n"
+        cmd = ["node", "--test", "--test-reporter=spec",
+               "--test-reporter-destination=stderr", *test_files]
     try:
-        output = sh(cmd, work, timeout=300).stdout
+        proc = _run_hidden_suite(cmd, work)
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + "\nTIMEOUT"
-    counts = parse_test_counts(output) or {"total": 0, "passed": 0}
+        output = _text(exc.stdout) + _text(exc.stderr) + "\nTIMEOUT"
+        return {"total": 0, "passed": 0}, output
+    output = proc.stdout + proc.stderr
+    # The runner writes its summary to stderr; imported worker code cannot
+    # inflate the counts by printing a fake summary to stdout.
+    counts = parse_test_counts(proc.stderr) or {"total": 0, "passed": 0}
+    if proc.returncode:
+        counts["passed"] = 0
     return counts, output
 
 

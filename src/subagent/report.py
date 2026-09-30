@@ -41,7 +41,7 @@ import math
 import sys
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +74,7 @@ class Report:
     lanes: list[dict[str, Any]]
     runs: int
     counterfactual: str | None
+    plan_price_notes: list[str] = field(default_factory=list)
 
 
 def _num(v: Any) -> float | None:
@@ -485,6 +486,13 @@ def build(traces: list[Path], since: dt.datetime | None, bench_run: str | None) 
     run_rows, delegation_records, aliases, cf_model = _priced_run_rows(settings, records)
     costs = price_delegations(delegation_records, run_rows)
     vendors = {name: cfg.vendor for name, cfg in settings.providers.items()}
+    used = {row["provider"] for row in run_rows}
+    plan_price_notes = [
+        f"{name}: plan usage, cash price unknown"
+        for name, spec in sorted(_specs(settings).items())
+        if name in used and spec.get("kind") == "flat_plan"
+        and _num(spec.get("monthly_usd")) is None
+    ]
     return Report(
         providers=_provider_rows(run_rows, delegation_records, vendors, aliases),
         delegations=[
@@ -494,6 +502,7 @@ def build(traces: list[Path], since: dt.datetime | None, bench_run: str | None) 
         lanes=lane_rows(run_rows),
         runs=len(run_rows),
         counterfactual=cf_model,
+        plan_price_notes=plan_price_notes,
     )
 
 
@@ -636,6 +645,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"counterfactual model: {report.counterfactual or 'unknown'}")
     print(f"runs: {report.runs}  delegations: {len(report.delegations)}")
     print_table(report.lanes)
+    for note in report.plan_price_notes:
+        print(note)
     print()
     _print_delegations(report.delegations)
 

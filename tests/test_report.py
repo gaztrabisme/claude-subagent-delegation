@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 from pathlib import Path
 
@@ -101,6 +102,17 @@ def test_provider_table(settings_env: None) -> None:
     assert omlx["wall_p50"] == pytest.approx(12.0)
     assert omlx["ttft_p50"] == pytest.approx(0.4)
     assert omlx["guard_denials"] == 0
+
+
+def test_report_review_b1_labels_flat_plan_without_monthly_price(
+    settings_env: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = Path(os.environ["SUBAGENT_CONFIG"])
+    config_path.write_text(CONFIG.replace("monthly_usd = 80\n", ""), encoding="utf-8")
+
+    assert report.main(["--trace", str(FIXTURE)]) == 0
+
+    assert "glm: plan usage, cash price unknown" in capsys.readouterr().out
 
 
 def test_delegation_table(settings_env: None) -> None:

@@ -224,7 +224,7 @@ UAT at close (against the goal file only):
 | 10 | PASS: `uv tool list` shows `subagent` editable from this checkout; config `default_provider = "codex"`; `grep -c '^SAM_'` on the env file is 0 |
 | 11 | PASS: this entry, S24, active-work State, CLAUDE.md Subagent lanes |
 
-## 2026-09-30 — v2 run (coordinator; in progress)
+## 2026-09-30 — v2 run (coordinator; closed 2026-10-01)
 
 Goal: `goals/2026-09-30-v2.md`. Decision: S25. Coordinator: Claude Code (conductor). Code and spec units on Codex gpt-6-luna xhigh, `-s danger-full-access`, one worktree each under `../subagent-mcp-wt/`, branch `v2` off `fuse` 6ae599a. Reviews on Gemini through the `subagent` MCP server in detached worktrees. Unit reports are beside the worktrees (`../subagent-mcp-wt/v2-<unit>-report.md`), briefs and reviews in `../subagent-mcp-wt/v2-briefs/`.
 
@@ -272,3 +272,30 @@ Goal: `goals/2026-09-30-v2.md`. Decision: S25. Coordinator: Claude Code (conduct
 ### Findings
 
 - U-A1 The `gemini` (Antigravity) lane is killed by the loop watchdog on read-heavy work: `view_file` calls count as identical. Cause not confirmed; the trace does not record tool arguments. Same class as the Codex fix 6ae599a. Workaround in briefs: read with distinct shell commands.
+
+### UAT at close (against `goals/2026-09-30-v2.md` only, run on `fuse` at abf3ef1)
+
+| Row | Result |
+|---|---|
+| 1 | PASS: 1042 passed, 1 skipped, 19 subtests; `ruff check src tests` clean |
+| 2 | PASS: machine-value grep over `src/` empty |
+| 3 | PASS: `-k run_refuses_live` 1, `-k cell_session_root` 1; skill line 90 says `subagent wait` |
+| 4 | PASS: `-k orch_tokens` 1, `-k provider_error_text` 6 |
+| 5 | PASS: `-k hidden_dest` 2 |
+| 6 | PASS: `-k packaged_pricing` 2; wheel lists `subagent/pricing.toml`; `SAM_`/`from_env` grep empty |
+| 7 | PASS: `tests/test_cli_provider.py` 18; `provider --help` names add, list, remove, test; `use --help` exit 0 |
+| 8 | PASS: `-k init_detect` 4 |
+| 9 | PASS: `-k auth_login` 9; `examples/config.claude.toml` exists |
+| 10 | PASS: `-k add_local` 7 |
+| 11 | PASS: `tests/test_goal.py` 14; `-k goal_protected` 1; `tests/test_trace_schema.py` 9; `-k goal_no_command_rows` 1 |
+| 12 | PASS: `tests/test_install.py` 25; `install --help` names claude, codex, gemini, copilot |
+| 13 | PASS: `-k loop_auto` 23; `description:` on line 3 of the skill |
+| 14 | PASS: `-k turn_source` 4; trace schema 9 |
+| 15 | PASS: `tests/test_knobs.py` 7 |
+| 16 | PASS: "2026-09-30 v2 review" section; each of its 8 HIGH findings has an `Outcome:` (wave A 4, wave B runtime 4; wave B commands and config had none) |
+| 17 | PASS: the four-term grep counts 9 lines |
+| 18 | PASS: no `subagent-mcp v` tool in `uv tool list`; `src/subagent_mcp/` absent |
+| 19 | PASS: `wiki/v2-spec.md` exists; 2026-09-30 entries in `log.md`, `decisions.md` (S25, S26), `active-work.md` |
+| 20 | PASS: `origin/fuse` is 84732bb; nothing pushed |
+
+Not in this run, as the goal file set out: item 9 (harness driver), item 15 (benchmark), item 17 (rename).

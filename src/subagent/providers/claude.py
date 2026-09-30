@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import subprocess
 from collections.abc import Iterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..config import Settings, log
@@ -27,8 +28,6 @@ from ..router import (
 from .base import DRIVER_CLAUDE, Process, ProviderConfig, Session
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from pathlib import Path
-
     from ..router import Refusal
 
 GUARD = "hook"
@@ -167,15 +166,22 @@ class ClaudeProcess(Process):
     """One ``claude -p`` subprocess. Tests replace `_spawn_claude` with a fake."""
 
     def events(self) -> Iterator[dict[str, Any]]:
-        proc = self._start()
-        assert proc.stdout is not None
-        # Drain stderr on a side thread while iterating stdout. Claude Code
-        # writes a per-request model warning there; if we only read stdout the
-        # stderr pipe fills up and the child blocks forever (pipe deadlock).
-        # The full text is kept for classify_exit().
-        stderr_buf: list[str] = []
-        stderr_thread = self._drain_thread(proc, stderr_buf)
+        from ..guard.classify import protect, release
+
+        protected_root = getattr(self, "protected_root", None)
+        if protected_root is not None:
+            protect(protected_root, temporary=True)
+        proc = None
+        stderr_thread = None
         try:
+            proc = self._start()
+            assert proc.stdout is not None
+            # Drain stderr on a side thread while iterating stdout. Claude Code
+            # writes a per-request model warning there; if we only read stdout the
+            # stderr pipe fills up and the child blocks forever (pipe deadlock).
+            # The full text is kept for classify_exit().
+            stderr_buf: list[str] = []
+            stderr_thread = self._drain_thread(proc, stderr_buf)
             last_result: dict[str, Any] | None = None
             for event in self._json_lines(proc.stdout):
                 if event.get("type") == "result":
@@ -186,9 +192,12 @@ class ClaudeProcess(Process):
             if code not in (0, None):
                 yield exit_event(code, "".join(stderr_buf), last_result)
         finally:
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 self.kill()
-            stderr_thread.join(timeout=5)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=5)
+            if protected_root is not None:
+                release(protected_root)
 
 
 def _spawn_claude(argv: list[str], env: dict[str, str], cwd: str) -> ClaudeProcess:
@@ -300,7 +309,10 @@ class ClaudeProvider:
     ) -> ClaudeProcess:
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session, model)
-        return _spawn_claude(argv, env, str(cwd))
+        process = _spawn_claude(argv, env, str(cwd))
+        if cfg.extra.get("auth") == "login":
+            process.protected_root = Path(env["CLAUDE_CONFIG_DIR"])
+        return process
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:
         """The before-work refusal in a turn's events, or None."""

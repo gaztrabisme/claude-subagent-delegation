@@ -16,6 +16,20 @@ class Outline(Sandbox):
         return self.delegate("run", "--plan", ".subagent/PLAN.md", "--test-outline", ".subagent/TESTS.md", "--auto",
                              *extra, cwd=root, scenario="outline", env={"OUT": mode})[1]
 
+    def test_test_writer_provider_error_text_is_reported(self):
+        root = self.project()
+        _, r = self.delegate("run", "--plan", ".subagent/PLAN.md", "--test-outline", ".subagent/TESTS.md", "--auto",
+                             cwd=root, scenario="outline",
+                             env={"FAKE_FAIL_MODEL": "gpt-5.6-sol"})
+        error = r["test_writer"]["provider_error"]
+        self.assertEqual(r["status"], "test_writer_error")
+        self.assertIn("not available", error["message"])
+        self.assertIn(error["finish_reason"], {"refused", "cli_error"})
+        if self.DRIVER == "copilot":
+            self.assertEqual(error["refusal_code"], "copilot_model_unavailable")
+        logs = sorted((root / ".subagent" / "logs").glob("tests-*.log"))
+        self.assertIn("not available", logs[-1].read_text())
+
     def calls(self, root):
         path = root / ".subagent" / "calls.txt"
         text = path.read_text().split() if path.exists() else []

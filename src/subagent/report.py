@@ -41,7 +41,7 @@ import math
 import sys
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +74,7 @@ class Report:
     lanes: list[dict[str, Any]]
     runs: int
     counterfactual: str | None
+    plan_price_notes: list[str] = field(default_factory=list)
 
 
 def _num(v: Any) -> float | None:
@@ -205,7 +206,7 @@ def _run_row(rec: Mapping[str, Any], pricing: Pricing | None, cf_model: str | No
             cf = pricing.usd(cf_model, input_t, output_t, cache_read_t, cache_write_t, 0)
         if cf is None:
             cf = _num(cost.get("counterfactual_usd"))
-    return {
+    row = {
         "lane": provider,
         "provider": provider,
         "model": rec.get("model"),
@@ -233,6 +234,7 @@ def _run_row(rec: Mapping[str, Any], pricing: Pricing | None, cf_model: str | No
         "cost": cost,
         "kind": (specs.get(provider) or {}).get("kind"),
     }
+    return row
 
 
 def _price_row(row: dict[str, Any], specs: dict[str, dict[str, Any]]) -> None:
@@ -350,7 +352,7 @@ def _delegation_row(d: Mapping[str, Any], provider_usd: float | None,
     if tokens is not None:
         tokens = int(tokens)
     cost_total = d.get("cost_total") or {}
-    return {
+    row = {
         "delegation_id": d.get("delegation_id"),
         "bench_run_id": d.get("bench_run_id"),
         "orchestrator": d.get("orchestrator"),
@@ -366,6 +368,9 @@ def _delegation_row(d: Mapping[str, Any], provider_usd: float | None,
         "verified_pass": d.get("verified_pass"),
         "ts": _ts(d),
     }
+    if "uat" in d:
+        row["uat"] = d["uat"]
+    return row
 
 
 def _recorded_run_usd(delegations: list[Mapping[str, Any]],
@@ -481,6 +486,13 @@ def build(traces: list[Path], since: dt.datetime | None, bench_run: str | None) 
     run_rows, delegation_records, aliases, cf_model = _priced_run_rows(settings, records)
     costs = price_delegations(delegation_records, run_rows)
     vendors = {name: cfg.vendor for name, cfg in settings.providers.items()}
+    used = {row["provider"] for row in run_rows}
+    plan_price_notes = [
+        f"{name}: plan usage, cash price unknown"
+        for name, spec in sorted(_specs(settings).items())
+        if name in used and spec.get("kind") == "flat_plan"
+        and _num(spec.get("monthly_usd")) is None
+    ]
     return Report(
         providers=_provider_rows(run_rows, delegation_records, vendors, aliases),
         delegations=[
@@ -490,6 +502,7 @@ def build(traces: list[Path], since: dt.datetime | None, bench_run: str | None) 
         lanes=lane_rows(run_rows),
         runs=len(run_rows),
         counterfactual=cf_model,
+        plan_price_notes=plan_price_notes,
     )
 
 
@@ -632,6 +645,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"counterfactual model: {report.counterfactual or 'unknown'}")
     print(f"runs: {report.runs}  delegations: {len(report.delegations)}")
     print_table(report.lanes)
+    for note in report.plan_price_notes:
+        print(note)
     print()
     _print_delegations(report.delegations)
 

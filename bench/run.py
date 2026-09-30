@@ -162,24 +162,62 @@ def cell_env(base: dict, setup: dict) -> dict:
     return env
 
 
+def _move_hidden_destination(target: Path) -> None:
+    """Move a worker-created destination aside before installing trusted tests."""
+    if not target.exists() and not target.is_symlink():
+        return
+    aside = target.with_name(f"{target.name}.worker")
+    suffix = 1
+    while aside.exists() or aside.is_symlink():
+        aside = target.with_name(f"{target.name}.worker-{suffix}")
+        suffix += 1
+    target.rename(aside)
+
+
+def _run_hidden_suite(cmd, work):
+    return subprocess.run(
+        cmd, cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, errors="replace", timeout=300,
+    )
+
+
+def _text(value):
+    return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
+
+
 def run_hidden_tests(task, work):
     """Copy the hidden tests in (only now, after the agent finished) and run them."""
     hidden = BENCH / "tasks" / task / "hidden"
     if any(hidden.glob("*.py")):
         target = work / "_hidden_tests"
+        _move_hidden_destination(target)
         shutil.copytree(hidden, target)
         (target / "__init__.py").touch()
         cmd = ["python3", "-m", "unittest", "discover", "-s", "_hidden_tests", "-t", "."]
     else:
         target = work / ".hidden"
+        _move_hidden_destination(target)
         shutil.copytree(hidden, target)
-        cmd = ["node", "--test",
-               *sorted(str(p.relative_to(work)) for p in target.glob("*.test.js"))]
+        test_files = sorted(
+            str(p.relative_to(work))
+            for suffix in ("js", "cjs", "mjs")
+            for p in target.glob(f"*.test.{suffix}")
+        )
+        if not test_files:
+            return {"total": 0, "passed": 0}, "No hidden Node test files found.\n"
+        cmd = ["node", "--test", "--test-reporter=spec",
+               "--test-reporter-destination=stderr", *test_files]
     try:
-        output = sh(cmd, work, timeout=300).stdout
+        proc = _run_hidden_suite(cmd, work)
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + "\nTIMEOUT"
-    counts = parse_test_counts(output) or {"total": 0, "passed": 0}
+        output = _text(exc.stdout) + _text(exc.stderr) + "\nTIMEOUT"
+        return {"total": 0, "passed": 0}, output
+    output = proc.stdout + proc.stderr
+    # The runner writes its summary to stderr; imported worker code cannot
+    # inflate the counts by printing a fake summary to stdout.
+    counts = parse_test_counts(proc.stderr) or {"total": 0, "passed": 0}
+    if proc.returncode:
+        counts["passed"] = 0
     return counts, output
 
 
@@ -224,14 +262,15 @@ def toml_dump(data: dict) -> str:
 
 
 def write_cell_config(source: Path, cell: Path, session_root: Path) -> Path:
-    """A copy of the chosen config with `[core].session_root` set to the cell's."""
+    """Write the cell config where the project-root loader discovers it."""
     data = tomllib.loads(source.read_text(encoding="utf-8"))
     core = data.get("core")
     if not isinstance(core, dict):
         core = {}
         data["core"] = core
     core["session_root"] = str(session_root)
-    path = cell / "config.toml"
+    path = cell / ".subagent" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(toml_dump(data), encoding="utf-8")
     return path
 

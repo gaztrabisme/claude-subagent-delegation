@@ -328,8 +328,9 @@ class AntigravityProvider:
         chosen_model = model or cfg.model
         if chosen_model:
             argv.extend(["--model", chosen_model])
-        if cfg.effort:
-            argv.extend(["--effort", cfg.effort])
+        effort = "low" if cfg.thinking == "low" else cfg.effort
+        if effort:
+            argv.extend(["--effort", effort])
         if session.session_id:
             argv.extend(["--conversation", session.session_id])
         argv.extend(["--dangerously-skip-permissions", "--sandbox"])

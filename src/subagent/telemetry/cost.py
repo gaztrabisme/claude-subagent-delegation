@@ -33,8 +33,8 @@ DEFAULT_TRACES = [
     HOME / ".subagent-mcp/sessions/trace.jsonl",
 ]
 DEFAULT_TRANSCRIPTS = HOME / ".claude/projects"
-# pricing.toml stays beside the repo's scripts/, not inside the package.
-DEFAULT_PRICING = Path(__file__).resolve().parents[3] / "scripts" / "pricing.toml"
+# The default pricing data ships with the package.
+DEFAULT_PRICING = Path(__file__).resolve().parents[1] / "pricing.toml"
 
 # Trace directory name -> lane, for schema 1/2 records that carry no "lane" field.
 TRACE_SOURCE_LANE = {
@@ -166,8 +166,8 @@ def price_run(usage, credits, provider_cfg, pricing, ts) -> dict[str, Any]:
     Returns {"provider_usd", "counterfactual_usd", "kind", "note"}. per_token
     uses the configured rates (the timestamp only labels peak/offpeak when the
     provider declares `offpeak_hours_utc`); credits are priced at
-    `usd_per_credit`; local at `usd`; flat_plan is spread at report time, so
-    its run-end provider cost is None.
+    `usd_per_credit`; local at `usd`; a known flat_plan fee is spread at report
+    time, while an absent monthly price stays unknown.
     """
     spec = provider_cfg.pricing
     kind = spec.kind
@@ -208,7 +208,11 @@ def price_run(usage, credits, provider_cfg, pricing, ts) -> dict[str, Any]:
         provider_usd = _num(values.get("usd"))
     elif kind == "flat_plan":
         provider_usd = None
-        note = "spread at report time"
+        note = (
+            "subscription plan; cash price unknown"
+            if _num(values.get("monthly_usd")) is None
+            else "spread at report time"
+        )
 
     return {
         "provider_usd": provider_usd,

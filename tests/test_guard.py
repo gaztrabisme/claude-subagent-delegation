@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from subagent.guard.classify import ALLOW, DENY, ESCALATE, classify, classify_bash
+from subagent.guard.classify import (
+    ALLOW,
+    DENY,
+    ESCALATE,
+    classify,
+    classify_bash,
+    protect,
+    release,
+)
 
 DESTRUCTIVE = "rm" + " -" + "rf"  # kept out of source text; see wiki/active-work.md
 
@@ -316,6 +324,40 @@ def test_web_tools_escalate(ws):
 
 def test_read_of_a_secret_is_denied(ws):
     assert classify("Read", {"file_path": str(ws / ".env")}, ws).action == DENY
+
+
+def test_guard_custom_root_protection_can_be_released(ws):
+    """A temporary owner config root stays protected only for the child run."""
+    owner_config = ws.parent / "custom-claude-config"
+    target = owner_config / "settings.json"
+    protect(owner_config, temporary=True)
+    protect(owner_config, temporary=True)
+    try:
+        verdict = classify("Write", {"file_path": str(target)}, ws)
+        assert verdict.action == DENY
+        assert str(owner_config) not in str(verdict.facts)
+        assert str(owner_config) not in verdict.reason
+        release(owner_config)
+        assert classify("Write", {"file_path": str(target)}, ws).action == DENY
+    finally:
+        release(owner_config)
+    assert classify("Write", {"file_path": str(target)}, ws).action == ESCALATE
+
+
+def test_review_b2_login_config_root_blocks_read_tools_and_bash(ws):
+    owner_config = ws.parent / "custom-claude-config"
+    history = owner_config / "projects" / "old-session.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text("private session history")
+    protect(owner_config, temporary=True)
+    try:
+        for tool in ("Read", "Grep", "Glob"):
+            verdict = classify(tool, {"file_path": str(history)}, ws)
+            assert verdict.action == DENY, (tool, verdict)
+        verdict = classify("Bash", {"command": f"cat {history}"}, ws)
+        assert verdict.action == DENY, verdict
+    finally:
+        release(owner_config)
 
 
 # --- report items 1, 2, 4, 5, 7: verification forms the policy now reads ----

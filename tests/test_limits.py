@@ -59,11 +59,11 @@ def _success(text: str = "done", turns: int = 1) -> dict[str, Any]:
     }
 
 
-# --- item 6: SAM_MAX_STEPS counts turns ---------------------------------------
+# --- max steps count turns ----------------------------------------------------
 
 
 def test_a_child_that_finishes_under_the_turn_cap_is_not_relabelled(tmp_path, monkeypatch):
-    """Five parallel tool calls in two turns, with SAM_MAX_STEPS=2: completed."""
+    """Five parallel tool calls in two turns, with max_steps=2: completed."""
     events = [_init(), *[_tool(f"ls {i}") for i in range(5)], _success(turns=2)]
     reg = _registry(tmp_path, monkeypatch, [events], max_steps=2)
     try:

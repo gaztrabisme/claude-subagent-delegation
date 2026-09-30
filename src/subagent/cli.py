@@ -166,42 +166,6 @@ def _report_written(settings: Settings, dest: Path) -> None:
         print(line)
 
 
-def _from_env_data() -> dict[str, Any]:
-    """The providers the old SAM_*/key environment stands for."""
-    providers: dict[str, Any] = {}
-    if os.environ.get("GLM_API_KEY") or os.environ.get("ZAI_API_KEY"):
-        key_env = "GLM_API_KEY" if os.environ.get("GLM_API_KEY") else "ZAI_API_KEY"
-        providers["glm"] = {
-            "driver": "claude",
-            "base_url": os.environ.get("SAM_GLM_BASE_URL") or "https://api.z.ai/api/anthropic",
-            "model": os.environ.get("SAM_GLM_MODEL") or "glm-5.3-flash[1m]",
-            "api_key_env": key_env,
-            "vendor": "zai",
-            "pricing": {"kind": "flat_plan", "monthly_usd": 80},
-        }
-    if os.environ.get("DEEPSEEK_API_KEY"):
-        providers["deepseek"] = {
-            "driver": "claude",
-            "base_url": "https://api.deepseek.com/anthropic",
-            "model": "deepseek-v4-pro",
-            "api_key_env": "DEEPSEEK_API_KEY",
-            "vendor": "deepseek",
-            "pricing": {"kind": "per_token", "input": 1.32, "output": 3.96,
-                        "cache_read": 0.044},
-        }
-    codex_bin = os.environ.get("SAM_CODEX_BIN")
-    if codex_bin or shutil.which("codex"):
-        codex: dict[str, Any] = {"driver": "codex"}
-        if codex_bin:
-            codex["binary"] = codex_bin
-        codex["pricing"] = {"kind": "flat_plan"}
-        providers["codex"] = codex
-    core: dict[str, Any] = {}
-    if providers:
-        core["default_provider"] = next(iter(providers))
-    return {"core": core, "providers": providers}
-
-
 def _wizard(seed: dict[str, Any] | None, args: argparse.Namespace) -> int:
     """Ask which examples to merge, which providers to keep, and write them."""
     names = _example_names()
@@ -258,15 +222,6 @@ def _wizard(seed: dict[str, Any] | None, args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     try:
-        if args.from_env:
-            if args.from_example:
-                print("--from-env and --from are mutually exclusive", file=sys.stderr)
-                return 2
-            dest = _dest_path(args.path)
-            settings = _write_config(_from_env_data(), dest, args.force)
-            _report_written(settings, dest)
-            return 0
-
         if args.from_example:
             src = _example_path(args.from_example)
             if not src.is_file():
@@ -538,8 +493,6 @@ def _parser() -> argparse.ArgumentParser:
                       help="seed the wizard with one example")
     init.add_argument("--yes", action="store_true",
                       help="write --from EXAMPLE non-interactively")
-    init.add_argument("--from-env", action="store_true",
-                      help="convert the old SAM_*/GLM_API_KEY/DEEPSEEK_API_KEY environment")
     init.add_argument("--force", action="store_true",
                       help="overwrite an existing config file")
     init.add_argument("--path", metavar="PATH",

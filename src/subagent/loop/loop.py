@@ -383,6 +383,48 @@ def _status(violations, timed_out, failed, report, tests):
     return report.get("status") if report.get("status") in ("done", "failed") else "no_report"
 
 
+_PROVIDER_ERROR_LIMIT = 500
+_PROVIDER_ERROR_META_LIMIT = 80
+
+
+def _clip_provider_error(value, limit):
+    text = " ".join(str(value).split())
+    return text[:limit - 1] + "…" if len(text) > limit else text
+
+
+def _provider_error(run):
+    """The bounded provider failure already recorded on a failed run."""
+    if run is None:
+        return None
+    message = run.error_detail or run.error
+    if not message:
+        return None
+    error = {"message": _clip_provider_error(message, _PROVIDER_ERROR_LIMIT)}
+    if run.error_detail:
+        for hop in reversed(run.hops):
+            if hop.get("outcome") == "refused" and hop.get("code") not in (None, "admission"):
+                error["refusal_code"] = _clip_provider_error(
+                    hop["code"], _PROVIDER_ERROR_META_LIMIT
+                )
+                break
+    if run.finish_reason:
+        error["finish_reason"] = _clip_provider_error(
+            run.finish_reason, _PROVIDER_ERROR_META_LIMIT
+        )
+    return error
+
+
+def _provider_error_log(error):
+    if not error:
+        return ""
+    details = error["message"]
+    if error.get("refusal_code"):
+        details += f" ({error['refusal_code']})"
+    if error.get("finish_reason"):
+        details += f" [{error['finish_reason']}]"
+    return f" · provider error: {details}"
+
+
 # ---------------------------------------------------------------- delegation trace
 
 _USAGE_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
@@ -591,6 +633,7 @@ def run_round(root, server, args, live_view=True):
         "seconds": round(time.time() - started),
         "checkpoint": cp["id"],
         "log": str(log.relative_to(root)),
+        "provider_error": _provider_error(run) if status == "backend_error" else None,
     }
     if run is not None and run.usage.credits is not None:
         result["worker_credits"] = round(run.usage.credits, 2)
@@ -616,6 +659,7 @@ def run_round(root, server, args, live_view=True):
     credits = f" · AI credits {credits_val:.2f}" if credits_val is not None else ""
     sink.write(
         f"{END_MARKER}: {status} · {result['seconds']}s · {len(changed)} files changed{credits}"
+        f"{_provider_error_log(result.get('provider_error'))}"
     )
     live.close()
     sink.close()
@@ -1040,13 +1084,17 @@ found by the
         "notes": report.get("notes") or None,
         "reverted_files": reverted or None,
         "worker_credits": round(run.usage.credits, 2) if run.usage.credits is not None else None,
+        "provider_error": _provider_error(run) if status == "test_writer_error" else None,
         "log_tail": tail(log.read_text(errors="ignore"), 30)
         if status == "test_writer_error"
         else None,
         "_runs": [_run_block(run, used, phase="test_writer")],
     }
     credits = f" · AI credits {run.usage.credits:.2f}" if run.usage.credits is not None else ""
-    sink.write(f"{END_MARKER}: test writer {status} · {len(written)} files{credits}")
+    sink.write(
+        f"{END_MARKER}: test writer {status} · {len(written)} files{credits}"
+        f"{_provider_error_log(result.get('provider_error'))}"
+    )
     live.close()
     sink.close()
     return {k: v for k, v in result.items() if v is not None}
@@ -1126,7 +1174,8 @@ def _brief_writer(writer):
     return {
         k: v
         for k, v in writer.items()
-        if k in ("model", "files", "cases", "outline_cases", "notes", "reverted_files", "fix_pass")
+        if k in ("model", "files", "cases", "outline_cases", "notes", "reverted_files", "fix_pass",
+                 "provider_error")
     }
 
 
@@ -1181,6 +1230,7 @@ def _round_brief(number, result):
         "tests": tests,
         "credits": result.get("worker_credits"),
         "checkpoint": result.get("checkpoint"),
+        "provider_error": result.get("provider_error"),
     }
     return {k: v for k, v in brief.items() if v is not None}
 
@@ -1371,6 +1421,7 @@ Claude only
         "violations",
         "log_tail",
         "error",
+        "provider_error",
         "model_fallback",
         "warning",
     ):

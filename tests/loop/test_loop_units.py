@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from subagent import config
 from subagent.config import LoopSettings, LoopTarget
@@ -87,6 +88,13 @@ class LiveLogFormatting(unittest.TestCase):
 
 
 class ResultShaping(unittest.TestCase):
+    def test_provider_error_text_is_bounded(self):
+        run = SimpleNamespace(error="e" * 600, error_detail=None, finish_reason="r" * 100, hops=[])
+        error = delegate._provider_error(run)
+        self.assertEqual(len(error["message"]), 500)
+        self.assertTrue(error["message"].endswith("…"))
+        self.assertEqual(len(error["finish_reason"]), 80)
+
     def test_verdict_from_message(self):
         self.assertEqual(delegate._verdict_from_text('Here: {"verdict": "ok", "issues": []} done')["verdict"], "ok")
         self.assertIsNone(delegate._verdict_from_text("no json"))

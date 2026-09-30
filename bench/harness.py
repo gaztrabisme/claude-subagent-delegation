@@ -99,15 +99,17 @@ def _jsonl(raw: str) -> list[dict[str, Any]]:
 
 
 def _sum_usages(usages: list[dict[str, Any]]) -> dict[str, int]:
-    """Claude-shaped usage dicts summed into the bench keys."""
+    """Claude usage dicts summed into the bench keys."""
     out = _empty_usage()
     for usage in usages:
         if not isinstance(usage, dict):
             continue
-        out["input"] += _int(usage.get("input_tokens"))
-        out["output"] += _int(usage.get("output_tokens"))
-        out["cache_read"] += _int(usage.get("cache_read_input_tokens"))
-        out["cache_write"] += _int(usage.get("cache_creation_input_tokens"))
+        out["input"] += _int(usage.get("input_tokens", usage.get("inputTokens")))
+        out["output"] += _int(usage.get("output_tokens", usage.get("outputTokens")))
+        out["cache_read"] += _int(usage.get(
+            "cache_read_input_tokens", usage.get("cacheReadInputTokens")))
+        out["cache_write"] += _int(usage.get(
+            "cache_creation_input_tokens", usage.get("cacheCreationInputTokens")))
     return out
 
 
@@ -162,9 +164,11 @@ class ClaudeOrchestrator(Orchestrator):
             return _result(False, raw)
         # modelUsage covers the subagents too; the top-level usage does not.
         per_model = data.get("modelUsage")
-        sums = [entry.get("usage") for entry in (per_model or {}).values()
+        sums = [entry.get("usage") or entry for entry in per_model.values()
                 if isinstance(entry, dict)] if isinstance(per_model, dict) else []
-        usage = _sum_usages(sums or [data.get("usage") or {}])
+        usage = _sum_usages(sums)
+        if not any(usage.values()):
+            usage = _sum_usages([data.get("usage") or {}])
         models = sorted(k for k in (per_model or {}) if isinstance(k, str))
         if not models and isinstance(data.get("model"), str):
             models = [data["model"]]

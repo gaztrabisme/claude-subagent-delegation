@@ -71,8 +71,8 @@ Never put test output or other free text in a quoted command-line argument.
      (parallel: `--parallel .subagent/parallel.json` instead of `--plan`; without an outline, omit
      `--test-outline`)
      with the Bash tool timeout set to 600000.
-   - If it returns `"status": "running"`, call `DELEGATE wait --timeout 540` (same Bash timeout) until
-     it returns something else. Never start another run while one is running.
+   - If it returns `"status": "running"`, call `subagent wait --timeout 540` (or `DELEGATE wait --timeout 540`)
+     until it returns something else. Never call `subagent run` again while that run is running.
    - Before the first round, the test writer turns your outline into test files (test files only;
      it gets one fix pass if the review finds transcription errors), and a model of another family
      checks the tests against the plan/spec (wrong expectations block the run; missing tests are only

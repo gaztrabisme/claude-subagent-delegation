@@ -14,7 +14,7 @@ HEADER_PROBLEM = (
 _HEADER_START = 'Execute plan "'
 _HEADER = re.compile(r'^Execute plan "([^"\r\n]+)" \((.+)\)\. Goal rows:$')
 _ROW = re.compile(r"^(\d+)\s+([^:]+):(.*)$")
-_ROW_NUMBER = re.compile(r"^(\d+)")
+_ROW_ATTEMPT = re.compile(r"^(\d+)\s+[^:]+:")
 
 
 class GoalError(ValueError):
@@ -100,8 +100,8 @@ def _extract_block(text: str) -> str:
 def _row_from_line(line: str, expected: int, trailing: bool) -> tuple[GoalRow | None, list[str]]:
     problems: list[str] = []
     match = _ROW.fullmatch(line)
-    number_match = _ROW_NUMBER.match(line)
     if match is None:
+        number_match = _ROW_ATTEMPT.match(line)
         if number_match is None:
             return None, problems
         number = int(number_match.group(1))
@@ -158,8 +158,8 @@ def _parse_block(text: str, path: str | None) -> Goal:
             continue
         syntactic_row = _ROW.fullmatch(line)
         parsed, row_problems = _row_from_line(line, expected, trailing)
-        if syntactic_row is not None:
-            expected = int(syntactic_row.group(1)) + 1
+        if syntactic_row is not None and int(syntactic_row.group(1)) == expected:
+            expected += 1
         if parsed is not None:
             rows.append(parsed)
             problems.extend(row_problems)

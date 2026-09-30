@@ -33,8 +33,8 @@ DEFAULT_TRACES = [
     HOME / ".subagent-mcp/sessions/trace.jsonl",
 ]
 DEFAULT_TRANSCRIPTS = HOME / ".claude/projects"
-# pricing.toml stays beside the repo's scripts/, not inside the package.
-DEFAULT_PRICING = Path(__file__).resolve().parents[3] / "scripts" / "pricing.toml"
+# The default pricing data ships with the package.
+DEFAULT_PRICING = Path(__file__).resolve().parents[1] / "pricing.toml"
 
 # Trace directory name -> lane, for schema 1/2 records that carry no "lane" field.
 TRACE_SOURCE_LANE = {

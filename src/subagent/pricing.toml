@@ -1,4 +1,4 @@
-# Pricing for scripts/cost_join.py.
+# Default pricing data for subagent.telemetry.cost.
 #
 # Model rates are USD per million tokens (Claude list prices).
 # Cache multipliers are relative to the model's input rate.

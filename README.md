@@ -42,9 +42,8 @@ symlinks `skills/delegate` into `~/.claude/skills/delegate`, installs the packag
 line instead), and prints `subagent init` as the next step.
 
 `subagent init` is interactive; `subagent init --from glm --yes` writes one example
-non-interactively, and `subagent init --from-env` converts the old `GLM_API_KEY` /
-`DEEPSEEK_API_KEY` environment once. For any provider whose key is not yet in your environment
-it prints the `export NAME=...` line you still need.
+non-interactively. For any provider whose key is not yet in your environment it prints the
+`export NAME=...` line you still need.
 
 ## Configuration
 

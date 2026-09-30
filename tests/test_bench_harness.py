@@ -53,6 +53,33 @@ def test_claude_prefers_the_modelusage_sums():
     assert parsed["models"] == ["claude-haiku-4.5", "claude-opus-5"]
 
 
+def test_claude_orch_tokens_reach_the_bench_cell_row(tmp_path, monkeypatch):
+    """Direct modelUsage token fields reach the three orchestrator CSV columns."""
+    config = tmp_path / "config.toml"
+    config.write_text('[providers.glm]\ndriver = "claude"\n', encoding="utf-8")
+    data = json.loads((FIXTURES / "claude.txt").read_text(encoding="utf-8").splitlines()[-1])
+    data["modelUsage"] = {
+        name: {
+            "inputTokens": item["usage"]["input_tokens"],
+            "outputTokens": item["usage"]["output_tokens"],
+            "cacheReadInputTokens": item["usage"]["cache_read_input_tokens"],
+            "cacheCreationInputTokens": item["usage"]["cache_creation_input_tokens"],
+        }
+        for name, item in data["modelUsage"].items()
+    }
+    stdout = json.dumps(data)
+    monkeypatch.setattr(run.bench_harness, "get", lambda _name: harness.get("claude"))
+    monkeypatch.setattr(run, "run_capture", lambda *args, **kwargs: (stdout, "", False))
+    monkeypatch.setattr(run, "run_hidden_tests",
+                        lambda task, work: ({"total": 0, "passed": 0}, ""))
+
+    row = run.run_one("claude", config, "cron", "alone", 1, tmp_path, None, 1)
+
+    assert row["orch_tokens_in"] == 750
+    assert row["orch_tokens_out"] == 460
+    assert row["orch_tokens_cache"] == 3000
+
+
 def test_codex_takes_the_last_completed_turn_and_uncaches_input():
     parsed = _parsed("codex")
     assert parsed["ok"] is True
@@ -243,6 +270,22 @@ def test_the_cell_config_overrides_session_root(tmp_path, monkeypatch):
     assert subconfig.load().session_root == (tmp_path / "sessions").resolve()
 
 
+def test_cell_session_root_is_discovered_from_project_config_without_env(tmp_path, monkeypatch):
+    """A Codex tool shell can find the cell config from the project root alone."""
+    source = ROOT / "examples" / "config.glm.toml"
+    cell = tmp_path / "cell"
+    cell.mkdir()
+    sessions = cell / "sessions"
+    run.write_cell_config(source, cell, sessions)
+
+    monkeypatch.delenv("SUBAGENT_CONFIG", raising=False)
+    from subagent import config as subconfig
+
+    loaded = subconfig.load(project_root=cell)
+    assert (cell / ".subagent" / "config.toml").is_file()
+    assert loaded.session_root == sessions.resolve()
+
+
 def test_toml_dump_round_trips_the_shapes_a_bench_config_has():
     data = {
         "core": {"default_provider": "glm", "max_agents": 8, "rate_limit_retries": 3,
@@ -325,7 +368,8 @@ def test_a_cell_gets_the_skill_the_path_and_a_cell_json(tmp_path, monkeypatch):
     assert seen["env"]["PATH"].startswith(f"{run.venv_bin()}{os.pathsep}")
     # ... and the bench variables, as before.
     assert seen["env"]["SUBAGENT_BENCH_RUN_ID"] == row["cell"]
-    assert seen["env"]["SUBAGENT_CONFIG"] == str(work / "config.toml")
+    assert Path(seen["env"]["SUBAGENT_CONFIG"]).is_file()
+    assert (work / ".subagent" / "config.toml").is_file()
 
 
 def test_cell_env_leaves_the_path_alone_without_a_venv():
@@ -337,6 +381,42 @@ def test_cell_env_leaves_the_path_alone_without_a_venv():
 
 
 # --- the worker side -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("directory", "filename", "summary"), [
+    ("_hidden_tests", "test_trusted.py", "Ran 1 test in 0.001s\n\nOK\n"),
+    (".hidden", "trusted.test.js", "ℹ tests 1\nℹ pass 1\nℹ fail 0\n"),
+])
+def test_hidden_dest_moves_preexisting_worker_directory_aside(
+        tmp_path, monkeypatch, directory, filename, summary):
+    bench = tmp_path / "bench"
+    hidden = bench / "tasks" / "task" / "hidden"
+    hidden.mkdir(parents=True)
+    (hidden / filename).write_text("trusted hidden test fixture\n", encoding="utf-8")
+    monkeypatch.setattr(run, "BENCH", bench)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    target = work / directory
+    target.mkdir()
+    (target / "worker_only.py").write_text("worker-created file\n", encoding="utf-8")
+    calls = []
+
+    def run_suite(cmd, cwd, **kwargs):
+        calls.append(cmd)
+        assert cwd == work
+        assert (target / filename).is_file()
+        assert not (target / "worker_only.py").exists()
+        assert (work / f"{directory}.worker" / "worker_only.py").is_file()
+        return SimpleNamespace(stdout=summary)
+
+    monkeypatch.setattr(run, "sh", run_suite)
+    counts, output = run.run_hidden_tests("task", work)
+
+    assert calls
+    assert counts["total"] == 1
+    assert counts["passed"] == 1
+    assert output == summary
 
 
 def test_delegation_fields_without_records_are_null_columns():

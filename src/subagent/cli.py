@@ -28,7 +28,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from . import config
+from .commands import init as init_command
+from .commands import install as install_command
+from .commands import providers as providers_command
 from .config import ConfigError, Settings
+from .goal import Goal, GoalError, parse_goal
 from .health import check as health_check
 from .loop import loop
 from .providers.base import ProviderConfig
@@ -317,6 +321,9 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         "binary_ok": path is not None,
         "api_key_envs": _key_envs(cfg),
     }
+    warning = _thinking_warning(cfg)
+    if warning:
+        row["warning"] = warning
     if not args.no_probe:
         if path is None:
             hard = True
@@ -340,6 +347,38 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
             if not result.get("ok"):
                 hard = True
     return row, hard
+
+
+def _thinking_warning(cfg: ProviderConfig) -> str | None:
+    thinking = cfg.thinking
+    if thinking is None:
+        return None
+    supported = (
+        (cfg.driver == "omp" and thinking in ("off", "low"))
+        or (cfg.driver in ("codex", "antigravity") and thinking == "low")
+    )
+    if supported:
+        return None
+    return (
+        f"warning: provider {cfg.name!r} driver {cfg.driver!r} does not support thinking = "
+        f"'{thinking}'; provider default used."
+    )
+
+
+def _goal_cli_errors(exc: GoalError) -> list[str]:
+    if exc.block:
+        return [f"error: goal block is invalid: {problem}" for problem in exc.problems]
+    return [f"error: {problem}" for problem in exc.problems]
+
+
+def _report_goal_error(exc: GoalError, *, json_mode: bool) -> int:
+    messages = _goal_cli_errors(exc)
+    if json_mode:
+        print(json.dumps({"errors": messages}))
+    else:
+        for message in messages:
+            print(message, file=sys.stderr)
+    return 1
 
 
 def _print_table(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
@@ -385,6 +424,14 @@ def _print_table(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    goal: Goal | None = None
+    if args.goal is not None:
+        workspace = Path(args.root or ".").expanduser().resolve()
+        try:
+            goal = parse_goal(args.goal, workspace)
+        except GoalError as exc:
+            return _report_goal_error(exc, json_mode=args.json)
+
     try:
         settings = config.load()
         settings.require_providers()
@@ -411,10 +458,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         rows.append(row)
         hard = hard or failed
 
+    goal_warning = (
+        "warning: goal has no command rows; completion has no server-side goal check "
+        "when it contains only prose"
+        if goal is not None and not any(row.kind == "command" for row in goal.rows)
+        else None
+    )
     if args.json:
-        print(json.dumps({"ok": not hard, "providers": rows}, indent=2))
+        response: dict[str, Any] = {
+            "ok": not hard,
+            "providers": rows,
+            "loop_auto": settings.loop.auto,
+        }
+        if goal is not None:
+            response["goal"] = {
+                "rows": len(goal.rows),
+                "command_rows": sum(row.kind == "command" for row in goal.rows),
+            }
+        if goal_warning:
+            response["warnings"] = [goal_warning]
+        print(json.dumps(response, indent=2))
     else:
         _print_table(rows, args)
+        for row in rows:
+            if row.get("warning"):
+                print(row["warning"], file=sys.stderr)
+        if goal_warning:
+            print(goal_warning, file=sys.stderr)
+        elif goal is not None:
+            print(f"goal block valid: {len(goal.rows)} rows")
 
     return 1 if hard else 0
 
@@ -425,6 +497,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def _loop_parsers(subparsers: argparse._SubParsersAction) -> None:
     run = subparsers.add_parser("run", help="one worker round (or autopilot) on a plan")
     run.add_argument("--plan", metavar="FILE", help="the plan file (single-round mode)")
+    run.add_argument("--goal", metavar="VALUE", help="goal-block text or workspace GOAL.md")
     run.add_argument(
         "--parallel", metavar="MANIFEST", help="a manifest of parts, one worktree each"
     )
@@ -488,15 +561,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    init = sub.add_parser("init", help="write a starter config from the examples")
-    init.add_argument("--from", dest="from_example", metavar="EXAMPLE",
-                      help="seed the wizard with one example")
-    init.add_argument("--yes", action="store_true",
-                      help="write --from EXAMPLE non-interactively")
-    init.add_argument("--force", action="store_true",
-                      help="overwrite an existing config file")
-    init.add_argument("--path", metavar="PATH",
-                      help="write to PATH instead of $XDG_CONFIG_HOME/subagent/config.toml")
+    init_command.register(sub)
 
     doctor = sub.add_parser("doctor", help="check the configured providers")
     doctor.add_argument("--provider", metavar="NAME", help="check only this provider")
@@ -505,9 +570,13 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--no-probe", action="store_true",
                         help="only validate the file and check binaries")
     doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    doctor.add_argument("--goal", metavar="VALUE", help="validate goal-block text or GOAL.md")
 
     sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",
                    add_help=False)
+
+    providers_command.register(sub)
+    install_command.register(sub)
 
     _loop_parsers(sub)
     return parser
@@ -591,11 +660,19 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init(args)
     if args.command == "doctor":
         return cmd_doctor(args)
+    handler = getattr(args, "command_handler", None)
+    if handler is not None:
+        return handler(args)
     if args.command not in loop.LOOP_COMMANDS:
         _parser().print_help()
         return 2
 
     root = Path(args.root or ".").expanduser().resolve()
+    if args.command == "run" and args.goal is not None:
+        try:
+            parse_goal(args.goal, root)
+        except GoalError as exc:
+            return _report_goal_error(exc, json_mode=False)
     try:
         project_root = root if args.root else _project_config_root(root)
         settings = config.load(project_root=project_root)

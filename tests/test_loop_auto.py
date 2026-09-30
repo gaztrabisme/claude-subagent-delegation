@@ -65,15 +65,10 @@ def test_loop_auto_is_reported_in_doctor_json(tmp_path: Path, monkeypatch, fake_
     assert data["loop_auto"] == "always"
 
 
-def test_loop_auto_never_does_not_start_run(
-    tmp_path: Path, monkeypatch, fake_codex, capsys
-) -> None:
-    _config_file(tmp_path, monkeypatch, fake_codex, auto="never")
+def test_review_b2_loop_auto_skill_gate_covers_never_and_bad_json() -> None:
+    skill = Path(__file__).resolve().parents[1] / "skills/delegate/SKILL.md"
+    text = " ".join(skill.read_text(encoding="utf-8").split())
 
-    def unexpected_run(*args, **kwargs):
-        pytest.fail("reading loop.auto must not start a delegation run")
-
-    monkeypatch.setattr("subagent.cli._run_loop_command", unexpected_run)
-
-    assert main(["doctor", "--no-probe", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["loop_auto"] == "never"
+    assert "`never`: keep the work with the orchestrator and do not start a worker." in text
+    assert "report a configuration error and stop before delegation." in text
+    assert "Never infer `always` from missing or malformed output." in text

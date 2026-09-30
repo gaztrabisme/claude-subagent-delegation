@@ -298,6 +298,8 @@ def is_sensitive(path: Path) -> str | None:
         resolved = path.resolve()
     except (OSError, RuntimeError):
         resolved = path
+    if any(inside(resolved, root) for root in _temporary_roots()):
+        return "the owner's Claude config directory is protected during login runs"
     home = str(_home().resolve()).lower().rstrip("/")
     for candidate in {str(resolved).lower(), os.path.normpath(str(path)).lower()}:
         if candidate != home and not candidate.startswith(home + "/"):

@@ -270,6 +270,28 @@ def test_install_force_replaces_inline_toml_server_and_preserves_neighbor(tmp_pa
     assert servers["subagent"] == {"command": "subagent-mcp", "tool_timeout_sec": 75}
 
 
+def test_review_b2_install_force_removes_stale_subagent_subtables(tmp_path):
+    target = tmp_path / "target"
+    config_path = target / ".codex/config.toml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "[mcp_servers.subagent]\n"
+        'command = "old"\n\n'
+        "[mcp_servers.subagent.env]\n"
+        'STALE = "value"\n\n'
+        "[mcp_servers.other]\n"
+        'command = "other-mcp"\n'
+    )
+
+    assert cli.main([
+        "install", "--for", "codex", "--target-dir", str(target), "--force", "--timeout", "75"
+    ]) == 0
+
+    servers = _toml_config(target)["mcp_servers"]
+    assert servers["subagent"] == {"command": "subagent-mcp", "tool_timeout_sec": 75}
+    assert servers["other"] == {"command": "other-mcp"}
+
+
 def test_install_config_write_failure_reports_partial_files(tmp_path, monkeypatch, capsys):
     target = tmp_path / "target"
     target.mkdir()
@@ -315,6 +337,29 @@ def test_install_invalid_json_leaves_targets_unchanged(tmp_path, capsys):
     assert f"error: cannot update '{config_path}':" in capsys.readouterr().err
     assert config_path.read_text() == "{invalid\n"
     assert not (target / ".claude/commands/plan.md").exists()
+
+
+def test_review_b2_install_rejects_dangling_registration_symlink(tmp_path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    outside = tmp_path / "outside" / "created.json"
+    outside.parent.mkdir()
+    registration = target / ".mcp.json"
+    registration.symlink_to(outside)
+
+    assert cli.main(["install", "--for", "claude", "--target-dir", str(target)]) == 1
+    assert registration.is_symlink()
+    assert not outside.exists()
+    assert f"error: file '{registration}' is a symlink" in capsys.readouterr().err
+
+
+def test_review_b2_installer_skill_sources_are_packaged():
+    package_skills = Path(cli.__file__).parent / "skills"
+    for name in ("delegate", "plan", "goal"):
+        packaged = package_skills / name / "SKILL.md"
+        source = ROOT / "skills" / name / "SKILL.md"
+        assert packaged.is_file()
+        assert packaged.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
 
 
 def test_install_default_timeout_uses_project_run_timeout(tmp_path):

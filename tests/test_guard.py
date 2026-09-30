@@ -344,6 +344,22 @@ def test_guard_custom_root_protection_can_be_released(ws):
     assert classify("Write", {"file_path": str(target)}, ws).action == ESCALATE
 
 
+def test_review_b2_login_config_root_blocks_read_tools_and_bash(ws):
+    owner_config = ws.parent / "custom-claude-config"
+    history = owner_config / "projects" / "old-session.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text("private session history")
+    protect(owner_config, temporary=True)
+    try:
+        for tool in ("Read", "Grep", "Glob"):
+            verdict = classify(tool, {"file_path": str(history)}, ws)
+            assert verdict.action == DENY, (tool, verdict)
+        verdict = classify("Bash", {"command": f"cat {history}"}, ws)
+        assert verdict.action == DENY, verdict
+    finally:
+        release(owner_config)
+
+
 # --- report items 1, 2, 4, 5, 7: verification forms the policy now reads ----
 
 

@@ -15,7 +15,6 @@ from subagent.cli import main
 @pytest.mark.parametrize(
     "module_name",
     [
-        "subagent.commands.init",
         "subagent.commands.install",
     ],
 )

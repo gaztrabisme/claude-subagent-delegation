@@ -1,0 +1,12 @@
+# Claude Code subscription login. The owner supplies the existing login; no
+# API key or monthly cash price is configured here.
+
+[core]
+default_provider = "claude"
+
+[providers.claude]
+driver = "claude"
+auth = "login"
+
+[providers.claude.pricing]
+kind = "flat_plan"

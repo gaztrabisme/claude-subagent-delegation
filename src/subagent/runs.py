@@ -23,6 +23,8 @@ from typing import Any
 
 from . import adapter, health, providers, router
 from .config import APPROVAL_HOOK, Settings, log
+from .goal import Goal
+from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import protect
 from .lane_state import LaneState
 from .providers.base import ProviderConfig, Session
@@ -450,6 +452,8 @@ class Run:
     verification: str | None = None
     # Where `verification` came from, when the caller did not pass it.
     verification_note: str | None = None
+    goal: Goal | None = None
+    uat: list[dict[str, Any]] | None = None
     state: str = WORKING
     phase: str = PHASE_QUEUED
     created_at: float = field(default_factory=_now)
@@ -542,6 +546,8 @@ class Run:
             out["verification"] = self.verification_result.as_dict()
         if self.verification_note:
             out["verification_note"] = self.verification_note
+        if self.goal is not None:
+            out["uat"] = self.uat or []
         if self.hops:
             out["hops"] = list(self.hops)
         if self.cold_load:
@@ -581,6 +587,8 @@ class Agent:
         provider_load: Callable[[str, Agent], int] | None = None,
         telemetry: Telemetry | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        goal: Goal | None = None,
+        goal_reviewer: GoalReviewer | None = None,
     ):
         self.trace = trace
         self.telemetry = telemetry
@@ -600,6 +608,8 @@ class Agent:
         self._provider_load = provider_load
         # Called for every parsed event of every turn, as it arrives.
         self.on_event = on_event
+        self.goal = goal
+        self.goal_reviewer = goal_reviewer
         # Guard context carries configured child-secret names even before the
         # loop adds its protected tests and state allowlist.
         self.guard_context: dict[str, Any] = {
@@ -666,6 +676,8 @@ class Agent:
             prompt=prompt,
             verification=verification,
             verification_note=note,
+            goal=self.goal,
+            uat=pending_uat(self.goal) if self.goal is not None else None,
             lane=self.cfg.name,
             fallback=self.fallback,
             provider=self.cfg.vendor,
@@ -694,12 +706,18 @@ class Agent:
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
+        goal: Goal | None = None,
+        reviewer: GoalReviewer | None = None,
     ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
         This run walks the lane chain; continues stay on the lane it ran on.
         """
         self.delegate_verification = verification
+        if goal is not None:
+            self.goal = goal
+        if reviewer is not None:
+            self.goal_reviewer = reviewer
         return self.submit(
             prompt,
             verification=verification,
@@ -898,6 +916,16 @@ class Agent:
             budget=remaining,
         )
 
+        if run.goal is not None:
+            remaining = (run.deadline - _now()) if run.deadline else None
+            run.uat = evaluate_goal(
+                run.goal,
+                self.workspace,
+                self.settings,
+                reviewer=self.goal_reviewer,
+                budget=remaining,
+            )
+
         if run.distill and len(run.final_response) > self.settings.result_cap_chars:
             run.phase = PHASE_DISTILLING
             distilled = self._distill(run)
@@ -913,7 +941,19 @@ class Agent:
         if run.trip:
             self._finish(run)
             return
-        if run.verification_result.passed:
+        goal_failed = any(
+            row["kind"] == "command" and row["passed"] is not True
+            for row in (run.uat or [])
+        )
+        goal_changed = bool(
+            run.goal is not None
+            and run.goal.path
+            and any(
+                row.get("file") == run.goal.path
+                for row in (run.pre_verify_result or {}).get("violations", [])
+            )
+        )
+        if run.verification_result.passed and not goal_failed and not goal_changed:
             run.state = COMPLETED
         else:
             run.state = COMPLETED_UNVERIFIED
@@ -1500,6 +1540,8 @@ class Registry:
         fallback: str = "full",
         on_event: Callable[[dict[str, Any]], None] | None = None,
         agent_id: str | None = None,
+        goal: Goal | None = None,
+        goal_reviewer: GoalReviewer | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -1534,6 +1576,8 @@ class Registry:
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,
+                goal=goal,
+                goal_reviewer=goal_reviewer,
             )
             self._agents[claimed] = agent
             return agent

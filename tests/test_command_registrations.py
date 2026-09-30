@@ -15,7 +15,6 @@ from subagent.cli import main
 @pytest.mark.parametrize(
     "module_name",
     [
-        "subagent.commands.providers",
         "subagent.commands.init",
         "subagent.commands.install",
     ],
@@ -35,7 +34,6 @@ def test_command_registration_stubs_are_importable_and_exit_two(
 @pytest.mark.parametrize(
     ("argv", "module_name"),
     [
-        (["provider", "list"], "subagent.commands.providers"),
         (["install", "--for", "codex"], "subagent.commands.install"),
     ],
 )
@@ -49,6 +47,29 @@ def test_command_registration_routes_cli_to_stubs(
     lines = (captured.out + captured.err).strip().splitlines()
     assert len(lines) == 1
     assert "not implemented" in lines[0].lower()
+
+
+def test_command_registration_routes_provider_commands(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv(config.CONFIG_ENV, raising=False)
+    destination = tmp_path / "xdg" / "subagent" / "config.toml"
+    destination.parent.mkdir(parents=True)
+    destination.write_text(
+        '[core]\ndefault_provider = "one"\n\n'
+        '[providers.one]\ndriver = "codex"\nmodel = "model-one"\n\n'
+        '[providers.two]\ndriver = "codex"\nmodel = "model-two"\n',
+        encoding="utf-8",
+    )
+
+    assert main(["provider", "list", "--json"]) == 0
+    listed = capsys.readouterr().out
+    assert '"one"' in listed and '"two"' in listed
+
+    assert main(["use", "two"]) == 0
+    assert "default provider set to 'two'" in capsys.readouterr().out
+    assert config.load(extra=destination).default_provider == "two"
 
 
 def test_command_registration_keeps_existing_init_working(

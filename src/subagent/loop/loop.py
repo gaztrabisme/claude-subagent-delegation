@@ -29,6 +29,7 @@ last round)
 """
 
 import difflib
+import fcntl
 import hashlib
 import json
 import os
@@ -44,6 +45,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ..providers import copilot as copilot_driver
+from ..secrets import redact_secrets
 from ..verify import run_verification
 from . import checkpoint, session
 from .common import (
@@ -263,21 +265,26 @@ class Worker:
 
 # ---------------------------------------------------------------- run bookkeeping
 
-def _pid_alive(pid):
+def _try_run_lock(root):
+    """Acquire the per-workspace run lock, or return None while it is held."""
+    lock = (state_dir(root) / "run.lock").open("a")
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
 
 
 def _active_run(root):
     current = read_json(root / STATE_DIR / "current.json")
     if not current or (root / STATE_DIR / "runs" / f"{current['run_id']}.json").exists():
         return None
-    return current if _pid_alive(current["pid"]) else None
+    lock = _try_run_lock(root)
+    if lock is None:
+        return current
+    lock.close()
+    return None
 
 
 def _stamp():
@@ -385,31 +392,35 @@ def _status(violations, timed_out, failed, report, tests):
 
 _PROVIDER_ERROR_LIMIT = 500
 _PROVIDER_ERROR_META_LIMIT = 80
+_RUN_LOCK_ENV = "SUBAGENT_INTERNAL_RUN_LOCK_FD"
 
 
-def _clip_provider_error(value, limit):
-    text = " ".join(str(value).split())
+def _clip_provider_error(value, limit, secret_env_names=()):
+    text = " ".join(redact_secrets(value, secret_env_names).split())
     return text[:limit - 1] + "…" if len(text) > limit else text
 
 
-def _provider_error(run):
+def _provider_error(run, settings=None):
     """The bounded provider failure already recorded on a failed run."""
     if run is None:
         return None
     message = run.error_detail or run.error
     if not message:
         return None
-    error = {"message": _clip_provider_error(message, _PROVIDER_ERROR_LIMIT)}
+    secret_env_names = getattr(settings, "leaked_keys", ())
+    error = {"message": _clip_provider_error(
+        message, _PROVIDER_ERROR_LIMIT, secret_env_names
+    )}
     if run.error_detail:
         for hop in reversed(run.hops):
             if hop.get("outcome") == "refused" and hop.get("code") not in (None, "admission"):
                 error["refusal_code"] = _clip_provider_error(
-                    hop["code"], _PROVIDER_ERROR_META_LIMIT
+                    hop["code"], _PROVIDER_ERROR_META_LIMIT, secret_env_names
                 )
                 break
     if run.finish_reason:
         error["finish_reason"] = _clip_provider_error(
-            run.finish_reason, _PROVIDER_ERROR_META_LIMIT
+            run.finish_reason, _PROVIDER_ERROR_META_LIMIT, secret_env_names
         )
     return error
 
@@ -633,7 +644,7 @@ def run_round(root, server, args, live_view=True):
         "seconds": round(time.time() - started),
         "checkpoint": cp["id"],
         "log": str(log.relative_to(root)),
-        "provider_error": _provider_error(run) if status == "backend_error" else None,
+        "provider_error": _provider_error(run, settings) if status == "backend_error" else None,
     }
     if run is not None and run.usage.credits is not None:
         result["worker_credits"] = round(run.usage.credits, 2)
@@ -1084,7 +1095,8 @@ found by the
         "notes": report.get("notes") or None,
         "reverted_files": reverted or None,
         "worker_credits": round(run.usage.credits, 2) if run.usage.credits is not None else None,
-        "provider_error": _provider_error(run) if status == "test_writer_error" else None,
+        "provider_error": _provider_error(run, server.settings)
+        if status == "test_writer_error" else None,
         "log_tail": tail(log.read_text(errors="ignore"), 30)
         if status == "test_writer_error"
         else None,
@@ -1462,33 +1474,59 @@ def _child_argv(argv):
 
 
 def cmd_run(root, server, args, raw):
-    active = _active_run(root)
-    is_background_child = (
-        active is not None
-        and active["run_id"] == args.run_id
-        and active["pid"] == os.getpid()
-    )
-    if active and not is_background_child:
-        return {
-            "status": "busy",
-            "error": f"run {active['run_id']} is still in progress; use `subagent wait`",
-        }, 2
-    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     state = state_dir(root)
+    inherited_fd = os.environ.pop(_RUN_LOCK_ENV, None)
+    is_background_child = inherited_fd is not None
+    if is_background_child:
+        run_lock = os.fdopen(int(inherited_fd), "a")
+        lock_path = state / "run.lock"
+        lock_stat, fd_stat = lock_path.stat(), os.fstat(run_lock.fileno())
+        if (lock_stat.st_dev, lock_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+            run_lock.close()
+            return {"status": "busy", "error": "invalid background run lock"}, 2
+        fcntl.flock(run_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current = read_json(state / "current.json") or {}
+        if current.get("run_id") != args.run_id:
+            run_lock.close()
+            return {"status": "busy", "error": "background run state changed before start"}, 2
+    else:
+        run_lock = _try_run_lock(root)
+        if run_lock is None:
+            active = _active_run(root)
+            if active:
+                message = f"run {active['run_id']} is still in progress; use `subagent wait`"
+            else:
+                message = "another run is starting; use `subagent wait`"
+            return {"status": "busy", "error": message}, 2
+    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
 
     if args.test_outline and not args.auto:
+        run_lock.close()
         return {"status": "bad_arguments", "error": "--test-outline needs --auto"}, 2
     if args.background or args.wait is not None:
         out = state / "logs" / f"runner-{run_id}.out"
+        write_json(
+            state / "current.json",
+            {"run_id": run_id, "pid": os.getpid(), "started": time.time(),
+             "runner_output": str(out.relative_to(root))},
+        )
+        child_env = os.environ.copy()
+        child_env[_RUN_LOCK_ENV] = str(run_lock.fileno())
         with open(out, "w") as fh:
-            proc = subprocess.Popen(
-                [*RUNNER, *_child_argv(raw), "--run-id", run_id],
-                cwd=os.getcwd(),
-                stdin=subprocess.DEVNULL,
-                stdout=fh,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            try:
+                proc = subprocess.Popen(
+                    [*RUNNER, *_child_argv(raw), "--run-id", run_id],
+                    cwd=os.getcwd(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    env=child_env,
+                    pass_fds=(run_lock.fileno(),),
+                )
+            except Exception:
+                run_lock.close()
+                raise
         write_json(
             state / "current.json",
             {
@@ -1498,11 +1536,12 @@ def cmd_run(root, server, args, raw):
                 "runner_output": str(out.relative_to(root)),
             },
         )
+        run_lock.close()
         if args.wait is not None:
             return cmd_wait(root, server, SimpleNamespace(timeout=args.wait))
         return {"status": "started", "run_id": run_id, "next": "wait --timeout 540"}, 0
 
-    if not args.run_id:  # a background child's record was written by its parent
+    if not is_background_child:
         write_json(
             state / "current.json", {"run_id": run_id, "pid": os.getpid(), "started": time.time()}
         )
@@ -1533,6 +1572,7 @@ def cmd_run(root, server, args, raw):
         result = {"status": "runner_error", "error": f"{type(exc).__name__}: {exc}"}
     result["run_id"] = run_id
     write_json(state / "runs" / f"{run_id}.json", result)
+    run_lock.close()
     return result, STATUS_EXIT.get(result["status"], 2)
 
 
@@ -1546,8 +1586,9 @@ def cmd_wait(root, server, args):
         result = read_json(result_path)
         if result:
             return result, STATUS_EXIT.get(result["status"], 2)
-        if not _pid_alive(current["pid"]):
-            time.sleep(1)
+        lock = _try_run_lock(root)
+        if lock is not None:
+            lock.close()
             result = read_json(result_path)
             if result:
                 return result, STATUS_EXIT.get(result["status"], 2)

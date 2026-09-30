@@ -37,6 +37,7 @@ from .providers.claude import (  # noqa: F401
 )
 from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
+from .secrets import redact_secrets
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
 from .telemetry.trace import Trace, open_trace
@@ -1350,6 +1351,10 @@ class Agent:
             run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
             run.error = reason
             run.finish_reason = kind
+        if run.error:
+            run.error = redact_secrets(run.error, self.settings.leaked_keys)
+        if run.error_detail:
+            run.error_detail = redact_secrets(run.error_detail, self.settings.leaked_keys)
         run.phase = PHASE_DONE
         run.finished_at = _now()
         try:

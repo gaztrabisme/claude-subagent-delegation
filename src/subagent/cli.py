@@ -566,11 +566,19 @@ def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
         server.stop()
 
 
+def _project_config_root(root: Path) -> Path:
+    """Use the nearest ancestor that owns a project config, if there is one."""
+    for candidate in (root, *root.parents):
+        if (candidate / config.PROJECT_DIR / config.CONFIG_NAME).is_file():
+            return candidate
+    return root
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "report":
         try:
-            settings = config.load()
+            settings = config.load(project_root=_project_config_root(Path.cwd().resolve()))
             settings.require_providers()
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -589,7 +597,8 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(args.root or ".").expanduser().resolve()
     try:
-        settings = config.load(project_root=root)
+        project_root = root if args.root else _project_config_root(root)
+        settings = config.load(project_root=project_root)
         settings.require_providers()
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)

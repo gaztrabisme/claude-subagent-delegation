@@ -63,7 +63,7 @@ from .common import (
     walk_files,
     write_json,
 )
-from .detect import detect
+from .detect import detect, feedback_output
 from .events import END_MARKER, LiveLog, LogSink, follow, open_live_view
 from .testguard import TestGuard, protected_hash
 
@@ -107,7 +107,10 @@ def resolve_tier(settings, tier, explicit_provider=None, explicit_model=None):
     return candidates or [(None, None)]
 
 
-def build_prompt(plan, feedback, info, protected_files, parallel=None):
+def build_prompt(
+    plan, feedback, info, protected_files, parallel=None,
+    parallel_tool_calls=False, no_narration=False,
+):
     shown = protected_files[:50]
     more = f"\n  ... and {len(protected_files) - 50} more" if len(protected_files) > 50 else ""
     feedback_block = (
@@ -138,12 +141,25 @@ Their code is not in your copy. Code against the interfaces described in the pla
 part with:
 {own_tests}
 """
+    tool_call_block = ""
+    if parallel_tool_calls:
+        tool_call_block = """
+## Model tool calls
+Issue independent model tool calls together in a single turn when possible, saving re-sent \
+context. This instruction does not change concurrent workers.
+"""
+    narration_block = ""
+    if no_narration:
+        narration_block = """
+## Response style
+Return only implementation results and the required final report. Do not narrate progress.
+"""
     return f"""You are implementing a task in this repository. Work autonomously; nobody will \
 answer questions during this run.
 
 ## Task plan
 {plan}
-{feedback_block}{parallel_block}
+{feedback_block}{parallel_block}{tool_call_block}{narration_block}
 ## Rules
 1. Implement the plan. The test command is: `{test_cmd}`
    Run it yourself and keep iterating until it passes.
@@ -163,6 +179,15 @@ Protected files
    {{"status": "done" | "failed" | "needs_test_change", "summary": "<one or two sentences>"}}
    Use "done" only if the tests for your work pass.
 """
+
+
+def _prompt_source_chars(prompt, plan, test_output=""):
+    """Lengths for the three loop prompt sources whose text is known here."""
+    return {
+        "harness_prompt": max(0, len(prompt) - len(plan) - len(test_output)),
+        "plan": len(plan),
+        "test_output": len(test_output),
+    }
 
 
 # ---------------------------------------------------------------- worker
@@ -219,7 +244,7 @@ class Worker:
             "secret_env_names": list(self.registry.settings.guard_secret_env_names),
         }
 
-    def run_round(self, candidates, fallback, prompt):
+    def run_round(self, candidates, fallback, prompt, source_chars=None):
         """A fresh worker round; a failed, no-work candidate walks to the next."""
         for attempt, (provider, model) in enumerate(candidates):
             if self.live is not None:
@@ -227,7 +252,7 @@ class Worker:
             self.agent = self._make_agent(provider, model, fallback)
             self.run = self.agent.delegate(
                 prompt, self.test_cmd, pre_verify=self._release,
-                on_event=self._on_event(), distill=False,
+                on_event=self._on_event(), distill=False, source_chars=source_chars,
             )
             self._wait(self.run)
             self.model = model
@@ -244,7 +269,7 @@ class Worker:
             break
         return self
 
-    def follow_up(self, record, prompt):
+    def follow_up(self, record, prompt, source_chars=None):
         """Continue the recorded agent session (--continue, autopilot rounds 2+)."""
         self.model = record.get("model")
         if self.live is not None:
@@ -255,7 +280,7 @@ class Worker:
         self.agent.guard_context = self._guard_context()
         self.run = self.agent.follow_up(
             prompt, verification=self.test_cmd, pre_verify=self._release,
-            on_event=self._on_event(), distill=False,
+            on_event=self._on_event(), distill=False, source_chars=source_chars,
         )
         self._wait(self.run)
         return self
@@ -363,7 +388,7 @@ def _tests_summary(tests):
     return out
 
 
-def _tests_from_verification(verification, state):
+def _tests_from_verification(verification, state, test_output_cap=None):
     """The {passed, cmd, counts, output_tail} dict for a run_verification result; \
 writes its full log."""
     if verification is None or verification.exit_code is None:
@@ -372,7 +397,7 @@ writes its full log."""
     if verification.counts is not None:
         tests["counts"] = verification.counts
     if not verification.passed:
-        tests["output_tail"] = tail(verification.output)
+        tests["output_tail"] = feedback_output(verification.output, test_output_cap)
     log_path = state / "logs" / f"test-{_stamp()}.log"
     log_path.write_text(verification.output)
     return tests
@@ -641,6 +666,7 @@ def run_round(root, server, args, live_view=True, goal=None):
     info = detect(root, settings.loop)
     plan = Path(args.plan).read_text()
     feedback = _feedback(args)
+    test_output = getattr(args, "test_output", "") or ""
 
     record = _load_session(root) if args.continue_session else {}
     cp = checkpoint.create(
@@ -666,15 +692,20 @@ def run_round(root, server, args, live_view=True, goal=None):
         protected_paths=(goal.path,) if goal is not None and goal.path else (),
     )
     guard.lock()
-    prompt = build_prompt(plan, feedback, info, guard.protected)
+    prompt = build_prompt(
+        plan, feedback, info, guard.protected,
+        parallel_tool_calls=settings.loop.parallel_tool_calls,
+        no_narration=settings.loop.no_narration,
+    )
+    source_chars = _prompt_source_chars(prompt, plan, test_output)
     started = time.time()
     worker = Worker(server, root, info["test_cmd"], guard, live)
     try:
         if args.continue_session and record.get("agent_id"):
-            worker.follow_up(record, prompt)
+            worker.follow_up(record, prompt, source_chars)
         else:
             worker.run_round(resolve_tier(settings, args.tier, args.provider, args.model),
-                             settings.loop.fallback, prompt)
+                             settings.loop.fallback, prompt, source_chars)
     except Exception:
         if not guard.released:
             guard.release()
@@ -687,7 +718,11 @@ def run_round(root, server, args, live_view=True, goal=None):
     else:
         violations, changed = guard.release()
 
-    tests = _tests_from_verification(run.verification_result if run is not None else None, state)
+    tests = _tests_from_verification(
+        run.verification_result if run is not None else None,
+        state,
+        settings.loop.test_output_cap,
+    )
     count_problem = (_check_test_counts(record, guard.protected_hash(), tests)
                      if settings.loop.count_tests else None)
     if count_problem:
@@ -799,6 +834,7 @@ def _parallel_work(
     state = root / STATE_DIR
     workers = []
     started = time.time()
+    test_output = getattr(args, "test_output", "") or ""
     try:
         candidate_sets = [
             resolve_tier(settings, t.get("tier", args.tier), args.provider, args.model)
@@ -818,7 +854,8 @@ def _parallel_work(
             worktree, proj = checkpoint.worktree_add(root, cp)
             w = {"task": task, "worktree": worktree, "proj": proj, "guard": None,
                  "worker": None, "live": None, "prompt": None, "candidates": candidates,
-                 "run": None, "model": None, "fallback_note": None, "error": None,
+                 "source_chars": None, "run": None, "model": None,
+                 "fallback_note": None, "error": None,
                  "session_record": None}
             # Track the worktree before any later setup can fail, so finally can remove it.
             workers.append(w)
@@ -833,12 +870,21 @@ def _parallel_work(
             w["guard"] = guard
             guard.lock()
             others = [{"name": t["name"], "files": t["files"]} for t in tasks if t is not task]
+            plan_text = Path(task["plan"]).read_text()
+            task_feedback = task.get("feedback") or feedback
             prompt = build_prompt(
-                Path(task["plan"]).read_text(), task.get("feedback") or feedback, info,
-                guard.protected, {"name": task["name"], "files": task["files"],
-                                  "others": others, "test_cmd": task.get("test_cmd")},
+                plan_text,
+                task_feedback,
+                info,
+                guard.protected,
+                {"name": task["name"], "files": task["files"],
+                 "others": others, "test_cmd": task.get("test_cmd")},
+                parallel_tool_calls=settings.loop.parallel_tool_calls,
+                no_narration=settings.loop.no_narration,
             )
             w["prompt"] = prompt
+            task_test_output = test_output if not task.get("feedback") else ""
+            w["source_chars"] = _prompt_source_chars(prompt, plan_text, task_test_output)
             live_path = log.with_name(f"{log.stem}-{task['name']}.jsonl")
             live = LiveLog(sink, live_path, proj, task["name"])
             w["live"] = live
@@ -848,9 +894,12 @@ def _parallel_work(
             try:
                 wrec = record["parallel"].get(w["task"]["name"]) if args.continue_session else None
                 if isinstance(wrec, dict) and wrec.get("agent_id"):
-                    w["worker"].follow_up(wrec, w["prompt"])
+                    w["worker"].follow_up(wrec, w["prompt"], w["source_chars"])
                 else:
-                    w["worker"].run_round(w["candidates"], settings.loop.fallback, w["prompt"])
+                    w["worker"].run_round(
+                        w["candidates"], settings.loop.fallback, w["prompt"],
+                        w["source_chars"],
+                    )
             except Exception as exc:  # a task failure belongs in its result, not in the runner
                 w["error"] = f"{type(exc).__name__}: {exc}"
                 w["live"].write(f"! worker failed: {w['error']}")
@@ -927,7 +976,9 @@ def _parallel_work(
         if info["test_cmd"]:
             sink.write("=== runner: running the full test suite on the merged result")
             verification = run_verification(info["test_cmd"], root, settings)
-            tests = _tests_from_verification(verification, state)
+            tests = _tests_from_verification(
+                verification, state, settings.loop.test_output_cap
+            )
         count_problem = (_check_test_counts(record, protected_hash(root, info["test_globs"]), tests)
                          if settings.loop.count_tests else None)
 
@@ -1047,7 +1098,7 @@ def _write_review_plan(root, plan_paths):
     )
 
 
-def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None):
+def write_tests_from_outline(root, server, outline_path, plan_paths, issues=None, target=None):
     """Turn Claude's test outline into test files with a separate worker session (test files only).
 
     Skipped when the outline is unchanged and its files exist, unless `issues` (wrong tests \
@@ -1097,7 +1148,7 @@ found by the
         test_cmd=info["test_cmd"] or "(use the project's test setup)",
         feedback=feedback,
     )
-    target = server.settings.loop.test_writer
+    target = target or server.settings.loop.test_writer
     cp = checkpoint.create(root, "before test writing")
     before = hash_tree(root)
     (state / "test_writer_result.json").unlink(missing_ok=True)
@@ -1211,7 +1262,18 @@ def _prepare_tests(root, server, args):
     extras = {"test_writer": None, "test_review": None, "credits": [], "blocks": []}
     writer = None
     if args.test_outline:
-        writer = write_tests_from_outline(root, server, args.test_outline, plans)
+        target = (
+            server.settings.loop.test_writer
+            if server.settings.loop.delegate_test_writer
+            else None
+        )
+        writer = (
+            write_tests_from_outline(
+                root, server, args.test_outline, plans, target=target
+            )
+            if target is not None
+            else write_tests_from_outline(root, server, args.test_outline, plans)
+        )
         extras["test_writer"] = writer
         extras["credits"].append(writer.get("worker_credits"))
         extras["blocks"].extend(writer.get("_runs") or [])
@@ -1230,7 +1292,15 @@ def _prepare_tests(root, server, args):
     wrong = _wrong_tests(review)
     if wrong and writer and writer["status"] == "done":
         # The generated tests may have transcription errors: one fix pass by the test writer.
-        fix = write_tests_from_outline(root, server, args.test_outline, plans, issues=wrong)
+        fix = (
+            write_tests_from_outline(
+                root, server, args.test_outline, plans, issues=wrong, target=target
+            )
+            if target is not None
+            else write_tests_from_outline(
+                root, server, args.test_outline, plans, issues=wrong
+            )
+        )
         extras["credits"].append(fix.get("worker_credits"))
         extras["blocks"].extend(fix.get("_runs") or [])
         writer["fix_pass"] = fix["status"]
@@ -1398,6 +1468,7 @@ Claude only
     while True:
         last = rounds[-1]
         status = last["status"]
+        test_output = ""
         if status in AUTO_HAND_BACK:
             stop = status
             break
@@ -1431,6 +1502,7 @@ Claude only
         else:  # tests_failed, failed, no_report, timeout, partial
             failed_in_row += 1
             output = (last.get("tests") or {}).get("output_tail")
+            test_output = output or ""
             feedback = (
                 f"The test suite fails:\n{output}"
                 if output
@@ -1453,6 +1525,7 @@ Claude only
             tier=tier,
             model=args.model,
             provider=args.provider,
+            test_output=test_output,
         )
         rounds.append(
             run_round(root, server, next_args, live_view=False, goal=goal)

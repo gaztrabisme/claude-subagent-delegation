@@ -433,7 +433,8 @@ class CodexProvider:
         session: Session,
         model: str | None,
     ) -> list[str]:
-        return codex_argv(cwd, model or None, session.session_id, self.binary(cfg), cfg.effort)
+        effort = "low" if cfg.thinking == "low" else cfg.effort
+        return codex_argv(cwd, model or None, session.session_id, self.binary(cfg), effort)
 
     def env(
         self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,

@@ -47,7 +47,6 @@ APPROVAL_HOOK = Path(__file__).parent / "guard" / "approval_hook.py"
 CONFIG_ENV = "SUBAGENT_CONFIG"
 CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
-_LOGIN_API_KEY_MARKER = "subagent-claude-login"
 UNIX_SOCKET_PATH_MAX = 104
 SHORT_SOCKET_ROOT = Path("/tmp")
 _APPROVAL_SOCKET_IDS = itertools.count()
@@ -65,30 +64,6 @@ FIXED_LEAKED_KEYS = (
 
 class ConfigError(RuntimeError):
     """A config file this server cannot run with. The message says why."""
-
-
-class _LoginProviderConfig(ProviderConfig):
-    """Compatibility view for runs.py's driver-wide API-key gate.
-
-    The current run gate is outside S3's file ownership. A non-secret marker
-    keeps that gate from rejecting login providers, while the public config
-    view still reports that no API key is configured.
-    """
-
-    __slots__ = ()
-
-    def api_key(self, env: Mapping[str, str] | None = None) -> str:
-        del env
-        return _LOGIN_API_KEY_MARKER
-
-    def unavailable(self) -> str | None:
-        return None
-
-    def as_dict(self) -> dict[str, object]:
-        view = super().as_dict()
-        view["auth"] = "login"
-        view["has_api_key"] = False
-        return view
 
 
 def _approval_socket_path(preferred: str | Path) -> str:
@@ -341,8 +316,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         raise ConfigError(f"provider {name!r} thinking must be 'off' or 'low'")
     api_key_envs = _strings(table, "api_key_env")
     api_key_default = None if auth == "login" else _str(table, "api_key", None)
-    provider_config = _LoginProviderConfig if auth == "login" else ProviderConfig
-    return provider_config(
+    return ProviderConfig(
         name=name,
         driver=driver,
         vendor=_str(table, "vendor", None) or derive_vendor(driver, base_url),

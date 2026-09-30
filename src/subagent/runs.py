@@ -562,7 +562,9 @@ class Run:
     # Caller hooks: `pre_verify()` runs in a finally before verification (the
     # loop's test-guard release) and also on cancel/timeout; its return
     # (`violations`, `changed_files`) lands in `pre_verify_result`. `on_event`
-    # overrides the agent-level watcher for this run only.
+    # overrides the agent-level watcher for this run only. `pre_run()` runs
+    # immediately before routing or continuing the child turn.
+    pre_run: Callable[[], None] | None = None
     pre_verify: Callable[[], dict] | None = None
     on_event: Callable[[dict[str, Any]], None] | None = None
     pre_verify_result: dict | None = None
@@ -722,6 +724,7 @@ class Agent:
         note: str | None = None,
         route: bool = False,
         parent: dict[str, Any] | None = None,
+        pre_run: Callable[[], None] | None = None,
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
@@ -749,6 +752,7 @@ class Agent:
             guard=self.driver.guard(self.settings, self.cfg),
             route=route,
             parent=parent or None,
+            pre_run=pre_run,
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
@@ -767,6 +771,7 @@ class Agent:
         prompt: str,
         verification: str,
         parent: dict[str, Any] | None = None,
+        pre_run: Callable[[], None] | None = None,
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
@@ -788,6 +793,7 @@ class Agent:
             verification=verification,
             route=True,
             parent=parent,
+            pre_run=pre_run,
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
@@ -799,6 +805,7 @@ class Agent:
         message: str,
         verification: str | None = None,
         parent: dict[str, Any] | None = None,
+        pre_run: Callable[[], None] | None = None,
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
@@ -821,6 +828,7 @@ class Agent:
                     f"`{_clip(self.delegate_verification, 200)}`. Pass "
                     'verification="" to skip it.'
                 ),
+                pre_run=pre_run,
                 pre_verify=pre_verify,
                 on_event=on_event,
                 distill=distill,
@@ -832,6 +840,7 @@ class Agent:
                 verification=None,
                 parent=parent,
                 note='verification="" given: skipped, so this run reports completed_unverified',
+                pre_run=pre_run,
                 pre_verify=pre_verify,
                 on_event=on_event,
                 distill=distill,
@@ -841,6 +850,7 @@ class Agent:
             message,
             verification=verification,
             parent=parent,
+            pre_run=pre_run,
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
@@ -908,7 +918,9 @@ class Agent:
                 error, session = driver.boot(self.settings, self.agent_id, cfg)
             except NotImplementedError as exc:
                 error, session = str(exc), Session(provider=cfg.name)
-            self._booted[cfg.name] = error
+            self._booted[cfg.name] = (
+                redact_secrets(error, self.settings.leaked_keys) if error else None
+            )
             self._sessions[cfg.name] = session
         return self._booted[cfg.name]
 
@@ -935,8 +947,11 @@ class Agent:
                 self._execute(run)
             except Exception as exc:  # noqa: BLE001
                 log.warning("run %s crashed", run.run_id, exc_info=True)
+                self._run_pre_verify(run)
                 run.state = FAILED
-                run.error = f"{type(exc).__name__}: {exc}"
+                run.error = redact_secrets(
+                    f"{type(exc).__name__}: {exc}", self.settings.leaked_keys
+                )
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
                 run.done.set()
@@ -955,16 +970,24 @@ class Agent:
         run.deadline = run.started_at + self.cfg.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
+        if run.pre_run is not None:
+            run.pre_run()
         if run.route:
             if not self._route(run):
+                self._run_pre_verify(run)
                 self._finish(run)
                 return
         else:
-            if self.driver.needs_api_key and not self.cfg.api_key():
+            if (
+                self.driver.needs_api_key
+                and self.cfg.extra.get("auth") != "login"
+                and not self.cfg.api_key()
+            ):
                 run.state = FAILED
                 run.error = self._missing_key(self.cfg)
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
+                self._run_pre_verify(run)
                 run.done.set()
                 return
             self._turn(run, run.prompt, resume=self.session_id)
@@ -1048,6 +1071,8 @@ class Agent:
         return f"missing API key for provider {cfg.name!r}: set one of {names}"
 
     def _hop(self, run: Run, hop: router.Hop) -> None:
+        if hop.message:
+            hop.message = redact_secrets(hop.message, self.settings.leaked_keys)
         run.hops.append(hop.as_dict())
         run.note(f"hop {hop.index}: {hop.lane} {hop.outcome}"
                  + (f" ({hop.code})" if hop.code else ""))
@@ -1077,7 +1102,12 @@ class Agent:
             hop = router.Hop(index, cfg.name, cfg.vendor, model, router.HOP_UNAVAILABLE,
                              driver=driver.name, guard=driver.guard(self.settings, cfg))
             reason = cfg.unavailable()
-            if reason is None and driver.needs_api_key and not cfg.api_key():
+            if (
+                reason is None
+                and driver.needs_api_key
+                and cfg.extra.get("auth") != "login"
+                and not cfg.api_key()
+            ):
                 reason = self._missing_key(cfg)
             if (
                 reason is None
@@ -1166,7 +1196,8 @@ class Agent:
                 return True
             hop.outcome = router.HOP_REFUSED
             hop.code = refusal.code
-            hop.message = refusal.message
+            message = redact_secrets(refusal.message, self.settings.leaked_keys)
+            hop.message = message
             hop.reset_at = refusal.reset_at
             until = router.close_until(
                 refusal,
@@ -1174,10 +1205,10 @@ class Agent:
                 throttle_close_minutes=self.settings.throttle_close_minutes,
             )
             if until is not None and self.lane_state is not None:
-                self.lane_state.close(cfg.name, until, refusal.code, refusal.message)
+                self.lane_state.close(cfg.name, until, refusal.code, message)
                 hop.closed_until = until
             self._hop(run, hop)
-            last_refusal = refusal.message
+            last_refusal = message
         if self._closing:
             return False
         tried = "; ".join(

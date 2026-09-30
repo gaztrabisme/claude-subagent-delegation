@@ -60,6 +60,100 @@ def _run(agent, prompt="do it", verification="true"):
     return run
 
 
+def _write_stream(path: Path, items: list[dict]) -> None:
+    events = [
+        {"type": "thread.started", "thread_id": "loop-test-thread"},
+        {"type": "turn.started"},
+        *({"type": "item.completed", "item": item} for item in items),
+        {"type": "item.completed", "item": {"id": "done", "type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+
+def _completed_codex_items(count: int, *, kind: str, command: str | None = None) -> list[dict]:
+    return [
+        {
+            "id": f"item_{index}",
+            "type": kind,
+            **({"changes": [{"path": "case.py", "kind": "update"}]} if kind == "file_change" else {}),
+            **({"command": command} if kind == "command_execution" else {}),
+        }
+        for index in range(count)
+    ]
+
+
+def test_codex_distinct_edits_to_one_file_are_not_a_loop(fake_codex, tmp_path: Path, monkeypatch):
+    providers = default_providers()
+    settings = make_settings(
+        tmp_path, providers=providers, loop_strikes=8, idle_timeout=3600, run_timeout=30
+    )
+    registry = Registry(settings, start_reaper=False)
+    try:
+        items = []
+        for index in range(10):
+            items.append({
+                "id": f"edit_{index}",
+                "type": "file_change",
+                "changes": [{"path": "case.py", "kind": "update"}],
+            })
+            if index < 9:
+                items.append({
+                    "id": f"check_{index}",
+                    "type": "command_execution",
+                    "command": f"python -c 'print({index})'",
+                })
+        stream = tmp_path / "codex-edits.jsonl"
+        _write_stream(stream, items)
+        monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(stream))
+
+        agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
+        run = _run(agent)
+
+        assert run.state == COMPLETED, run.error
+        assert run.trip is None
+        assert run.usage.steps == 19
+    finally:
+        registry.shutdown()
+
+
+def test_codex_identical_commands_still_trip_loop(fake_codex, tmp_path: Path, monkeypatch):
+    settings = make_settings(
+        tmp_path,
+        providers=default_providers(),
+        loop_strikes=8,
+        idle_timeout=3600,
+        run_timeout=30,
+    )
+    registry = Registry(settings, start_reaper=False)
+    try:
+        command = "/bin/zsh -lc 'pytest -q'"
+        same_run = tmp_path / "codex-repeat.jsonl"
+        _write_stream(same_run, _completed_codex_items(8, kind="command_execution", command=command))
+        monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(same_run))
+        agent = registry.create_agent("same-run", _workspace(tmp_path), provider="codex")
+        run = _run(agent)
+        assert run.state == FAILED
+        assert run.trip and run.trip[0] == "loop"
+
+        first_half = tmp_path / "codex-repeat-first.jsonl"
+        second_half = tmp_path / "codex-repeat-second.jsonl"
+        _write_stream(first_half, _completed_codex_items(4, kind="command_execution", command=command))
+        _write_stream(second_half, _completed_codex_items(4, kind="command_execution", command=command))
+        monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(first_half))
+        continuing = registry.create_agent("continued", _workspace(tmp_path), provider="codex")
+        first = _run(continuing)
+        assert first.state == COMPLETED, first.error
+
+        monkeypatch.setenv("FAKE_CODEX_FIXTURE", str(second_half))
+        second = continuing.follow_up("continue", verification="true")
+        assert second.done.wait(10), f"run did not finish: {second.state} {second.error}"
+        assert second.state == FAILED
+        assert second.trip and second.trip[0] == "loop"
+    finally:
+        registry.shutdown()
+
+
 def test_success_maps_usage_text_and_thread(fake_codex, registry, tmp_path: Path):
     agent = registry.create_agent("c", _workspace(tmp_path), provider="codex")
     run = _run(agent, prompt="the task")

@@ -27,6 +27,7 @@ from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..config import Settings, log
 from ..router import Refusal, codex_reset
@@ -158,7 +159,10 @@ def _usage(raw: dict[str, Any]) -> dict[str, int]:
 def _tool_use(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if item.get("type") == "command_execution":
         return "Bash", {"command": item.get("command")}
-    return "Edit", {"changes": item.get("changes")}
+    # Codex reports file changes as path/kind metadata, without the edit text.
+    # Give each completed item its own identity so same-file progress is not
+    # mistaken for a repeated identical call by the shared loop watcher.
+    return "Edit", {"changes": item.get("changes"), "_codex_signature_nonce": uuid4().hex}
 
 
 class Translator:

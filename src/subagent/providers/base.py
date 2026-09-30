@@ -144,6 +144,9 @@ class ProviderConfig:
     health: HealthSpec = field(default_factory=HealthSpec)
     probe: ProbeSpec = field(default_factory=ProbeSpec)
     pricing: PricingSpec = field(default_factory=PricingSpec)
+    # An optional native thinking override; each driver defines its supported
+    # value mapping while unsupported values retain its ordinary default.
+    thinking: str | None = None
     # Every key in the provider's config table this module does not recognise.
     # Drivers read their own extras from it: copilot's builtin_mcps, loop and
     # extra_args, grok's hooks.
@@ -178,6 +181,7 @@ class ProviderConfig:
             "base_url": self.base_url,
             "model": self.model,
             "effort": self.effort,
+            "thinking": self.thinking,
             "local": self.local,
             "available": self.unavailable() is None,
             "api_key_envs": list(self.api_key_envs),

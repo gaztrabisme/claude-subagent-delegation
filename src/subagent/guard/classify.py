@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import threading
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -158,6 +159,9 @@ SECRET_ENV_NAMES = frozenset({
 # guard, so they are refused as write targets wherever they sit. The server
 # adds its session root at startup (`protect`).
 PROTECTED_ROOTS: set[Path] = set()
+_PERMANENT_PROTECTED_ROOTS: set[Path] = set()
+_TEMP_PROTECTED_ROOT_COUNTS: dict[Path, int] = {}
+_PROTECTED_ROOT_LOCK = threading.Lock()
 
 # Commands that are never routine for a delegated coding agent.
 NEVER = frozenset({
@@ -306,9 +310,52 @@ def is_sensitive(path: Path) -> str | None:
     return None
 
 
-def protect(path: Path) -> None:
-    """Refuse writes under `path` from now on (see PROTECTED_ROOTS)."""
-    PROTECTED_ROOTS.add(Path(path).expanduser().resolve())
+def protect(path: Path, *, temporary: bool = False) -> None:
+    """Refuse writes under `path`, permanently or until `release`."""
+    root = Path(path).expanduser().resolve()
+    with _PROTECTED_ROOT_LOCK:
+        if temporary:
+            _TEMP_PROTECTED_ROOT_COUNTS[root] = _TEMP_PROTECTED_ROOT_COUNTS.get(root, 0) + 1
+        else:
+            _PERMANENT_PROTECTED_ROOTS.add(root)
+        PROTECTED_ROOTS.add(root)
+
+
+def release(path: Path) -> None:
+    """Drop one protection reference without unprotecting another active run."""
+    root = Path(path).expanduser().resolve()
+    with _PROTECTED_ROOT_LOCK:
+        count = _TEMP_PROTECTED_ROOT_COUNTS.get(root, 0)
+        if count <= 1:
+            _TEMP_PROTECTED_ROOT_COUNTS.pop(root, None)
+            if root not in _PERMANENT_PROTECTED_ROOTS:
+                PROTECTED_ROOTS.discard(root)
+        else:
+            _TEMP_PROTECTED_ROOT_COUNTS[root] = count - 1
+
+
+def _temporary_roots() -> tuple[Path, ...]:
+    with _PROTECTED_ROOT_LOCK:
+        return tuple(_TEMP_PROTECTED_ROOT_COUNTS)
+
+
+def _redact_private_paths(value):
+    """Remove temporary owner config paths from supervisor trace facts."""
+    if isinstance(value, dict):
+        return {key: _redact_private_paths(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_private_paths(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_private_paths(item) for item in value)
+    if isinstance(value, str):
+        for root in _temporary_roots():
+            try:
+                if inside(Path(value), root):
+                    return "<owner Claude config path>"
+            except (OSError, RuntimeError, ValueError):
+                continue
+            value = value.replace(str(root), "<owner Claude config>")
+    return value
 
 
 def protected(path: Path) -> str | None:
@@ -329,7 +376,12 @@ def protected(path: Path) -> str | None:
                     f"{candidate} is Codex project config (.codex/), read by the next "
                     "Codex run in this directory, hooks included"
                 )
-        for root in PROTECTED_ROOTS:
+        for root in _temporary_roots():
+            if inside(candidate, root):
+                return "the owner's Claude config directory is protected during login runs"
+        with _PROTECTED_ROOT_LOCK:
+            roots = tuple(PROTECTED_ROOTS)
+        for root in roots:
             if inside(candidate, root):
                 return f"{root} holds this server's per-agent settings and sessions"
     return None
@@ -1598,7 +1650,7 @@ def _working_dir(
     return path, None
 
 
-def classify(
+def _classify(
     tool_name: str, tool_input: dict, workspace: Path, cwd: str | Path | None = None,
     context: dict | None = None,
 ) -> Verdict:
@@ -1670,6 +1722,17 @@ def classify(
         verdict = classify_path_write(str(target), workspace, context=context)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
     return Verdict(ESCALATE, f"unrecognized tool `{name}`", {"tool": name})
+
+
+def classify(
+    tool_name: str, tool_input: dict, workspace: Path, cwd: str | Path | None = None,
+    context: dict | None = None,
+) -> Verdict:
+    """Classify a tool call and keep temporary owner config paths out of traces."""
+    verdict = _classify(tool_name, tool_input, workspace, cwd, context)
+    reason = _redact_private_paths(verdict.reason)
+    facts = _redact_private_paths(verdict.facts)
+    return Verdict(verdict.action, reason, facts)
 
 
 def _first(payload: dict, keys: tuple[str, ...]):

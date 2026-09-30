@@ -1,226 +1,206 @@
-# claude-subagent-delegation
+# subagent
 
-Cut Claude Code's token bill by delegating implementation work to a cheaper agent, on the
-provider you already have — Codex, Copilot, GLM, DeepSeek, Grok, Gemini, or a local model
-(llama.cpp, vLLM, oMLX). **Claude plans and verifies; the worker implements.** Claude writes a
-plan and the tests, hands the work to a worker on the configured provider, and then only looks
-at a small JSON status and the test results. It never reads the implementation, so the expensive
-model spends tokens on the plan and the tests, not on code.
+`subagent` hands implementation work to a configured AI coding worker, runs the project's
+checks, asks a different model family to review the tests and changes, and reports the result
+with per-provider usage and cost. The orchestrator writes the plan and test outline; the worker
+implements in rounds. Failed checks and high-severity review findings go back to the worker for
+another round.
 
-Two pieces, fused under one `config.toml`:
-
-- **The delegation loop** — `subagent detect|run|wait|test|review|undo|checkpoints|watch` — the
-  plan–tests–implement–review loop, driven by the `/delegate` skill.
-- **The provider runtime** — an MCP server (`subagent-mcp`) exposing the same subagents as
-  `delegate` / `await` / `continue` / `list` / `cancel` / `transcript` tools.
-
-- [Install](#install)
-- [Configuration](#configuration)
-- [Providers](#providers)
-- [The delegation loop](#the-delegation-loop)
-- [subagent doctor](#subagent-doctor)
-- [MCP wrapper](#mcp-wrapper)
-- [Telemetry](#telemetry)
-- [Benchmark results](#benchmark-results)
-- [Development](#development)
-- [Limitations](#limitations)
-- [Credits](#credits)
-
----
+A goal file adds user acceptance checks to that loop. The runner checks executable rows against
+the final workspace and sends prose rows to the configured reviewer. A tool-call guard classifies
+worker actions on drivers that support it; checkpoints and the test runner provide additional
+protection during the delegation loop.
 
 ## Install
 
+Python 3.11 or later and `uv` are required. From a checkout of this repository, install the CLI
+and MCP server:
+
 ```sh
-git clone https://github.com/gaztrabisme/claude-subagent-delegation && cd claude-subagent-delegation
-./install.sh                    # links the skill into ~/.claude/skills/ and installs `subagent`
-subagent init                   # writes ~/.config/subagent/config.toml from the examples
+uv tool install --editable .
 ```
 
-`install.sh` is POSIX `sh`, so it runs the same from bash, zsh, fish or any other shell. It
-symlinks `skills/delegate` into `~/.claude/skills/delegate`, installs the package with
-`uv tool install --editable .` (when `uv` is not installed it prints the `pipx install -e .`
-line instead), and prints `subagent init` as the next step.
+Run `subagent init` to create a starter configuration. From the project where you want to use the
+tool, run `subagent install --for` with your coding harness:
 
-`subagent init` is interactive; `subagent init --from glm --yes` writes one example
-non-interactively. For any provider whose key is not yet in your environment it prints the
-`export NAME=...` line you still need.
+```sh
+subagent init
+subagent install --for claude
+```
 
-## Configuration
+`--for` accepts `claude`, `codex`, `gemini`, or `copilot`. The installer adds the `/delegate`
+skill, native `/plan` and `/goal` prompts, and a project-scoped MCP registration named
+`subagent`. Run it from the project root or pass `--target-dir DIR`. `--timeout SECONDS` sets the
+MCP timeout; `--force` replaces installer-managed files and the `subagent` registration while
+preserving unrelated configuration. Install the matching harness separately and sign in to it as
+usual.
 
-Configuration is TOML, layered — each file overrides the one before, tables merged key by key:
-`~/.config/subagent/config.toml` (all projects), then `<project>/.subagent/config.toml`, then
-whatever `$SUBAGENT_CONFIG` names. Eight starter examples live in `examples/`.
+## Configure providers
+
+A provider is a worker configuration: a driver plus a model endpoint or CLI login. There are no
+built-in worker accounts; `subagent init` starts from the examples in this checkout and detects
+installed `claude`, `codex`, `copilot`, `gemini`, and `grok` CLIs by checking whether their
+executables are on `PATH`. Detection does not launch a CLI or contact a service. The wizard lets
+you choose detected CLIs and example providers. `--yes` writes without prompts and includes all
+detected CLIs; `--from EXAMPLE` selects a seed, `--path PATH` changes the config destination, and
+`--force` overwrites an existing destination.
+
+If you want to add an example provider that is not already configured, select it as the
+default, and check it:
+
+```sh
+subagent provider add glm --from glm
+subagent provider list
+subagent use glm
+subagent provider test glm --prompt
+```
+
+`provider list` marks the current default; add `--json` for structured output. `--project` on
+provider mutations and `subagent use` writes the project setting. `provider remove NAME` removes
+a provider, but the current default must be changed with `subagent use` first. `provider add`
+accepts `--force` to replace an existing provider table without replacing unrelated settings.
+
+For an opt-in Claude Code login worker, configure a Claude provider with `auth = "login"` and no
+`api_key_env`:
 
 ```toml
-[core]
-default_provider = "glm"
-# Optional exact names for non-secret child variables, mainly for test harnesses.
-# child_env_passthrough = ["TEST_SCENARIO"]
-
-[providers.glm]
+[providers.claude]
 driver = "claude"
-base_url = "https://api.z.ai/api/anthropic"
-model = "glm-5.3-flash[1m]"
-api_key_env = "GLM_API_KEY"
+auth = "login"
+
+[providers.claude.pricing]
+kind = "flat_plan"
 ```
+
+The worker uses the owner's existing Claude login. `subagent doctor` warns about the shared
+history and quota; select it with `subagent use claude`. See [Limitations](#limitations).
+
+To discover a local OpenAI-compatible or oMLX endpoint, set `LOCAL_LLM_BASE_URL` to its base URL
+and run:
 
 ```sh
-export GLM_API_KEY=...
-subagent doctor                 # check every configured provider against this machine
+subagent provider add local --url "$LOCAL_LLM_BASE_URL"
+subagent use local
 ```
 
-`api_key_env` names the variable, never the value: keys live in the environment, not in the
-file. A provider can also carry `local = true`, `max_agents`, per-provider timeouts, an
-`adapter`, and `[providers.<name>.health]` / `.probe` / `.pricing` tables for local servers.
-Provider subprocesses inherit a small runtime environment. Use
-`[core].child_env_passthrough` only for exact non-secret names a child needs (primarily fake
-CLI controls in tests); names containing `KEY`, `TOKEN`, `SECRET`, or `PASSWORD` stay blocked
-even when listed.
+Local discovery makes bounded read-only requests to the supplied URL to identify a model and
+health endpoint. It does not start or wake the server. The new provider uses the `omp` driver.
 
-## Providers
-
-`driver` says how the worker runs. `claude` means Claude Code pointed at any
-Anthropic-compatible endpoint; the CLI drivers own their own login and connection.
-
-| Provider | driver | The worker runs | Notes |
-|---|---|---|---|
-| GLM (z.ai) | `claude` | `claude -p` against z.ai's Anthropic-compatible endpoint | flat plan; `model = "glm-5.3-flash[1m]"` |
-| DeepSeek | `claude` | `claude -p` against DeepSeek's Anthropic-compatible endpoint | per-token pricing |
-| llama.cpp | `claude` | `claude -p` against a llama.cpp OpenAI-compatible proxy | `local = true`; `adapter = "fold_system"` when the template rejects mid-conversation system messages |
-| vLLM | `claude` | `claude -p` against a vLLM OpenAI-compatible endpoint | `local = true`; literal `api_key = "local"` |
-| oMLX | `claude` | `claude -p` against oMLX on localhost | `local = true`; `send_sampling = false` |
-| Codex | `codex` | the Codex CLI (`codex exec --json`) | own login (`codex login`); no base_url or key |
-| Copilot | `copilot` | the Copilot CLI (`copilot -p`) | own login; no guard hook, so MCP use needs `[guard].allow_unguarded = true` |
-| Grok | `grok` | the Grok CLI (`grok -p`) | own login |
-| Gemini | `gemini` | the Gemini CLI (`gemini -p`) | experimental: needs `experimental = true` |
-| Oh My Pi | `omp` | `omp -p --mode json` | own model config in `~/.omp/agent/models.yml`; no guard hook, so `[guard].allow_unguarded = true` |
-
-## The delegation loop
-
-Claude starts a loop from the `/delegate` skill: it first runs a **size check** (small work stays
-with Claude; delegation only pays off past ~200 lines), picks a **tier** (`hard` for parsers,
-graphs, concurrency, perf/security; otherwise `normal`), writes a plan and the tests, and hands
-one command to the autopilot.
-
-```mermaid
-flowchart TD
-    U(["You: /delegate build X"]) --> C
-
-    subgraph CL["Claude Code: expensive, used sparingly"]
-        C["1. Size check, tier,<br/>parallel or not"] --> P["2. Write plan(s)"] --> T["3. Write tests"]
-        T --> RUN["4. One command:<br/>run --auto --wait 540"]
-        RES{"5. Final result"}
-    end
-
-    subgraph R["subagent: autopilot (no Claude tokens)"]
-        CP["Checkpoint + protect<br/>tests and test config"]
-        CHK{"Runner runs<br/>the test suite"}
-        REV{"Review by another<br/>model family"}
-    end
-
-    subgraph W["Worker(s): configured provider"]
-        I["Implement,<br/>run tests, iterate"]
-    end
-
-    RUN --> CP
-    CP --> I --> CHK
-    CHK -- "fail: output as feedback<br/>(hard tier after 2 fails)" --> CP
-    CHK -- pass --> REV
-    REV -- "high-severity issues<br/>as feedback" --> CP
-    REV -- "ok" --> RES
-    CHK -. "stuck, or a test is disputed" .-> RES
-    RES --> D(["Report: summary, files, rounds, review, credits"])
-```
-
-The tiers map to a provider (and optionally a model on it) in the config, so you can remap them
-without touching the skill: `[loop.tiers.normal]` and `[loop.tiers.hard]` name a `provider`, and
-`[loop.review]` / `[loop.test_writer]` name the providers for the cross-family review and the
-test writer.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Claude
-    participant R as subagent
-    participant W as worker
-    participant V as reviewer
-
-    C->>R: run --plan .subagent/PLAN.md --tier hard --auto --wait 540
-    R->>V: review Claude's tests against the plan and spec
-    V-->>R: {verdict, issues}
-    alt high-severity test issues
-        R-->>C: tests_questioned (Claude fixes its tests, runs again)
-    end
-    loop until tests pass and the review is clean (max 4 rounds)
-        R->>R: checkpoint, lock tests
-        R->>W: plan + rules (+ feedback from the previous round)
-        W->>W: edit, run tests, iterate
-        R->>R: restore touched tests/config, run the test suite
-        alt tests fail
-            R->>R: feedback = failing output
-        else tests pass
-            R->>V: review the diff (a model of another family)
-            V-->>R: {verdict, issues}
-            R->>R: feedback = high-severity issues (if any)
-        end
-    end
-    R-->>C: {status, rounds, tests, review, changed_files, worker_credits}
-```
-
-The loop runs entirely under the autopilot: it checkpoints the tree before each round, protects
-the tests, re-runs the suite after each round, moves to the `hard` tier after two failed rounds,
-and when the tests pass has a model of another family review the diff and sends high-severity
-issues back. It hands back one final status — `done`, `tests_questioned`, `needs_test_change`,
-`review_concerns`, `tests_failed`, or a setup error — with `rounds`, `tests`, `review` and
-`changed_files`. The full status-handling playbook is in `skills/delegate/SKILL.md`; the commands
-are `subagent detect|run|wait|test|review|undo|checkpoints|watch` (each prints one JSON object).
-
-## subagent doctor
-
-`subagent doctor` checks each configured provider against this machine: the driver's binary on
-`PATH`, the API-key variables, the health gate (for local providers), and — with `--prompt` — one
-cheap turn. `--provider NAME` checks one provider, `--json` prints a machine-readable row per
-provider.
+Configuration layers merge in this order: the user config selected by `XDG_CONFIG_HOME` (or the
+standard config directory when unset), `.subagent/config.toml` in the project, then the file named
+by `SUBAGENT_CONFIG`. Later layers override earlier values. API keys belong in environment
+variables; config stores their names in `api_key_env`, never their values. To check providers and
+configuration, run:
 
 ```sh
-subagent doctor                  # every configured provider
-subagent doctor --provider glm   # just one
-subagent doctor --prompt --json  # also run one cheap turn on each
+subagent doctor
 ```
 
-## MCP wrapper
+`subagent doctor --provider NAME` checks one provider; `--prompt` also runs a small provider turn,
+`--no-probe` checks config and binaries only, and `--json` returns structured results.
 
-The provider runtime is also an MCP server, `subagent-mcp`, so the same subagents are available
-as tools to any MCP client. Register it in Claude Code's `~/.claude.json`:
+## The delegation workflow
 
-```json
-{
-  "mcpServers": {
-    "subagent": {
-      "command": "subagent-mcp",
-      "env": { "SUBAGENT_CONFIG": "/absolute/path/to/config.toml" }
-    }
-  }
-}
-```
+Use `/delegate` for implementation work. The installed skill checks `[loop].auto`, detects the
+test command and protected test files, then prepares the plan and tests before starting a worker.
+The test outline can be turned into test files and reviewed against the plan. A configured worker
+receives the plan and test contract, edits the workspace, and can run tests. After each worker
+round, `subagent` restores protected test files if needed, runs the verification command, and
+asks a reviewer from another model family to inspect passing changes. Test failures and
+high-severity review findings become feedback for the next round. The loop returns a result with
+status, changed files, tests, review findings, rounds, and worker credits or cost.
 
-Tools: `delegate` starts a run on a provider — `provider=` picks it (`lane=` is a deprecated
-alias), and `verification=` is the command that proves the work is done, which the server runs
-itself — then `await` polls it, `continue` gives more work to the same session, `list` reports
-the configured `providers` and `default_provider`, `cancel` stops it, and `transcript` shows what
-it did. The child's tool calls are gated by a policy classifier and a supervisor; anything the
-classifier cannot settle is escalated to the caller. Point a delegation at a branch, a worktree,
-or a scratch directory rather than anything you cannot afford to have edited.
-
-## Telemetry
-
-`[core] trace = "on"` appends one JSON line per decision and finished run (unset writes to the
-session root; `off` disables it). `[pricing]` names the counterfactual Claude model. To join the
-child runs to the parent Claude Code turns that issued them, and price both sides:
+`[loop].auto` defaults to `ask`: `ask` requests approval before an automatically triggered
+delegation, `always` starts the workflow without that extra prompt, and `never` keeps the work
+with the orchestrator. An explicit `/delegate` request starts the workflow. You can run the loop
+from a terminal as well:
 
 ```sh
-uv run --group report python -m subagent.telemetry.cost --out ./cost-out
+subagent run --plan .subagent/PLAN.md --goal GOAL.md --auto --wait 540
 ```
+
+Run `uv run subagent --help` for the command list. The installed harness integration is the
+usual path; individual loop commands are available for manual workflows.
+
+## Goal files
+
+`/plan` writes a plan that ends with a `## Goal block`; `/goal` writes a workspace-root
+`GOAL.md` containing only that block. A goal can also be supplied inline to `subagent run --goal`.
+The required block has a plan reference followed by consecutive numbered rows:
+
+```text
+## Goal block
+Execute plan "Add CSV export" (PLAN.md). Goal rows:
+1 tests: `uv run pytest -q`
+2 output format: The CSV has a header and one row for each exported record.
+```
+
+A row has the form `<number> <label>: <check>`. A check wrapped in exactly one pair of inline
+backticks is a command; a check with no backticks is prose for the reviewer. Mixed command and
+prose text in one check is rejected. Blank lines between rows are allowed. The parser requires
+row numbers to start at 1 without gaps, and the extracted block may be at most 4,000 characters.
+A goal file must be UTF-8 and inside the selected workspace; its path is protected from worker
+writes. Validate a block or file before running it with:
+
+```sh
+subagent doctor --goal GOAL.md
+```
+
+Command rows run on the server after the final worker round, in the selected workspace. The guard
+uses the existing verification command classifier and adds no goal-specific allowlist. It can
+allow safe read-only commands such as `cat`, `grep`, `rg`, and `test`; read-only Git commands such
+as `git status` and `git diff`; test/build runners such as `pytest`, `tox`, `nose2`, `unittest`,
+`make`, `cargo`, and `go`; and recognized forms such as `uv run pytest`, subject to argument and
+path checks. Commands such as `uv run ruff check`, `uv build --wheel`, shell substitution, or
+arbitrary interpreter snippets are not generally allowed. Only an `ALLOW` verdict executes a
+command. A denied or escalated check is blocked without calling a supervisor, recorded as failed,
+and leaves the run `completed_unverified`; a command passes only on exit code zero. Timeouts and
+execution errors fail the check. The result
+includes each UAT row and a bounded output tail. Prose rows go to the configured cross-family
+reviewer; without a reviewer verdict they remain pending. Prose review does not replace command
+checks. A goal with only prose has no server-side goal check, which `doctor --goal` reports.
+
+## Configuration and usage records
+
+The main loop settings live in `[loop]`:
+
+- `auto` is `ask`, `always`, or `never` (default `ask`).
+- `test_output_cap` is an optional positive character limit for test output copied into worker
+  feedback. The full output remains in its log; without this setting, the loop uses its existing
+  30-line tail.
+- `parallel_tool_calls` defaults to `false`; setting it to `true` asks the worker to batch
+  independent model tool calls in one turn. It does not set the number of concurrent workers;
+  `[core].max_agents` does that.
+- `no_narration` defaults to `false`; setting it to `true` asks the worker to return
+  implementation results without progress narration.
+- `delegate_test_writer` defaults to `false`; setting it to `true` routes a supplied
+  `--test-outline FILE` to
+  `[loop.test_writer].provider` and reviews the generated tests before execution. It requires a
+  configured test writer and `[loop].review_tests = true`; the outline flag is still the trigger.
+
+`[core].compact_window` and `[providers.NAME].compact_window` are token counts for Claude context
+compaction. The default is 1,000,000 tokens; a provider value overrides the core value. Provider
+`thinking` accepts `off` or `low`, but support depends on the driver: `omp` supports both; `codex`
+and `antigravity` support `low`. Unsupported combinations use the driver's default and produce a
+doctor warning. `[core].chars_per_token` defaults to `3.5` and controls source-token estimates.
+
+Turn records retain the provider's input, output, cache, and reasoning totals. They also add
+`source_usage` for visible `harness_prompt`, `plan`, `tool_results`, and `test_output` input
+characters and estimated tokens, plus provider-reported output and reasoning tokens under
+`model_output`. Input estimates use `round(characters / chars_per_token)`. An `unmeasured` list
+identifies sources a driver cannot observe; for example, the current Codex translator does not
+expose tool-result text. These source estimates describe content visible to `subagent`; they do
+not split hidden provider system text or replace provider-reported totals.
+
+View per-provider and per-delegation usage and cost in a self-contained HTML report:
+
+```sh
+subagent report --html report.html
+```
+
+The report uses configured pricing and provider usage, including credits where reported. A flat
+subscription with no monthly price remains an unknown cash cost rather than an invented dollar
+amount.
 
 ## First measured cell (2026-09-23)
 
@@ -316,27 +296,28 @@ hidden tests passed. Copilot's credits rose about 45%, and runs took longer.
 
 Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](docs/benchmark.md).
 
-## Development
-
-```sh
-uv run pytest -q                 # full suite; no network and no provider account needed
-```
-
-The tests run a fake Codex/Copilot and mock HTTP endpoints, so nothing reaches a real provider.
-The loop's shell tests (the documented commands in bash, zsh and fish) skip shells that aren't
-installed and need git, node and npm.
-
 ## Limitations
 
-- **Tests are protected by path and known settings.** Unusual setups (a custom runner script, Rust
-  inline `#[cfg(test)]` modules) are not guarded; add paths with `extra_protected`. The test-count
-  check still catches a passing suite that runs fewer tests.
-- **Workers run with full tools.** The loop's checkpoints make every round undoable; the MCP
-  wrapper's children are gated by the policy classifier and supervisor, but either can still run
-  arbitrary commands in the workspace you name.
-- **Claude trusts the tests and the reviews, not the code.** The reviews catch a lot, but not
-  everything. For anything important, read `git diff` yourself (it costs no Claude tokens).
+- **Guard coverage depends on the driver.** The loop still checkpoints work and verifies tests,
+  but tool-call protection differs:
 
-## Credits
+  | Driver | Tool-call protection |
+  |---|---|
+  | Claude (`claude`) | PreToolUse hook with the subagent classifier. |
+  | Codex (`codex`) | Classifier hook plus Codex `workspace-write` sandbox. |
+  | Copilot (`copilot`) | No guard hook. Direct MCP worker use requires `[guard].allow_unguarded = true`. |
+  | Grok (`grok`) | Built-in sandbox by default; uses Grok's native hook path when configured. |
+  | Oh My Pi (`omp`) | Packaged tool-call hook reaches the subagent classifier. |
+  | Gemini (`gemini`) | No tool-call guard; runs with `--yolo` and is experimental. |
+  | Antigravity (`antigravity`) | No installed approval hook; relies on its CLI sandbox and is experimental. |
 
-The delegation loop comes from [khangzxrr/claude-to-copilot-delegation](https://github.com/khangzxrr/claude-to-copilot-delegation); the provider runtime comes from [gaztrabisme/subagent-mcp](https://github.com/gaztrabisme/subagent-mcp).
+  With `[guard].supervisor = "off"`, Codex's hook is disabled but its sandbox remains.
+
+- **Windows is unsupported.**
+- **Claude login uses the owner's account.** The opt-in Claude provider setting `auth = "login"`
+  uses the owner's Claude login and plan quota. Worker sessions are written into the owner's
+  Claude history. The owner's global instructions, commands, and skills may also load in that
+  worker; `subagent doctor` warns when it checks this provider.
+- Workers edit the workspace you give them. The loop checkpoints work and protects detected test
+  files, but review and tests cannot guarantee that every defect is found. Inspect important
+  changes before relying on them.

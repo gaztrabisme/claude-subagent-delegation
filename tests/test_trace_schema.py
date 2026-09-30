@@ -66,8 +66,10 @@ REQUIRED: dict[str, set[str]] = {
 # Fields a kind may also carry, never required.
 OPTIONAL: dict[str, set[str]] = {
     "run": {"cost"},
-    "delegation": {"stopped_because", "test_writer"},
+    "delegation": {"stopped_because", "test_writer", "uat"},
 }
+
+UAT_KEYS = {"row", "label", "kind", "command", "passed", "output_tail"}
 
 
 def problems(record: dict[str, Any]) -> list[str]:
@@ -134,6 +136,31 @@ def problems(record: dict[str, Any]) -> list[str]:
                 or not {"provider_usd", "counterfactual_usd", "kind", "note"} <= set(round_cost)
             ):
                 found.append(f"{label}: round {i} cost shape")
+        if "uat" in record:
+            uat = record["uat"]
+            if not isinstance(uat, list):
+                found.append(f"{label}: uat is not a list")
+            else:
+                for i, row in enumerate(uat):
+                    if not isinstance(row, dict) or set(row) != UAT_KEYS:
+                        found.append(f"{label}: uat row {i} keys {set(row) if isinstance(row, dict) else row!r}")
+                        continue
+                    if not isinstance(row["row"], int) or isinstance(row["row"], bool):
+                        found.append(f"{label}: uat row {i} number is not an integer")
+                    if not isinstance(row["label"], str):
+                        found.append(f"{label}: uat row {i} label is not a string")
+                    if row["kind"] not in ("command", "prose"):
+                        found.append(f"{label}: uat row {i} kind {row['kind']!r}")
+                    if row["command"] is not None and not isinstance(row["command"], str):
+                        found.append(f"{label}: uat row {i} command is not a string or null")
+                    if row["kind"] == "command" and not isinstance(row["command"], str):
+                        found.append(f"{label}: uat row {i} command kind needs a string")
+                    if row["kind"] == "prose" and row["command"] is not None:
+                        found.append(f"{label}: uat row {i} prose command must be null")
+                    if row["passed"] is not None and type(row["passed"]) is not bool:
+                        found.append(f"{label}: uat row {i} passed is not boolean or null")
+                    if not isinstance(row["output_tail"], str) or len(row["output_tail"]) > 2000:
+                        found.append(f"{label}: uat row {i} output_tail is not a string capped at 2000")
     return found
 
 

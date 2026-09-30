@@ -6,6 +6,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
@@ -14,6 +15,8 @@ from mcp.server.mcpserver import Context
 
 from . import __version__, config
 from .config import ConfigError, configure_logging, log
+from .goal import GoalError, parse_goal
+from .goal_runtime import goal_error_messages
 from .guard.classify import protect_provider_homes
 from .guard.supervisor import Supervisor
 from .router import FALLBACK_MODES
@@ -169,9 +172,9 @@ def _result(run: Run) -> dict[str, Any]:
         )
     elif run.state == "completed_unverified":
         out["hint"] = (
-            "The child finished but the verification command did not pass. Read "
-            f"`verification.output_tail`, then continue(agent_id='{run.agent_id}', ...) "
-            "with what to fix."
+            "One or more server-side acceptance checks did not pass. Read "
+            "`verification.output_tail` and `uat`, then continue "
+            f"(agent_id='{run.agent_id}') with what to fix."
         )
     return out
 
@@ -188,6 +191,7 @@ async def delegate(
     provider: str | None = None,
     lane: str | None = None,
     fallback: str = "full",
+    goal: str | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Start a new subagent on a task.
@@ -221,6 +225,8 @@ async def delegate(
             A failure after work started is never moved. The result's `lane`
             names the provider that ran and `hops` lists every one tried.
             continue always stays on that provider.
+        goal: Optional inline goal block or workspace-relative GOAL.md path.
+            Command rows run on the server; prose rows go to the configured reviewer.
     """
     wanted = provider or lane
     deprecated = provider is None and lane is not None
@@ -248,10 +254,24 @@ async def delegate(
         raise RegistryError(f"cannot resolve workspace {workspace!r}: {exc}") from exc
     if not resolved.is_dir():
         raise RegistryError(f"workspace is not an existing directory: {resolved}")
+    parsed_goal = None
+    if goal is not None:
+        try:
+            parsed_goal = parse_goal(goal, resolved)
+        except GoalError as exc:
+            raise RegistryError("\n".join(goal_error_messages(exc))) from None
     if not (verification or "").strip():
         raise RegistryError(
             "verification is required: give the command that proves the task is done, "
             'or "true" if there is genuinely nothing to check.'
+        )
+
+    goal_review = None
+    if parsed_goal is not None and any(row.kind == "prose" for row in parsed_goal.rows):
+        from .loop.loop import goal_reviewer
+
+        goal_review = goal_reviewer(
+            resolved, SimpleNamespace(settings=settings, registry=registry)
         )
 
     agent = registry.create_agent(
@@ -260,12 +280,31 @@ async def delegate(
         model=model or chosen.model,
         provider=chosen.name,
         fallback=fallback,
+        goal=parsed_goal,
+        goal_reviewer=goal_review,
     )
     start_error = await anyio.to_thread.run_sync(agent.wait_ready, 60.0)
     if start_error is not None:
         raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
     prompt = f"{instructions.strip()}\n\n---\n\n{task}" if instructions else task
-    run = agent.delegate(prompt, verification, parent=_parent_context(ctx))
+    goal_guard = None
+    if parsed_goal is not None and parsed_goal.path:
+        from .loop.testguard import TestGuard
+
+        goal_guard = TestGuard(resolved, (), protected_paths=(parsed_goal.path,))
+        goal_guard.lock()
+        agent.guard_context["protected"] = list(goal_guard.protected)
+    try:
+        run = agent.delegate(
+            prompt,
+            verification,
+            parent=_parent_context(ctx),
+            pre_verify=goal_guard.release if goal_guard is not None else None,
+        )
+    except Exception:
+        if goal_guard is not None:
+            goal_guard.release()
+        raise
     await _wait_for(run, wait_seconds, ctx)
     out = _result(run)
     out["workspace"] = str(resolved)

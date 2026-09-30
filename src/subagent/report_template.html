@@ -55,6 +55,10 @@
   tbody tr:nth-child(even) td:first-child { background: var(--panel); }
   .num-null { color: var(--muted); }
   .badge { display: inline-block; padding: 0 .4rem; border-radius: 3px; font-size: .78rem; }
+  .uat-cell { min-width: 14rem; max-width: 28rem; text-align: left; white-space: normal; }
+  .uat-row { padding: .35rem 0; border-top: 1px solid var(--border); }
+  .uat-command { color: var(--muted); font: .78rem/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+  .uat-output { margin: .2rem 0 0; color: var(--muted); font-size: .75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
   .badge.done { background: #2e7d4f33; color: #2e7d4f; }
   .badge.failed { background: #b3404033; color: #b34040; }
   @media (prefers-color-scheme: dark) {
@@ -158,7 +162,7 @@
   function renderDelegations() {
     var table = document.getElementById("delegations");
     var headers = ["Delegation", "Bench run", "Orchestrator", "Provider(s)", "Status",
-                   "Rounds", "Reviews", "Tests", "Tokens", "USD", "CF USD", "Wall"];
+                   "Rounds", "Reviews", "Tests", "Tokens", "USD", "CF USD", "Wall", "UAT"];
     var thead = el("thead");
     var hr = el("tr");
     headers.forEach(function (h) { hr.appendChild(el("th", null, h)); });
@@ -187,6 +191,24 @@
       tr.appendChild(el("td", null, usd(d.provider_usd)));
       tr.appendChild(el("td", null, usd(d.counterfactual_usd)));
       tr.appendChild(el("td", null, wall(d.wall_seconds)));
+      var uatCell = el("td", "uat-cell");
+      if (Array.isArray(d.uat) && d.uat.length) {
+        var details = el("details");
+        details.appendChild(el("summary", null, d.uat.length + " row(s)"));
+        d.uat.forEach(function (item) {
+          var row = el("div", "uat-row");
+          var state = item.passed === true ? "passed" : item.passed === false ? "failed" : "pending";
+          row.appendChild(el("div", "badge " + (state === "passed" ? "done" : state === "failed" ? "failed" : ""),
+                            item.row + ". " + item.label + " · " + item.kind + " · " + state));
+          if (item.command) row.appendChild(el("div", "uat-command", item.command));
+          if (item.output_tail) row.appendChild(el("pre", "uat-output", item.output_tail));
+          details.appendChild(row);
+        });
+        uatCell.appendChild(details);
+      } else {
+        uatCell.textContent = "—";
+      }
+      tr.appendChild(uatCell);
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);

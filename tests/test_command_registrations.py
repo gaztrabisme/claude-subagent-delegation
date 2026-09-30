@@ -16,7 +16,6 @@ from subagent.cli import main
     "module_name",
     [
         "subagent.commands.init",
-        "subagent.commands.install",
     ],
 )
 def test_command_registration_stubs_are_importable_and_exit_two(
@@ -31,22 +30,18 @@ def test_command_registration_stubs_are_importable_and_exit_two(
     assert "not implemented" in lines[0].lower()
 
 
-@pytest.mark.parametrize(
-    ("argv", "module_name"),
-    [
-        (["install", "--for", "codex"], "subagent.commands.install"),
-    ],
-)
-def test_command_registration_routes_cli_to_stubs(
-    argv: list[str], module_name: str, capsys
+def test_command_registration_routes_cli_to_install(
+    tmp_path: Path, capsys
 ) -> None:
-    importlib.import_module(module_name)
+    target = tmp_path / "target"
 
-    assert main(argv) == 2
-    captured = capsys.readouterr()
-    lines = (captured.out + captured.err).strip().splitlines()
-    assert len(lines) == 1
-    assert "not implemented" in lines[0].lower()
+    assert main([
+        "install", "--for", "codex", "--target-dir", str(target)
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "Installed for: codex" in output
+    assert f"Target: {target}" in output
+    assert (target / ".codex/config.toml").is_file()
 
 
 def test_command_registration_routes_provider_commands(

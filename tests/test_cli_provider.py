@@ -110,6 +110,34 @@ def test_provider_list_json_redacts_credentials(tmp_path, monkeypatch, capsys):
     assert "environment-secret" not in output
 
 
+def test_review_b2_provider_list_redacts_secret_named_keys(tmp_path, monkeypatch, capsys):
+    _user_config(monkeypatch, tmp_path, (
+        "[core]\n"
+        'default_provider = "one"\n\n'
+        "[providers.one]\n"
+        'driver = "claude"\n'
+        'api_key_env = "PROVIDER_TOKEN"\n'
+        'token = "token-value"\n'
+        'password = "password-value"\n'
+        'customSecret = "secret-value"\n\n'
+        "[providers.one.options]\n"
+        'bearer_token = "nested-token-value"\n'
+    ))
+
+    assert main(["provider", "list", "--json"]) == 0
+
+    output = capsys.readouterr().out
+    data = json.loads(output)
+    provider = data["providers"]["one"]
+    assert provider["api_key_env"] == "PROVIDER_TOKEN"
+    assert provider["token"] == "<redacted>"
+    assert provider["password"] == "<redacted>"
+    assert provider["customSecret"] == "<redacted>"
+    assert provider["options"]["bearer_token"] == "<redacted>"
+    for secret in ("token-value", "password-value", "secret-value", "nested-token-value"):
+        assert secret not in output
+
+
 def test_provider_remove_keeps_other_tables(tmp_path, monkeypatch, capsys):
     path = _user_config(monkeypatch, tmp_path, _provider_config())
     assert main(["provider", "remove", "one"]) == 1
@@ -126,6 +154,40 @@ def test_use_sets_default_provider(tmp_path, monkeypatch):
     assert main(["use", "two"]) == 0
     assert config.load().default_provider == "two"
     assert tomllib.loads(path.read_text(encoding="utf-8"))["core"]["run_timeout"] == 900
+
+
+def test_review_b2_provider_edit_preserves_comments_and_arrays(tmp_path, monkeypatch):
+    original = (
+        "# root note stays\n"
+        "[core]\n"
+        "# keep the selection note\n"
+        'default_provider = "one" # inline note\n'
+        "run_timeout = 900\n\n"
+        "# provider note stays\n"
+        "[providers.one]\n"
+        'driver = "codex"\n\n'
+        "[providers.two]\n"
+        'driver = "codex"\n\n'
+        "# routes stay intact\n"
+        "[[jobs]]\n"
+        'name = "alpha"\n'
+        "[[jobs.routes]]\n"
+        'path = "/one"\n'
+    )
+    path = _user_config(monkeypatch, tmp_path, original)
+
+    assert main(["use", "two"]) == 0
+
+    written = path.read_text(encoding="utf-8")
+    assert "# root note stays" in written
+    assert "# keep the selection note" in written
+    assert "# inline note" in written
+    assert "# provider note stays" in written
+    assert "# routes stay intact" in written
+    assert "[[jobs.routes]]\npath = \"/one\"\n" in written
+    parsed = tomllib.loads(written)
+    assert parsed["core"]["default_provider"] == "two"
+    assert parsed["jobs"][0]["routes"][0]["path"] == "/one"
 
 
 def test_provider_test_uses_doctor_checks(tmp_path, monkeypatch, fake_codex, capsys):

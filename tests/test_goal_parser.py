@@ -84,7 +84,7 @@ def test_goal_parser_path_and_inline_use_the_same_validator(tmp_path: Path) -> N
         ),
         (
             f"{HEADER}\n1malformed: check",
-            'row 1: expected "<n> <label>: <check>"',
+            "free text before row 1",
         ),
         (
             f"{HEADER}\n1 first:",
@@ -108,6 +108,17 @@ def test_goal_parser_reports_block_problems(
         parse_goal(value, tmp_path)
 
     assert problem in str(exc_info.value)
+
+
+def test_review_b2_goal_parser_tracks_prose_and_consecutive_rows(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as prose_error:
+        parse_goal(f"{HEADER}\n2024-01-01: kickoff\n1 first: check", tmp_path)
+    assert prose_error.value.args[0] == "free text before row 1"
+
+    gap = f"{HEADER}\n1 one: check\n2 two: check\n5 five: check\n3 three: check\n4 four: check"
+    with pytest.raises(ValueError) as gap_error:
+        parse_goal(gap, tmp_path)
+    assert gap_error.value.problems == ("rows not consecutive: expected 3 got 5",)
 
 
 def test_goal_parser_rejects_blocks_over_4000_characters(tmp_path: Path) -> None:

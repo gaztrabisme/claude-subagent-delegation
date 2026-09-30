@@ -1,7 +1,7 @@
-# Copy of scripts/pricing.toml for tests/test_cost_join.py, with every provider
+# Copy of subagent/pricing.toml for tests/test_cost_join.py, with every provider
 # price set to "null" so provider costs are unknown. Keep the other sections in
-# sync with scripts/pricing.toml; real provider prices are asserted in
-# test_real_pricing_file_has_known_provider_costs.
+# sync with subagent/pricing.toml; real provider prices are asserted in
+# test_packaged_pricing_has_known_provider_costs in tests/test_packaged_pricing.py.
 #
 # Model rates are USD per million tokens (Claude list prices).
 # Cache multipliers are relative to the model's input rate.

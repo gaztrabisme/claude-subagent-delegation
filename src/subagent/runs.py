@@ -42,6 +42,7 @@ from .router import FALLBACK_MODES
 from .secrets import redact_secrets
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
+from .telemetry.source_usage import INPUT_SOURCES, make_source_usage
 from .telemetry.trace import Trace, open_trace
 from .verify import VerificationResult, run_verification
 
@@ -280,6 +281,39 @@ def _max_fields(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
     return {key: max(a.get(key, 0), b.get(key, 0)) for key in _USAGE_KEYS}
 
 
+def _tool_result_text_chars(event: dict[str, Any]) -> tuple[int, bool]:
+    """Count text in normalized tool-result events, or flag an unknown shape."""
+    try:
+        return _tool_result_text_chars_unchecked(event)
+    except Exception:  # noqa: BLE001 - malformed source events are unmeasured
+        return 0, False
+
+
+def _tool_result_text_chars_unchecked(event: dict[str, Any]) -> tuple[int, bool]:
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return 0, content in (None, "")
+    chars = 0
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        value = block.get("content")
+        if isinstance(value, str):
+            chars += len(value)
+        elif isinstance(value, list):
+            for part in value:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        chars += len(text)
+                    else:
+                        return chars, False
+        elif value is not None:
+            return chars, False
+    return chars, True
+
+
 class _Meter:
     """Token and timing accounting for one attempt, fed every event as it arrives.
 
@@ -314,6 +348,8 @@ class _Meter:
         # own message_delta (which carries its usage and stop_reason), and
         # that delta still belongs to the message that started the stream.
         self._stream: str | None = None
+        self._pending_tool_result_chars = 0
+        self._pending_source_unmeasured: set[str] = set()
 
     def _turn(self, message_id: Any, now: float, model: Any = None) -> dict[str, Any]:
         key = str(message_id) if message_id else (self._current or f"attempt-{self.attempt}")
@@ -329,7 +365,11 @@ class _Meter:
                 "tool_calls": [],
                 "tool_ids": set(),
                 "stop_reason": None,
+                "source_tool_result_chars": self._pending_tool_result_chars,
+                "source_unmeasured": set(self._pending_source_unmeasured),
             }
+            self._pending_tool_result_chars = 0
+            self._pending_source_unmeasured.clear()
             self.turns[key] = turn
         if isinstance(model, str) and model:
             turn["model"] = model
@@ -396,6 +436,16 @@ class _Meter:
             return
         if kind == "user":
             # A tool result: the next message's request goes out now.
+            chars, observed = _tool_result_text_chars(event)
+            target = self.turns.get(self._current) if self._current is not None else None
+            if target is None:
+                self._pending_tool_result_chars += chars
+                if not observed:
+                    self._pending_source_unmeasured.add("tool_results")
+            else:
+                target["source_tool_result_chars"] += chars
+                if not observed:
+                    target["source_unmeasured"].add("tool_results")
             self._mark = now
             self._current = None
             return
@@ -424,6 +474,9 @@ class _Meter:
             and not any(any(t["usage"].values()) for t in turns)
         ):
             turns[-1]["usage"] = dict(self.result_usage)
+        if turns and self._pending_tool_result_chars:
+            turns[-1]["source_tool_result_chars"] += self._pending_tool_result_chars
+            turns[-1]["source_unmeasured"].update(self._pending_source_unmeasured)
         out = []
         for turn in turns:
             out.append({
@@ -436,6 +489,8 @@ class _Meter:
                 **turn["usage"],
                 "tool_calls": list(turn["tool_calls"]),
                 "stop_reason": turn["stop_reason"],
+                "_source_tool_result_chars": turn["source_tool_result_chars"],
+                "_source_unmeasured": list(turn["source_unmeasured"]),
             })
         return out
 
@@ -513,6 +568,9 @@ class Run:
     pre_verify_result: dict | None = None
     # Guard denials the supervisor recorded for this run (the loop drains them).
     guard_verdicts: list[dict[str, Any]] = field(default_factory=list)
+    # Known lengths for source-tagged prompt text; absent metadata means the
+    # entire submitted prompt is treated as harness text.
+    source_chars: dict[str, int] | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -667,6 +725,7 @@ class Agent:
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
+        source_chars: dict[str, int] | None = None,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -674,6 +733,11 @@ class Agent:
             run_id=f"run-{uuid.uuid4().hex[:12]}",
             agent_id=self.agent_id,
             prompt=prompt,
+            source_chars=(
+                dict(source_chars)
+                if source_chars is not None
+                else {"harness_prompt": len(prompt), "plan": 0, "test_output": 0}
+            ),
             verification=verification,
             verification_note=note,
             goal=self.goal,
@@ -708,6 +772,7 @@ class Agent:
         distill: bool = True,
         goal: Goal | None = None,
         reviewer: GoalReviewer | None = None,
+        source_chars: dict[str, int] | None = None,
     ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
@@ -726,6 +791,7 @@ class Agent:
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
+            source_chars=source_chars,
         )
 
     def follow_up(
@@ -736,6 +802,7 @@ class Agent:
         pre_verify: Callable[[], dict] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
+        source_chars: dict[str, int] | None = None,
     ) -> Run:
         """A continue. Omitting `verification` reuses the delegate's; "" skips it.
 
@@ -757,6 +824,7 @@ class Agent:
                 pre_verify=pre_verify,
                 on_event=on_event,
                 distill=distill,
+                source_chars=source_chars,
             )
         if verification is not None and not verification.strip():
             return self.submit(
@@ -767,6 +835,7 @@ class Agent:
                 pre_verify=pre_verify,
                 on_event=on_event,
                 distill=distill,
+                source_chars=source_chars,
             )
         return self.submit(
             message,
@@ -775,6 +844,7 @@ class Agent:
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
+            source_chars=source_chars,
         )
 
     def get_run(self, run_id: str) -> Run | None:
@@ -1270,6 +1340,29 @@ class Agent:
         if run.ttft_seconds is None and meter.first_assistant is not None:
             run.ttft_seconds = round(meter.first_assistant - meter.spawned_at, 3)
         for turn in meter.records():
+            try:
+                tool_result_chars = turn.pop("_source_tool_result_chars", 0)
+                source_unknown = set(turn.pop("_source_unmeasured", ()))
+                if self.driver.name == "codex":
+                    source_unknown.add("tool_results")
+                source_chars = dict(run.source_chars or {})
+                source_chars["tool_results"] = tool_result_chars
+                source_usage, unmeasured = make_source_usage(
+                    source_chars,
+                    output_tokens=turn["output"],
+                    reasoning_tokens=turn["reasoning"],
+                    chars_per_token=self.settings.chars_per_token,
+                    unmeasured=tuple(source_unknown),
+                )
+            except Exception:  # noqa: BLE001 - source accounting cannot fail the worker
+                turn.pop("_source_tool_result_chars", None)
+                turn.pop("_source_unmeasured", None)
+                source_usage, unmeasured = make_source_usage(
+                    None,
+                    output_tokens=turn.get("output", 0),
+                    reasoning_tokens=turn.get("reasoning", 0),
+                    unmeasured=INPUT_SOURCES,
+                )
             record = {
                 "run_id": run.run_id,
                 "agent_id": self.agent_id,
@@ -1278,6 +1371,8 @@ class Agent:
                 "turn": len(run.turn_log),
                 **turn,
                 "model": turn["model"] or self.model,
+                "source_usage": source_usage,
+                "unmeasured": unmeasured,
             }
             run.turn_log.append(record)
             if self.trace is not None:

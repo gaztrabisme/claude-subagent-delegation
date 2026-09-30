@@ -19,6 +19,18 @@ class Rounds(Sandbox):
         self.assertEqual(r["worker_credits"], 2.5)
         self.assertIn("checkpoint", r)
 
+    def test_worker_round_provider_error_text_is_reported(self):
+        root = self.node_project()
+        _, r = self.delegate("run", "--plan", ".subagent/PLAN.md", cwd=root, scenario="good",
+                             env={"FAKE_FAIL_MODEL": "claude-sonnet-5"})
+        error = r["provider_error"]
+        self.assertEqual(r["status"], "backend_error")
+        self.assertIn("not available", error["message"])
+        self.assertIn(error["finish_reason"], {"refused", "cli_error"})
+        if self.DRIVER == "copilot":
+            self.assertEqual(error["refusal_code"], "copilot_model_unavailable")
+        self.assertIn("not available", self.read(root, r["log"]))
+
     def test_runner_catches_failing_tests(self):
         root = self.node_project()
         code, r = self.delegate("run", "--plan", ".subagent/PLAN.md", cwd=root, scenario="buggy")

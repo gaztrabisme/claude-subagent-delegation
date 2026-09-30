@@ -319,6 +319,18 @@ def test_the_skill_copy_lands_where_each_harness_reads_skills(tmp_path):
     assert not (claude / ".agents").exists() and not (claude / ".grok").exists()
 
 
+def test_c_fix2_bench_copy_materializes_packaged_skill_contents(tmp_path):
+    cell = tmp_path / "codex"
+    cell.mkdir()
+
+    assert run.install_skill(cell, "codex") == [".agents/skills/delegate"]
+    copied = cell / ".agents/skills/delegate/SKILL.md"
+    packaged = ROOT / "src/subagent/skills/delegate/SKILL.md"
+    assert copied.is_file()
+    assert not copied.is_symlink()
+    assert copied.read_bytes() == packaged.read_bytes()
+
+
 def test_venv_bin_is_the_running_interpreter_s_bin_with_subagent():
     bin_dir = run.venv_bin()
     expected = Path(sys.executable).parent

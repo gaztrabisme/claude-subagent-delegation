@@ -65,6 +65,10 @@ Housekeeping
 
 Not in v2: Windows, opencode driver, omp driver merge, any settings UI.
 
+## Resumed (2026-09-30)
+
+Gary lifted the pause below (`decisions.md` S25): the v2 list goes ahead, item 9 deferred with omp as the stand-in. Grounding and the lane check are in `grounded.md` (2026-09-30). The Plan Block was put to Gary on 2026-09-30; no goal file is written and no unit is dispatched until Gary answers it.
+
 ## Paused (2026-09-25)
 
 Gary's decision: build his own lean coding-agent harness (a more token-efficient pi) first; `subagent` v2 waits for it. The spike that led here is at `wiki/data/spike-harness-2026-09-24.md` (verdict: wrap pi as a driver; build-own as fallback; two unverified points: prompt-prefix stability for local KV reuse, `enable_thinking` passthrough to oMLX/llama.cpp).

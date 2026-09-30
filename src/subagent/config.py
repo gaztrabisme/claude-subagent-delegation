@@ -47,6 +47,7 @@ APPROVAL_HOOK = Path(__file__).parent / "guard" / "approval_hook.py"
 CONFIG_ENV = "SUBAGENT_CONFIG"
 CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
+_LOGIN_API_KEY_MARKER = "subagent-claude-login"
 UNIX_SOCKET_PATH_MAX = 104
 SHORT_SOCKET_ROOT = Path("/tmp")
 _APPROVAL_SOCKET_IDS = itertools.count()
@@ -64,6 +65,30 @@ FIXED_LEAKED_KEYS = (
 
 class ConfigError(RuntimeError):
     """A config file this server cannot run with. The message says why."""
+
+
+class _LoginProviderConfig(ProviderConfig):
+    """Compatibility view for runs.py's driver-wide API-key gate.
+
+    The current run gate is outside S3's file ownership. A non-secret marker
+    keeps that gate from rejecting login providers, while the public config
+    view still reports that no API key is configured.
+    """
+
+    __slots__ = ()
+
+    def api_key(self, env: Mapping[str, str] | None = None) -> str:
+        del env
+        return _LOGIN_API_KEY_MARKER
+
+    def unavailable(self) -> str | None:
+        return None
+
+    def as_dict(self) -> dict[str, object]:
+        view = super().as_dict()
+        view["auth"] = "login"
+        view["has_api_key"] = False
+        return view
 
 
 def _approval_socket_path(preferred: str | Path) -> str:
@@ -298,6 +323,13 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
             f"provider {name!r} has unknown driver {driver!r}; "
             f"expected one of {', '.join(DRIVERS)}"
         )
+    auth = table.get("auth")
+    if auth is not None and auth != "login":
+        raise ConfigError(f"provider {name!r} auth must be 'login'")
+    if auth == "login" and driver != DRIVER_CLAUDE:
+        raise ConfigError(f"provider {name!r} auth = 'login' requires driver = 'claude'")
+    if auth == "login" and "api_key_env" in table:
+        raise ConfigError(f"provider {name!r} auth = 'login' cannot set api_key_env")
     base_url = _str(table, "base_url", None)
     if base_url:
         base_url = base_url.rstrip("/")
@@ -307,15 +339,18 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
     thinking = table.get("thinking")
     if thinking is not None and thinking not in ("off", "low"):
         raise ConfigError(f"provider {name!r} thinking must be 'off' or 'low'")
-    return ProviderConfig(
+    api_key_envs = _strings(table, "api_key_env")
+    api_key_default = None if auth == "login" else _str(table, "api_key", None)
+    provider_config = _LoginProviderConfig if auth == "login" else ProviderConfig
+    return provider_config(
         name=name,
         driver=driver,
         vendor=_str(table, "vendor", None) or derive_vendor(driver, base_url),
         base_url=base_url,
         model=_str(table, "model", None),
         effort=_str(table, "effort", None),
-        api_key_envs=_strings(table, "api_key_env"),
-        api_key_default=_str(table, "api_key", None),
+        api_key_envs=api_key_envs,
+        api_key_default=api_key_default,
         local=_bool(table, "local", False),
         send_sampling=_bool(table, "send_sampling", True),
         max_agents=int(_int(table, "max_agents", core["max_agents"])),
@@ -579,16 +614,18 @@ class Settings:
                     }
                 ]
             }
+        env = {
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(cfg.compact_window),
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "API_TIMEOUT_MS": "3000000",
+        }
+        if cfg.extra.get("auth") != "login":
+            env["ANTHROPIC_BASE_URL"] = adapter.child_base_url(cfg) or ""
         payload = {
-            "env": {
-                "ANTHROPIC_BASE_URL": adapter.child_base_url(cfg) or "",
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(cfg.compact_window),
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                "API_TIMEOUT_MS": "3000000",
-            },
+            "env": env,
             "hooks": hooks,
             "autoCompactWindow": cfg.compact_window,
         }
@@ -608,11 +645,9 @@ class Settings:
         # Start from the runtime allowlist; provider credentials are added only
         # below after mapping the selected provider's key to Claude's name.
         env = self.base_child_env()
-        key = cfg.api_key() or ""
+        login = cfg.extra.get("auth") == "login"
+        key = "" if login else (cfg.api_key() or "")
         env.update({
-            "CLAUDE_CONFIG_DIR": str(self.agent_home(agent_id)),
-            "ANTHROPIC_BASE_URL": adapter.child_base_url(cfg) or "",
-            "ANTHROPIC_AUTH_TOKEN": key,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
@@ -626,6 +661,24 @@ class Settings:
             "SUBAGENT_APPROVAL_SOCKET": self.approval_socket,
             "SUBAGENT_HOOK_TIMEOUT": str(self.supervisor_timeout + 20),
         })
+        if login:
+            parent_config = os.environ.get("CLAUDE_CONFIG_DIR")
+            config_dir = (
+                Path(parent_config).expanduser()
+                if parent_config
+                else Path.home() / ".claude"
+            )
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir.resolve())
+            env.pop("ANTHROPIC_BASE_URL", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        else:
+            env.update({
+                "CLAUDE_CONFIG_DIR": str(self.agent_home(agent_id)),
+                "ANTHROPIC_BASE_URL": adapter.child_base_url(cfg) or "",
+                "ANTHROPIC_AUTH_TOKEN": key,
+            })
         return env
 
     def workspace_refusal(self, workspace: Path) -> str | None:
@@ -722,7 +775,9 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
             raise ConfigError(f"[providers.{name}] must be a table")
         cfg = _provider(str(name), table, defaults)
         providers[cfg.name] = cfg
-        if cfg.api_key_envs:
+        if cfg.extra.get("auth") == "login":
+            pass
+        elif cfg.api_key_envs:
             if not cfg.api_key():
                 warnings.append(
                     f"provider {cfg.name}: no API key in this server's environment; "

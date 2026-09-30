@@ -224,8 +224,33 @@ UAT at close (against the goal file only):
 | 10 | PASS: `uv tool list` shows `subagent` editable from this checkout; config `default_provider = "codex"`; `grep -c '^SAM_'` on the env file is 0 |
 | 11 | PASS: this entry, S24, active-work State, CLAUDE.md Subagent lanes |
 
-## 2026-09-30 — Unit A1 run/wait accounting and bench fixes
+## 2026-09-30 — v2 run (coordinator; in progress)
 
-- Fixed the live-run refusal message and background-child identity check; the delegate skill now directs a `running` result to `subagent wait`.
-- Cell configs now live at `.subagent/config.toml`, so the project loader selects the cell session root even when a tool shell does not preserve `SUBAGENT_CONFIG`. Claude `modelUsage` now accepts direct camelCase token fields, and hidden-test destinations created by the worker are moved aside before trusted tests are copied in.
-- Verification: the four requested focused pytest selections pass; full suite is 873 passed, 1 skipped, 19 subtests; `uv run ruff check src tests` passes. Details and exact command output: [v2-a1-report.md](../v2-a1-report.md).
+Goal: `goals/2026-09-30-v2.md`. Decision: S25. Coordinator: Claude Code (conductor). Code and spec units on Codex gpt-6-luna xhigh, `-s danger-full-access`, one worktree each under `../subagent-mcp-wt/`, branch `v2` off `fuse` 6ae599a. Reviews on Gemini through the `subagent` MCP server in detached worktrees. Unit reports are beside the worktrees (`../subagent-mcp-wt/v2-<unit>-report.md`), briefs and reviews in `../subagent-mcp-wt/v2-briefs/`.
+
+### Run ledger
+
+| Unit | Lane | Result |
+|---|---|---|
+| A3 pricing, old env import (item 4) | Codex | PASS, merged e364d4b. Coordinator ran: `-k packaged_pricing` 2 passed; wheel lists `subagent/pricing.toml`; `SAM_`/`from-env` grep empty; ruff clean |
+| A2 provider error text (item 2, U-L1) | Codex | PASS, merged a51cc92. Coordinator ran: `-k provider_error_text` 5 passed; ruff clean; result object shows `provider_error` with message, refusal code, finish reason |
+| A1 run/wait, bench (items 1, 2, 3) | Codex | PASS, merged 4856ad0. Coordinator ran: `-k run_refuses_live`, `cell_session_root`, `orch_tokens`, `hidden_dest` each pass; ruff clean. The unit wrote a `wiki/log.md` entry against its brief; folded into this ledger. The cause it fixed for U-B4 (the orchestrator's tool shell dropping `SUBAGENT_CONFIG`, so the cell config is now written to the project's `.subagent/config.toml`) is a hypothesis: the recorded cell kept no evidence, and no live bench cell was replayed |
+| Wave A on `v2` | coordinator | 878 passed, 1 skipped; ruff clean; machine-value grep empty |
+| Review A, attempt 1 | Gemini | FAILED after 319 s: loop watchdog, "identical tool call repeated 8 times" on `view_file` (finding U-A1 below). Worktree unchanged |
+| Review A, attempt 2 | Gemini | 4 HIGH, 4 MED, 2 LOW (`review.md`, 2026-09-30 v2 review). Reads done through distinct shell commands |
+| SPEC | Codex | `wiki/v2-spec.md` 7a134e0 on `v2-spec`: nine item sections, build units, key decisions |
+| Spec cold review | Gemini | 4 CRITICAL, 9 WARNING, 2 ADVISORY; spec sent back for one revision (SPEC2) |
+
+### Forks decided forward
+
+- Goal-row kind (item 12): the harness contract does not say how a command row is told from a prose row. Decided: a check that is exactly one backticked span is a command; a check with a backtick that is not exactly that is rejected (`mixed command and prose check`); no backtick means prose. The efficient-pi mapping needs the same rule.
+- Goal commands take the same guard path as the job's `verification` command; the classifier allowlist is not widened in this run, so a goal command such as a linter call is handled as an escalated verification command is today. Open for Gary: whether to widen it.
+- Login mode (item 7): the login child's config directory is a protected root for the run; isolated directory if a login child authenticates with one (live probe in SPEC2), otherwise the owner's directory with a plain warning.
+- Source buckets (item 13): character counts passed from the loop, plus an `unmeasured` list per turn, because no driver reports usage by source.
+- `parallel_tool_calls` (item 14) is read as the worker model batching tool calls in one turn, not loop concurrency (that is `max_agents`). This is the coordinator's reading of the v2 list's wording.
+- The spec's two build units are replaced by six (S1, then S2→S3, R1→R2 and I in parallel), each sized for one 90-minute run.
+- `rm -rf` and `git restore --worktree` are blocked by the machine's safety hook for the coordinator and for Codex; wheel checks build into the session scratchpad instead.
+
+### Findings
+
+- U-A1 The `gemini` (Antigravity) lane is killed by the loop watchdog on read-heavy work: `view_file` calls count as identical. Cause not confirmed; the trace does not record tool arguments. Same class as the Codex fix 6ae599a. Workaround in briefs: read with distinct shell commands.

@@ -284,3 +284,28 @@ Scope: the numbered findings in the lanes review report, the U7 coordinator find
 10. **Review outcomes recorded** — complete in this section; fixed findings cite their implementation commits, and the accepted finding below records the owner's decision.
 
 **HIGH — Antigravity can write without the shared guard** — accepted by the owner. The driver remains experimental and passes `--sandbox`; no deny-capable hook format was found in agy 1.2.12. No change was made for this finding.
+
+## 2026-09-30 v2 review
+
+Reader: the next session auditing the v2 run. Reviewer: Gemini (gemini-3.8-flash-high) through the `gemini` provider, in a detached worktree, on code written by Codex. Each wave has its own subsection. Full reviewer text: `../subagent-mcp-wt/v2-briefs/review-<wave>.md`.
+
+### Wave A (diff 8a784d7..4856ad0: items 1 to 4)
+
+Fixes are in `47fded2` (merged as `4924ab6`); each names its regression test.
+
+1. **HIGH — the live-run check is bypassed by `--run-id` on a foreground run.** Outcome: fixed; `test_review_a_foreground_custom_run_id_records_the_live_process`.
+2. **HIGH — a dead run whose pid is reused wedges `run` and hangs `wait`.** Outcome: fixed; liveness is a kernel lock on `.subagent/run.lock`, not the pid; `test_review_a_recycled_pid_does_not_wedge_run_or_wait`.
+3. **HIGH — `provider_error` can carry a credential into run records and logs.** Outcome: fixed; `src/subagent/secrets.py` redacts configured key values and common key formats before the error is stored or logged; `test_review_a_provider_error_text_redacts_configured_and_common_keys`.
+4. **HIGH — `subagent report` does not load the project config.** Outcome: fixed; `test_review_a_report_loads_the_project_config_from_its_directory`.
+5. **MED — race between the background parent and child on `current.json`.** Outcome: not real, by the fix unit's reading: a live prior record makes the parent return before it spawns. The lock handed to the child in finding 2's fix also removes the window.
+6. **MED — commands run from a subdirectory miss the project config.** Outcome: fixed; nearest ancestor `.subagent/config.toml` when `--root` is not given; `test_review_a_subdirectory_command_finds_the_ancestor_project_config`.
+7. **MED — the hidden-destination test never runs a real test runner.** Outcome: fixed; `test_review_a_hidden_dest_moves_worker_tests_aside_and_runs_trusted_tests` runs unittest and node.
+8. **MED — a worker can forge hidden-test counts on stdout.** Outcome: fixed; counts come from the runner's own summary stream; `test_review_a_hidden_test_import_cannot_forge_counts_on_stdout`.
+9. **LOW — `node --test` with no matching files runs every test in the workspace.** Outcome: fixed; `test_review_a_node_hidden_tests_run_explicit_mjs_files_not_worker_discovery`.
+10. **LOW — a partial `modelUsage` record hides the top-level totals.** Outcome: not real; `modelUsage` sums include subagent usage and the top-level usage does not, so the sums are the intended source (`test_claude_prefers_the_modelusage_sums`).
+
+The fix itself (a new run lock and a redaction module) has not been read by a second reviewer; it is in the scope of the wave B review.
+
+### Spec (wiki/v2-spec.md at 7a134e0)
+
+Cold review before build: 4 CRITICAL, 9 WARNING, 2 ADVISORY (`../subagent-mcp-wt/v2-briefs/review-spec.md`). The spec went back for one revision; the coordinator's decisions on the four CRITICAL findings are in `log.md` (2026-09-30, "Forks decided forward").

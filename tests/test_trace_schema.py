@@ -14,6 +14,7 @@ from typing import Any
 
 from subagent.runs import COMPLETED, Registry
 from subagent.telemetry.sampler import Telemetry
+from subagent.telemetry.source_usage import make_source_usage
 from subagent.telemetry.trace import KINDS, SCHEMA, Trace
 
 from .conftest import default_providers, make_settings
@@ -46,7 +47,7 @@ REQUIRED: dict[str, set[str]] = {
     "turn": {
         "run_id", "agent_id", "lane", "provider", "model", "turn", "attempt", "message_id",
         "ts_start", "ts_first_token", "ts_end", "input", "output", "cache_read",
-        "cache_write", "reasoning", "tool_calls", "stop_reason",
+        "cache_write", "reasoning", "tool_calls", "stop_reason", "source_usage", "unmeasured",
     },
     "sample": {"lane", "run_ids", "snapshot"},
     "run_summary": {
@@ -108,6 +109,35 @@ def problems(record: dict[str, Any]) -> list[str]:
         for key in ("input", "output", "cache_read", "cache_write", "reasoning"):
             if not isinstance(record.get(key), int):
                 found.append(f"{label}: {key} is not an integer")
+        source_usage = record.get("source_usage")
+        input_sources = {"harness_prompt", "plan", "tool_results", "test_output"}
+        if not isinstance(source_usage, dict) or set(source_usage) != input_sources | {"model_output"}:
+            found.append(f"{label}: source_usage bucket names")
+        else:
+            for source in input_sources:
+                bucket = source_usage[source]
+                if not isinstance(bucket, dict) or set(bucket) != {"input_chars", "input_tokens_est"}:
+                    found.append(f"{label}: source_usage {source} shape")
+                    continue
+                for unit in ("input_chars", "input_tokens_est"):
+                    if type(bucket.get(unit)) is not int or bucket[unit] < 0:
+                        found.append(f"{label}: source_usage {source}.{unit} is not a non-negative integer")
+            model_output = source_usage["model_output"]
+            if not isinstance(model_output, dict) or set(model_output) != {
+                "output_tokens", "reasoning_tokens"
+            }:
+                found.append(f"{label}: source_usage model_output shape")
+            else:
+                for unit in ("output_tokens", "reasoning_tokens"):
+                    if type(model_output.get(unit)) is not int or model_output[unit] < 0:
+                        found.append(f"{label}: source_usage model_output.{unit} is not a non-negative integer")
+        unmeasured = record.get("unmeasured")
+        if not isinstance(unmeasured, list) or any(
+            not isinstance(source, str)
+            or source not in {"harness_prompt", "plan", "tool_results", "test_output", "model_output"}
+            for source in unmeasured
+        ):
+            found.append(f"{label}: unmeasured is not a list of source bucket names")
     if kind == "sample" and (
         not isinstance(record.get("run_ids"), list)
         or not isinstance(record.get("snapshot"), dict)
@@ -195,7 +225,9 @@ def _events() -> list[dict[str, Any]]:
                                            "delta": {"stop_reason": "tool_use"},
                                            "usage": {"output_tokens": 12}}},
         {"type": "stream_event", "event": {"type": "message_stop"}},
-        {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+        {"type": "user", "message": {
+            "content": [{"type": "tool_result", "content": "tool output"}]
+        }},
         {"type": "result", "subtype": "success", "is_error": False, "result": "done",
          "session_id": "s1", "usage": {"input_tokens": 30, "output_tokens": 12}, "num_turns": 1},
     ]
@@ -237,6 +269,17 @@ def test_records_from_a_local_lane_run_satisfy_the_schema(tmp_path: Path, monkey
     records = _read(tmp_path / "trace.jsonl") + _read(tmp_path / "metrics.jsonl")
     kinds = {r["kind"] for r in records}
     assert {"run", "hop", "turn", "run_summary", "sample"} <= kinds
+    turn = next(r for r in records if r["kind"] == "turn")
+    assert turn["input"] == 30
+    assert turn["output"] == 12
+    assert turn["source_usage"]["harness_prompt"]["input_chars"] == len("do it")
+    assert turn["source_usage"]["plan"]["input_chars"] == 0
+    assert turn["source_usage"]["test_output"]["input_chars"] == 0
+    assert turn["source_usage"]["tool_results"]["input_chars"] == len("tool output")
+    assert turn["source_usage"]["model_output"] == {
+        "output_tokens": 12,
+        "reasoning_tokens": 0,
+    }
     assert [p for r in records for p in problems(r)] == []
 
 
@@ -253,3 +296,61 @@ def test_verdict_and_calibration_records_satisfy_the_schema(tmp_path: Path):
 def test_the_validator_catches_a_missing_key():
     assert problems({"schema": SCHEMA, "ts": 0, "kind": "turn", "run_id": "r"})
     assert problems({"schema": SCHEMA, "ts": 0, "kind": "nonsense"}) == ["unknown kind 'nonsense'"]
+
+
+def test_turn_source_has_five_named_buckets():
+    usage, unmeasured = make_source_usage(
+        {"harness_prompt": 70, "plan": 35, "tool_results": 7, "test_output": 14},
+        output_tokens=11,
+        reasoning_tokens=3,
+    )
+    assert set(usage) == {
+        "harness_prompt", "plan", "tool_results", "test_output", "model_output"
+    }
+    assert set(usage["model_output"]) == {"output_tokens", "reasoning_tokens"}
+    assert unmeasured == []
+
+
+def test_turn_source_estimates_tokens_from_characters():
+    usage, unmeasured = make_source_usage(
+        {"harness_prompt": 70, "plan": 35, "tool_results": 7, "test_output": 14},
+        output_tokens=0,
+        reasoning_tokens=0,
+        chars_per_token=3.5,
+    )
+    assert usage["harness_prompt"] == {"input_chars": 70, "input_tokens_est": 20}
+    assert usage["plan"] == {"input_chars": 35, "input_tokens_est": 10}
+    assert usage["tool_results"] == {"input_chars": 7, "input_tokens_est": 2}
+    assert usage["test_output"] == {"input_chars": 14, "input_tokens_est": 4}
+    assert unmeasured == []
+
+
+def test_turn_source_preserves_provider_totals():
+    provider_totals = {"input": 31, "output": 13, "reasoning": 5}
+    usage, _ = make_source_usage(
+        {"harness_prompt": 10, "plan": 20, "tool_results": 0, "test_output": 0},
+        output_tokens=provider_totals["output"],
+        reasoning_tokens=provider_totals["reasoning"],
+    )
+    assert usage["model_output"] == {"output_tokens": 13, "reasoning_tokens": 5}
+    assert provider_totals == {"input": 31, "output": 13, "reasoning": 5}
+
+
+def test_turn_source_marks_unobservable_buckets():
+    usage, unmeasured = make_source_usage(
+        {"harness_prompt": 10, "plan": 20, "tool_results": 12, "test_output": 0},
+        output_tokens=1,
+        reasoning_tokens=0,
+        unmeasured=("tool_results",),
+    )
+    assert usage["tool_results"] == {"input_chars": 0, "input_tokens_est": 0}
+    assert unmeasured == ["tool_results"]
+
+    invalid, invalid_unmeasured = make_source_usage(
+        {"harness_prompt": "unknown", "plan": 0, "tool_results": 0, "test_output": 0},
+        output_tokens=1,
+        reasoning_tokens=0,
+        chars_per_token=0,
+    )
+    assert invalid["harness_prompt"] == {"input_chars": 0, "input_tokens_est": 0}
+    assert invalid_unmeasured == ["harness_prompt", "plan", "tool_results", "test_output"]

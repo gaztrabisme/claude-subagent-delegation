@@ -72,7 +72,7 @@ def run_verification(
     """
     timeout = settings.verify_timeout
     if budget is not None:
-        timeout = max(1.0, min(timeout, budget))
+        timeout = max(0.0, min(timeout, budget))
     command = (command or "").strip()
     if not command:
         return VerificationResult(command, False, "no verification command was given")

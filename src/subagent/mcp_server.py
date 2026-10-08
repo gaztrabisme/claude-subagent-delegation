@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__, config
 from .config import ConfigError, configure_logging, log
@@ -157,7 +159,7 @@ def _goal_guard_hooks(agent):
 async def _wait_for(run: Run, seconds: float, ctx: Context | None = None) -> None:
     """Block for up to `seconds`, reporting progress while we wait.
 
-    run.done.wait is a blocking SDK-adjacent call, so it crosses to a thread.
+    run.await_ready.wait is a blocking call, so it crosses to a thread.
     Chunking it is what makes progress reporting possible at all.
     """
     if seconds <= 0:
@@ -168,7 +170,7 @@ async def _wait_for(run: Run, seconds: float, ctx: Context | None = None) -> Non
         if remaining <= 0:
             return
         finished = await anyio.to_thread.run_sync(
-            run.done.wait, min(PROGRESS_INTERVAL, remaining)
+            run.await_ready.wait, min(PROGRESS_INTERVAL, remaining)
         )
         if finished:
             return
@@ -186,7 +188,9 @@ async def _report(ctx: Context, run: Run, total: float, elapsed: float) -> None:
 
 def _result(run: Run) -> dict[str, Any]:
     out = run.detail()
-    if run.state not in TERMINAL_STATES:
+    if run.state not in TERMINAL_STATES and run.needs_human:
+        out["hint"] = "Waiting for a human. Follow human_action outside MCP, then call await again."
+    elif run.state not in TERMINAL_STATES:
         out["hint"] = (
             f"Still working. Call await(run_id='{run.run_id}') to keep waiting, "
             f"or transcript(run_id='{run.run_id}') to see what it is doing."
@@ -216,8 +220,9 @@ async def delegate(
     wait_seconds: float = 0,
     provider: str | None = None,
     lane: str | None = None,
-    fallback: str = "full",
+    fallback: str | None = None,
     goal: str | None = None,
+    request_id: str | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Start a new subagent on a task.
@@ -253,6 +258,9 @@ async def delegate(
             continue always stays on that provider.
         goal: Optional inline goal block or workspace-relative GOAL.md path.
             Command rows run on the server; prose rows go to the configured reviewer.
+        request_id: Optional caller key for providers supporting run context.
+            Identical retries return the original run; conflicting work raises.
+            Epi waits up to five seconds for admission even with wait_seconds=0.
     """
     wanted = provider or lane
     deprecated = provider is None and lane is not None
@@ -265,7 +273,7 @@ async def delegate(
             "error": str(exc),
             "lane": wanted or settings.default_provider,
             "provider": wanted or settings.default_provider,
-            "fallback": fallback,
+            "fallback": fallback or "full",
             "known_providers": list(settings.providers),
             "fallback_modes": list(FALLBACK_MODES),
         }
@@ -300,38 +308,58 @@ async def delegate(
             resolved, SimpleNamespace(settings=settings, registry=registry)
         )
 
-    agent = registry.create_agent(
-        name=name,
-        workspace=resolved,
-        model=model or chosen.model,
-        provider=chosen.name,
-        fallback=fallback,
-        goal=parsed_goal,
-        goal_reviewer=goal_review,
-    )
-    start_error = await anyio.to_thread.run_sync(agent.wait_ready, 60.0)
-    if start_error is not None:
-        raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
-    prompt = f"{instructions.strip()}\n\n---\n\n{task}" if instructions else task
-    pre_run, pre_verify = _goal_guard_hooks(agent)
-    try:
-        run = agent.delegate(
-            prompt,
-            verification,
-            parent=_parent_context(ctx),
-            pre_run=pre_run,
-            pre_verify=pre_verify,
+    from .providers import for_driver
+    from .providers.base import capabilities
+
+    caller_key = request_id if capabilities(for_driver(chosen.driver)).run_context else None
+    arguments = {"tool": "delegate", "task": task, "verification": verification,
+                 "workspace": str(resolved), "instructions": instructions, "model": model,
+                 "name": name, "fallback": fallback or "full", "goal": goal}
+    agent = None
+
+    def submit():
+        nonlocal agent
+        agent = registry.create_agent(
+            name=name, workspace=resolved, model=model, provider=chosen.name,
+            fallback=fallback, goal=parsed_goal, goal_reviewer=goal_review,
+            task=task, instructions=instructions,
         )
-    except Exception:
-        if pre_verify is not None:
-            pre_verify()
+        start_error = agent.wait_ready(60.0)
+        if start_error is not None:
+            raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
+        prompt = f"{instructions.strip()}\n\n---\n\n{task}" if instructions else task
+        pre_run, pre_verify = _goal_guard_hooks(agent)
+        try:
+            return agent.delegate(prompt, verification, parent=_parent_context(ctx),
+                                  pre_run=pre_run, pre_verify=pre_verify, request_id=caller_key)
+        except Exception:
+            if pre_verify is not None:
+                pre_verify()
+            raise
+
+    try:
+        if caller_key is None:
+            run = await anyio.to_thread.run_sync(submit)
+        else:
+            run = await anyio.to_thread.run_sync(partial(
+                registry.request_once, (chosen.name, str(resolved)), caller_key, arguments, submit,
+            ))
+            agent = registry.find_agent(run.agent_id)
+        if (agent is not None
+                and capabilities(for_driver(chosen.driver)).admission_barrier):
+            await anyio.to_thread.run_sync(agent.wait_admission, run)
+        elif getattr(run, "admission_error", None):
+            raise RegistryError(run.admission_error)
+    except RegistryError as exc:
+        if caller_key is not None or capabilities(for_driver(chosen.driver)).admission_barrier:
+            raise ToolError(str(exc)) from None
         raise
     await _wait_for(run, wait_seconds, ctx)
     out = _result(run)
     out["workspace"] = str(resolved)
-    out["model"] = agent.model
-    out["lane"] = run.lane or agent.cfg.name
-    out["fallback"] = agent.fallback
+    out["model"] = agent.model if agent is not None else (model or chosen.model)
+    out["lane"] = run.lane or chosen.name
+    out["fallback"] = agent.fallback if agent is not None else run.fallback
     if deprecated:
         out["warning"] = LANE_DEPRECATED
     return out
@@ -364,13 +392,17 @@ async def continue_agent(
     message: str,
     verification: str | None = None,
     wait_seconds: float = 0,
+    request_id: str | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Send follow-up work to an existing subagent, in its original session.
 
     The child keeps the full context of its earlier turns, so refer to prior
     work directly ("the migration you just wrote"). Work is queued: if the agent
-    is mid-run, this message runs after it.
+    is mid-run, this message runs after it. Providers with synchronous admission
+    (epi) must admit within five seconds, even with wait_seconds=0. A queued
+    request that cannot start by then raises a tool error before submission;
+    the active run continues.
 
     Args:
         agent_id: Agent to continue, from delegate or list.
@@ -380,18 +412,44 @@ async def continue_agent(
             `verification_note` says so). Pass "" to skip verification; the run
             then reports completed_unverified.
         wait_seconds: Block up to this long for the run to finish. 0 returns at once.
+        request_id: Optional caller key. Repeating it with identical work arguments
+            returns the original run; conflicting arguments raise a tool error.
     """
     if ctx is not None:
         supervisor.bind(ctx.session)
-    agent = registry.agent(agent_id)
-    pre_run, pre_verify = _goal_guard_hooks(agent)
-    run = agent.follow_up(
-        message,
-        verification,
-        parent=_parent_context(ctx),
-        pre_run=pre_run,
-        pre_verify=pre_verify,
-    )
+    arguments = {"tool": "continue", "agent_id": agent_id, "message": message,
+                 "verification": verification}
+    admission_barrier = False
+    caller_key = None
+    try:
+        run = registry.replay_continue(agent_id, request_id, arguments)
+        if run is None:
+            agent = registry.agent(agent_id)
+            from .providers.base import capabilities
+
+            caller_key = request_id if capabilities(agent.driver).run_context else None
+            admission_barrier = capabilities(agent.driver).admission_barrier
+
+            def submit():
+                pre_run, pre_verify = _goal_guard_hooks(agent)
+                return agent.follow_up(
+                    message, verification, parent=_parent_context(ctx), pre_run=pre_run,
+                    pre_verify=pre_verify, request_id=caller_key,
+                )
+
+            run = await anyio.to_thread.run_sync(partial(
+                registry.request_once, (agent.cfg.name, str(agent.workspace.resolve())),
+                caller_key, arguments, submit,
+            ))
+        agent = registry.find_agent(agent_id)
+        if agent is not None:
+            await anyio.to_thread.run_sync(agent.wait_admission, run)
+        elif run.admission_error:
+            raise RegistryError(run.admission_error)
+    except RegistryError as exc:
+        if request_id is not None or admission_barrier:
+            raise ToolError(str(exc)) from None
+        raise
     await _wait_for(run, wait_seconds, ctx)
     return _result(run)
 
@@ -408,12 +466,27 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
     for info in agents:
         for key in spent:
             spent[key] += info["usage"][key]
+    provider_views = []
+    from .providers import for_driver
+    from .providers.base import capabilities
+
+    for cfg in settings.providers.values():
+        view = cfg.as_dict()
+        driver = for_driver(cfg.driver)
+        if capabilities(driver).metadata:
+            try:
+                view["extra"] = await anyio.to_thread.run_sync(
+                    partial(driver.metadata, settings, cfg)
+                )
+            except RuntimeError as exc:
+                view["extra"] = {"error": str(exc)}
+        provider_views.append(view)
     return {
         "agents": agents,
         "live": sum(1 for a in agents if a["state"] != "closed"),
         "limit": settings.max_agents,
         "default_provider": settings.default_provider,
-        "providers": [cfg.as_dict() for cfg in settings.providers.values()],
+        "providers": provider_views,
         "default_workspace": str(settings.workspace),
         "tokens_spent": spent,
         "archived_runs": len(registry.archived_runs()),
@@ -436,8 +509,8 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
 async def cancel(agent_id: str) -> dict[str, Any]:
     """Stop a subagent and release its runtime process.
 
-    The harness protocol has no mid-turn cancel, so this kills the child
-    process. Any in-flight run is reported as cancelled, and file edits it
+    Providers with a cancel hook cancel their service job before this kills
+    the child process. Any in-flight run is reported as cancelled, and file edits it
     already made stay on disk. Cancelling ends the session: its context cannot
     be resumed, so start a new agent rather than continuing this one.
 
@@ -449,7 +522,7 @@ async def cancel(agent_id: str) -> dict[str, Any]:
     await anyio.to_thread.run_sync(agent.close)
     return {
         "agent_id": agent_id,
-        "closed": True,
+        "closed": agent.closed,
         "interrupted_running_work": was_busy,
         "usage": agent.usage().as_dict(),
         "runs": [r.summary() for r in agent.runs()],
@@ -472,6 +545,27 @@ async def transcript(run_id: str, limit: int = 60, raw: bool = False) -> dict[st
             the original text lives.
     """
     run = registry.find_run(run_id)
+    from .providers import for_driver
+    from .providers.base import capabilities
+
+    agent = registry.find_agent(run.agent_id)
+    cfg = settings.providers.get(run.lane)
+    driver = agent.driver if agent is not None else (for_driver(cfg.driver) if cfg else None)
+    if capabilities(driver).transcript and run.native_outcome:
+        native_id = run.native_outcome.get("extra", {}).get("epi", {}).get("run_id")
+        if native_id:
+            if agent is not None:
+                session = agent.session()
+            else:
+                error, session = driver.boot(settings, run.agent_id, cfg)
+                if error:
+                    raise RegistryError(error)
+                session.session_id = run.native_outcome["extra"]["epi"].get("agent_id")
+            native = await anyio.to_thread.run_sync(partial(
+                driver.transcript, session, run_id=native_id, limit=limit, raw=raw,
+            ))
+            return {**native, "run_id": run_id, "agent_id": run.agent_id,
+                    "state": run.state, "phase": run.phase, "usage": run.usage.as_dict()}
     lines = list(run.transcript)
     tail = lines[-limit:] if limit > 0 else lines
     out = {

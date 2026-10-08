@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MAX_GOAL_CHARS = 4000
@@ -39,6 +39,7 @@ class GoalRow:
 class Goal:
     rows: tuple[GoalRow, ...]
     path: str | None = None
+    block: str | None = field(default=None, compare=False)
 
 
 def _goal_source(value: str, workspace: Path) -> tuple[str, str | None]:
@@ -177,7 +178,7 @@ def _parse_block(text: str, path: str | None) -> Goal:
         problems.append("no goal rows")
     if problems:
         raise GoalError(list(dict.fromkeys(problems)), block=True)
-    return Goal(tuple(rows), path)
+    return Goal(tuple(rows), path, block)
 
 
 def parse_goal(value: str, workspace: str | Path) -> Goal:

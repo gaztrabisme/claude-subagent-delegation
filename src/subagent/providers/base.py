@@ -17,6 +17,7 @@ import signal
 import subprocess
 import threading
 from collections.abc import Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -24,6 +25,7 @@ from urllib.parse import urlsplit
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..config import Settings
+    from ..goal import Goal
     from ..router import Refusal
 
 DRIVER_CLAUDE = "claude"
@@ -32,6 +34,7 @@ DRIVER_COPILOT = "copilot"
 DRIVER_GEMINI = "gemini"
 DRIVER_GROK = "grok"
 DRIVER_OMP = "omp"
+DRIVER_EPI = "epi"
 DRIVER_ANTIGRAVITY = "antigravity"
 
 # Every driver name the config file accepts. The ones with no module yet
@@ -39,7 +42,7 @@ DRIVER_ANTIGRAVITY = "antigravity"
 # run on this build.
 DRIVERS = (
     DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK,
-    DRIVER_ANTIGRAVITY, DRIVER_OMP,
+    DRIVER_ANTIGRAVITY, DRIVER_OMP, DRIVER_EPI,
 )
 
 NOT_PORTED = "driver not yet ported"
@@ -47,6 +50,7 @@ NOT_PORTED = "driver not yet ported"
 # A vendor label groups providers that share a refusal dialect (router keys
 # its refusal codes on it). Derived when the config does not say.
 VENDOR_BY_DRIVER = {
+    DRIVER_EPI: "epi",
     DRIVER_CODEX: "codex",
     DRIVER_COPILOT: "copilot",
     DRIVER_GROK: "grok",
@@ -223,6 +227,65 @@ class Translator(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class RunContext:
+    """Outer-run inputs, unchanged across retries of that run.
+
+    `deadline` is an absolute Unix timestamp, not a duration. `goal` is the
+    existing parsed goal object. A continue gets a fresh `request_id`.
+    """
+
+    verification: str | None
+    goal: Goal | None
+    request_id: str
+    deadline: float | None
+    # Original caller inputs. Defaults keep existing hook providers compatible.
+    # In particular, an outer config's model and default fallback are not
+    # instructions to reroute inside another service.
+    task: str | None = None
+    instructions: str | None = None
+    name: str | None = None
+    model: str | None = None
+    fallback: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """Explicit opt-ins. Drivers without this declaration retain all defaults.
+
+    run_context: spawn accepts the keyword-only `context` argument.
+    native_outcome: result events carry an `outcome` dict in Run.detail shape.
+    native_verification: that dict's checks are authoritative; no local checks
+        or distillation run. A missing outcome fails rather than claiming success.
+    native_usage: usage and cost are service snapshots, never stream-metered
+        or repriced. Preserve top-level credits, credits_unit and cash_usd.
+    cancel: cancel(session, *, reason, kind) cancels the service job before kill.
+        It may return a final native snapshot for cancellation accounting.
+    poll: poll(session) returns an outcome snapshot or None. Hooks must bound
+        their own I/O; neither hook may approve a human gate.
+    transcript: transcript(session, *, run_id, limit, raw) fetches activity for
+        a native run. Native run identities must remain in that run's extra.
+    metadata: metadata(settings, cfg) returns read-only provider extras for list.
+    """
+
+    run_context: bool = False
+    native_outcome: bool = False
+    native_verification: bool = False
+    native_usage: bool = False
+    cancel: bool = False
+    poll: bool = False
+    transcript: bool = False
+    metadata: bool = False
+    # MCP waits for admission or a pre-admission argument error, even with
+    # wait_seconds=0. Cancellation must be confirmed before releasing guards.
+    admission_barrier: bool = False
+    confirmed_cancel: bool = False
+
+
+def capabilities(provider: Any) -> ProviderCapabilities:
+    return getattr(provider, "capabilities", ProviderCapabilities())
+
+
 class Provider(Protocol):
     """The driver interface. One instance per driver, shared by every agent."""
 
@@ -258,9 +321,54 @@ class Provider(Protocol):
     def translator(self, session: Session) -> Translator | None:
         ...
 
+    def spawn(
+        self,
+        cfg: ProviderConfig,
+        settings: Settings,
+        agent_id: str,
+        prompt: str,
+        cwd: Path,
+        session: Session,
+        model: str | None,
+    ) -> Process:
+        ...
+
     def refusal(
         self, cfg: ProviderConfig, events: list[dict[str, Any]]
     ) -> Refusal | None:
+        ...
+
+
+class HookProvider(Provider, Protocol):
+    """Optional extension. Only declared capabilities are invoked at runtime.
+
+    Native result events are {type: "result", session_id: ..., outcome: {...}}.
+    Poll returns the same outcome dict, not a stream event. Its fields are a
+    snapshot, so a resumed snapshot must clear needs_human and human_action.
+    Outer run/agent/provider identities remain the registry's identities; put
+    service identities and routing metadata inside `extra` or Session.data.
+    """
+
+    capabilities: ProviderCapabilities
+
+    def spawn(
+        self,
+        cfg: ProviderConfig,
+        settings: Settings,
+        agent_id: str,
+        prompt: str,
+        cwd: Path,
+        session: Session,
+        model: str | None,
+        *,
+        context: RunContext,
+    ) -> Process:
+        ...
+
+    def cancel(self, session: Session, *, reason: str, kind: str) -> dict[str, Any] | None:
+        ...
+
+    def poll(self, session: Session) -> dict[str, Any] | None:
         ...
 
 
@@ -281,6 +389,16 @@ class Process:
         self.cwd = cwd
         self.prompt = prompt
         self._proc: subprocess.Popen[str] | None = None
+        self._cancel_fence: threading.Lock | None = None
+        self._cancelled = False
+
+    def enable_cancel_fence(self) -> None:
+        """Opt-in clients cannot start after kill, even before Popen exists.
+
+        The run layer enables this before publishing a hook provider's process.
+        Legacy processes keep their original start and kill behavior.
+        """
+        self._cancel_fence = threading.Lock()
 
     def _start(self, stdin: bool = False, *, closed_stdin: bool = False) -> subprocess.Popen[str]:
         """Start the child. `stdin` opens a pipe to write the prompt on;
@@ -293,17 +411,20 @@ class Process:
             child_stdin = subprocess.DEVNULL
         else:
             child_stdin = None
-        self._proc = subprocess.Popen(
-            self.argv,
-            cwd=self.cwd,
-            env=self.env,
-            stdin=child_stdin,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        return self._proc
+        with self._cancel_fence or nullcontext():
+            if self._cancelled:
+                raise RuntimeError("provider client cancelled before start")
+            self._proc = subprocess.Popen(
+                self.argv,
+                cwd=self.cwd,
+                env=self.env,
+                stdin=child_stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            return self._proc
 
     def events(self) -> Iterator[dict[str, Any]]:  # pragma: no cover - interface
         raise NotImplementedError
@@ -344,7 +465,10 @@ class Process:
                 yield event
 
     def kill(self) -> None:
-        proc = self._proc
+        with self._cancel_fence or nullcontext():
+            if self._cancel_fence is not None:
+                self._cancelled = True
+            proc = self._proc
         if proc is None or proc.poll() is not None:
             return
         try:

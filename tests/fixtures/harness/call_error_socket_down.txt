@@ -1,0 +1,4 @@
+stderr:
+agent serve socket is unavailable: /fixture/serve.sock
+Next: start `agent serve` before retrying the caller connection
+exit_code: 1

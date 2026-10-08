@@ -9,6 +9,7 @@ from .base import (
     DRIVER_CLAUDE,
     DRIVER_CODEX,
     DRIVER_COPILOT,
+    DRIVER_EPI,
     DRIVER_GEMINI,
     DRIVER_GROK,
     DRIVER_OMP,
@@ -48,6 +49,8 @@ def for_driver(name: str) -> Any:
         from .omp import OMP_PROVIDER as provider
     elif name == DRIVER_ANTIGRAVITY:
         from .antigravity import ANTIGRAVITY_PROVIDER as provider
+    elif name == DRIVER_EPI:
+        from .epi import EPI_PROVIDER as provider
     else:
         raise KeyError(f"unknown driver {name!r}; expected one of {', '.join(DRIVERS)}")
     _CACHE[name] = provider

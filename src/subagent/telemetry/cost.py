@@ -275,6 +275,8 @@ def read_traces(paths: list[Path]) -> list[dict]:
                         "output": int(u.get("output") or 0),
                         "cache_read": int(u.get("cache_read") or 0),
                         "cache_write": int(u.get("cache_write") or 0),
+                        **({"native_usage": True, "cash_usd": r.get("cash_usd")}
+                           if r.get("native_usage") else {}),
                     }
                 )
     counts = defaultdict(int)
@@ -500,8 +502,12 @@ def provider_costs(
         return dt.datetime.fromtimestamp(r["ts"] or 0, dt.UTC).strftime("%Y-%m")
 
     for r in runs:
-        month_counts[(r["lane"], month(r))] += 1
+        if not r.get("native_usage"):
+            month_counts[(r["lane"], month(r))] += 1
     for r in runs:
+        if r.get("native_usage"):
+            r["provider_usd"] = r.get("cash_usd")
+            continue
         spec = lookup.get(r["lane"])
         cost = None
         if spec:

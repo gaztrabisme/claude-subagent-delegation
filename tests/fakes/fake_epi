@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Replay epi's recorded CLI streams; never contact a service or a model."""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "env": dict(os.environ),
+          "stdin": sys.stdin.read()}
+with open(os.environ["FAKE_EPI_RECORD"], "a") as file:
+    file.write(json.dumps(record) + "\n")
+
+fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "harness"
+tool = sys.argv[2]
+scenario = os.environ.get("FAKE_EPI_SCENARIO", "change_completed")
+
+
+def wait_for_file(path):
+    gate = Path(path)
+    Path(str(gate) + ".ready").touch()
+    deadline = time.monotonic() + 15
+    while not gate.exists():
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(0.01)
+
+
+def argument(flag):
+    option = "--" + flag
+    if option in sys.argv:
+        return sys.argv[sys.argv.index(option) + 1]
+    return next((value.split("=", 1)[1] for value in sys.argv
+                 if value.startswith(option + "=")), None)
+
+
+if tool in {"delegate", "continue"} and scenario == "argument_error":
+    sys.stderr.write('schema-invalid: verification "true" has no objective check for a change; '
+                     'give a command\n')
+    sys.exit(1)
+state_path = Path(os.environ["FAKE_EPI_RECORD"] + ".request.json")
+# epi resolves an omitted workspace to the caller's default project, not cwd.
+workspace = str(Path(argument("workspace") or os.environ.get(
+    "FAKE_EPI_DEFAULT_PROJECT", os.getcwd())).resolve())
+request_key = json.dumps([workspace, argument("request-id")])
+if tool == "cancel" and os.environ.get("FAKE_EPI_RECOVERY_FAIL"):
+    sys.stderr.write("cancellation lookup unavailable\n")
+    sys.exit(1)
+if tool == "cancel" and argument("request-id") is not None:
+    key = argument("request-id")
+    saved = json.loads(state_path.read_text()) if state_path.exists() else {"admissions": 0}
+    requests = saved.setdefault("requests", {})
+    request = requests.get(request_key, {"admissions": 0})
+    receipt = request.get("receipt") or {}
+    request.update(request_id=key, workspace=workspace, cancelled=True)
+    requests[request_key] = request
+    saved.update(request)
+    state_path.write_text(json.dumps(saved))
+    print(json.dumps({"request_id": key, "closed": True, "admitted": bool(request["admissions"]),
+                      "agent_id": receipt.get("agent_id"), "usage": receipt.get("usage", {})}))
+    sys.exit(0)
+if tool == "delegate" and os.environ.get("FAKE_EPI_SEND_GATE"):
+    wait_for_file(os.environ["FAKE_EPI_SEND_GATE"])
+if tool in {"delegate", "continue"} and state_path.exists():
+    saved = json.loads(state_path.read_text())
+    request = saved.get("requests", {}).get(request_key, {})
+    if request.get("cancelled"):
+        arguments = [a for a in sys.argv[1:] if a != "--follow"]
+        if request.get("arguments") and arguments != request["arguments"]:
+            sys.stderr.write("schema-invalid: request_id reused with different arguments\n")
+            sys.exit(1)
+        result = {"request_id": argument("request-id"), "state": "cancelled",
+                          "phase": "done", "admitted": False, "agent_id": None, "run_id": None,
+                          "usage": dict.fromkeys(("input", "output", "cache_read", "cache_write",
+                                                 "reasoning", "total", "steps", "turns"), 0)}
+        if request["admissions"]:
+            result.update(request["receipt"])
+            result.update(request_id=argument("request-id"), admitted=True, state="cancelled",
+                          phase="done", needs_human=False)
+            result.pop("human_action", None)
+        print(json.dumps(result))
+        sys.exit(0)
+if tool == "delegate" and scenario == "socket_down":
+    text = (fixtures / "call_error_socket_down.txt").read_text()
+    sys.stderr.write(text.split("stderr:\n", 1)[1].split("exit_code:", 1)[0])
+    sys.exit(1)
+if tool == "delegate" and scenario == "bad_output":
+    print("test-token-canary is not JSON")
+    sys.exit(1)
+if tool == "delegate" and scenario == "no_receipt":
+    print(json.dumps({"state": "completed", "phase": "done"}))
+    sys.exit(0)
+if tool == "delegate" and scenario == "ambiguous_error":
+    sys.stderr.write("verification failed after acceptance\n")
+    sys.exit(1)
+if tool == "delegate" and scenario == "oversized":
+    print("x" * 1_048_577)
+    sys.exit(0)
+if tool == "delegate":
+    if scenario == "refused_then_available":
+        scenario = "rejected" if "--follow" in sys.argv else "change_completed"
+    name = ("delegate_rejected_provider.json" if scenario == "rejected" else
+            f"delegate_{scenario}.jsonl")
+elif tool == "continue":
+    name = "continue_completed.jsonl"
+elif tool == "await":
+    name = "await_after_approval.json"
+else:
+    name = f"{tool}.json"
+text = (fixtures / name).read_text()
+if tool in {"delegate", "continue"} and "--follow" not in sys.argv:
+    text = text.splitlines()[0]
+if tool == "delegate" and os.environ.get("FAKE_EPI_RECEIPT_GATE"):
+    # Durable idempotency fake: admit once before losing the initial receipt.
+    # The second CLI invocation must use the exact original work arguments.
+    arguments = [a for a in sys.argv[1:] if a != "--follow"]
+    saved = json.loads(state_path.read_text()) if state_path.exists() else {}
+    requests = saved.setdefault("requests", {})
+    key = argument("request-id")
+    if request_key in requests:
+        request = requests[request_key]
+        if arguments != request["arguments"]:
+            sys.stderr.write("schema-invalid: request_id reused with different arguments\n")
+            sys.exit(1)
+        if os.environ.get("FAKE_EPI_RECOVERY_FAIL"):
+            sys.stderr.write("caller lookup unavailable\n")
+            sys.exit(1)
+        print(json.dumps(request["receipt"]))
+        sys.exit(0)
+    request = {"request_id": key, "workspace": workspace, "arguments": arguments, "admissions": 1,
+               "receipt": json.loads(text.splitlines()[0])}
+    requests[request_key] = request
+    saved.update(request)
+    state_path.write_text(json.dumps(saved))
+    wait_for_file(os.environ["FAKE_EPI_RECEIPT_GATE"])
+if tool == "list" and os.environ.get("FAKE_EPI_SCOPE"):
+    value = json.loads(text)
+    scope = value["providers"][0]["extra"]
+    root = str(Path(os.environ["FAKE_EPI_SCOPE"]).resolve())
+    scope["allowed_projects"] = [root]
+    scope["default_project"] = root
+    text = json.dumps(value)
+if tool == "list" and os.environ.get("FAKE_EPI_NO_SCOPE"):
+    value = json.loads(text)
+    scope = value["providers"][0]["extra"]
+    scope.pop("allowed_projects", None)
+    scope.pop("default_project", None)
+    text = json.dumps(value)
+if tool == "await" and os.environ.get("FAKE_EPI_HUMAN_WAIT"):
+    text = (fixtures / "delegate_awaiting_approval.jsonl").read_text().splitlines()[-1]
+if tool == "await" and os.environ.get("FAKE_EPI_WORKING_WAIT"):
+    text = (fixtures / "delegate_awaiting_approval.jsonl").read_text().splitlines()[0]
+if tool == "await" and os.environ.get("FAKE_EPI_AWAIT_FAILED"):
+    value = json.loads((fixtures / "delegate_failed_no_lane.jsonl").read_text().splitlines()[-1])
+    value["run_id"] = sys.argv[sys.argv.index("--run-id") + 1]
+    first = json.loads((fixtures / f"delegate_{scenario}.jsonl").read_text().splitlines()[0])
+    value["agent_id"] = first["agent_id"]
+    text = json.dumps(value)
+if tool == "transcript":
+    value = json.loads(text)
+    value["run_id"] = sys.argv[sys.argv.index("--run-id") + 1]
+    text = json.dumps(value)
+if tool == "cancel":
+    value = json.loads(text)
+    value["agent_id"] = sys.argv[sys.argv.index("--agent-id") + 1]
+    text = json.dumps(value)
+if tool == "delegate" and os.environ.get("FAKE_EPI_PROGRESS_GATE"):
+    first, text = text.split("\n", 1)
+    print(first, flush=True)
+    wait_for_file(os.environ["FAKE_EPI_PROGRESS_GATE"])
+sys.stdout.write(text + ("" if text.endswith("\n") else "\n"))
+sys.stdout.flush()
+if tool == "delegate" and os.environ.get("FAKE_EPI_HUMAN_GATE"):
+    wait_for_file(os.environ["FAKE_EPI_HUMAN_GATE"])
+if tool == "delegate" and os.environ.get("FAKE_EPI_EXIT_AFTER_ADMISSION"):
+    sys.stderr.write("agent serve socket is unavailable\n")
+    sys.exit(1)

@@ -7,6 +7,7 @@ re-enters the same session via ``--resume``.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import itertools
@@ -27,7 +28,7 @@ from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import protect
 from .lane_state import LaneState
-from .providers.base import ProviderConfig, Session
+from .providers.base import Process, ProviderConfig, RunContext, Session, capabilities
 
 # classify_exit and exit_event are re-exported: they were part of this
 # module's surface before the drivers moved into providers/.
@@ -59,6 +60,8 @@ PHASE_RUNNING = "running"
 PHASE_VERIFYING = "verifying"
 PHASE_DISTILLING = "distilling"
 PHASE_DONE = "done"
+PHASE_AWAITING_APPROVAL = "awaiting_approval"
+PHASE_AWAITING_HUMAN = "awaiting_human"
 
 KILL_CANCEL = "cancel"
 KILL_TIMEOUT = "timeout"
@@ -127,9 +130,13 @@ class Usage:
     steps: int = 0  # tool calls
     turns: int = 0  # model turns, as --max-turns counts them
     credits: float | None = None  # Copilot AI credits (nano-AIU / 1e9)
+    # A service's whole-run snapshot. Its wire fields and total are authoritative.
+    native: dict[str, Any] | None = None
 
     @property
     def total(self) -> int:
+        if self.native is not None:
+            return self.native.get("total", 0)
         return self.input + self.cache_read + self.cache_write + self.output
 
     def add(self, usage: dict[str, Any]) -> None:
@@ -147,6 +154,8 @@ class Usage:
             self.credits = (self.credits or 0.0) + float(credits)
 
     def as_dict(self) -> dict[str, Any]:
+        if self.native is not None:
+            return copy.deepcopy(self.native)
         return {
             "input": self.input,
             "output": self.output,
@@ -159,7 +168,27 @@ class Usage:
             "credits": self.credits,
         }
 
+    def set_native(self, usage: dict[str, Any], credits: float | None = None) -> None:
+        self.native = copy.deepcopy(usage)
+        for key in (*_USAGE_KEYS, "steps", "turns"):
+            setattr(self, key, usage.get(key, 0))
+        self.credits = credits
+
     def merge(self, other: Usage) -> None:
+        native = None
+        if self.native is not None or other.native is not None:
+            before = self.as_dict()
+            incoming = other.as_dict()
+            if self.native is None and self.total == 0 and not self.steps and not self.turns:
+                native = copy.deepcopy(incoming)
+            else:
+                native = copy.deepcopy(before)
+                for key in (*_USAGE_KEYS, "total", "steps", "turns"):
+                    native[key] = before.get(key, 0) + incoming.get(key, 0)
+                if "usage_unreported" in before or "usage_unreported" in incoming:
+                    native["usage_unreported"] = list(dict.fromkeys(
+                        [*before.get("usage_unreported", []), *incoming.get("usage_unreported", [])]
+                    ))
         self.input += other.input
         self.output += other.output
         self.cache_read += other.cache_read
@@ -169,6 +198,10 @@ class Usage:
         self.turns += other.turns
         if other.credits is not None:
             self.credits = (self.credits or 0.0) + other.credits
+        if native is not None:
+            if "credits" in native:
+                native["credits"] = self.credits
+            self.native = native
 
 
 def _assistant_text(event: dict[str, Any]) -> str:
@@ -504,6 +537,7 @@ class Run:
     run_id: str
     agent_id: str
     prompt: str
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex, kw_only=True)
     verification: str | None = None
     # Where `verification` came from, when the caller did not pass it.
     verification_note: str | None = None
@@ -527,12 +561,23 @@ class Run:
     event_count: int = 0
     transcript: deque[str] = field(default_factory=lambda: deque(maxlen=400))
     done: threading.Event = field(default_factory=threading.Event)
+    # MCP waits end at a human gate as well as at a terminal result. `done`
+    # continues to mean terminal, for callers that require completion.
+    await_ready: threading.Event = field(default_factory=threading.Event)
+    admission_ready: threading.Event = field(default_factory=threading.Event)
+    admission_error: str | None = None
+    cancel_pending: bool = False
+    native_outcome: dict[str, Any] | None = None
+    native_usage: bool = False
+    native_verification: bool = False
     signatures: Counter[str] = field(default_factory=Counter)
     usage: Usage = field(default_factory=Usage)
     cost: dict[str, Any] | None = None
     verification_result: VerificationResult | None = None
     trip: tuple[str, str] | None = None
     deadline: float | None = None
+    _human_wait_started_at: float | None = field(default=None, repr=False)
+    _timeout_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     session_id: str | None = None
     lane: str | None = None
     fallback: str | None = None
@@ -574,8 +619,24 @@ class Run:
     # entire submitted prompt is treated as harness text.
     source_chars: dict[str, int] | None = None
 
+    def observe_native_wait(self, outcome: dict[str, Any], observed_at: float) -> None:
+        """Charge active work only; repeated human-wait snapshots add no time."""
+        waiting = outcome.get("state") == WORKING and bool(outcome.get("needs_human"))
+        with self._timeout_lock:
+            if waiting and self._human_wait_started_at is None:
+                self._human_wait_started_at = observed_at
+            elif not waiting and self._human_wait_started_at is not None:
+                if self.deadline is not None:
+                    self.deadline += max(0, observed_at - self._human_wait_started_at)
+                self._human_wait_started_at = None
+
+    def timeout_expired(self, now: float) -> bool:
+        with self._timeout_lock:
+            return (self._human_wait_started_at is None and self.deadline is not None
+                    and now >= self.deadline)
+
     def summary(self) -> dict[str, Any]:
-        return {
+        out = {
             "run_id": self.run_id,
             "agent_id": self.agent_id,
             "state": self.state,
@@ -593,9 +654,37 @@ class Run:
             "usage": self.usage.as_dict(),
             "last_activity": self.transcript[-1] if self.transcript else None,
         }
+        if self.native_outcome is not None:
+            for key in ("needs_human", "human_action", "plan_id", "usage_unreported",
+                        "credits", "credits_unit", "cash_usd", "extra"):
+                if key in self.native_outcome:
+                    out[key] = copy.deepcopy(self.native_outcome[key])
+        return out
 
     def detail(self) -> dict[str, Any]:
         out = self.summary()
+        if self.native_outcome is not None:
+            summary = out.copy()
+            # Preserve extensions, but outer identity and cancellation state
+            # belong to this registry, not to a service snapshot.
+            out.update(copy.deepcopy(self.native_outcome))
+            for key in ("run_id", "agent_id", "state", "phase", "lane", "provider",
+                        "driver", "fallback", "finish_reason", "usage"):
+                out[key] = summary[key]
+            if self.hops:
+                out["hops"] = list(self.hops)
+            if self.cold_load and "cold_load" not in out:
+                out["cold_load"] = True
+            if self.error is not None:
+                out["error"] = self.error
+            if self.error_detail is not None:
+                out["error_detail"] = self.error_detail
+            if not self.native_verification:
+                if self.verification_result is not None:
+                    out["verification"] = self.verification_result.as_dict()
+                if self.goal is not None:
+                    out["uat"] = self.uat or []
+            return out
         out["result"] = self.result_text
         if self.distilled:
             out["distilled"] = True
@@ -617,6 +706,10 @@ class Run:
         if self.error_detail:
             out["error_detail"] = self.error_detail
         return out
+
+    @property
+    def needs_human(self) -> bool:
+        return bool((self.native_outcome or {}).get("needs_human"))
 
     def note(self, line: str) -> None:
         self.event_count += 1
@@ -649,6 +742,7 @@ class Agent:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         goal: Goal | None = None,
         goal_reviewer: GoalReviewer | None = None,
+        delegate_options: dict[str, Any] | None = None,
     ):
         self.trace = trace
         self.telemetry = telemetry
@@ -670,11 +764,15 @@ class Agent:
         self.on_event = on_event
         self.goal = goal
         self.goal_reviewer = goal_reviewer
+        self.delegate_options = delegate_options or {}
         # Guard context carries configured child-secret names even before the
         # loop adds its protected tests and state allowlist.
         self.guard_context: dict[str, Any] = {
             "secret_env_names": list(settings.guard_secret_env_names),
         }
+        from .guard.classify import provider_secret_files
+
+        self.guard_context["secret_files"] = [str(p) for p in provider_secret_files(settings)]
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -697,11 +795,39 @@ class Agent:
         self.last_activity = _now()
         self._ready = threading.Event()
         self._start_error: str | None = None
-        self._current: ClaudeProcess | None = None
+        self._current: Process | None = None
+        # Publish a spawn's session and process before cancellation can inspect
+        # them. Do not hold this lock while consuming the event stream.
+        self._dispatch_lock = threading.RLock()
+        self._cancel_lock = threading.Lock()
+        self._cancelled_requests: set[str | None] = set()
+        self._cancel_complete = threading.Event()
+        self._cancel_complete.set()
         self._thread = threading.Thread(
             target=self._worker, name=f"sam-agent-{agent_id}", daemon=True
         )
         self._thread.start()
+
+    def wait_admission(self, run: Run, timeout: float = 5.0) -> None:
+        """Opt-in boundary for clients that require synchronous input errors."""
+        if not capabilities(self.driver).admission_barrier:
+            return
+        if not run.admission_ready.wait(timeout):
+            # A serial continuation may still be queued behind a human wait.
+            # Cancel only that unsubmitted run, never the active service job.
+            with self._dispatch_lock, self._wake:
+                queued = run.started_at is None
+                if queued:
+                    if run in self._queue:
+                        self._queue.remove(run)
+                    run.trip = (KILL_TIMEOUT, "provider admission timed out before submission")
+                    self._finish_locked(run)
+            if queued:
+                raise RegistryError("provider admission timed out before submission")
+            self.close("provider admission timed out", kind=KILL_TIMEOUT)
+            raise RegistryError("provider admission timed out; cancellation requested")
+        if run.admission_error:
+            raise RegistryError(run.admission_error)
 
     @property
     def closed(self) -> bool:
@@ -729,6 +855,7 @@ class Agent:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
         source_chars: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -749,6 +876,7 @@ class Agent:
             fallback=self.fallback,
             provider=self.cfg.vendor,
             driver=self.driver.name,
+            native_usage=capabilities(self.driver).native_usage,
             guard=self.driver.guard(self.settings, self.cfg),
             route=route,
             parent=parent or None,
@@ -756,6 +884,8 @@ class Agent:
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
+            **({"request_id": request_id} if request_id and capabilities(self.driver).run_context
+               else {}),
         )
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
@@ -778,6 +908,7 @@ class Agent:
         goal: Goal | None = None,
         reviewer: GoalReviewer | None = None,
         source_chars: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
@@ -798,6 +929,7 @@ class Agent:
             on_event=on_event,
             distill=distill,
             source_chars=source_chars,
+            request_id=request_id,
         )
 
     def follow_up(
@@ -810,6 +942,7 @@ class Agent:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
         source_chars: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> Run:
         """A continue. Omitting `verification` reuses the delegate's; "" skips it.
 
@@ -818,6 +951,9 @@ class Agent:
         the work was done. Judged against the original acceptance check, a
         completed continue means the task passes.
         """
+        if (capabilities(self.driver).native_verification and self.runs()
+                and not self.busy and self.session_id is None):
+            raise RegistryError("native agent was never admitted; delegate a new task")
         if verification is None and self.delegate_verification:
             return self.submit(
                 message,
@@ -833,6 +969,7 @@ class Agent:
                 on_event=on_event,
                 distill=distill,
                 source_chars=source_chars,
+                request_id=request_id,
             )
         if verification is not None and not verification.strip():
             return self.submit(
@@ -845,6 +982,7 @@ class Agent:
                 on_event=on_event,
                 distill=distill,
                 source_chars=source_chars,
+                request_id=request_id,
             )
         return self.submit(
             message,
@@ -855,6 +993,7 @@ class Agent:
             on_event=on_event,
             distill=distill,
             source_chars=source_chars,
+            request_id=request_id,
         )
 
     def get_run(self, run_id: str) -> Run | None:
@@ -889,21 +1028,37 @@ class Agent:
         with self._wake:
             if self._closed:
                 return
+            self._cancel_complete.clear()
             self._closing = True
             self._kill_kind = kind
             self._wake.notify_all()
-        current = self._current
-        if current is not None:
-            current.kill()
+        with self._dispatch_lock:
+            try:
+                current = self._current
+                self._cancel_provider(reason, kind)
+                if current is not None:
+                    current.kill()
+            finally:
+                self._cancel_complete.set()
         for run in self.runs():
             if run.state == WORKING:
+                if run.cancel_pending:
+                    continue
                 run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
                 run.error = reason
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
                 run.done.set()
+                run.await_ready.set()
         self._thread.join(timeout=8)
-        self._closed = True
+        self._closed = not any(r.cancel_pending for r in self.runs())
+        # A second close may resolve a previously uncertain native cancel after
+        # the serial worker has stopped. Its retained guard still belongs here.
+        for run in self.runs():
+            if run.pre_verify_result is None and not run.cancel_pending:
+                self._run_pre_verify(run)
+                if not run.done.is_set():
+                    self._finish(run)
 
     def _boot(self) -> None:
         try:
@@ -936,7 +1091,8 @@ class Agent:
         self._boot()
         while True:
             with self._wake:
-                while not self._queue and not self._closing:
+                while (not self._queue or any(r.cancel_pending for r in self._runs.values())) \
+                        and not self._closing:
                     self._wake.wait(timeout=0.5)
                 if self._closing and not self._queue:
                     break
@@ -946,8 +1102,21 @@ class Agent:
             try:
                 self._execute(run)
             except Exception as exc:  # noqa: BLE001
-                log.warning("run %s crashed", run.run_id, exc_info=True)
+                if capabilities(self.driver).native_outcome or capabilities(self.driver).cancel:
+                    message = redact_secrets(
+                        f"{type(exc).__name__}: {exc}", self.settings.leaked_keys
+                    )
+                    log.warning("run %s crashed: %s", run.run_id, message)
+                    self._cancel_provider("provider run crashed", "error", run)
+                    self._run_pre_verify(run)
+                    if not self._closing:
+                        run.state = FAILED
+                        run.error = message
+                        run.finish_reason = "error"
+                    self._finish(run)
+                    continue
                 self._run_pre_verify(run)
+                log.warning("run %s crashed", run.run_id, exc_info=True)
                 run.state = FAILED
                 run.error = redact_secrets(
                     f"{type(exc).__name__}: {exc}", self.settings.leaked_keys
@@ -955,21 +1124,52 @@ class Agent:
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
                 run.done.set()
+                run.await_ready.set()
 
-    def _spawn(self, prompt: str, resume: str | None) -> ClaudeProcess:
+    def _spawn(self, run: Run, prompt: str, resume: str | None) -> Process:
         """One turn's child process, on the current provider's driver."""
         session = self.session()
         session.session_id = resume
-        return self.driver.spawn(
+        kwargs = {}
+        if capabilities(self.driver).run_context:
+            session.data["request_id"] = run.request_id
+            kwargs["context"] = RunContext(
+                verification=run.verification, goal=run.goal,
+                request_id=run.request_id, deadline=run.deadline,
+                **(self.delegate_options if resume is None else {}),
+            )
+        process = self.driver.spawn(
             self.cfg, self.settings, self.agent_id, prompt, self.workspace,
-            session, self.model,
+            session, self.model, **kwargs,
         )
+        if capabilities(self.driver).cancel and isinstance(process, Process):
+            process.enable_cancel_fence()
+        return process
 
     def _execute(self, run: Run) -> None:
-        run.started_at = _now()
+        with self._dispatch_lock:
+            if run.done.is_set():
+                return
+            closing = self._closing and run.started_at is None
+            if not closing:
+                run.started_at = _now()
+        if closing:
+            self._finish(run)
+            return
+        run.native_usage = capabilities(self.driver).native_usage
         run.deadline = run.started_at + self.cfg.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
+        if (not run.route and run.continues and capabilities(self.driver).native_verification
+                and self.session_id is None):
+            # A queued predecessor may have refused after follow_up was called.
+            # A continuation can never turn into a fresh native delegate.
+            run.admission_error = "native agent was never admitted; delegate a new task"
+            run.error = run.admission_error
+            run.state = FAILED
+            run.finish_reason = "error"
+            self._finish(run)
+            return
         if run.pre_run is not None:
             run.pre_run()
         if run.route:
@@ -989,13 +1189,29 @@ class Agent:
                 run.finished_at = _now()
                 self._run_pre_verify(run)
                 run.done.set()
+                run.await_ready.set()
                 return
             self._turn(run, run.prompt, resume=self.session_id)
-        # Release the caller's guard (the loop's test lock) in a finally-style
-        # position: after the turn, so a tampered test never decides
-        # "completed", and also on the cancel/timeout path, where `_turn`
-        # returns only after the child was killed.
+        if (capabilities(self.driver).confirmed_cancel
+                and self.session().data.pop("cancellation_required", False)):
+            self._cancel_provider("native admission could not be determined", "error", run)
+        if run.native_outcome is not None and run.state == WORKING and not run.cancel_pending:
+            self._follow_native(run)
+        # Release the caller's guard only when all provider work has ended,
+        # including service work that outlived the CLI. Exceptions reach the
+        # worker's cleanup, which cancels native work before releasing it.
         self._run_pre_verify(run)
+        if capabilities(self.driver).native_verification:
+            if (run.native_outcome is None and run.state == WORKING
+                    and not self._closing and not run.trip):
+                run.state = FAILED
+                run.finish_reason = "error"
+                run.error = "provider with native verification returned no outcome"
+            self._finish(run)
+            return
+        if run.native_outcome is not None and run.state in (COMPLETED, COMPLETED_UNVERIFIED):
+            # Outcome transport alone does not opt out of the outer checks.
+            run.state = WORKING
         if self._closing or run.trip or run.state in TERMINAL_STATES:
             self._finish(run)
             return
@@ -1046,7 +1262,9 @@ class Agent:
                 for row in (run.pre_verify_result or {}).get("violations", [])
             )
         )
-        if run.verification_result.passed and not goal_failed and not goal_changed:
+        provider_completed = run.native_outcome is None or run.native_outcome["state"] == COMPLETED
+        if (run.verification_result.passed and not goal_failed and not goal_changed
+                and provider_completed):
             run.state = COMPLETED
         else:
             run.state = COMPLETED_UNVERIFIED
@@ -1057,6 +1275,17 @@ class Agent:
 
         Never raises: a broken release must not mask the run's own outcome.
         """
+        while True:
+            self._cancel_complete.wait()
+            with self._dispatch_lock:
+                if self._closing and not self._cancel_complete.is_set():
+                    continue
+                if run.cancel_pending:
+                    return
+                self._release_pre_verify(run)
+                return
+
+    def _release_pre_verify(self, run: Run) -> None:
         if run.pre_verify is None or run.pre_verify_result is not None:
             return
         try:
@@ -1179,6 +1408,7 @@ class Agent:
             run.provider = cfg.vendor
             run.driver = hop.driver
             run.guard = hop.guard
+            run.native_usage = capabilities(driver).native_usage
             run.cold_load = gate.cold_load
             hop.cold_load = gate.cold_load
             extra = self.settings.cold_load_seconds(cfg.name) if gate.cold_load else 0.0
@@ -1273,15 +1503,39 @@ class Agent:
         """
         attempt = 0
         while True:
+            if self._closing:
+                return []
             self._sample_begin(run)
             meter = _Meter(attempt, _now())
-            proc = self._spawn(prompt, resume)
-            self._current = proc
+            with self._dispatch_lock:
+                if self._closing:
+                    self._sample_end(run)
+                    return []
+                proc = self._spawn(run, prompt, resume)
+                self._current = proc
             collected: list[dict[str, Any]] = []
             watch = _Watch(run, self.settings, self.signatures, self.cfg.max_steps)
             try:
+                if self._closing:
+                    self._cancel_provider("agent closing", self._kill_kind or KILL_CANCEL, run)
+                    proc.kill()
+                    return []
                 for event in proc.events():
+                    if capabilities(self.driver).admission_barrier:
+                        if event.get("admission_error"):
+                            run.admission_error = redact_secrets(
+                                str(event["admission_error"]), self.settings.leaked_keys,
+                            )
+                            run.admission_ready.set()
+                        elif event.get("admitted"):
+                            run.admission_ready.set()
                     self.last_activity = _now()
+                    if capabilities(self.driver).native_outcome and "outcome" in event:
+                        # _collect buffers events until the CLI exits. Pause as
+                        # soon as a service snapshot arrives, even if its client
+                        # keeps the stream open, then avoid replaying that timing.
+                        run.observe_native_wait(event["outcome"], self.last_activity)
+                        event["_native_wait_observed"] = True
                     meter.see(event, self.last_activity)
                     watcher = run.on_event if run.on_event is not None else self.on_event
                     if watcher is not None:
@@ -1301,8 +1555,17 @@ class Agent:
                     if trip is not None and run.trip is None:
                         run.trip = trip
                     if run.trip or self._closing:
+                        kind, reason = run.trip or (
+                            self._kill_kind or KILL_CANCEL, "agent closing"
+                        )
+                        self._cancel_provider(reason, kind, run)
                         proc.kill()
                         break
+            except Exception:  # noqa: BLE001 - a broken reader must not orphan a native client
+                if capabilities(self.driver).native_outcome or capabilities(self.driver).cancel:
+                    self._cancel_provider("provider event reader failed", "error", run)
+                    proc.kill()
+                raise
             finally:
                 self._current = None
                 self._sample_end(run)
@@ -1365,6 +1628,9 @@ class Agent:
 
     def _account(self, run: Run, meter: _Meter) -> None:
         """Add an attempt's tokens to the run and write its turn records."""
+        if capabilities(self.driver).native_usage:
+            run.native_usage = True
+            return
         spent = meter.usage()
         for key in _USAGE_KEYS:
             setattr(run.usage, key, getattr(run.usage, key) + spent[key])
@@ -1464,6 +1730,10 @@ class Agent:
                 run.note(f"assistant: {_clip(text, 240)}")
             return
         if kind == "result":
+            if capabilities(self.driver).native_outcome and "outcome" in event:
+                self._ingest_native(run, event["outcome"],
+                                    observe_wait=not event.get("_native_wait_observed", False))
+                return
             # Tokens were counted as the events arrived (_Meter, via _account).
             # Credits are whole-run (Copilot's session.usage_checkpoint), not
             # per message, so the result event is the only place they arrive.
@@ -1503,7 +1773,125 @@ class Agent:
         if kind:
             run.note(str(kind))
 
+    def _ingest_native(
+        self, run: Run, outcome: dict[str, Any], *, cancelling: bool = False,
+        observe_wait: bool = True,
+    ) -> None:
+        """One service snapshot. Do not reinterpret checks or fill absent fields."""
+        if (self._closing and not cancelling) or run.done.is_set():
+            return
+        state = outcome.get("state")
+        if state not in TERMINAL_STATES and state != WORKING:
+            raise ValueError(f"invalid native outcome state: {state!r}")
+        if observe_wait:
+            run.observe_native_wait(outcome, _now())
+        run.native_outcome = copy.deepcopy(outcome)
+        run.native_verification = capabilities(self.driver).native_verification
+        run.state = state
+        run.phase = outcome.get("phase", PHASE_DONE if state in TERMINAL_STATES else PHASE_RUNNING)
+        run.finish_reason = outcome.get("finish_reason")
+        run.final_response = outcome.get("result", "")
+        run.result_text = run.final_response
+        run.error = outcome.get("error")
+        run.error_detail = outcome.get("error_detail")
+        run.uat = outcome.get("uat")
+        if capabilities(self.driver).native_usage:
+            run.native_usage = True
+            if "usage" in outcome:
+                run.usage.set_native(outcome["usage"], outcome.get("credits"))
+            run.cost = copy.deepcopy(outcome.get("cost"))
+        run.note(f"provider: {run.phase}")
+        if run.needs_human:
+            run.await_ready.set()
+        else:
+            run.await_ready.clear()
+
+    def _follow_native(self, run: Run) -> None:
+        """Keep the serial run alive after its client exits, including human waits."""
+        if not capabilities(self.driver).poll:
+            raise RuntimeError("working native outcome requires provider poll capability")
+        while run.state == WORKING and not self._closing and not run.trip:
+            if run.timeout_expired(_now()):
+                run.trip = (KILL_TIMEOUT, "run deadline exceeded")
+                self._cancel_provider(run.trip[1], KILL_TIMEOUT, run)
+                break
+            snapshot = self.driver.poll(self.session())
+            if snapshot is not None:
+                self.last_activity = _now()
+                self._ingest_native(run, snapshot)
+            if run.state == WORKING:
+                with self._wake:
+                    if not self._closing:
+                        self._wake.wait(timeout=0.25)
+
+    def _cancel_provider(self, reason: str, kind: str, run: Run | None = None) -> None:
+        """Cancel a service job at most once per outer run, always before kill."""
+        if not capabilities(self.driver).cancel:
+            return
+        if run is None:
+            owner = self.session().data.get("request_id")
+            run = next((r for r in self.runs() if owner and r.request_id == owner), None)
+            if run is None:
+                run = next((r for r in self.runs() if r.state == WORKING and r.started_at), None)
+            if run is None and self._order:
+                run = self._runs[self._order[-1]]
+        key = run.request_id if run is not None else None
+        with self._dispatch_lock, self._cancel_lock:
+            if key in self._cancelled_requests:
+                return
+            try:
+                snapshot = self.driver.cancel(self.session(), reason=reason, kind=kind)
+                self._cancelled_requests.add(key)
+                if run is not None:
+                    run.cancel_pending = False
+                if (isinstance(snapshot, dict) and run is not None
+                        and (not capabilities(self.driver).run_context
+                             or self.session().data.get("request_id") == run.request_id)):
+                    # Final service accounting may arrive only in cancel. The
+                    # caller still owns the outer cancellation/timeout state.
+                    native_agent = self.session().session_id
+                    if native_agent is not None:
+                        self.session_id = run.session_id = native_agent
+                    previous = (run.state, run.phase, run.finish_reason, run.error)
+                    self._ingest_native(run, snapshot, cancelling=True)
+                    run.state, run.phase, run.finish_reason, run.error = previous
+            except Exception as exc:  # noqa: BLE001 - remote failure must not block local kill
+                message = redact_secrets(str(exc), self.settings.leaked_keys)
+                if run is not None and capabilities(self.driver).native_outcome:
+                    snapshot = copy.deepcopy(run.native_outcome or {})
+                    snapshot.update(needs_human=False)
+                    run.observe_native_wait(snapshot, _now())
+                    snapshot.pop("human_action", None)
+                    snapshot.setdefault("extra", {}).update(
+                        cancellation_confirmed=False, cancellation_error=message,
+                    )
+                    run.native_outcome = snapshot
+                    if capabilities(self.driver).confirmed_cancel and not run.done.is_set():
+                        run.cancel_pending = True
+                        run.state = WORKING
+                        run.phase = "cancellation_pending"
+                        run.await_ready.set()
+                log.warning("provider cancel failed for %s: %s: %s",
+                            self.agent_id, type(exc).__name__, message)
+
     def _finish(self, run: Run) -> None:
+        # Cancellation can return the last accounting snapshot. Finish and
+        # write the trace only after its bounded hook has returned.
+        while True:
+            self._cancel_complete.wait()
+            with self._dispatch_lock:
+                if self._closing and not self._cancel_complete.is_set():
+                    continue
+                self._finish_locked(run)
+                return
+
+    def _finish_locked(self, run: Run) -> None:
+        run.admission_ready.set()
+        if run.cancel_pending:
+            run.state = WORKING
+            run.phase = "cancellation_pending"
+            run.await_ready.set()
+            return
         if self._kill_kind:
             kind = self._kill_kind
             run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
@@ -1524,7 +1912,8 @@ class Agent:
         run.phase = PHASE_DONE
         run.finished_at = _now()
         try:
-            run.cost = self._price(run)
+            if not run.native_usage:
+                run.cost = self._price(run)
         except Exception:  # noqa: BLE001 - costing must never fail a run
             log.warning("cost pricing failed for %s", run.run_id, exc_info=True)
             run.cost = None
@@ -1535,6 +1924,7 @@ class Agent:
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
         run.done.set()
+        run.await_ready.set()
 
     def _price(self, run: Run) -> dict[str, Any] | None:
         """The run's cost at run end (telemetry.cost.price_run), priced once per agent."""
@@ -1572,6 +1962,8 @@ class Registry:
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()
+        self._requests_lock = threading.RLock()
+        self._requests: dict[tuple[str, ...], tuple[dict[str, Any], Run]] = {}
         self._counter = itertools.count(1)
         # Agent ids name directories under the shared session root
         # (agents/<id>/claude-home, codex-home), so they must not repeat
@@ -1591,6 +1983,37 @@ class Registry:
             )
             self._reaper.start()
 
+    def request_once(self, scope: tuple[str, ...], request_id: str | None,
+                     arguments: dict[str, Any], submit: Callable[[], Run]) -> Run:
+        """Process-local outer identity for a service's caller idempotency key."""
+        if request_id is None:
+            return submit()
+        if not request_id:
+            raise RegistryError("request_id must be a non-empty string")
+        key = (*scope, request_id)
+        with self._requests_lock:
+            previous = self._requests.get(key)
+            if previous is not None:
+                original, run = previous
+                if original != arguments:
+                    raise RegistryError("request_id reused with different arguments")
+                return run
+            run = submit()
+            self._requests[key] = (copy.deepcopy(arguments), run)
+            return run
+
+    def replay_continue(self, agent_id: str, request_id: str | None,
+                        arguments: dict[str, Any]) -> Run | None:
+        # Archived/closed agents still support a replay of an existing request.
+        if request_id is not None:
+            with self._requests_lock:
+                for key, (original, run) in self._requests.items():
+                    if key[-1] == request_id and run.agent_id == agent_id:
+                        if original != arguments:
+                            raise RegistryError("request_id reused with different arguments")
+                        return run
+        return None
+
     def reap_once(self) -> list[tuple[str, str]]:
         now = _now()
         acted: list[tuple[str, str]] = []
@@ -1599,7 +2022,7 @@ class Registry:
                 continue
             active = [r for r in agent.runs() if r.state == WORKING and r.started_at]
             tripped = next((r for r in active if r.trip), None)
-            overdue = next((r for r in active if r.deadline and now > r.deadline), None)
+            overdue = next((r for r in active if r.timeout_expired(now)), None)
             if tripped is not None and tripped.trip is not None:
                 kind, reason = tripped.trip
                 agent.close(reason, kind=kind)
@@ -1663,11 +2086,13 @@ class Registry:
         workspace: Path,
         model: str | None = None,
         provider: str | None = None,
-        fallback: str = "full",
+        fallback: str | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         agent_id: str | None = None,
         goal: Goal | None = None,
         goal_reviewer: GoalReviewer | None = None,
+        task: str | None = None,
+        instructions: str | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -1696,14 +2121,16 @@ class Registry:
                 settings=self.settings,
                 trace=self.trace,
                 cfg=chosen,
-                fallback=fallback,
-                chain=self.settings.chain(chosen.name, fallback),
+                fallback=fallback or "full",
+                chain=self.settings.chain(chosen.name, fallback or "full"),
                 lane_state=self.lane_state,
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,
                 goal=goal,
                 goal_reviewer=goal_reviewer,
+                delegate_options={"task": task, "instructions": instructions,
+                                  "name": name, "model": model, "fallback": fallback},
             )
             self._agents[claimed] = agent
             return agent

@@ -52,6 +52,15 @@ def _provider_keys(monkeypatch, tmp_path_factory):
     monkeypatch.delenv(config.CONFIG_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_provider_secret_paths(monkeypatch):
+    # Provider declarations are process-global in the in-process classifier.
+    # Each test supplies its own Settings, just as hook subprocesses do.
+    from subagent.guard import classify
+
+    monkeypatch.setattr(classify, "_provider_secret_files", ())
+
+
 def default_providers() -> dict[str, dict[str, Any]]:
     """The five backends this project ran on before the config file landed.
 

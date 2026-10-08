@@ -576,6 +576,8 @@ class Run:
     verification_result: VerificationResult | None = None
     trip: tuple[str, str] | None = None
     deadline: float | None = None
+    _human_wait_started_at: float | None = field(default=None, repr=False)
+    _timeout_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     session_id: str | None = None
     lane: str | None = None
     fallback: str | None = None
@@ -616,6 +618,22 @@ class Run:
     # Known lengths for source-tagged prompt text; absent metadata means the
     # entire submitted prompt is treated as harness text.
     source_chars: dict[str, int] | None = None
+
+    def observe_native_wait(self, outcome: dict[str, Any], observed_at: float) -> None:
+        """Charge active work only; repeated human-wait snapshots add no time."""
+        waiting = outcome.get("state") == WORKING and bool(outcome.get("needs_human"))
+        with self._timeout_lock:
+            if waiting and self._human_wait_started_at is None:
+                self._human_wait_started_at = observed_at
+            elif not waiting and self._human_wait_started_at is not None:
+                if self.deadline is not None:
+                    self.deadline += max(0, observed_at - self._human_wait_started_at)
+                self._human_wait_started_at = None
+
+    def timeout_expired(self, now: float) -> bool:
+        with self._timeout_lock:
+            return (self._human_wait_started_at is None and self.deadline is not None
+                    and now >= self.deadline)
 
     def summary(self) -> dict[str, Any]:
         out = {
@@ -1512,6 +1530,12 @@ class Agent:
                         elif event.get("admitted"):
                             run.admission_ready.set()
                     self.last_activity = _now()
+                    if capabilities(self.driver).native_outcome and "outcome" in event:
+                        # _collect buffers events until the CLI exits. Pause as
+                        # soon as a service snapshot arrives, even if its client
+                        # keeps the stream open, then avoid replaying that timing.
+                        run.observe_native_wait(event["outcome"], self.last_activity)
+                        event["_native_wait_observed"] = True
                     meter.see(event, self.last_activity)
                     watcher = run.on_event if run.on_event is not None else self.on_event
                     if watcher is not None:
@@ -1707,7 +1731,8 @@ class Agent:
             return
         if kind == "result":
             if capabilities(self.driver).native_outcome and "outcome" in event:
-                self._ingest_native(run, event["outcome"])
+                self._ingest_native(run, event["outcome"],
+                                    observe_wait=not event.get("_native_wait_observed", False))
                 return
             # Tokens were counted as the events arrived (_Meter, via _account).
             # Credits are whole-run (Copilot's session.usage_checkpoint), not
@@ -1750,6 +1775,7 @@ class Agent:
 
     def _ingest_native(
         self, run: Run, outcome: dict[str, Any], *, cancelling: bool = False,
+        observe_wait: bool = True,
     ) -> None:
         """One service snapshot. Do not reinterpret checks or fill absent fields."""
         if (self._closing and not cancelling) or run.done.is_set():
@@ -1757,6 +1783,8 @@ class Agent:
         state = outcome.get("state")
         if state not in TERMINAL_STATES and state != WORKING:
             raise ValueError(f"invalid native outcome state: {state!r}")
+        if observe_wait:
+            run.observe_native_wait(outcome, _now())
         run.native_outcome = copy.deepcopy(outcome)
         run.native_verification = capabilities(self.driver).native_verification
         run.state = state
@@ -1783,7 +1811,7 @@ class Agent:
         if not capabilities(self.driver).poll:
             raise RuntimeError("working native outcome requires provider poll capability")
         while run.state == WORKING and not self._closing and not run.trip:
-            if run.deadline is not None and _now() >= run.deadline:
+            if run.timeout_expired(_now()):
                 run.trip = (KILL_TIMEOUT, "run deadline exceeded")
                 self._cancel_provider(run.trip[1], KILL_TIMEOUT, run)
                 break
@@ -1832,6 +1860,7 @@ class Agent:
                 if run is not None and capabilities(self.driver).native_outcome:
                     snapshot = copy.deepcopy(run.native_outcome or {})
                     snapshot.update(needs_human=False)
+                    run.observe_native_wait(snapshot, _now())
                     snapshot.pop("human_action", None)
                     snapshot.setdefault("extra", {}).update(
                         cancellation_confirmed=False, cancellation_error=message,
@@ -1993,7 +2022,7 @@ class Registry:
                 continue
             active = [r for r in agent.runs() if r.state == WORKING and r.started_at]
             tripped = next((r for r in active if r.trip), None)
-            overdue = next((r for r in active if r.deadline and now > r.deadline), None)
+            overdue = next((r for r in active if r.timeout_expired(now)), None)
             if tripped is not None and tripped.trip is not None:
                 kind, reason = tripped.trip
                 agent.close(reason, kind=kind)

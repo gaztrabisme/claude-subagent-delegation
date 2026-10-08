@@ -222,12 +222,16 @@ class Translator:
         snapshot = {**(self.last or {}), "state": "failed", "phase": "done",
                     "finish_reason": "refused" if prework else "error",
                     "error": error, "result": "", "extra": extra, "needs_human": False}
-        snapshot.pop("human_action", None)
         if self.admitted:
             # A dead client cannot terminate a live service job. Let the run
             # layer poll (or cancel) while it still owns the caller's guard.
-            snapshot.update(state="working", phase="reconciling", finish_reason=None)
+            # Nor is client failure evidence that a human acted. Preserve the
+            # last native wait until a real snapshot resumes active work.
+            snapshot.update(state="working", phase="reconciling", finish_reason=None,
+                            needs_human=bool((self.last or {}).get("needs_human")))
             snapshot.setdefault("extra", {})["transport_error"] = error
+        if not snapshot["needs_human"]:
+            snapshot.pop("human_action", None)
         event = {"type": "result", "is_error": True, "error": error,
                  "epi_admitted": self.admitted,
                  "epi_prework_refusal": prework and not self.admitted,
@@ -369,8 +373,13 @@ class EpiProvider:
             return args
         _argument(args, "task", context.task if context.task is not None else prompt)
         _argument(args, "verification", context.verification or "")
-        if cwd is not None:
-            args += ["--workspace", str(cwd.resolve())]
+        # Request keys are scoped to the submitted project. Preserve both its
+        # canonical spelling and omission (epi then chooses the caller default)
+        # before the CLI can admit work without returning a receipt.
+        workspace = str(cwd.resolve()) if cwd is not None else None
+        session.data["submission_workspace"] = workspace
+        if workspace is not None:
+            args += ["--workspace", workspace]
         for flag, value in (("instructions", context.instructions), ("name", context.name),
                             ("model", context.model), ("fallback", context.fallback)):
             if value is not None:
@@ -495,6 +504,9 @@ class EpiProvider:
                 return None  # no request was ever submitted
             arguments: list[str] = []
             _argument(arguments, "request-id", key)
+            workspace = session.data.get("submission_workspace")
+            if workspace is not None:
+                arguments += ["--workspace", workspace]
             result = self._call(session, "cancel", *arguments)
             admitted = result.get("admitted")
             native_agent = result.get("agent_id")

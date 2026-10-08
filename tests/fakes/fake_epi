@@ -26,10 +26,44 @@ def wait_for_file(path):
         time.sleep(0.01)
 
 
-if tool == "delegate" and scenario == "argument_error":
+def argument(flag):
+    option = "--" + flag
+    if option in sys.argv:
+        return sys.argv[sys.argv.index(option) + 1]
+    return next((value.split("=", 1)[1] for value in sys.argv
+                 if value.startswith(option + "=")), None)
+
+
+if tool in {"delegate", "continue"} and scenario == "argument_error":
     sys.stderr.write('schema-invalid: verification "true" has no objective check for a change; '
                      'give a command\n')
     sys.exit(1)
+state_path = Path(os.environ["FAKE_EPI_RECORD"] + ".request.json")
+if tool == "cancel" and os.environ.get("FAKE_EPI_RECOVERY_FAIL"):
+    sys.stderr.write("cancellation lookup unavailable\n")
+    sys.exit(1)
+if tool == "cancel" and argument("request-id") is not None:
+    key = argument("request-id")
+    saved = json.loads(state_path.read_text()) if state_path.exists() else {"admissions": 0}
+    requests = saved.setdefault("requests", {})
+    request = requests.get(key, {"admissions": 0})
+    receipt = request.get("receipt") or {}
+    request.update(request_id=key, cancelled=True)
+    requests[key] = request
+    saved.update(request)
+    state_path.write_text(json.dumps(saved))
+    print(json.dumps({"request_id": key, "closed": True, "admitted": bool(request["admissions"]),
+                      "agent_id": receipt.get("agent_id"), "usage": receipt.get("usage", {})}))
+    sys.exit(0)
+if tool in {"delegate", "continue"} and state_path.exists():
+    saved = json.loads(state_path.read_text())
+    request = saved.get("requests", {}).get(argument("request-id"), {})
+    if request.get("cancelled"):
+        print(json.dumps({"request_id": argument("request-id"), "state": "cancelled",
+                          "phase": "done", "admitted": False, "agent_id": None, "run_id": None,
+                          "usage": dict.fromkeys(("input", "output", "cache_read", "cache_write",
+                                                 "reasoning", "total", "steps", "turns"), 0)}))
+        sys.exit(0)
 if tool == "delegate" and scenario == "socket_down":
     text = (fixtures / "call_error_socket_down.txt").read_text()
     sys.stderr.write(text.split("stderr:\n", 1)[1].split("exit_code:", 1)[0])
@@ -63,20 +97,25 @@ if tool in {"delegate", "continue"} and "--follow" not in sys.argv:
 if tool == "delegate" and os.environ.get("FAKE_EPI_RECEIPT_GATE"):
     # Durable idempotency fake: admit once before losing the initial receipt.
     # The second CLI invocation must use the exact original work arguments.
-    state_path = Path(os.environ["FAKE_EPI_RECORD"] + ".request.json")
     arguments = [a for a in sys.argv[1:] if a != "--follow"]
-    if state_path.exists():
-        saved = json.loads(state_path.read_text())
-        if arguments != saved["arguments"]:
+    saved = json.loads(state_path.read_text()) if state_path.exists() else {}
+    requests = saved.setdefault("requests", {})
+    key = argument("request-id")
+    if key in requests:
+        request = requests[key]
+        if arguments != request["arguments"]:
             sys.stderr.write("schema-invalid: request_id reused with different arguments\n")
             sys.exit(1)
         if os.environ.get("FAKE_EPI_RECOVERY_FAIL"):
             sys.stderr.write("caller lookup unavailable\n")
             sys.exit(1)
-        print(json.dumps(saved["receipt"]))
+        print(json.dumps(request["receipt"]))
         sys.exit(0)
-    state_path.write_text(json.dumps({"arguments": arguments, "admissions": 1,
-                                    "receipt": json.loads(text.splitlines()[0])}))
+    request = {"request_id": key, "arguments": arguments, "admissions": 1,
+               "receipt": json.loads(text.splitlines()[0])}
+    requests[key] = request
+    saved.update(request)
+    state_path.write_text(json.dumps(saved))
     wait_for_file(os.environ["FAKE_EPI_RECEIPT_GATE"])
 if tool == "list" and os.environ.get("FAKE_EPI_SCOPE"):
     value = json.loads(text)

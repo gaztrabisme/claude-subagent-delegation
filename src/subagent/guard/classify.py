@@ -15,9 +15,12 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import stat
 import threading
 from contextlib import suppress
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
+from glob import iglob
 from pathlib import Path, PurePosixPath
 
 ALLOW = "allow"
@@ -117,15 +120,41 @@ PROVIDER_HOMES = {
 # The provider homes currently merged into SENSITIVE_HOME by
 # protect_provider_homes. Empty until the server starts.
 _provider_homes: tuple[str, ...] = ()
+_provider_secret_files: tuple[Path, ...] = ()
+
+
+def provider_secret_files(settings) -> tuple[Path, ...]:
+    """Declared credential paths for all configured providers, without reading them.
+
+    Drivers may optionally implement ``secret_files(cfg)``. Keep the configured
+    spelling as well as its current target: atomic replacement or a symlink
+    change must not make the configured credential path writable. The result
+    also travels in worker guard contexts, whose hooks run in other processes.
+    A broken declaration raises rather than starting workers without protection.
+    """
+    from ..providers import for_driver
+
+    paths: list[Path] = []
+    for cfg in settings.providers.values():
+        declare = getattr(for_driver(cfg.driver), "secret_files", None)
+        if declare is None:
+            continue
+        for raw in declare(cfg):
+            path = Path(raw).expanduser().absolute()
+            paths.append(path)
+            with suppress(OSError, RuntimeError):
+                paths.append(path.resolve())
+    return tuple(dict.fromkeys(paths))
 
 
 def protect_provider_homes(settings) -> None:
-    """Protect the credential homes of every driver/vendor in `settings`.
+    """Protect credential homes and declared files of every provider in `settings`.
 
     Replaces the previous set (it does not accumulate): a home is off-limits
     only while a provider that uses it is configured.
     """
-    global _provider_homes
+    global _provider_homes, _provider_secret_files
+    secret_files = provider_secret_files(settings)
     labels = {
         label
         for cfg in settings.providers.values()
@@ -137,6 +166,7 @@ def protect_provider_homes(settings) -> None:
             if home not in homes:
                 homes.append(home)
     _provider_homes = tuple(homes)
+    _provider_secret_files = secret_files
 # Basenames that carry secrets wherever they appear, including in a workspace.
 SENSITIVE_NAMES = frozenset({
     ".env", ".env.local", ".env.production", ".netrc", ".npmrc", ".pypirc",
@@ -285,12 +315,105 @@ def _home() -> Path:
     return Path.home()
 
 
-def is_sensitive(path: Path) -> str | None:
+def _secret_paths(context: dict | None = None) -> tuple[Path, ...]:
+    """Current lexical and resolved secret paths, including subprocess context."""
+    paths = list(_provider_secret_files)
+    if context:
+        paths.extend(Path(value) for value in context.get("secret_files", ()))
+    for path in tuple(paths):
+        with suppress(OSError, RuntimeError):
+            paths.append(path.resolve())
+    return tuple(dict.fromkeys(paths))
+
+
+def _provider_secret(path: Path, context: dict | None = None, *, recursive: bool = False) -> bool:
+    secrets = _secret_paths(context)
+    if not secrets:
+        return False
+    candidates = [path]
+    with suppress(OSError, RuntimeError):
+        candidates.append(path.resolve())
+    if any(char in str(path) for char in "*?["):
+        # Shell globs can name a hardlink whose spelling differs from the
+        # declared file. Bound expansion; a larger ambiguous set fails closed.
+        for index, match in enumerate(iglob(str(path))):
+            if index >= 256:
+                return True
+            candidates.append(Path(match))
+    for candidate in candidates:
+        parts = _folded_parts(candidate)
+        pattern = str(Path(os.path.normpath(str(candidate)))).lower()
+        for secret in secrets:
+            secret_parts = _folded_parts(secret)
+            # The path, its aliases, and a directory scan containing the path.
+            if parts[:len(secret_parts)] == secret_parts or (
+                recursive and secret_parts[:len(parts)] == parts
+            ) or fnmatchcase(str(secret).lower(), pattern):
+                return True
+            # Hard links have distinct pathnames but the same file identity.
+            with suppress(OSError, RuntimeError):
+                if candidate.samefile(secret):
+                    return True
+    if recursive:
+        return any(_tree_contains_secret(candidate, secrets) for candidate in candidates)
+    return False
+
+
+def _tree_contains_secret(root: Path, secrets: tuple[Path, ...]) -> bool:
+    """Inspect identities, never contents, for aliases within a recursive read.
+
+    Follow directory links with an identity fence against cycles. Unreadable
+    trees or more than 16384 entries cannot be cleared, so they fail closed.
+    """
+    identities: set[tuple[int, int]] = set()
+    for secret in secrets:
+        try:
+            info = secret.stat()
+        except FileNotFoundError:
+            continue  # Its declared pathname remains protected above.
+        except (OSError, RuntimeError):
+            return True
+        identities.add((info.st_dev, info.st_ino))
+    pending = [root]
+    seen: set[tuple[int, int]] = set()
+    entries = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            info = directory.stat()
+            identity = (info.st_dev, info.st_ino)
+            if not stat.S_ISDIR(info.st_mode) or identity in seen:
+                continue
+            seen.add(identity)
+            with os.scandir(directory) as children:
+                for child in children:
+                    entries += 1
+                    if entries > 16384:
+                        return True
+                    try:
+                        child_info = child.stat(follow_symlinks=True)
+                    except FileNotFoundError:
+                        continue  # Keep checking siblings after a dangling link.
+                    child_identity = (child_info.st_dev, child_info.st_ino)
+                    if child_identity in identities:
+                        return True
+                    if stat.S_ISDIR(child_info.st_mode):
+                        pending.append(Path(child.path))
+        except FileNotFoundError:
+            continue  # A dangling link has no readable content.
+        except (OSError, RuntimeError):
+            return True
+    return False
+
+
+def is_sensitive(path: Path, context: dict | None = None) -> str | None:
     """Return why a path is off-limits, or None.
 
     Compared case-folded: APFS is case-insensitive, so `~/.SSH/config` is
     `~/.ssh/config`.
     """
+    if _provider_secret(path, context):
+        return "configured provider credential files are off-limits to a delegated agent"
     name = path.name.lower()
     if name in SENSITIVE_NAMES or name.startswith(".env."):
         return f"{path.name} carries credentials"
@@ -525,7 +648,7 @@ def classify_path_write(path_str: str, workspace: Path, context: dict | None = N
     facts = {"path": str(path), "inside_workspace": inside(path, workspace)}
     if _protected_git_state(path, workspace):
         return Verdict(DENY, "refused: writes to protected git state", facts)
-    sensitive = is_sensitive(path) or protected(path)
+    sensitive = is_sensitive(path, context) or protected(path)
     if sensitive:
         return Verdict(DENY, f"refused: {sensitive}", facts)
     if inside(path, workspace):
@@ -548,6 +671,10 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
     cwd = cwd or workspace
     protected, state_allow, state_root = _guard_rules(context, workspace)
     facts: dict[str, object] = {"command_length": len(command)}
+    # zsh numeric globs become redirect-looking tokens under the shell-word
+    # parser, so reject them before their original path spelling is lost.
+    if _secret_paths(context) and re.search(r"<\d*-\d*>", command):
+        return Verdict(DENY, "refused: numeric shell globs cannot be cleared of credentials", facts)
     tokens, error = _tokenize(command)
     if tokens is None:
         return Verdict(ESCALATE, f"command does not parse as shell words: {error}", facts)
@@ -574,6 +701,16 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
         if denial is not None:
             return denial
 
+    checks_tree = any(PurePosixPath(head).name in WRITE_COMMANDS | {
+        "rm", "rmdir", "shred", "unlink", "diff",
+    } for head in heads)
+    # diff reads common child files of directory operands even without -r.
+    leaked = _sensitive_argument(argv, cwd, context, recursive=checks_tree)
+    if leaked is not None:
+        path, why = leaked
+        facts["sensitive_path"] = str(path)
+        return Verdict(DENY, f"refused: {why}", facts)
+
     if len(segments) > 1 and unsupported is None and not substitution:
         # Cross-segment dangers first: they are the pipe or the chain itself
         # (`curl … | sh`), which no single segment shows.
@@ -581,15 +718,6 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
         if danger is not None:
             return danger
         return _classify_segments(segments, workspace, cwd, facts, context)
-
-    # A read command is not automatically safe: `cat ~/.ssh/id_rsa` is a
-    # read-only tool applied to a secret. Sensitive paths are refused whatever
-    # the verb, before the per-command rules get a say.
-    leaked = _sensitive_argument(argv, cwd)
-    if leaked is not None:
-        path, why = leaked
-        facts["sensitive_path"] = str(path)
-        return Verdict(DENY, f"refused: {why}", facts)
 
     # Populate the path facts BEFORE any early return. A compound line escalates
     # on the next few lines, and an escalation that carries only "compound: true"
@@ -645,6 +773,10 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
             DENY, "refused: prints the child's environment, which holds its API key", facts
         )
     if base in READ_ONLY:
+        if _searches_provider_secret(base, words, cwd, context):
+            return Verdict(
+                DENY, "refused: search includes configured provider credential files", facts
+            )
         exposed = _read_only_exposure(base, words)
         if exposed is not None:
             return Verdict(ESCALATE, exposed, facts)
@@ -1420,7 +1552,9 @@ def _unique(paths: list[Path]) -> list[Path]:
     return list(dict.fromkeys(paths))
 
 
-def _sensitive_argument(argv: list[str], cwd: Path) -> tuple[Path | str, str] | None:
+def _sensitive_argument(
+    argv: list[str], cwd: Path, context: dict | None = None, *, recursive: bool = False,
+) -> tuple[Path | str, str] | None:
     """The first argument naming an off-limits path, or None.
 
     Only words that look like paths are considered -- containing a separator or
@@ -1428,24 +1562,107 @@ def _sensitive_argument(argv: list[str], cwd: Path) -> tuple[Path | str, str] | 
     argument than a filename, and denying it would be the substring-matching
     mistake this module exists to avoid.
 
-    Values count too: `--file=X`, `-fX`, `NAME=X`, and curl's `@X`. `$HOME` is
-    expanded. A `~+`, `~-` or unknown `~name` word is refused outright: it
-    could name anything, and a secret is among the things it could name.
+    Literal spellings precede extracted values: `=` and leading `@` or `-`
+    may be part of a filename. Values count too: `--file=X`, `-fX`, `NAME=X`,
+    and curl's `@X`. `$HOME` is expanded. Other unresolved shell operands
+    cannot be cleared when provider credential files are configured.
     """
-    for word in argv[1:]:
-        for value in _values(word):
+    has_provider_secrets = bool(_secret_paths(context))
+    for word in argv:
+        values = [word]
+        if "=" in word and (word.startswith("-") or ASSIGNMENT.match(word)):
+            values.append(word.split("=", 1)[1])
+        if word.startswith("-") and not word.startswith("--") and len(word) > 2:
+            values.append(word[2:])
+        values.extend(_values(word))
+        for value in dict.fromkeys(values):
             if value.startswith("~") and _unresolvable(value):
                 return value, f"{value} cannot be resolved, so it cannot be cleared"
             value = _expand_home(value)
+            if has_provider_secrets and (
+                UNEXPANDED.search(value) or any(char in value for char in "{}[]") or "**" in value
+            ):
+                return value, "unresolved shell operands cannot be cleared of provider credentials"
+            if not UNEXPANDED.search(value):
+                path = _resolve(value, cwd)
+                # Declared secrets also have ordinary basenames. Check these
+                # before the general path-shaped heuristic (cat caller.token).
+                if _provider_secret(path, context, recursive=recursive):
+                    return path, (
+                        "configured provider credential files are off-limits to a delegated agent"
+                    )
             if not _path_like(value):
                 continue
             if UNEXPANDED.search(value):
                 continue
             path = _resolve(value, cwd)
-            why = is_sensitive(path)
+            why = is_sensitive(path, context)
             if why:
                 return path, why
     return None
+
+
+def _searches_provider_secret(
+    base: str, words: list[str], cwd: Path, context: dict | None,
+) -> bool:
+    """Directory searches must not reveal a secret via an allowed ancestor.
+
+    Recognized search options consume their values. An unknown option falls
+    back to the cwd as well as named roots, so uncertain parsing cannot clear
+    a default scan of a workspace containing credentials.
+    """
+    if base not in {"rg", "ag", "grep", "egrep", "fgrep"} or not _secret_paths(context):
+        return False
+    args = words[1:]
+    if base in {"grep", "egrep", "fgrep"} and not (
+        _short_letters(args) & {"r", "R"} or
+        any(arg in {"--recursive", "--dereference-recursive", "--directories=recurse",
+                    "-drecurse"} for arg in args) or
+        any(arg in {"-d", "--directories"} and args[index + 1] == "recurse"
+            for index, arg in enumerate(args[:-1]))
+    ):
+        return False
+    value_options = {"-e", "--regexp", "-f", "--file", "-d", "--directories",
+                     "-g", "--glob", "--iglob",
+                     "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "-m",
+                     "--max-count", "--max-depth", "--max-columns", "--encoding", "--ignore-file"}
+    flag_options = {"--files", "--hidden", "--no-ignore", "--no-ignore-vcs", "--follow",
+                    "--recursive", "--dereference-recursive", "--line-number", "--count",
+                    "--files-with-matches", "--files-without-match", "--fixed-strings",
+                    "--ignore-case", "--smart-case", "--word-regexp", "--invert-match",
+                    "--only-matching", "--no-heading", "--heading", "--null", "--null-data"}
+    operands: list[str] = []
+    explicit_pattern = "--files" in args
+    uncertain = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            operands.extend(args[index + 1:])
+            break
+        if arg in value_options:
+            explicit_pattern |= arg in {"-e", "--regexp", "-f", "--file"}
+            index += 2
+            continue
+        if arg.startswith(("--regexp=", "--file=")) or (
+            arg.startswith(("-e", "-f")) and not arg.startswith("--") and len(arg) > 2
+        ):
+            explicit_pattern = True
+        elif (
+            arg.startswith("--") and arg.split("=", 1)[0] not in value_options | flag_options
+        ) or (
+            arg.startswith("-") and not arg.startswith("--") and
+            not re.fullmatch(r"-[nrilLRHIhsSuvFwocqaz]+", arg)
+        ):
+            uncertain = True
+        if not arg.startswith("-"):
+            operands.append(arg)
+        index += 1
+    roots = operands if explicit_pattern else operands[1:]
+    if uncertain:
+        roots.append(".")
+    return any(_provider_secret(_resolve(_expand_home(root), cwd), context, recursive=True)
+               for root in (roots or ["."]))
 
 
 def _command_heads(command: str, tokens: list[str]) -> list[str]:
@@ -1682,9 +1899,14 @@ def _classify(
     base = base or workspace
     if name in READ_TOOLS:
         path = _first(tool_input, PATH_KEYS)
+        if name in {"Grep", "grep", "Glob", "glob"} and _provider_secret(
+            _resolve(str(path), base) if path is not None else base, context, recursive=True
+        ):
+            return Verdict(DENY, "refused: search includes configured provider credential files",
+                           {"tool": name})
         if path is not None:
             candidate = _resolve(str(path), base)
-            why = is_sensitive(candidate)
+            why = is_sensitive(candidate, context)
             if why:
                 return Verdict(
                     DENY,
@@ -1704,12 +1926,15 @@ def _classify(
             base = own or base
         verdict = classify_bash(str(command), workspace, cwd=base, context=context)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
-    if name in WRITE_TOOLS or (context and name == "MultiEdit"):
+    if name in WRITE_TOOLS or name == "MultiEdit":
         paths = _tool_paths(name, tool_input)
         if paths is None:
             return Verdict(ESCALATE, "write call with no readable path", {"tool": name})
         for raw in paths:
             target = _resolve(str(raw), base)
+            why = is_sensitive(target, context)
+            if why:
+                return Verdict(DENY, f"refused: {why}", {"tool": name, "path": str(target)})
             if context and _under_folded(target, protected):
                 return Verdict(DENY, TEST_FILES_READ_ONLY, {"tool": name, "path": str(target)})
             if context and _under_folded(target, state_root) and not _under_folded(
@@ -1720,6 +1945,8 @@ def _classify(
                     f"refused: writes under {STATE_DIR_NAME}/ are limited to the state files",
                     {"tool": name, "path": str(target)},
                 )
+        if name == "MultiEdit" and not context:
+            return Verdict(ESCALATE, f"unrecognized tool `{name}`", {"tool": name})
         target = _resolve(str(paths[0]), base)
         verdict = classify_path_write(str(target), workspace, context=context)
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})

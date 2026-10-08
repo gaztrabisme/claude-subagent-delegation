@@ -564,6 +564,9 @@ class Run:
     # MCP waits end at a human gate as well as at a terminal result. `done`
     # continues to mean terminal, for callers that require completion.
     await_ready: threading.Event = field(default_factory=threading.Event)
+    admission_ready: threading.Event = field(default_factory=threading.Event)
+    admission_error: str | None = None
+    cancel_pending: bool = False
     native_outcome: dict[str, Any] | None = None
     native_usage: bool = False
     native_verification: bool = False
@@ -749,6 +752,9 @@ class Agent:
         self.guard_context: dict[str, Any] = {
             "secret_env_names": list(settings.guard_secret_env_names),
         }
+        from .guard.classify import provider_secret_files
+
+        self.guard_context["secret_files"] = [str(p) for p in provider_secret_files(settings)]
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -784,6 +790,27 @@ class Agent:
         )
         self._thread.start()
 
+    def wait_admission(self, run: Run, timeout: float = 5.0) -> None:
+        """Opt-in boundary for clients that require synchronous input errors."""
+        if not capabilities(self.driver).admission_barrier:
+            return
+        if not run.admission_ready.wait(timeout):
+            # A serial continuation may still be queued behind a human wait.
+            # Cancel only that unsubmitted run, never the active service job.
+            with self._dispatch_lock, self._wake:
+                queued = run.started_at is None
+                if queued:
+                    if run in self._queue:
+                        self._queue.remove(run)
+                    run.trip = (KILL_TIMEOUT, "provider admission timed out before submission")
+                    self._finish_locked(run)
+            if queued:
+                raise RegistryError("provider admission timed out before submission")
+            self.close("provider admission timed out", kind=KILL_TIMEOUT)
+            raise RegistryError("provider admission timed out; cancellation requested")
+        if run.admission_error:
+            raise RegistryError(run.admission_error)
+
     @property
     def closed(self) -> bool:
         return self._closed
@@ -810,6 +837,7 @@ class Agent:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
         source_chars: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -830,6 +858,7 @@ class Agent:
             fallback=self.fallback,
             provider=self.cfg.vendor,
             driver=self.driver.name,
+            native_usage=capabilities(self.driver).native_usage,
             guard=self.driver.guard(self.settings, self.cfg),
             route=route,
             parent=parent or None,
@@ -837,6 +866,8 @@ class Agent:
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
+            **({"request_id": request_id} if request_id and capabilities(self.driver).run_context
+               else {}),
         )
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
@@ -859,6 +890,7 @@ class Agent:
         goal: Goal | None = None,
         reviewer: GoalReviewer | None = None,
         source_chars: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
@@ -879,6 +911,7 @@ class Agent:
             on_event=on_event,
             distill=distill,
             source_chars=source_chars,
+            request_id=request_id,
         )
 
     def follow_up(
@@ -891,6 +924,7 @@ class Agent:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         distill: bool = True,
         source_chars: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> Run:
         """A continue. Omitting `verification` reuses the delegate's; "" skips it.
 
@@ -899,6 +933,9 @@ class Agent:
         the work was done. Judged against the original acceptance check, a
         completed continue means the task passes.
         """
+        if (capabilities(self.driver).native_verification and self.runs()
+                and not self.busy and self.session_id is None):
+            raise RegistryError("native agent was never admitted; delegate a new task")
         if verification is None and self.delegate_verification:
             return self.submit(
                 message,
@@ -914,6 +951,7 @@ class Agent:
                 on_event=on_event,
                 distill=distill,
                 source_chars=source_chars,
+                request_id=request_id,
             )
         if verification is not None and not verification.strip():
             return self.submit(
@@ -926,6 +964,7 @@ class Agent:
                 on_event=on_event,
                 distill=distill,
                 source_chars=source_chars,
+                request_id=request_id,
             )
         return self.submit(
             message,
@@ -936,6 +975,7 @@ class Agent:
             on_event=on_event,
             distill=distill,
             source_chars=source_chars,
+            request_id=request_id,
         )
 
     def get_run(self, run_id: str) -> Run | None:
@@ -984,6 +1024,8 @@ class Agent:
                 self._cancel_complete.set()
         for run in self.runs():
             if run.state == WORKING:
+                if run.cancel_pending:
+                    continue
                 run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
                 run.error = reason
                 run.phase = PHASE_DONE
@@ -991,7 +1033,14 @@ class Agent:
                 run.done.set()
                 run.await_ready.set()
         self._thread.join(timeout=8)
-        self._closed = True
+        self._closed = not any(r.cancel_pending for r in self.runs())
+        # A second close may resolve a previously uncertain native cancel after
+        # the serial worker has stopped. Its retained guard still belongs here.
+        for run in self.runs():
+            if run.pre_verify_result is None and not run.cancel_pending:
+                self._run_pre_verify(run)
+                if not run.done.is_set():
+                    self._finish(run)
 
     def _boot(self) -> None:
         try:
@@ -1024,7 +1073,8 @@ class Agent:
         self._boot()
         while True:
             with self._wake:
-                while not self._queue and not self._closing:
+                while (not self._queue or any(r.cancel_pending for r in self._runs.values())) \
+                        and not self._closing:
                     self._wake.wait(timeout=0.5)
                 if self._closing and not self._queue:
                     break
@@ -1079,11 +1129,29 @@ class Agent:
         return process
 
     def _execute(self, run: Run) -> None:
-        run.started_at = _now()
+        with self._dispatch_lock:
+            if run.done.is_set():
+                return
+            closing = self._closing and run.started_at is None
+            if not closing:
+                run.started_at = _now()
+        if closing:
+            self._finish(run)
+            return
         run.native_usage = capabilities(self.driver).native_usage
         run.deadline = run.started_at + self.cfg.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
+        if (not run.route and run.continues and capabilities(self.driver).native_verification
+                and self.session_id is None):
+            # A queued predecessor may have refused after follow_up was called.
+            # A continuation can never turn into a fresh native delegate.
+            run.admission_error = "native agent was never admitted; delegate a new task"
+            run.error = run.admission_error
+            run.state = FAILED
+            run.finish_reason = "error"
+            self._finish(run)
+            return
         if run.pre_run is not None:
             run.pre_run()
         if run.route:
@@ -1106,7 +1174,10 @@ class Agent:
                 run.await_ready.set()
                 return
             self._turn(run, run.prompt, resume=self.session_id)
-        if run.native_outcome is not None and run.state == WORKING:
+        if (capabilities(self.driver).confirmed_cancel
+                and self.session().data.pop("cancellation_required", False)):
+            self._cancel_provider("native admission could not be determined", "error", run)
+        if run.native_outcome is not None and run.state == WORKING and not run.cancel_pending:
             self._follow_native(run)
         # Release the caller's guard only when all provider work has ended,
         # including service work that outlived the CLI. Exceptions reach the
@@ -1191,6 +1262,8 @@ class Agent:
             with self._dispatch_lock:
                 if self._closing and not self._cancel_complete.is_set():
                     continue
+                if run.cancel_pending:
+                    return
                 self._release_pre_verify(run)
                 return
 
@@ -1430,6 +1503,14 @@ class Agent:
                     proc.kill()
                     return []
                 for event in proc.events():
+                    if capabilities(self.driver).admission_barrier:
+                        if event.get("admission_error"):
+                            run.admission_error = redact_secrets(
+                                str(event["admission_error"]), self.settings.leaked_keys,
+                            )
+                            run.admission_ready.set()
+                        elif event.get("admitted"):
+                            run.admission_ready.set()
                     self.last_activity = _now()
                     meter.see(event, self.last_activity)
                     watcher = run.on_event if run.on_event is not None else self.on_event
@@ -1720,19 +1801,29 @@ class Agent:
         if not capabilities(self.driver).cancel:
             return
         if run is None:
-            run = next((r for r in self.runs() if r.state == WORKING and r.started_at), None)
+            owner = self.session().data.get("request_id")
+            run = next((r for r in self.runs() if owner and r.request_id == owner), None)
+            if run is None:
+                run = next((r for r in self.runs() if r.state == WORKING and r.started_at), None)
             if run is None and self._order:
                 run = self._runs[self._order[-1]]
         key = run.request_id if run is not None else None
         with self._dispatch_lock, self._cancel_lock:
             if key in self._cancelled_requests:
                 return
-            self._cancelled_requests.add(key)
             try:
                 snapshot = self.driver.cancel(self.session(), reason=reason, kind=kind)
-                if isinstance(snapshot, dict) and run is not None:
+                self._cancelled_requests.add(key)
+                if run is not None:
+                    run.cancel_pending = False
+                if (isinstance(snapshot, dict) and run is not None
+                        and (not capabilities(self.driver).run_context
+                             or self.session().data.get("request_id") == run.request_id)):
                     # Final service accounting may arrive only in cancel. The
                     # caller still owns the outer cancellation/timeout state.
+                    native_agent = self.session().session_id
+                    if native_agent is not None:
+                        self.session_id = run.session_id = native_agent
                     previous = (run.state, run.phase, run.finish_reason, run.error)
                     self._ingest_native(run, snapshot, cancelling=True)
                     run.state, run.phase, run.finish_reason, run.error = previous
@@ -1746,6 +1837,11 @@ class Agent:
                         cancellation_confirmed=False, cancellation_error=message,
                     )
                     run.native_outcome = snapshot
+                    if capabilities(self.driver).confirmed_cancel and not run.done.is_set():
+                        run.cancel_pending = True
+                        run.state = WORKING
+                        run.phase = "cancellation_pending"
+                        run.await_ready.set()
                 log.warning("provider cancel failed for %s: %s: %s",
                             self.agent_id, type(exc).__name__, message)
 
@@ -1761,6 +1857,12 @@ class Agent:
                 return
 
     def _finish_locked(self, run: Run) -> None:
+        run.admission_ready.set()
+        if run.cancel_pending:
+            run.state = WORKING
+            run.phase = "cancellation_pending"
+            run.await_ready.set()
+            return
         if self._kill_kind:
             kind = self._kill_kind
             run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
@@ -1831,6 +1933,8 @@ class Registry:
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()
+        self._requests_lock = threading.RLock()
+        self._requests: dict[tuple[str, ...], tuple[dict[str, Any], Run]] = {}
         self._counter = itertools.count(1)
         # Agent ids name directories under the shared session root
         # (agents/<id>/claude-home, codex-home), so they must not repeat
@@ -1849,6 +1953,37 @@ class Registry:
                 target=self._reap_loop, args=(interval,), name="sam-reaper", daemon=True
             )
             self._reaper.start()
+
+    def request_once(self, scope: tuple[str, ...], request_id: str | None,
+                     arguments: dict[str, Any], submit: Callable[[], Run]) -> Run:
+        """Process-local outer identity for a service's caller idempotency key."""
+        if request_id is None:
+            return submit()
+        if not request_id:
+            raise RegistryError("request_id must be a non-empty string")
+        key = (*scope, request_id)
+        with self._requests_lock:
+            previous = self._requests.get(key)
+            if previous is not None:
+                original, run = previous
+                if original != arguments:
+                    raise RegistryError("request_id reused with different arguments")
+                return run
+            run = submit()
+            self._requests[key] = (copy.deepcopy(arguments), run)
+            return run
+
+    def replay_continue(self, agent_id: str, request_id: str | None,
+                        arguments: dict[str, Any]) -> Run | None:
+        # Archived/closed agents still support a replay of an existing request.
+        if request_id is not None:
+            with self._requests_lock:
+                for key, (original, run) in self._requests.items():
+                    if key[-1] == request_id and run.agent_id == agent_id:
+                        if original != arguments:
+                            raise RegistryError("request_id reused with different arguments")
+                        return run
+        return None
 
     def reap_once(self) -> list[tuple[str, str]]:
         now = _now()

@@ -276,6 +276,10 @@ class ProviderCapabilities:
     poll: bool = False
     transcript: bool = False
     metadata: bool = False
+    # MCP waits for admission or a pre-admission argument error, even with
+    # wait_seconds=0. Cancellation must be confirmed before releasing guards.
+    admission_barrier: bool = False
+    confirmed_cancel: bool = False
 
 
 def capabilities(provider: Any) -> ProviderCapabilities:

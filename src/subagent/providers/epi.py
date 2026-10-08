@@ -9,10 +9,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -20,11 +22,44 @@ from typing import Any
 from ..config import Settings
 from ..router import Refusal
 from .base import Process, ProviderCapabilities, ProviderConfig, RunContext, Session
+from .private_files import token_privacy_error
 
 TERMINAL = {"completed", "completed_unverified", "failed", "cancelled"}
 ROUTING = {"agent_id", "run_id", "provider", "lane", "driver", "model", "fallback",
            "hops", "profile", "known_providers", "fallback_modes"}
 MAX_OUTPUT_CHARS = 1_048_576
+
+# Stderr is not a structured run snapshot and can contain a client's token
+# echo. Preserve only diagnostics whose grammar contains no arbitrary values.
+_SCHEMA_MESSAGES = {
+    'verification "true" has no objective check for a change; give a command',
+    "task is required", "message is required", "verification is required",
+    "fallback must be full, local or none", "request_id must not be empty",
+    "request_id was reused with different arguments",
+    "request_id reused with different arguments", "workspace is not a harness project",
+    "caller has no configured project scope", "invalid caller project scope",
+    "goal exceeds 4000 characters", "goal row number out of range", "no goal rows",
+    "free text before row 1", "missing header line", "cannot read goal file",
+    "goal file exceeds 65536 bytes", "goal file is not UTF-8", "cannot reap goal reader",
+    'missing header line: expected Execute plan "<plan name>" '
+    '(<plan file path or reference>). Goal rows:',
+}
+_SCHEMA_ROW = re.compile(
+    r'(?:rows not consecutive: expected [0-9]{1,10} got [0-9]{1,10}'
+    r'|row [0-9]{1,10}: (?:row after trailing free text|expected "<n> <label>: <check>")'
+    r'|goal row [0-9]{1,10} (?:has an (?:unmatched backtick|empty command)'
+    r'|is prose: harness lanes accept command rows only, '
+    r'because harness checks are never judge calls))'
+)
+
+
+def _schema_diagnostic(stderr: str) -> str:
+    raw = stderr.strip()
+    body = raw.removeprefix("schema-invalid:").strip().removeprefix("schema-invalid:").strip()
+    if body and all(line in _SCHEMA_MESSAGES or _SCHEMA_ROW.fullmatch(line)
+                    for line in body.splitlines()):
+        return raw
+    return "schema-invalid: epi rejected arguments; unrecognized diagnostic withheld"
 
 
 def _capture(stream: Any, buffer: list[str], limit: int,
@@ -88,7 +123,9 @@ class Translator:
         self.session = session
         self.agent_id = session.session_id
         self.run_id = run_id
-        self.admitted = False
+        # Poll is reconciliation of an existing admission; continue starts a
+        # new request and passes no saved run id to its stream translator.
+        self.admitted = run_id is not None and session.session_id is not None
         self.seen = False
         self.last: dict[str, Any] | None = None
 
@@ -98,11 +135,16 @@ class Translator:
             raise ValueError("epi returned an invalid run state")
         if state == "rejected" and self.admitted:
             raise ValueError("epi rejected a run after admission")
-        if state != "rejected" and not all(
+        tombstone = (state == "cancelled" and detail.get("admitted") is False
+                     and not self.admitted and self.run_id is None
+                     and detail.get("request_id") == self.session.data.get("request_id")
+                     and bool(detail.get("request_id"))
+                     and detail.get("agent_id") is None and detail.get("run_id") is None)
+        if state != "rejected" and not tombstone and not all(
             isinstance(detail.get(key), str) and detail[key] for key in ("agent_id", "run_id")
         ):
             raise ValueError("epi returned a run without its admission identities")
-        if state != "rejected":
+        if state != "rejected" and not tombstone:
             if self.agent_id is not None and detail["agent_id"] != self.agent_id:
                 raise ValueError("epi returned a different admitted agent")
             if self.run_id is not None and detail["run_id"] != self.run_id:
@@ -131,6 +173,9 @@ class Translator:
                 if len(actual) != len(expected) or set(actual) != expected:
                     raise ValueError("epi completed without all requested goal rows")
         out = copy.deepcopy({k: v for k, v in detail.items() if k not in ROUTING})
+        if tombstone:
+            out["usage"] = dict.fromkeys(("input", "output", "cache_read", "cache_write",
+                                          "reasoning", "total", "steps", "turns"), 0)
         extra = out.setdefault("extra", {})
         extra["epi"] = {k: copy.deepcopy(v) for k, v in detail.items() if k in ROUTING}
         if detail.get("state") == "rejected":
@@ -154,6 +199,8 @@ class Translator:
                  "result": out.get("result", ""),
                  "is_error": out["state"] in {"failed", "cancelled"},
                  "epi_admitted": self.admitted}
+        if self.admitted:
+            event["admitted"] = True
         if self.session.session_id:
             event["session_id"] = self.session.session_id
         if detail.get("state") == "rejected" and not self.admitted:
@@ -165,6 +212,10 @@ class Translator:
         # Do not surface subprocess stderr or malformed JSON. The driver never
         # reads the token, so cannot safely redact a misbehaving client's echo.
         error = "epi client refused before admission" if prework else "epi client failed"
+        if self.last and self.last.get("state") in TERMINAL:
+            return {"type": "result", "outcome": copy.deepcopy(self.last),
+                    "epi_admitted": self.admitted,
+                    "is_error": self.last["state"] in {"failed", "cancelled"}}
         if prework and not self.admitted:
             self.session.data["prework_refusal"] = True
         extra = copy.deepcopy((self.last or {}).get("extra", {}))
@@ -172,10 +223,18 @@ class Translator:
                     "finish_reason": "refused" if prework else "error",
                     "error": error, "result": "", "extra": extra, "needs_human": False}
         snapshot.pop("human_action", None)
-        return {"type": "result", "is_error": True, "error": error,
-                "epi_admitted": self.admitted,
-                "epi_prework_refusal": prework and not self.admitted,
-                "outcome": snapshot}
+        if self.admitted:
+            # A dead client cannot terminate a live service job. Let the run
+            # layer poll (or cancel) while it still owns the caller's guard.
+            snapshot.update(state="working", phase="reconciling", finish_reason=None)
+            snapshot.setdefault("extra", {})["transport_error"] = error
+        event = {"type": "result", "is_error": True, "error": error,
+                 "epi_admitted": self.admitted,
+                 "epi_prework_refusal": prework and not self.admitted,
+                 "outcome": snapshot}
+        if self.admitted:
+            event.update(admitted=True, session_id=self.session.session_id)
+        return event
 
 
 class EpiProcess(Process):
@@ -221,7 +280,22 @@ class EpiProcess(Process):
                     evidence.startswith("agent serve socket is unavailable:")
                     or evidence.startswith("caller token rejected")
                 )
-                yield translator.failure(prework=refusal)
+                failure = translator.failure(prework=refusal)
+                if not translator.admitted and evidence.startswith("schema-invalid:"):
+                    from ..secrets import redact_secrets
+
+                    # Use original casing, after redacting configured keys.
+                    message = _schema_diagnostic("".join(stderr))
+                    message = redact_secrets(message, self.session.data.get("leaked_keys", ()))
+                    failure["admission_error"] = message
+                    failure["error"] = message
+                    failure["outcome"]["error"] = message
+                    self.session.data["argument_error"] = True
+                elif not translator.admitted and not refusal:
+                    # The service may have admitted before the receipt was
+                    # lost. Only request-key cancellation can prove it stopped.
+                    self.session.data["cancellation_required"] = True
+                yield failure
         finally:
             self.session.data["receipt"].set()
             if proc.poll() is None:
@@ -237,10 +311,15 @@ class EpiProvider:
     capabilities = ProviderCapabilities(
         run_context=True, native_outcome=True, native_verification=True,
         native_usage=True, cancel=True, poll=True, transcript=True, metadata=True,
+        admission_barrier=True, confirmed_cancel=True,
     )
 
     def guard(self, settings: Settings, cfg: ProviderConfig | None = None) -> str:
         return "harness"
+
+    def secret_files(self, cfg: ProviderConfig) -> tuple[Path, ...]:
+        token = _token_path(cfg)
+        return (token,) if token is not None else ()
 
     def boot(self, settings: Settings, agent_id: str,
              cfg: ProviderConfig) -> tuple[str | None, Session]:
@@ -262,8 +341,12 @@ class EpiProvider:
                 return "epi token_file is unreadable", session
         except OSError:
             return "epi token_file is unavailable", session
+        privacy_error = token_privacy_error(token)
+        if privacy_error is not None:
+            return privacy_error, session
         session.data.update(cfg=cfg, env=self.env(settings, agent_id, cfg, session),
-                            cwd=str(_project(cfg) or settings.workspace))
+                            cwd=str(_project(cfg) or settings.workspace),
+                            leaked_keys=settings.leaked_keys)
         return None, session
 
     def _call_argv(self, cfg: ProviderConfig, tool: str) -> list[str]:
@@ -277,7 +360,8 @@ class EpiProvider:
         context: RunContext = session.data["context"]
         continuing = session.session_id is not None
         args = self._call_argv(cfg, "continue" if continuing else "delegate")
-        args += ["--follow", "--request-id", context.request_id]
+        args.append("--follow")
+        _argument(args, "request-id", context.request_id)
         if continuing:
             args += ["--agent-id", session.session_id]
             _argument(args, "message", prompt)
@@ -320,15 +404,11 @@ class EpiProvider:
         session.data.pop("run_id", None)
         session.data.pop("last_outcome", None)
         session.data.pop("prework_refusal", None)
+        session.data.pop("argument_error", None)
+        session.data.pop("cancellation_required", None)
         session.data.update(context=context, request_id=context.request_id,
                             cwd=str(cwd), receipt=threading.Event())
         args = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
-        session.data.pop("delegate_args", None)
-        if session.session_id is None:
-            # Retain the exact work arguments, including the idempotency key.
-            # A non-following replay returns the original run's current detail.
-            prefix = len(self._call_argv(cfg, "delegate"))
-            session.data["delegate_args"] = [a for a in args[prefix:] if a != "--follow"]
         process = EpiProcess(args, self.env(settings, agent_id, cfg, session), str(cwd), session)
         session.data["process"] = process
         return process
@@ -384,6 +464,22 @@ class EpiProvider:
         return Translator(session, run_id=run_id).outcome(detail)
 
     def cancel(self, session: Session, *, reason: str, kind: str) -> dict[str, Any] | None:
+        # Each request remains retryable if cancellation cannot be confirmed.
+        cfg = session.data["cfg"]
+        budget = min(30.0, max(0.1, float(cfg.extra.get("cancel_retry_seconds", 10))))
+        deadline = time.monotonic() + budget
+        delay = 0.05
+        while True:
+            try:
+                return self._cancel_once(session)
+            except (RuntimeError, ValueError):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("epi cancellation was not confirmed after retries") from None
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 1.0)
+
+    def _cancel_once(self, session: Session) -> dict[str, Any] | None:
         process = session.data.get("process")
         if process is not None:
             # Fence publication against Popen before waiting for admission.
@@ -391,23 +487,38 @@ class EpiProvider:
             if fence is not None:
                 with fence:
                     process._cancelled = True
-                    started = process._proc is not None
-            else:
-                started = process._proc is not None
-            if started and not session.session_id:
-                session.data["receipt"].wait(timeout=5)
-                if not session.session_id:
-                    if session.data.get("prework_refusal"):
-                        # A known refusal has no admitted job to recover. A
-                        # fresh call could start work if conditions changed.
-                        return None
-                    arguments = session.data.get("delegate_args")
-                    if arguments is None:
-                        raise RuntimeError("epi cancel has no original delegate arguments")
-                    detail = self._call(session, "delegate", *arguments)
-                    Translator(session, run_id=session.data.get("run_id")).outcome(detail)
-                    if not session.session_id:
-                        raise RuntimeError("epi cancel could not identify an admitted agent")
+        if not session.session_id:
+            if session.data.get("prework_refusal") or session.data.get("argument_error"):
+                return None
+            key = session.data.get("request_id")
+            if not key:
+                return None  # no request was ever submitted
+            arguments: list[str] = []
+            _argument(arguments, "request-id", key)
+            result = self._call(session, "cancel", *arguments)
+            admitted = result.get("admitted")
+            native_agent = result.get("agent_id")
+            if (result.get("closed") is not True or result.get("request_id") != key
+                    or not isinstance(admitted, bool)
+                    or (admitted and (not isinstance(native_agent, str) or not native_agent))
+                    or (not admitted and native_agent is not None)):
+                raise RuntimeError("epi request cancellation was not confirmed")
+            snapshot = copy.deepcopy(session.data.get("last_outcome", {}))
+            usage = copy.deepcopy(result.get("usage", {}))
+            if not admitted:
+                # A request tombstone cannot have incurred any work or usage.
+                usage = dict.fromkeys(("input", "output", "cache_read", "cache_write",
+                                       "reasoning", "total", "steps", "turns"), 0)
+            snapshot.update(state="cancelled", phase="done", needs_human=False,
+                            usage=usage)
+            snapshot.pop("human_action", None)
+            snapshot.setdefault("extra", {}).setdefault("epi", {}).update(
+                request_id=key, agent_id=native_agent, cancel=result,
+            )
+            snapshot["extra"]["cancellation_confirmed"] = True
+            if admitted:
+                session.session_id = native_agent
+            return snapshot
         if session.session_id:
             result = self._call(session, "cancel", "--agent-id", session.session_id)
             if result.get("closed") is not True or result.get("agent_id") != session.session_id:

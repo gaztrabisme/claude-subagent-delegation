@@ -10,10 +10,12 @@ import dataclasses
 import importlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from subagent import cli
 from subagent.guard.supervisor import Supervisor
@@ -220,36 +222,51 @@ def test_lane_cancel_reaches_epi(lane, monkeypatch):
 def test_lane_cancel_before_receipt_recovers_agent(lane, tmp_path, monkeypatch):
     gate = tmp_path / "receipt"
     monkeypatch.setenv("FAKE_EPI_RECEIPT_GATE", str(gate))
-    first = lane.delegate(name="lost receipt", instructions="Keep the approved check",
-                          model="scripted-fake", fallback="none", wait_seconds=0)
-    lane.wait_until(lambda: Path(str(gate) + ".ready").exists())
-    agent = lane.server.registry.agent(first["agent_id"])
-    assert agent.session().session_id is None
-    result = lane.call("cancel", agent_id=first["agent_id"])
-    assert result["closed"]
+    with ThreadPoolExecutor() as pool:
+        pending = pool.submit(lane.delegate, name="lost receipt",
+                              instructions="Keep the approved check", model="scripted-fake",
+                              fallback="none", wait_seconds=0)
+        lane.wait_until(lambda: Path(str(gate) + ".ready").exists())
+        agent = next(iter(lane.server.registry._agents.values()))
+        assert agent.session().session_id is None
+        result = lane.call("cancel", agent_id=agent.agent_id)
+        assert result["closed"]
+        first = pending.result(timeout=5)
     run = lane.server.registry.find_run(first["run_id"])
     assert run.done.is_set() and run.state == "cancelled"
     assert run.detail()["extra"]["cancellation_confirmed"] is True
-    original, lookup = [c["argv"] for c in lane.calls("delegate")]
-    assert "--follow" in original and "--follow" not in lookup
-    assert lookup == [arg for arg in original if arg != "--follow"]
+    assert len(lane.calls("delegate")) == 1
     saved = json.loads(Path(str(lane.record) + ".request.json").read_text())
     assert saved["admissions"] == 1
     args = lane.calls("cancel")[0]["argv"]
-    assert args[args.index("--agent-id") + 1] == saved["receipt"]["agent_id"]
+    assert args[args.index("--request-id") + 1] == run.request_id
+    assert run.detail()["extra"]["epi"]["agent_id"] == saved["receipt"]["agent_id"]
 
 
 def test_lane_cancel_before_receipt_lookup_failure_is_unconfirmed(lane, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_EPI_RECEIPT_GATE", str(tmp_path / "lost"))
     monkeypatch.setenv("FAKE_EPI_RECOVERY_FAIL", "1")
-    first = lane.delegate(wait_seconds=0)
-    lane.wait_until(lambda: Path(str(tmp_path / "lost") + ".ready").exists())
-    lane.call("cancel", agent_id=first["agent_id"])
-    run = lane.server.registry.find_run(first["run_id"])
-    assert run.done.is_set() and run.state == "cancelled"
-    assert run.detail()["extra"]["cancellation_confirmed"] is False
-    assert len(lane.calls("delegate")) == 2 and not lane.calls("cancel")
-    assert CANARY not in json.dumps(run.detail())
+    cfg = lane.server.registry.settings.provider()
+    lane.server.registry.settings = dataclasses.replace(
+        lane.server.registry.settings, providers={"epi": dataclasses.replace(
+            cfg, extra={**cfg.extra, "cancel_retry_seconds": 0.1},
+        )},
+    )
+    with ThreadPoolExecutor() as pool:
+        pending = pool.submit(lane.delegate, wait_seconds=0)
+        lane.wait_until(lambda: Path(str(tmp_path / "lost") + ".ready").exists())
+        agent = next(iter(lane.server.registry._agents.values()))
+        run = agent.runs()[0]
+        result = lane.call("cancel", agent_id=agent.agent_id)
+        assert not result["closed"]
+        assert not run.done.is_set() and run.state == "working"
+        assert run.detail()["extra"]["cancellation_confirmed"] is False
+        assert len(lane.calls("delegate")) == 1 and len(lane.calls("cancel")) >= 2
+        assert CANARY not in json.dumps(run.detail())
+        agent.session().data["env"].pop("FAKE_EPI_RECOVERY_FAIL", None)
+        agent.close()
+        assert pending.result(timeout=5)["run_id"] == run.run_id
+        assert lane.call("await", run_id=run.run_id, wait_seconds=0)["state"] == "cancelled"
 
 
 @pytest.mark.parametrize("scenario", ["refused_then_available", "socket_down"])
@@ -316,6 +333,11 @@ def add_backup(lane, tmp_path):
 def test_lane_fallback_only_on_prework_refusal(lane, tmp_path, monkeypatch, scenario, falls_back):
     add_backup(lane, tmp_path)
     monkeypatch.setenv("FAKE_EPI_SCENARIO", scenario)
+    if scenario == "argument_error":
+        with pytest.raises(ToolError, match="schema-invalid:.*verification"):
+            lane.delegate(fallback="full", wait_seconds=5)
+        assert len(lane.calls("delegate")) == 1
+        return
     result = lane.delegate(fallback="full", wait_seconds=5)
     assert len(lane.calls("delegate")) == (2 if falls_back else 1)
     assert result["lane"] == ("backup" if falls_back else "epi")
@@ -323,17 +345,6 @@ def test_lane_fallback_only_on_prework_refusal(lane, tmp_path, monkeypatch, scen
     assert result["hops"][0]["outcome"] == ("refused" if falls_back else "ran")
     if falls_back:
         assert result["hops"][1]["outcome"] == "ran"
-
-
-def test_lane_argument_error_is_failed_without_fallback(lane, tmp_path, monkeypatch):
-    add_backup(lane, tmp_path)
-    monkeypatch.setenv("FAKE_EPI_SCENARIO", "argument_error")
-    first = lane.delegate(verification="true", fallback="full", wait_seconds=0)
-    result = lane.call("await", run_id=first["run_id"], wait_seconds=5)
-    assert result["state"] == "failed" and result["finish_reason"] == "error"
-    assert len(lane.calls("delegate")) == 1
-    assert "agent_id" not in result["extra"].get("epi", {})
-    assert "run_id" not in result["extra"].get("epi", {})
 
 
 @pytest.mark.parametrize("scope", ["allowed", "other", "missing"])

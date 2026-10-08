@@ -529,13 +529,20 @@ def test_unconfirmed_cancel_is_reported(epi, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_EPI_HUMAN_WAIT", "1")
     agent, run = start(epi, tmp_path, scenario="awaiting_approval", monkeypatch=monkeypatch)
     assert run.await_ready.wait(5)
+    agent.cfg.extra["cancel_retry_seconds"] = 0.1
+    original = EPI_PROVIDER._call
     monkeypatch.setattr(EPI_PROVIDER, "_call",
                         lambda *a: (_ for _ in ()).throw(RuntimeError("epi cancel client failed")))
     agent.close("cancelled")
-    _wait(run)
+    assert not run.done.is_set() and not agent.closed
     assert not run.needs_human
     assert run.detail()["extra"]["cancellation_confirmed"] is False
-    assert run.detail()["extra"]["cancellation_error"] == "epi cancel client failed"
+    assert run.detail()["extra"]["cancellation_error"] == (
+        "epi cancellation was not confirmed after retries"
+    )
+    monkeypatch.setattr(EPI_PROVIDER, "_call", original)
+    agent.close()
+    _wait(run)
 
 
 def test_auxiliary_output_is_bounded(epi, monkeypatch):

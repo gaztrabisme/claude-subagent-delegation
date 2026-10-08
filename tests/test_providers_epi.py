@@ -288,11 +288,11 @@ def test_usage_cost_preserved(epi, tmp_path, monkeypatch):
 
 def test_doctor_makes_no_model_call(epi, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SUBAGENT_CONFIG", str(tmp_path / "subagent.toml"))
-    # Recorded list has no caller scope: fail closed without fabricating it.
+    # Recorded scope names /fixture/project, not this temporary project.
     assert cli.main(["provider", "test", "epi", "--json"]) == 1
     row = json.loads(capsys.readouterr().out)["providers"][0]
     assert row["socket_ok"] and row["profile"] == "fake"
-    assert row["project_allowed"] is None
+    assert row["project_allowed"] is False
     monkeypatch.setenv("FAKE_EPI_SCOPE", str(tmp_path))
     assert cli.main(["doctor", "--json"]) == 0
     row = json.loads(capsys.readouterr().out)["providers"][0]

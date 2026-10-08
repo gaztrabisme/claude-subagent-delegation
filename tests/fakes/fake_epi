@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "env": dict(os.environ),
@@ -13,6 +14,22 @@ with open(os.environ["FAKE_EPI_RECORD"], "a") as file:
 fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "harness"
 tool = sys.argv[2]
 scenario = os.environ.get("FAKE_EPI_SCENARIO", "change_completed")
+
+
+def wait_for_file(path):
+    gate = Path(path)
+    Path(str(gate) + ".ready").touch()
+    deadline = time.monotonic() + 15
+    while not gate.exists():
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(0.01)
+
+
+if tool == "delegate" and scenario == "argument_error":
+    sys.stderr.write('schema-invalid: verification "true" has no objective check for a change; '
+                     'give a command\n')
+    sys.exit(1)
 if tool == "delegate" and scenario == "socket_down":
     text = (fixtures / "call_error_socket_down.txt").read_text()
     sys.stderr.write(text.split("stderr:\n", 1)[1].split("exit_code:", 1)[0])
@@ -30,6 +47,8 @@ if tool == "delegate" and scenario == "oversized":
     print("x" * 1_048_577)
     sys.exit(0)
 if tool == "delegate":
+    if scenario == "refused_then_available":
+        scenario = "rejected" if "--follow" in sys.argv else "change_completed"
     name = ("delegate_rejected_provider.json" if scenario == "rejected" else
             f"delegate_{scenario}.jsonl")
 elif tool == "continue":
@@ -39,10 +58,38 @@ elif tool == "await":
 else:
     name = f"{tool}.json"
 text = (fixtures / name).read_text()
+if tool in {"delegate", "continue"} and "--follow" not in sys.argv:
+    text = text.splitlines()[0]
+if tool == "delegate" and os.environ.get("FAKE_EPI_RECEIPT_GATE"):
+    # Durable idempotency fake: admit once before losing the initial receipt.
+    # The second CLI invocation must use the exact original work arguments.
+    state_path = Path(os.environ["FAKE_EPI_RECORD"] + ".request.json")
+    arguments = [a for a in sys.argv[1:] if a != "--follow"]
+    if state_path.exists():
+        saved = json.loads(state_path.read_text())
+        if arguments != saved["arguments"]:
+            sys.stderr.write("schema-invalid: request_id reused with different arguments\n")
+            sys.exit(1)
+        if os.environ.get("FAKE_EPI_RECOVERY_FAIL"):
+            sys.stderr.write("caller lookup unavailable\n")
+            sys.exit(1)
+        print(json.dumps(saved["receipt"]))
+        sys.exit(0)
+    state_path.write_text(json.dumps({"arguments": arguments, "admissions": 1,
+                                    "receipt": json.loads(text.splitlines()[0])}))
+    wait_for_file(os.environ["FAKE_EPI_RECEIPT_GATE"])
 if tool == "list" and os.environ.get("FAKE_EPI_SCOPE"):
     value = json.loads(text)
-    value["allowed_projects"] = [os.environ["FAKE_EPI_SCOPE"]]
-    value["default_project"] = os.environ["FAKE_EPI_SCOPE"]
+    scope = value["providers"][0]["extra"]
+    root = str(Path(os.environ["FAKE_EPI_SCOPE"]).resolve())
+    scope["allowed_projects"] = [root]
+    scope["default_project"] = root
+    text = json.dumps(value)
+if tool == "list" and os.environ.get("FAKE_EPI_NO_SCOPE"):
+    value = json.loads(text)
+    scope = value["providers"][0]["extra"]
+    scope.pop("allowed_projects", None)
+    scope.pop("default_project", None)
     text = json.dumps(value)
 if tool == "await" and os.environ.get("FAKE_EPI_HUMAN_WAIT"):
     text = (fixtures / "delegate_awaiting_approval.jsonl").read_text().splitlines()[-1]
@@ -60,6 +107,10 @@ if tool == "cancel":
     value = json.loads(text)
     value["agent_id"] = sys.argv[sys.argv.index("--agent-id") + 1]
     text = json.dumps(value)
+if tool == "delegate" and os.environ.get("FAKE_EPI_PROGRESS_GATE"):
+    first, text = text.split("\n", 1)
+    print(first, flush=True)
+    wait_for_file(os.environ["FAKE_EPI_PROGRESS_GATE"])
 sys.stdout.write(text + ("" if text.endswith("\n") else "\n"))
 sys.stdout.flush()
 if tool == "delegate" and os.environ.get("FAKE_EPI_EXIT_AFTER_ADMISSION"):

@@ -73,6 +73,14 @@ def _initialized(root: Path | None) -> bool:
         return False
 
 
+def _provider_extra(value: dict[str, Any]) -> dict[str, Any]:
+    for entry in value.get("providers", []):
+        if isinstance(entry, dict) and entry.get("name") in {"epi", "harness"}:
+            extra = entry.get("extra")
+            return extra if isinstance(extra, dict) else {}
+    return {}
+
+
 class Translator:
     """Each CLI line is a native run snapshot, including progress snapshots."""
 
@@ -127,6 +135,7 @@ class Translator:
         extra["epi"] = {k: copy.deepcopy(v) for k, v in detail.items() if k in ROUTING}
         if detail.get("state") == "rejected":
             out.update(state="failed", phase="done", finish_reason="refused")
+            self.session.data["prework_refusal"] = True
         self.session.data["last_outcome"] = copy.deepcopy(out)
         return out
 
@@ -156,6 +165,8 @@ class Translator:
         # Do not surface subprocess stderr or malformed JSON. The driver never
         # reads the token, so cannot safely redact a misbehaving client's echo.
         error = "epi client refused before admission" if prework else "epi client failed"
+        if prework and not self.admitted:
+            self.session.data["prework_refusal"] = True
         extra = copy.deepcopy((self.last or {}).get("extra", {}))
         snapshot = {**(self.last or {}), "state": "failed", "phase": "done",
                     "finish_reason": "refused" if prework else "error",
@@ -308,9 +319,16 @@ class EpiProvider:
         # belong to the new request. Never charge the previous run twice.
         session.data.pop("run_id", None)
         session.data.pop("last_outcome", None)
+        session.data.pop("prework_refusal", None)
         session.data.update(context=context, request_id=context.request_id,
                             cwd=str(cwd), receipt=threading.Event())
         args = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
+        session.data.pop("delegate_args", None)
+        if session.session_id is None:
+            # Retain the exact work arguments, including the idempotency key.
+            # A non-following replay returns the original run's current detail.
+            prefix = len(self._call_argv(cfg, "delegate"))
+            session.data["delegate_args"] = [a for a in args[prefix:] if a != "--follow"]
         process = EpiProcess(args, self.env(settings, agent_id, cfg, session), str(cwd), session)
         session.data["process"] = process
         return process
@@ -379,7 +397,17 @@ class EpiProvider:
             if started and not session.session_id:
                 session.data["receipt"].wait(timeout=5)
                 if not session.session_id:
-                    raise RuntimeError("epi cancel could not identify an admitted agent")
+                    if session.data.get("prework_refusal"):
+                        # A known refusal has no admitted job to recover. A
+                        # fresh call could start work if conditions changed.
+                        return None
+                    arguments = session.data.get("delegate_args")
+                    if arguments is None:
+                        raise RuntimeError("epi cancel has no original delegate arguments")
+                    detail = self._call(session, "delegate", *arguments)
+                    Translator(session, run_id=session.data.get("run_id")).outcome(detail)
+                    if not session.session_id:
+                        raise RuntimeError("epi cancel could not identify an admitted agent")
         if session.session_id:
             result = self._call(session, "cancel", "--agent-id", session.session_id)
             if result.get("closed") is not True or result.get("agent_id") != session.session_id:
@@ -421,10 +449,10 @@ class EpiProvider:
         if error:
             raise RuntimeError(error)
         value = self._call(session, "list")
-        entries = value.get("providers", [])
-        profile = next((p.get("extra", {}).get("profile") for p in entries
-                        if isinstance(p, dict)), None)
-        return {"profile": profile, "epi": value}
+        scope = _provider_extra(value)
+        metadata = {key: copy.deepcopy(scope[key])
+                    for key in ("default_project", "allowed_projects") if key in scope}
+        return {"profile": scope.get("profile"), **metadata, "epi": value}
 
     def doctor(self, settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
         error, session = self.boot(settings, "doctor", cfg)
@@ -439,16 +467,17 @@ class EpiProvider:
             return {**row, "health": str(exc)}
         row["socket_ok"] = True
         row["extra"] = {"epi": value}
-        entries = value.get("providers", [])
-        row["profile"] = next((p.get("extra", {}).get("profile") for p in entries
-                               if isinstance(p, dict)), None)
+        scope = _provider_extra(value)
+        row["profile"] = scope.get("profile")
+        row["default_project"] = scope.get("default_project")
         root = _project(cfg)
         row["project_initialized"] = _initialized(root)
-        # Current epi list omits caller scope. Never infer authorization from
-        # old jobs, local files, or the provider's configured root. Accept the
-        # additive read-only scope metadata when the service exposes it.
-        allowed = value.get("allowed_projects")
-        if root is not None and isinstance(allowed, list):
+        # Scope belongs to the authenticated native provider entry. Old jobs,
+        # a default project, or local board files cannot establish permission.
+        allowed = scope.get("allowed_projects")
+        if root is not None and isinstance(allowed, list) and all(
+            isinstance(path, str) for path in allowed
+        ):
             row["project_allowed"] = str(root) in allowed
         row["health_ok"] = bool(row["project_initialized"] and row["project_allowed"]
                                 and row["profile"])

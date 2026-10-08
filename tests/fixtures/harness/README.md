@@ -1,6 +1,6 @@
 # Harness CLI fixtures
 
-Source commit: `b9963cb614680e3fd0e6a84026c794cf12bfa0aa` (`b9963cb6`, epi branch `lane/e1`, clean tree), recorded by the run coordinator outside any sandbox for run `epi-lane-2026-10-08`.
+Source commit: `63be7b4f` (epi branch `lane/e1`; the recordings committed there), recorded by the run coordinator outside any sandbox for run `epi-lane-2026-10-08`.
 
 Regenerate from `core/` with:
 
@@ -12,4 +12,4 @@ Set `EPI_FIXTURE_OUT` to override this directory. Every stream goes through `par
 
 The approval stream ends at `needs_human`; `await_after_approval.json` resumes the same job. Completed change fixtures retain a real ticket branch commit. UAT reports the real final plan-close checks. Output tails are raw captured text, without stream labels or synthetic truncation markers. Socket failure captures stderr and the client exit code.
 
-Reader: the subagent epi-lane maintainer. All recordings, `list.json` included, are copied verbatim from that recording. `tests/fakes/fake_epi` remaps these fixture paths only when a test supplies `FAKE_EPI_SCOPE`.
+Reader: the subagent epi-lane maintainer. All recordings, `list.json` included, are copied verbatim from that recording. `tests/fakes/fake_epi` remaps these fixture paths only when a test supplies `FAKE_EPI_SCOPE`. `cancel_by_request_id_admitted.json` and `cancel_by_request_id_unadmitted.json` record `epi call cancel --request-id` for an admitted and an unadmitted key.

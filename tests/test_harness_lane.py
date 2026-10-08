@@ -371,7 +371,7 @@ def test_lane_doctor_requires_allowed_project(lane, tmp_path, monkeypatch, capsy
 
 def test_lane_fixture_readme_names_source_commit():
     readme = (FIXTURES / "README.md").read_text()
-    assert "b9963cb6" in readme
+    assert "63be7b4f" in readme
     assert "CARGO_NET_OFFLINE=true cargo test -p cli record_harness_fixtures -- --ignored" in readme
     assert "real confined check runner" in readme
     assert "test-token-canary" not in "".join(p.read_text() for p in FIXTURES.glob("*.json*"))

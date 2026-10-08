@@ -234,6 +234,9 @@ def _run_row(rec: Mapping[str, Any], pricing: Pricing | None, cf_model: str | No
         "cost": cost,
         "kind": (specs.get(provider) or {}).get("kind"),
     }
+    if rec.get("native_usage"):
+        row.update(native_usage=True, cash_usd=rec.get("cash_usd"),
+                   credits=rec.get("credits"), kind="native")
     return row
 
 
@@ -247,8 +250,11 @@ def _price_row(row: dict[str, Any], specs: dict[str, dict[str, Any]]) -> None:
     so it does not depend on the run carrying a `cost` dict.
     """
     spec = specs.get(row["provider"])
+    if row.get("native_usage"):
+        row["provider_usd"] = row.get("cash_usd")
+        spec = None
     cost = row.get("cost")
-    if isinstance(cost, dict):
+    if not row.get("native_usage") and isinstance(cost, dict):
         run_end = _num(cost.get("provider_usd"))
         if run_end is not None:
             row["provider_usd"] = run_end
@@ -318,7 +324,9 @@ def _provider_rows(run_rows: list[dict[str, Any]],
             "tokens_out": sum(r["output"] for r in g),
             "tokens_cache_read": sum(r["cache_read"] for r in g),
             "tokens_cache_write": sum(r["cache_write"] for r in g),
-            "credits": sum(r["credits"] for r in g),
+            "credits": (_sum_or_none([r["credits"] for r in g])
+                        if any(r.get("native_usage") for r in g)
+                        else sum(r["credits"] for r in g)),
             "provider_usd": prov,
             "api_equivalent_usd": api,
             "counterfactual_usd": cf,
@@ -447,7 +455,7 @@ def _priced_run_rows(settings: Any, records: list[dict[str, Any]]):
     )
     recorded = _recorded_run_usd(delegation_records, aliases)
     for row in run_rows:
-        if row["provider_usd"] is None:
+        if row["provider_usd"] is None and not row.get("native_usage"):
             share = recorded.get((row.get("delegation_id"), row["provider"]))
             if share is not None:
                 row["provider_usd"] = share

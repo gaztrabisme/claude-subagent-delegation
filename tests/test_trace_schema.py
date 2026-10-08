@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from subagent.runs import COMPLETED, Registry
+from subagent.runs import COMPLETED, Registry, Run
 from subagent.telemetry.sampler import Telemetry
 from subagent.telemetry.source_usage import make_source_usage
 from subagent.telemetry.trace import KINDS, SCHEMA, Trace
@@ -29,7 +29,7 @@ USAGE_KEYS = {"input", "output", "cache_read", "cache_write", "reasoning", "tota
               "turns"}
 # Fields a usage dict may also carry, never required: credits is Copilot's
 # AI-credit spend (nano-AIU / 1e9), present only on providers that bill it.
-OPTIONAL_USAGE_KEYS = {"credits"}
+OPTIONAL_USAGE_KEYS = {"credits", "usage_unreported"}
 
 REQUIRED: dict[str, set[str]] = {
     "run": {
@@ -66,7 +66,9 @@ REQUIRED: dict[str, set[str]] = {
 
 # Fields a kind may also carry, never required.
 OPTIONAL: dict[str, set[str]] = {
-    "run": {"cost"},
+    "run": {"cost", "native_usage", "uat", "usage_unreported", "credits",
+            "credits_unit", "cash_usd", "turn_usage", "extra", "needs_human",
+            "human_action", "plan_id", "verification_note"},
     "delegation": {"stopped_because", "test_writer", "uat"},
 }
 
@@ -103,6 +105,38 @@ def problems(record: dict[str, Any]) -> list[str]:
             or not {"provider_usd", "counterfactual_usd", "kind", "note"} <= set(cost)
         ):
             found.append(f"{label}: cost shape {cost!r}")
+        if "native_usage" in record and type(record["native_usage"]) is not bool:
+            found.append(f"{label}: native_usage is not boolean")
+        for key in ("credits", "cash_usd"):
+            if key in record and record[key] is not None and (
+                type(record[key]) not in (int, float)
+            ):
+                found.append(f"{label}: {key} is not a number or null")
+        for key in ("credits_unit", "human_action", "plan_id", "verification_note"):
+            if key in record and record[key] is not None and not isinstance(record[key], str):
+                found.append(f"{label}: {key} is not a string or null")
+        if "needs_human" in record and type(record["needs_human"]) is not bool:
+            found.append(f"{label}: needs_human is not boolean")
+        if "extra" in record and not isinstance(record["extra"], dict):
+            found.append(f"{label}: extra is not a dict")
+        for source in (record, usage):
+            if "usage_unreported" in source and (
+                not isinstance(source["usage_unreported"], list)
+                or any(not isinstance(key, str) or key not in USAGE_KEYS
+                       for key in source["usage_unreported"])
+            ):
+                found.append(f"{label}: usage_unreported is not a list of usage keys")
+        if "turn_usage" in record:
+            turns = record["turn_usage"]
+            if not isinstance(turns, list):
+                found.append(f"{label}: turn_usage is not a list")
+            else:
+                keys = {"ts_start", "ts_first_token", "ts_end", "provider", "model",
+                        "input", "output", "cache_read", "cache_write", "reasoning",
+                        "tool_calls", "stop_reason", "usage_unreported"}
+                for i, turn in enumerate(turns):
+                    if not isinstance(turn, dict) or not keys <= set(turn):
+                        found.append(f"{label}: turn_usage {i} shape")
     if kind == "turn":
         if not isinstance(record.get("tool_calls"), list):
             found.append(f"{label}: tool_calls is not a list")
@@ -166,31 +200,31 @@ def problems(record: dict[str, Any]) -> list[str]:
                 or not {"provider_usd", "counterfactual_usd", "kind", "note"} <= set(round_cost)
             ):
                 found.append(f"{label}: round {i} cost shape")
-        if "uat" in record:
-            uat = record["uat"]
-            if not isinstance(uat, list):
-                found.append(f"{label}: uat is not a list")
-            else:
-                for i, row in enumerate(uat):
-                    if not isinstance(row, dict) or set(row) != UAT_KEYS:
-                        found.append(f"{label}: uat row {i} keys {set(row) if isinstance(row, dict) else row!r}")
-                        continue
-                    if not isinstance(row["row"], int) or isinstance(row["row"], bool):
-                        found.append(f"{label}: uat row {i} number is not an integer")
-                    if not isinstance(row["label"], str):
-                        found.append(f"{label}: uat row {i} label is not a string")
-                    if row["kind"] not in ("command", "prose"):
-                        found.append(f"{label}: uat row {i} kind {row['kind']!r}")
-                    if row["command"] is not None and not isinstance(row["command"], str):
-                        found.append(f"{label}: uat row {i} command is not a string or null")
-                    if row["kind"] == "command" and not isinstance(row["command"], str):
-                        found.append(f"{label}: uat row {i} command kind needs a string")
-                    if row["kind"] == "prose" and row["command"] is not None:
-                        found.append(f"{label}: uat row {i} prose command must be null")
-                    if row["passed"] is not None and type(row["passed"]) is not bool:
-                        found.append(f"{label}: uat row {i} passed is not boolean or null")
-                    if not isinstance(row["output_tail"], str) or len(row["output_tail"]) > 2000:
-                        found.append(f"{label}: uat row {i} output_tail is not a string capped at 2000")
+    if kind in ("run", "delegation") and "uat" in record:
+        uat = record["uat"]
+        if not isinstance(uat, list):
+            found.append(f"{label}: uat is not a list")
+        else:
+            for i, row in enumerate(uat):
+                if not isinstance(row, dict) or set(row) != UAT_KEYS:
+                    found.append(f"{label}: uat row {i} keys {set(row) if isinstance(row, dict) else row!r}")
+                    continue
+                if not isinstance(row["row"], int) or isinstance(row["row"], bool):
+                    found.append(f"{label}: uat row {i} number is not an integer")
+                if not isinstance(row["label"], str):
+                    found.append(f"{label}: uat row {i} label is not a string")
+                if row["kind"] not in ("command", "prose"):
+                    found.append(f"{label}: uat row {i} kind {row['kind']!r}")
+                if row["command"] is not None and not isinstance(row["command"], str):
+                    found.append(f"{label}: uat row {i} command is not a string or null")
+                if row["kind"] == "command" and not isinstance(row["command"], str):
+                    found.append(f"{label}: uat row {i} command kind needs a string")
+                if row["kind"] == "prose" and row["command"] is not None:
+                    found.append(f"{label}: uat row {i} prose command must be null")
+                if row["passed"] is not None and type(row["passed"]) is not bool:
+                    found.append(f"{label}: uat row {i} passed is not boolean or null")
+                if not isinstance(row["output_tail"], str) or len(row["output_tail"]) > 2000:
+                    found.append(f"{label}: uat row {i} output_tail is not a string capped at 2000")
     return found
 
 
@@ -203,6 +237,44 @@ def test_optional_keys_are_not_required():
         assert not (optionals & REQUIRED[kind]), f"{kind}: {optionals} overlaps REQUIRED"
     for kind, required in REQUIRED.items():
         assert COMMON_OPTIONAL.isdisjoint(required), f"{kind}: common-optional overlap"
+
+
+def _native_record(tmp_path: Path) -> dict[str, Any]:
+    run = Run(run_id="run-native", agent_id="agent-native", prompt="task",
+              state=COMPLETED, native_usage=True, native_verification=True)
+    run.started_at, run.finished_at = 1, 2
+    run.usage.set_native({"input": 8, "output": 2, "cache_read": 0, "cache_write": 0,
+                          "reasoning": 0, "total": 10, "steps": 1, "turns": 1})
+    run.native_outcome = {
+        "verification": {"command": "true", "passed": True, "exit_code": 0,
+                         "output_tail": "checked"},
+        "uat": [{"row": 1, "label": "works", "kind": "command", "command": "true",
+                 "passed": True, "output_tail": "checked"}],
+        "usage_unreported": ["cache_write", "reasoning"], "credits": None,
+        "credits_unit": None, "cash_usd": 0, "turn_usage": [], "needs_human": False,
+        "human_action": None, "plan_id": "plan-1", "extra": {"profile": "test", "hops": []},
+    }
+    path = tmp_path / "native-trace.jsonl"
+    Trace(path).run(run, str(tmp_path), "native-model")
+    return json.loads(path.read_text())
+
+
+def test_native_provider_fields_extend_schema_additively(tmp_path: Path):
+    record = _native_record(tmp_path)
+    assert SCHEMA == 3
+    assert problems(record) == []
+    assert record["credits"] is None
+    assert record["cash_usd"] == 0
+    assert record["usage_unreported"] == ["cache_write", "reasoning"]
+    assert record["turns"] == 1
+
+
+def test_native_provider_field_shape_errors_are_rejected(tmp_path: Path):
+    record = _native_record(tmp_path)
+    for fields in ({"cash_usd": "unknown"}, {"credits": True}, {"needs_human": 1},
+                   {"usage_unreported": [["bad"]]}, {"turn_usage": "bad"},
+                   {"extra": []}, {"uat": [{"passed": True}]}):
+        assert problems({**record, **fields}), fields
 
 
 def _read(path: Path) -> list[dict[str, Any]]:

@@ -44,6 +44,9 @@ from ..config import log
 #    state, verification_passed, guard_verdicts, refusal_code and the parent
 #    context; hop records gained the admission snapshot. Every kind and its
 #    required keys: tests/test_trace_schema.py.
+#    Additive service-provider fields (2026-10-08): native_usage, uat,
+#    usage_unreported, credits, credits_unit, cash_usd, turn_usage, extra,
+#    needs_human, human_action and plan_id. Native values are never repriced.
 SCHEMA = 3
 
 KINDS = ("run", "hop", "turn", "sample", "run_summary", "verdict", "calibration", "delegation")
@@ -134,6 +137,7 @@ class Trace:
 
     def run(self, run: Any, workspace: str, model: str, guard: str | None = None) -> None:
         verification = run.verification_result
+        verification_dict = verification.as_dict() if verification else None
         started = run.started_at or 0
         finished = run.finished_at or 0
         refusal = next(
@@ -142,6 +146,22 @@ class Trace:
             None,
         )
         extra: dict[str, Any] = {}
+        native = getattr(run, "native_outcome", None)
+        if native is not None:
+            native_verification = getattr(run, "native_verification", False)
+            if native_verification:
+                verification_dict = native.get("verification")
+            for key in ("uat", "usage_unreported", "credits", "credits_unit", "cash_usd",
+                        "turn_usage", "extra", "needs_human", "human_action", "plan_id",
+                        "verification_note"):
+                if key in ("uat", "verification_note") and not native_verification:
+                    continue
+                if key in native:
+                    extra[key] = native[key]
+            if not native_verification and getattr(run, "goal", None) is not None:
+                extra["uat"] = run.uat
+        if getattr(run, "native_usage", False):
+            extra["native_usage"] = True
         verdicts = self.take_verdicts(run.agent_id)
         guard = guard or getattr(run, "guard", None) or "hook"
         if (
@@ -178,11 +198,12 @@ class Trace:
             # Submit to finish, queue wait included; elapsed_seconds starts at dispatch.
             wall_seconds=round(finished - (run.created_at or started), 2),
             ttft_seconds=getattr(run, "ttft_seconds", None),
-            turns=len(getattr(run, "turn_log", []) or []),
+            turns=(run.usage.turns if getattr(run, "native_usage", False)
+                   else len(getattr(run, "turn_log", []) or [])),
             tool_calls=run.usage.steps,
             continues=getattr(run, "continues", 0),
             end_state=run.state,
-            verification_passed=verification.passed if verification else None,
+            verification_passed=(verification_dict.get("passed") if verification_dict else None),
             guard_verdicts=verdicts,
             refusal_code=refusal,
             usage=run.usage.as_dict(),
@@ -192,7 +213,7 @@ class Trace:
             prompt_chars=len(run.prompt),
             result_chars=len(run.result_text),
             **distil,
-            verification=verification.as_dict() if verification else None,
+            verification=verification_dict,
             error=run.error,
             **extra,
         )
@@ -250,5 +271,3 @@ def open_trace(raw: str | None, session_root: Path) -> Trace:
     if raw:
         return Trace(Path(raw).expanduser().resolve())
     return Trace(session_root / "trace.jsonl")
-
-

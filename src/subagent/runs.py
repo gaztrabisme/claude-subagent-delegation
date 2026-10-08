@@ -7,6 +7,7 @@ re-enters the same session via ``--resume``.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import itertools
@@ -27,7 +28,7 @@ from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import protect
 from .lane_state import LaneState
-from .providers.base import ProviderConfig, Session
+from .providers.base import Process, ProviderConfig, RunContext, Session, capabilities
 
 # classify_exit and exit_event are re-exported: they were part of this
 # module's surface before the drivers moved into providers/.
@@ -59,6 +60,8 @@ PHASE_RUNNING = "running"
 PHASE_VERIFYING = "verifying"
 PHASE_DISTILLING = "distilling"
 PHASE_DONE = "done"
+PHASE_AWAITING_APPROVAL = "awaiting_approval"
+PHASE_AWAITING_HUMAN = "awaiting_human"
 
 KILL_CANCEL = "cancel"
 KILL_TIMEOUT = "timeout"
@@ -127,9 +130,13 @@ class Usage:
     steps: int = 0  # tool calls
     turns: int = 0  # model turns, as --max-turns counts them
     credits: float | None = None  # Copilot AI credits (nano-AIU / 1e9)
+    # A service's whole-run snapshot. Its wire fields and total are authoritative.
+    native: dict[str, Any] | None = None
 
     @property
     def total(self) -> int:
+        if self.native is not None:
+            return self.native.get("total", 0)
         return self.input + self.cache_read + self.cache_write + self.output
 
     def add(self, usage: dict[str, Any]) -> None:
@@ -147,6 +154,8 @@ class Usage:
             self.credits = (self.credits or 0.0) + float(credits)
 
     def as_dict(self) -> dict[str, Any]:
+        if self.native is not None:
+            return copy.deepcopy(self.native)
         return {
             "input": self.input,
             "output": self.output,
@@ -159,7 +168,27 @@ class Usage:
             "credits": self.credits,
         }
 
+    def set_native(self, usage: dict[str, Any], credits: float | None = None) -> None:
+        self.native = copy.deepcopy(usage)
+        for key in (*_USAGE_KEYS, "steps", "turns"):
+            setattr(self, key, usage.get(key, 0))
+        self.credits = credits
+
     def merge(self, other: Usage) -> None:
+        native = None
+        if self.native is not None or other.native is not None:
+            before = self.as_dict()
+            incoming = other.as_dict()
+            if self.native is None and self.total == 0 and not self.steps and not self.turns:
+                native = copy.deepcopy(incoming)
+            else:
+                native = copy.deepcopy(before)
+                for key in (*_USAGE_KEYS, "total", "steps", "turns"):
+                    native[key] = before.get(key, 0) + incoming.get(key, 0)
+                if "usage_unreported" in before or "usage_unreported" in incoming:
+                    native["usage_unreported"] = list(dict.fromkeys(
+                        [*before.get("usage_unreported", []), *incoming.get("usage_unreported", [])]
+                    ))
         self.input += other.input
         self.output += other.output
         self.cache_read += other.cache_read
@@ -169,6 +198,10 @@ class Usage:
         self.turns += other.turns
         if other.credits is not None:
             self.credits = (self.credits or 0.0) + other.credits
+        if native is not None:
+            if "credits" in native:
+                native["credits"] = self.credits
+            self.native = native
 
 
 def _assistant_text(event: dict[str, Any]) -> str:
@@ -504,6 +537,7 @@ class Run:
     run_id: str
     agent_id: str
     prompt: str
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex, kw_only=True)
     verification: str | None = None
     # Where `verification` came from, when the caller did not pass it.
     verification_note: str | None = None
@@ -527,6 +561,12 @@ class Run:
     event_count: int = 0
     transcript: deque[str] = field(default_factory=lambda: deque(maxlen=400))
     done: threading.Event = field(default_factory=threading.Event)
+    # MCP waits end at a human gate as well as at a terminal result. `done`
+    # continues to mean terminal, for callers that require completion.
+    await_ready: threading.Event = field(default_factory=threading.Event)
+    native_outcome: dict[str, Any] | None = None
+    native_usage: bool = False
+    native_verification: bool = False
     signatures: Counter[str] = field(default_factory=Counter)
     usage: Usage = field(default_factory=Usage)
     cost: dict[str, Any] | None = None
@@ -575,7 +615,7 @@ class Run:
     source_chars: dict[str, int] | None = None
 
     def summary(self) -> dict[str, Any]:
-        return {
+        out = {
             "run_id": self.run_id,
             "agent_id": self.agent_id,
             "state": self.state,
@@ -593,9 +633,37 @@ class Run:
             "usage": self.usage.as_dict(),
             "last_activity": self.transcript[-1] if self.transcript else None,
         }
+        if self.native_outcome is not None:
+            for key in ("needs_human", "human_action", "plan_id", "usage_unreported",
+                        "credits", "credits_unit", "cash_usd", "extra"):
+                if key in self.native_outcome:
+                    out[key] = copy.deepcopy(self.native_outcome[key])
+        return out
 
     def detail(self) -> dict[str, Any]:
         out = self.summary()
+        if self.native_outcome is not None:
+            summary = out.copy()
+            # Preserve extensions, but outer identity and cancellation state
+            # belong to this registry, not to a service snapshot.
+            out.update(copy.deepcopy(self.native_outcome))
+            for key in ("run_id", "agent_id", "state", "phase", "lane", "provider",
+                        "driver", "fallback", "finish_reason", "usage"):
+                out[key] = summary[key]
+            if self.hops:
+                out["hops"] = list(self.hops)
+            if self.cold_load and "cold_load" not in out:
+                out["cold_load"] = True
+            if self.error is not None:
+                out["error"] = self.error
+            if self.error_detail is not None:
+                out["error_detail"] = self.error_detail
+            if not self.native_verification:
+                if self.verification_result is not None:
+                    out["verification"] = self.verification_result.as_dict()
+                if self.goal is not None:
+                    out["uat"] = self.uat or []
+            return out
         out["result"] = self.result_text
         if self.distilled:
             out["distilled"] = True
@@ -617,6 +685,10 @@ class Run:
         if self.error_detail:
             out["error_detail"] = self.error_detail
         return out
+
+    @property
+    def needs_human(self) -> bool:
+        return bool((self.native_outcome or {}).get("needs_human"))
 
     def note(self, line: str) -> None:
         self.event_count += 1
@@ -697,7 +769,12 @@ class Agent:
         self.last_activity = _now()
         self._ready = threading.Event()
         self._start_error: str | None = None
-        self._current: ClaudeProcess | None = None
+        self._current: Process | None = None
+        # Publish a spawn's session and process before cancellation can inspect
+        # them. Do not hold this lock while consuming the event stream.
+        self._dispatch_lock = threading.RLock()
+        self._cancel_lock = threading.Lock()
+        self._cancelled_requests: set[str | None] = set()
         self._thread = threading.Thread(
             target=self._worker, name=f"sam-agent-{agent_id}", daemon=True
         )
@@ -892,9 +969,11 @@ class Agent:
             self._closing = True
             self._kill_kind = kind
             self._wake.notify_all()
-        current = self._current
-        if current is not None:
-            current.kill()
+        with self._dispatch_lock:
+            current = self._current
+            self._cancel_provider(reason, kind)
+            if current is not None:
+                current.kill()
         for run in self.runs():
             if run.state == WORKING:
                 run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
@@ -902,6 +981,7 @@ class Agent:
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
                 run.done.set()
+                run.await_ready.set()
         self._thread.join(timeout=8)
         self._closed = True
 
@@ -946,8 +1026,21 @@ class Agent:
             try:
                 self._execute(run)
             except Exception as exc:  # noqa: BLE001
-                log.warning("run %s crashed", run.run_id, exc_info=True)
+                if capabilities(self.driver).native_outcome or capabilities(self.driver).cancel:
+                    message = redact_secrets(
+                        f"{type(exc).__name__}: {exc}", self.settings.leaked_keys
+                    )
+                    log.warning("run %s crashed: %s", run.run_id, message)
+                    self._cancel_provider("provider run crashed", "error", run)
+                    self._run_pre_verify(run)
+                    if not self._closing:
+                        run.state = FAILED
+                        run.error = message
+                        run.finish_reason = "error"
+                    self._finish(run)
+                    continue
                 self._run_pre_verify(run)
+                log.warning("run %s crashed", run.run_id, exc_info=True)
                 run.state = FAILED
                 run.error = redact_secrets(
                     f"{type(exc).__name__}: {exc}", self.settings.leaked_keys
@@ -955,18 +1048,30 @@ class Agent:
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
                 run.done.set()
+                run.await_ready.set()
 
-    def _spawn(self, prompt: str, resume: str | None) -> ClaudeProcess:
+    def _spawn(self, run: Run, prompt: str, resume: str | None) -> Process:
         """One turn's child process, on the current provider's driver."""
         session = self.session()
         session.session_id = resume
-        return self.driver.spawn(
+        kwargs = {}
+        if capabilities(self.driver).run_context:
+            session.data["request_id"] = run.request_id
+            kwargs["context"] = RunContext(
+                verification=run.verification, goal=run.goal,
+                request_id=run.request_id, deadline=run.deadline,
+            )
+        process = self.driver.spawn(
             self.cfg, self.settings, self.agent_id, prompt, self.workspace,
-            session, self.model,
+            session, self.model, **kwargs,
         )
+        if capabilities(self.driver).cancel and isinstance(process, Process):
+            process.enable_cancel_fence()
+        return process
 
     def _execute(self, run: Run) -> None:
         run.started_at = _now()
+        run.native_usage = capabilities(self.driver).native_usage
         run.deadline = run.started_at + self.cfg.run_timeout
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
@@ -989,13 +1094,26 @@ class Agent:
                 run.finished_at = _now()
                 self._run_pre_verify(run)
                 run.done.set()
+                run.await_ready.set()
                 return
             self._turn(run, run.prompt, resume=self.session_id)
-        # Release the caller's guard (the loop's test lock) in a finally-style
-        # position: after the turn, so a tampered test never decides
-        # "completed", and also on the cancel/timeout path, where `_turn`
-        # returns only after the child was killed.
+        if run.native_outcome is not None and run.state == WORKING:
+            self._follow_native(run)
+        # Release the caller's guard only when all provider work has ended,
+        # including service work that outlived the CLI. Exceptions reach the
+        # worker's cleanup, which cancels native work before releasing it.
         self._run_pre_verify(run)
+        if capabilities(self.driver).native_verification:
+            if (run.native_outcome is None and run.state == WORKING
+                    and not self._closing and not run.trip):
+                run.state = FAILED
+                run.finish_reason = "error"
+                run.error = "provider with native verification returned no outcome"
+            self._finish(run)
+            return
+        if run.native_outcome is not None and run.state in (COMPLETED, COMPLETED_UNVERIFIED):
+            # Outcome transport alone does not opt out of the outer checks.
+            run.state = WORKING
         if self._closing or run.trip or run.state in TERMINAL_STATES:
             self._finish(run)
             return
@@ -1046,7 +1164,9 @@ class Agent:
                 for row in (run.pre_verify_result or {}).get("violations", [])
             )
         )
-        if run.verification_result.passed and not goal_failed and not goal_changed:
+        provider_completed = run.native_outcome is None or run.native_outcome["state"] == COMPLETED
+        if (run.verification_result.passed and not goal_failed and not goal_changed
+                and provider_completed):
             run.state = COMPLETED
         else:
             run.state = COMPLETED_UNVERIFIED
@@ -1179,6 +1299,7 @@ class Agent:
             run.provider = cfg.vendor
             run.driver = hop.driver
             run.guard = hop.guard
+            run.native_usage = capabilities(driver).native_usage
             run.cold_load = gate.cold_load
             hop.cold_load = gate.cold_load
             extra = self.settings.cold_load_seconds(cfg.name) if gate.cold_load else 0.0
@@ -1273,13 +1394,23 @@ class Agent:
         """
         attempt = 0
         while True:
+            if self._closing:
+                return []
             self._sample_begin(run)
             meter = _Meter(attempt, _now())
-            proc = self._spawn(prompt, resume)
-            self._current = proc
+            with self._dispatch_lock:
+                if self._closing:
+                    self._sample_end(run)
+                    return []
+                proc = self._spawn(run, prompt, resume)
+                self._current = proc
             collected: list[dict[str, Any]] = []
             watch = _Watch(run, self.settings, self.signatures, self.cfg.max_steps)
             try:
+                if self._closing:
+                    self._cancel_provider("agent closing", self._kill_kind or KILL_CANCEL, run)
+                    proc.kill()
+                    return []
                 for event in proc.events():
                     self.last_activity = _now()
                     meter.see(event, self.last_activity)
@@ -1301,8 +1432,17 @@ class Agent:
                     if trip is not None and run.trip is None:
                         run.trip = trip
                     if run.trip or self._closing:
+                        kind, reason = run.trip or (
+                            self._kill_kind or KILL_CANCEL, "agent closing"
+                        )
+                        self._cancel_provider(reason, kind, run)
                         proc.kill()
                         break
+            except Exception:  # noqa: BLE001 - a broken reader must not orphan a native client
+                if capabilities(self.driver).native_outcome or capabilities(self.driver).cancel:
+                    self._cancel_provider("provider event reader failed", "error", run)
+                    proc.kill()
+                raise
             finally:
                 self._current = None
                 self._sample_end(run)
@@ -1365,6 +1505,9 @@ class Agent:
 
     def _account(self, run: Run, meter: _Meter) -> None:
         """Add an attempt's tokens to the run and write its turn records."""
+        if capabilities(self.driver).native_usage:
+            run.native_usage = True
+            return
         spent = meter.usage()
         for key in _USAGE_KEYS:
             setattr(run.usage, key, getattr(run.usage, key) + spent[key])
@@ -1464,6 +1607,9 @@ class Agent:
                 run.note(f"assistant: {_clip(text, 240)}")
             return
         if kind == "result":
+            if capabilities(self.driver).native_outcome and "outcome" in event:
+                self._ingest_native(run, event["outcome"])
+                return
             # Tokens were counted as the events arrived (_Meter, via _account).
             # Credits are whole-run (Copilot's session.usage_checkpoint), not
             # per message, so the result event is the only place they arrive.
@@ -1503,6 +1649,72 @@ class Agent:
         if kind:
             run.note(str(kind))
 
+    def _ingest_native(self, run: Run, outcome: dict[str, Any]) -> None:
+        """One service snapshot. Do not reinterpret checks or fill absent fields."""
+        if self._closing or run.done.is_set():
+            return
+        state = outcome.get("state")
+        if state not in TERMINAL_STATES and state != WORKING:
+            raise ValueError(f"invalid native outcome state: {state!r}")
+        run.native_outcome = copy.deepcopy(outcome)
+        run.native_verification = capabilities(self.driver).native_verification
+        run.state = state
+        run.phase = outcome.get("phase", PHASE_DONE if state in TERMINAL_STATES else PHASE_RUNNING)
+        run.finish_reason = outcome.get("finish_reason")
+        run.final_response = outcome.get("result", "")
+        run.result_text = run.final_response
+        run.error = outcome.get("error")
+        run.error_detail = outcome.get("error_detail")
+        run.uat = outcome.get("uat")
+        if capabilities(self.driver).native_usage:
+            run.native_usage = True
+            if "usage" in outcome:
+                run.usage.set_native(outcome["usage"], outcome.get("credits"))
+            run.cost = copy.deepcopy(outcome.get("cost"))
+        run.note(f"provider: {run.phase}")
+        if run.needs_human:
+            run.await_ready.set()
+        else:
+            run.await_ready.clear()
+
+    def _follow_native(self, run: Run) -> None:
+        """Keep the serial run alive after its client exits, including human waits."""
+        if not capabilities(self.driver).poll:
+            raise RuntimeError("working native outcome requires provider poll capability")
+        while run.state == WORKING and not self._closing and not run.trip:
+            if run.deadline is not None and _now() >= run.deadline:
+                run.trip = (KILL_TIMEOUT, "run deadline exceeded")
+                self._cancel_provider(run.trip[1], KILL_TIMEOUT, run)
+                break
+            snapshot = self.driver.poll(self.session())
+            if snapshot is not None:
+                self.last_activity = _now()
+                self._ingest_native(run, snapshot)
+            if run.state == WORKING:
+                with self._wake:
+                    if not self._closing:
+                        self._wake.wait(timeout=0.25)
+
+    def _cancel_provider(self, reason: str, kind: str, run: Run | None = None) -> None:
+        """Cancel a service job at most once per outer run, always before kill."""
+        if not capabilities(self.driver).cancel:
+            return
+        if run is None:
+            run = next((r for r in self.runs() if r.state == WORKING and r.started_at), None)
+            if run is None and self._order:
+                run = self._runs[self._order[-1]]
+        key = run.request_id if run is not None else None
+        with self._dispatch_lock, self._cancel_lock:
+            if key in self._cancelled_requests:
+                return
+            self._cancelled_requests.add(key)
+            try:
+                self.driver.cancel(self.session(), reason=reason, kind=kind)
+            except Exception as exc:  # noqa: BLE001 - remote failure must not block local kill
+                message = redact_secrets(str(exc), self.settings.leaked_keys)
+                log.warning("provider cancel failed for %s: %s: %s",
+                            self.agent_id, type(exc).__name__, message)
+
     def _finish(self, run: Run) -> None:
         if self._kill_kind:
             kind = self._kill_kind
@@ -1524,7 +1736,8 @@ class Agent:
         run.phase = PHASE_DONE
         run.finished_at = _now()
         try:
-            run.cost = self._price(run)
+            if not run.native_usage:
+                run.cost = self._price(run)
         except Exception:  # noqa: BLE001 - costing must never fail a run
             log.warning("cost pricing failed for %s", run.run_id, exc_info=True)
             run.cost = None
@@ -1535,6 +1748,7 @@ class Agent:
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
         run.done.set()
+        run.await_ready.set()
 
     def _price(self, run: Run) -> dict[str, Any] | None:
         """The run's cost at run end (telemetry.cost.price_run), priced once per agent."""

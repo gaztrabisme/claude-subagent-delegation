@@ -157,7 +157,7 @@ def _goal_guard_hooks(agent):
 async def _wait_for(run: Run, seconds: float, ctx: Context | None = None) -> None:
     """Block for up to `seconds`, reporting progress while we wait.
 
-    run.done.wait is a blocking SDK-adjacent call, so it crosses to a thread.
+    run.await_ready.wait is a blocking call, so it crosses to a thread.
     Chunking it is what makes progress reporting possible at all.
     """
     if seconds <= 0:
@@ -168,7 +168,7 @@ async def _wait_for(run: Run, seconds: float, ctx: Context | None = None) -> Non
         if remaining <= 0:
             return
         finished = await anyio.to_thread.run_sync(
-            run.done.wait, min(PROGRESS_INTERVAL, remaining)
+            run.await_ready.wait, min(PROGRESS_INTERVAL, remaining)
         )
         if finished:
             return
@@ -186,7 +186,9 @@ async def _report(ctx: Context, run: Run, total: float, elapsed: float) -> None:
 
 def _result(run: Run) -> dict[str, Any]:
     out = run.detail()
-    if run.state not in TERMINAL_STATES:
+    if run.state not in TERMINAL_STATES and run.needs_human:
+        out["hint"] = "Waiting for a human. Follow human_action outside MCP, then call await again."
+    elif run.state not in TERMINAL_STATES:
         out["hint"] = (
             f"Still working. Call await(run_id='{run.run_id}') to keep waiting, "
             f"or transcript(run_id='{run.run_id}') to see what it is doing."
@@ -436,8 +438,8 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
 async def cancel(agent_id: str) -> dict[str, Any]:
     """Stop a subagent and release its runtime process.
 
-    The harness protocol has no mid-turn cancel, so this kills the child
-    process. Any in-flight run is reported as cancelled, and file edits it
+    Providers with a cancel hook cancel their service job before this kills
+    the child process. Any in-flight run is reported as cancelled, and file edits it
     already made stay on disk. Cancelling ends the session: its context cannot
     be resumed, so start a new agent rather than continuing this one.
 

@@ -396,25 +396,221 @@ _DATA_OPTIONS = {
     'uniq': {'-f', '--skip-fields', '-s', '--skip-chars', '-w', '--check-chars'},
     'stat': {'-f', '-c', '--format', '--printf'},
     'du': {'-d', '--max-depth', '--block-size'},
+    'curl': {'-A', '--user-agent', '-u', '--user', '-U', '--proxy-user',
+             '-X', '--request', '-e', '--referer', '-x', '--proxy', '-m', '--max-time',
+             '-r', '--range', '-Y', '--speed-limit', '-y', '--speed-time',
+             '--connect-timeout', '--retry', '--retry-delay', '--resolve', '--connect-to'},
 }
 _SEARCH = {'rg', 'ag', 'grep', 'egrep', 'fgrep'}
 _DATA_COMMANDS = {'echo', 'printf', 'true', 'false', 'pwd', 'date'}
 _TREE_COMMANDS = {'cp', 'mv', 'rm', 'rmdir', 'chmod', 'chown', 'shred', 'unlink', 'diff'}
-_CURL_DATA = {'--data', '--data-binary', '--data-raw', '--data-urlencode', '-d', '--form', '-F'}
+_CURL_DATA = {'--data', '--data-binary', '--data-raw', '--data-urlencode', '-d',
+              '--data-ascii', '--json', '--header', '-H',
+              '--form', '-F', '--form-string', '-T', '--upload-file', '--variable'}
+_CURL_SPACE = ' \t\r\n\v\f'
+_CURL_SHORT_VALUES = {'-' + char for char in 'AbcCDeEHmopPQrTtUuwxyYzXKFd'}
+_CURL_SWITCHES = {'--silent', '--show-error', '--fail', '--fail-with-body', '--insecure',
+                  '--location', '--verbose', '--head', '--include', '--compressed',
+                  '--http1.0', '--http1.1', '--http2', '--http3'}
 
 
-def _curl_file(word: Word, flag: str) -> Word | None:
-    if flag in {'--data', '--data-binary', '-d'} and word.value.startswith('@'):
-        return word.tail(1)
-    if flag == '--data-urlencode' and '@' in word.value:
+class CurlFileSyntaxError(ValueError):
+    """A file-bearing curl argument cannot safely be decoded."""
+
+
+def _curl_form_files(word: Word, blanks: str = _CURL_SPACE) -> list[Word]:
+    """Decode curl's multipart grammar after shell quoting, without opening files.
+
+    Only @ attachments have comma lists. < fields and headers read one file;
+    filename/type/encoder attributes are data. Inner quotes escape only quotes
+    and backslashes. Retain shell expansion state for the decoded operands.
+    """
+    if '=' not in word.value:
+        return []
+    start = word.value.index('=') + 1
+    attachment = word.value[start:start + 1] == '@'
+    file_data = word.value[start:start + 1] in {'@', '<'}
+    delimiters = ';,' if attachment else ';'
+    pieces = re.findall('\x00.|[^\x00]', word.pattern, re.DOTALL)
+
+    def field(index: int, quoted: bool = True) -> tuple[Word, int]:
+        while index < len(word.value) and word.value[index] in blanks:
+            index += 1
+        decoded = []
+        if quoted and word.value[index:index + 1] == '"':
+            index += 1
+            while index < len(word.value) and word.value[index] != '"':
+                if (word.value[index] == '\\'
+                        and word.value[index + 1:index + 2] in {'\\', '"'}):
+                    index += 1
+                decoded.append(index)
+                index += 1
+            if index == len(word.value):
+                raise CurlFileSyntaxError('unclosed inner quote')
+            index += 1
+            while index < len(word.value) and word.value[index] not in delimiters:
+                if word.value[index] not in _CURL_SPACE:
+                    raise CurlFileSyntaxError('trailing text after inner quote')
+                index += 1
+        else:
+            end = index
+            while end < len(word.value) and word.value[end] not in delimiters:
+                end += 1
+            decoded = list(range(index, len(word.value[index:end].rstrip(blanks)) + index))
+            index = end
+        return Word(''.join(word.value[i] for i in decoded),
+                    ''.join(pieces[i] for i in decoded), word.source), index
+
+    files = []
+
+    def add_file(file: Word, stdin_allowed: bool = True) -> None:
+        if not file.value or len(files) >= 256:
+            raise CurlFileSyntaxError('empty filename or too many form files')
+        if file.value != '-' or not stdin_allowed:
+            files.append(file)
+
+    try:
+        index = start + int(file_data)
+        while True:
+            value, index = field(index)
+            if file_data:
+                add_file(value)
+            type_context = False
+            while word.value[index:index + 1] == ';':
+                index += 1
+                while word.value[index:index + 1] and word.value[index] in blanks:
+                    index += 1
+                attribute = re.match(r'(filename|type|encoder|headers)=',
+                                     word.value[index:], re.IGNORECASE)
+                if attribute and attribute[1].lower() == 'type' and type_context:
+                    attribute = None
+                header_file = False
+                if attribute:
+                    index += len(attribute[0])
+                    if attribute[1].lower() == 'type':
+                        type_context = True
+                        # Curl treats subsequent unknown attributes as raw MIME
+                        # type continuations. Quotes do not hide their delimiters.
+                        _, index = field(index, quoted=False)
+                        continue
+                    type_context = False
+                    header_file = (attribute[1].lower() == 'headers'
+                                   and word.value[index:index + 1] in {'@', '<'})
+                    index += int(header_file)
+                value, index = field(index, quoted=not type_context)
+                if header_file:
+                    add_file(value, stdin_allowed=False)  # headers=@- opens a file named '-'.
+            if not attachment or word.value[index:index + 1] != ',':
+                return files
+            index += 1
+    except CurlFileSyntaxError:
+        # Literal data may use curl's permissive malformed-quote fallback, but
+        # any possible file read must be decoded completely or hard-denied.
+        if file_data or re.search(r';\s*headers=[@<]', word.value[start:], re.IGNORECASE):
+            raise
+        return []
+
+
+def _curl_upload_files(word: Word, globoff: bool) -> list[Word]:
+    """Curl expands upload brace lists and numeric/letter ranges even in quotes.
+
+    Bound the Cartesian product at 256 names. Unrecognized/native glob syntax
+    is hard-denied, rather than guessing which files curl might open.
+    """
+    if globoff or word.value in {'-', '.'}:
+        return [] if word.value in {'-', '.'} else [word]
+    names = [Word('', '', word.source)]
+    pieces = re.findall('\x00.|[^\x00]', word.pattern, re.DOTALL)
+    index = 0
+    while index < len(word.value):
+        char = word.value[index]
+        if char == '\\' and word.value[index + 1:index + 2] in {'{', '}', '[', ']'}:
+            choices = [Word(word.value[index + 1], quote_pattern(word.value[index + 1]),
+                            word.source)]
+            index += 2
+        elif char == '{':
+            if word.value[index + 1:index + 2] == '<':
+                raise CurlFileSyntaxError('unsupported named upload glob')
+            choices = []
+            decoded = []
+            index += 1
+            while index < len(word.value):
+                char = word.value[index]
+                if char in '{[]':
+                    raise CurlFileSyntaxError('unsupported nested upload glob')
+                if char in ',}':
+                    if not decoded or len(choices) >= 256:
+                        raise CurlFileSyntaxError('empty or oversized upload brace list')
+                    choices.append(Word(''.join(word.value[i] for i in decoded),
+                                        ''.join(pieces[i] for i in decoded), word.source))
+                    decoded = []
+                    index += 1
+                    if char == '}':
+                        break
+                    continue
+                if char == '\\' and index + 1 < len(word.value):
+                    index += 1  # Within a set curl unescapes any following character.
+                decoded.append(index)
+                index += 1
+            else:
+                raise CurlFileSyntaxError('unclosed upload brace list')
+        elif char == '[':
+            end = word.value.find(']', index + 1)
+            match = re.fullmatch(r'(\d+)-(\d+)(?::(\d+))?|([a-zA-Z])-([a-zA-Z])(?::(\d+))?',
+                                 word.value[index + 1:end]) if end >= 0 else None
+            if not match:
+                raise CurlFileSyntaxError('unsupported upload range')
+            if any(len(part) > 20 for part in match.groups() if part):
+                raise CurlFileSyntaxError('oversized upload range number')
+            numeric = match[1] is not None
+            low, high = ((int(match[1]), int(match[2])) if numeric else
+                         (ord(match[4]), ord(match[5])))
+            step = int((match[3] if numeric else match[6]) or '1')
+            if not step or low > high or (high - low) // step + 1 > 256:
+                raise CurlFileSyntaxError('invalid or oversized upload range')
+            width = len(match[1]) if numeric and match[1].startswith('0') else 0
+            values = (str(n).zfill(width) if numeric else chr(n)
+                      for n in range(low, high + 1, step))
+            choices = [Word(value, quote_pattern(value), word.source) for value in values]
+            index = end + 1
+        elif char in '}]':
+            raise CurlFileSyntaxError('unmatched upload delimiter')
+        else:
+            end = index + 1
+            while end < len(word.value) and word.value[end] not in '\\{}[]':
+                end += 1
+            choices = [word.tail(index).prefix(end - index)]
+            index = end
+        if len(names) * len(choices) > 256:
+            raise CurlFileSyntaxError('too many upload filenames')
+        names = [Word(name.value + part.value, name.pattern + part.pattern, word.source)
+                 for name in names for part in choices]
+    return names
+
+
+def _curl_files(word: Word, flag: str) -> list[Word]:
+    if flag in {'--data', '--data-binary', '--data-ascii', '--json', '-d',
+                '--header', '-H'} and word.value.startswith('@'):
+        return [] if word.value == '@-' else [word.tail(1)]
+    if flag in {'--data-urlencode', '--variable'} and '@' in word.value:
         index = word.value.index('@')
-        if '=' not in word.value[:index]:
-            return word.tail(index + 1)
-    if flag in {'--form', '-F'} and '=' in word.value:
-        index = word.value.index('=') + 1
-        if word.value[index:index + 1] in {'@', '<'}:
-            return word.tail(index + 1)
-    return None
+        if '=' not in (word.value if flag == '--data-urlencode' else word.value[:index]):
+            return [] if word.value[index + 1:] == '-' else [word.tail(index + 1)]
+    if flag in {'--form', '-F'}:
+        # Curl releases differ between ISBLANK and ISSPACE here. Check both
+        # interpretations, so whitespace-named secrets are protected too.
+        return list(dict.fromkeys(_curl_form_files(word) + _curl_form_files(word, ' \t')))
+    return []
+
+
+def _append_curl_uploads(paths: list[tuple[Word, bool]], uploads: list[Word],
+                         globoff: bool, uncertain: bool) -> None:
+    for upload in uploads:
+        if uncertain and globoff:
+            paths.append((upload, False))
+        files = _curl_upload_files(upload, globoff and not uncertain)
+        paths.extend((file, False) for file in files)
+    uploads.clear()
 
 
 def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
@@ -474,6 +670,9 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
         positionals = []
         explicit_pattern = any(arg.value == '--files' for arg in args)
         uncertain = False
+        curl_uploads: list[Word] = []
+        curl_globoff = False
+        curl_uncertain = False
         index = 0
         options = True
         while index < len(args):
@@ -484,21 +683,36 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
                 index += 1
                 continue
             flag = value.split('=', 1)[0]
+            curl_expand = base == 'curl' and flag.startswith('--expand-')
+            if curl_expand:
+                flag = '--' + flag[len('--expand-'):]
             if options and value.startswith('-'):
                 # Short options may be clustered, with the first value-taking
                 # option owning the remaining bytes (`grep -ne.`, `sort -ofile`).
                 attached = None
                 if not value.startswith('--') and len(value) > 2:
                     value_flags = (path_options | data_options |
-                                   (_CURL_DATA if base == 'curl' else set()))
+                                   (_CURL_DATA | _CURL_SHORT_VALUES if base == 'curl' else set()))
                     for offset, letter in enumerate(value[1:], start=1):
                         candidate = '-' + letter
+                        if base == 'curl' and candidate == '-:':
+                            flag = '-:'
+                            break  # Curl ignores the remaining letters after next.
+                        if base == 'curl' and candidate == '-g':
+                            curl_globoff = True
                         if candidate in value_flags:
                             flag = candidate
                             if offset + 1 < len(value):
                                 attached = word.tail(offset + 1)
                             break
-                if base == 'curl' and flag in _CURL_DATA:
+                if base == 'curl' and flag in {'-g', '--globoff', '--no-globoff', '--next', '-:'}:
+                    if flag in {'--next', '-:'}:
+                        _append_curl_uploads(paths, curl_uploads, curl_globoff, curl_uncertain)
+                        curl_globoff = False
+                        curl_uncertain = False
+                    else:
+                        curl_globoff = flag != '--no-globoff'
+                elif base == 'curl' and flag in _CURL_DATA:
                     if attached is not None:
                         data = attached
                     elif '=' in value:
@@ -507,11 +721,21 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
                         data = args[index + 1] if index + 1 < len(args) else None
                     if attached is None and '=' not in value:
                         index += 1
-                    if data is not None and flag != '--data-raw':
-                        file = _curl_file(data, flag)
-                        if file is not None:
-                            paths.append((file, False))
+                    if data is not None:
+                        if (curl_expand and '{{' in data.value
+                                and flag not in {'--form-string', '--data-raw'}):
+                            raise CurlFileSyntaxError('unresolved curl variable expansion')
+                        if flag in {'-T', '--upload-file'}:
+                            curl_uploads.append(data)
+                        else:
+                            paths.extend((file, False) for file in _curl_files(data, flag))
                 elif flag in path_options:
+                    if curl_expand:
+                        path_value = (attached.value if attached is not None else
+                                      value.split('=', 1)[1] if '=' in value else
+                                      args[index + 1].value if index + 1 < len(args) else '')
+                        if '{{' in path_value:
+                            raise CurlFileSyntaxError('unresolved curl path expansion')
                     if attached is not None:
                         paths.append((attached, False))
                     elif '=' in value:
@@ -526,6 +750,12 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
                         explicit_pattern = True
                     if attached is None and '=' not in value:
                         index += 1
+                elif base == 'curl':
+                    # An unknown option may own the next switch-looking word.
+                    # It cannot establish that native upload globbing is off.
+                    if (flag not in _CURL_SWITCHES
+                            and not re.fullmatch(r'-[sSgfvkLIOiNJ#0aBqRGl?]+', value)):
+                        curl_uncertain = True
                 elif search and value.startswith(('-e', '-f')) and not value.startswith('--'):
                     explicit_pattern = True
                     if value.startswith('-f'):
@@ -543,6 +773,7 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
                 continue
             positionals.append(word)
             index += 1
+        _append_curl_uploads(paths, curl_uploads, curl_globoff, curl_uncertain)
         if search:
             positionals = positionals if explicit_pattern or uncertain else positionals[1:]
             if tree_search:

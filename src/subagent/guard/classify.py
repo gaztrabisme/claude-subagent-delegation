@@ -1642,6 +1642,8 @@ def _shell_provider_secret(
             return nested, verdict.reason
     try:
         paths, roots = shell_paths.operands(command)
+    except shell_paths.CurlFileSyntaxError:
+        return command, 'curl file operands cannot be reliably cleared of provider credentials'
     except ValueError:
         return None  # The main tokenizer returns a parse-error escalation.
     for word, recursive in paths + [(root, True) for root in roots]:

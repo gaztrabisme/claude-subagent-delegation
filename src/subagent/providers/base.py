@@ -34,6 +34,7 @@ DRIVER_COPILOT = "copilot"
 DRIVER_GEMINI = "gemini"
 DRIVER_GROK = "grok"
 DRIVER_OMP = "omp"
+DRIVER_EPI = "epi"
 DRIVER_ANTIGRAVITY = "antigravity"
 
 # Every driver name the config file accepts. The ones with no module yet
@@ -41,7 +42,7 @@ DRIVER_ANTIGRAVITY = "antigravity"
 # run on this build.
 DRIVERS = (
     DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK,
-    DRIVER_ANTIGRAVITY, DRIVER_OMP,
+    DRIVER_ANTIGRAVITY, DRIVER_OMP, DRIVER_EPI,
 )
 
 NOT_PORTED = "driver not yet ported"
@@ -49,6 +50,7 @@ NOT_PORTED = "driver not yet ported"
 # A vendor label groups providers that share a refusal dialect (router keys
 # its refusal codes on it). Derived when the config does not say.
 VENDOR_BY_DRIVER = {
+    DRIVER_EPI: "epi",
     DRIVER_CODEX: "codex",
     DRIVER_COPILOT: "copilot",
     DRIVER_GROK: "grok",
@@ -237,6 +239,14 @@ class RunContext:
     goal: Goal | None
     request_id: str
     deadline: float | None
+    # Original caller inputs. Defaults keep existing hook providers compatible.
+    # In particular, an outer config's model and default fallback are not
+    # instructions to reroute inside another service.
+    task: str | None = None
+    instructions: str | None = None
+    name: str | None = None
+    model: str | None = None
+    fallback: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,8 +260,12 @@ class ProviderCapabilities:
     native_usage: usage and cost are service snapshots, never stream-metered
         or repriced. Preserve top-level credits, credits_unit and cash_usd.
     cancel: cancel(session, *, reason, kind) cancels the service job before kill.
+        It may return a final native snapshot for cancellation accounting.
     poll: poll(session) returns an outcome snapshot or None. Hooks must bound
         their own I/O; neither hook may approve a human gate.
+    transcript: transcript(session, *, run_id, limit, raw) fetches activity for
+        a native run. Native run identities must remain in that run's extra.
+    metadata: metadata(settings, cfg) returns read-only provider extras for list.
     """
 
     run_context: bool = False
@@ -260,6 +274,8 @@ class ProviderCapabilities:
     native_usage: bool = False
     cancel: bool = False
     poll: bool = False
+    transcript: bool = False
+    metadata: bool = False
 
 
 def capabilities(provider: Any) -> ProviderCapabilities:
@@ -345,7 +361,7 @@ class HookProvider(Provider, Protocol):
     ) -> Process:
         ...
 
-    def cancel(self, session: Session, *, reason: str, kind: str) -> None:
+    def cancel(self, session: Session, *, reason: str, kind: str) -> dict[str, Any] | None:
         ...
 
     def poll(self, session: Session) -> dict[str, Any] | None:

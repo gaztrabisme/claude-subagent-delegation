@@ -160,11 +160,21 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
 
     from .core import InProcessServer
 
+    epi_workspace = None
+    if cfg.driver == "epi":
+        from .providers.epi import EPI_PROVIDER, _project
+
+        probe = EPI_PROVIDER.doctor(settings, cfg)
+        if not probe["health_ok"]:
+            return {"ok": False, "state": "refused", "error": probe["health"]}
+        epi_workspace = _project(cfg)
+
     # A short prefix leaves room for the per-probe Unix socket on macOS, even
     # when TMPDIR points inside a deeply nested worktree.
     tmp = Path(tempfile.mkdtemp(prefix="d-"))
-    workspace = tmp / "workspace"
-    workspace.mkdir()
+    workspace = epi_workspace or tmp / "workspace"
+    if epi_workspace is None:
+        workspace.mkdir()
     server = InProcessServer(tmp / "sessions", settings)
     try:
         server.start()
@@ -223,6 +233,16 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         warning = f"{warning}\n{login_warning}" if warning else login_warning
     if warning:
         row["warning"] = warning
+    if cfg.driver == "epi" and not args.no_probe:
+        from .providers.epi import EPI_PROVIDER
+
+        row.update(EPI_PROVIDER.doctor(settings, cfg))
+        row["adapter"] = None
+        row["prompt"] = None
+        if args.prompt:
+            row["prompt"] = (_prompt_turn(settings, cfg) if row["health_ok"] else
+                             {"ok": False, "state": "refused", "error": row["health"]})
+        return row, not row["health_ok"] or bool(row["prompt"] and not row["prompt"]["ok"])
     if not args.no_probe:
         if path is None:
             hard = True

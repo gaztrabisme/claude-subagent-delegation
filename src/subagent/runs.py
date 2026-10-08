@@ -721,6 +721,7 @@ class Agent:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         goal: Goal | None = None,
         goal_reviewer: GoalReviewer | None = None,
+        delegate_options: dict[str, Any] | None = None,
     ):
         self.trace = trace
         self.telemetry = telemetry
@@ -742,6 +743,7 @@ class Agent:
         self.on_event = on_event
         self.goal = goal
         self.goal_reviewer = goal_reviewer
+        self.delegate_options = delegate_options or {}
         # Guard context carries configured child-secret names even before the
         # loop adds its protected tests and state allowlist.
         self.guard_context: dict[str, Any] = {
@@ -775,6 +777,8 @@ class Agent:
         self._dispatch_lock = threading.RLock()
         self._cancel_lock = threading.Lock()
         self._cancelled_requests: set[str | None] = set()
+        self._cancel_complete = threading.Event()
+        self._cancel_complete.set()
         self._thread = threading.Thread(
             target=self._worker, name=f"sam-agent-{agent_id}", daemon=True
         )
@@ -966,14 +970,18 @@ class Agent:
         with self._wake:
             if self._closed:
                 return
+            self._cancel_complete.clear()
             self._closing = True
             self._kill_kind = kind
             self._wake.notify_all()
         with self._dispatch_lock:
-            current = self._current
-            self._cancel_provider(reason, kind)
-            if current is not None:
-                current.kill()
+            try:
+                current = self._current
+                self._cancel_provider(reason, kind)
+                if current is not None:
+                    current.kill()
+            finally:
+                self._cancel_complete.set()
         for run in self.runs():
             if run.state == WORKING:
                 run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
@@ -1060,6 +1068,7 @@ class Agent:
             kwargs["context"] = RunContext(
                 verification=run.verification, goal=run.goal,
                 request_id=run.request_id, deadline=run.deadline,
+                **(self.delegate_options if resume is None else {}),
             )
         process = self.driver.spawn(
             self.cfg, self.settings, self.agent_id, prompt, self.workspace,
@@ -1177,6 +1186,15 @@ class Agent:
 
         Never raises: a broken release must not mask the run's own outcome.
         """
+        while True:
+            self._cancel_complete.wait()
+            with self._dispatch_lock:
+                if self._closing and not self._cancel_complete.is_set():
+                    continue
+                self._release_pre_verify(run)
+                return
+
+    def _release_pre_verify(self, run: Run) -> None:
         if run.pre_verify is None or run.pre_verify_result is not None:
             return
         try:
@@ -1649,9 +1667,11 @@ class Agent:
         if kind:
             run.note(str(kind))
 
-    def _ingest_native(self, run: Run, outcome: dict[str, Any]) -> None:
+    def _ingest_native(
+        self, run: Run, outcome: dict[str, Any], *, cancelling: bool = False,
+    ) -> None:
         """One service snapshot. Do not reinterpret checks or fill absent fields."""
-        if self._closing or run.done.is_set():
+        if (self._closing and not cancelling) or run.done.is_set():
             return
         state = outcome.get("state")
         if state not in TERMINAL_STATES and state != WORKING:
@@ -1709,13 +1729,38 @@ class Agent:
                 return
             self._cancelled_requests.add(key)
             try:
-                self.driver.cancel(self.session(), reason=reason, kind=kind)
+                snapshot = self.driver.cancel(self.session(), reason=reason, kind=kind)
+                if isinstance(snapshot, dict) and run is not None:
+                    # Final service accounting may arrive only in cancel. The
+                    # caller still owns the outer cancellation/timeout state.
+                    previous = (run.state, run.phase, run.finish_reason, run.error)
+                    self._ingest_native(run, snapshot, cancelling=True)
+                    run.state, run.phase, run.finish_reason, run.error = previous
             except Exception as exc:  # noqa: BLE001 - remote failure must not block local kill
                 message = redact_secrets(str(exc), self.settings.leaked_keys)
+                if run is not None and capabilities(self.driver).native_outcome:
+                    snapshot = copy.deepcopy(run.native_outcome or {})
+                    snapshot.update(needs_human=False)
+                    snapshot.pop("human_action", None)
+                    snapshot.setdefault("extra", {}).update(
+                        cancellation_confirmed=False, cancellation_error=message,
+                    )
+                    run.native_outcome = snapshot
                 log.warning("provider cancel failed for %s: %s: %s",
                             self.agent_id, type(exc).__name__, message)
 
     def _finish(self, run: Run) -> None:
+        # Cancellation can return the last accounting snapshot. Finish and
+        # write the trace only after its bounded hook has returned.
+        while True:
+            self._cancel_complete.wait()
+            with self._dispatch_lock:
+                if self._closing and not self._cancel_complete.is_set():
+                    continue
+                self._finish_locked(run)
+                return
+
+    def _finish_locked(self, run: Run) -> None:
         if self._kill_kind:
             kind = self._kill_kind
             run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
@@ -1877,11 +1922,13 @@ class Registry:
         workspace: Path,
         model: str | None = None,
         provider: str | None = None,
-        fallback: str = "full",
+        fallback: str | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         agent_id: str | None = None,
         goal: Goal | None = None,
         goal_reviewer: GoalReviewer | None = None,
+        task: str | None = None,
+        instructions: str | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -1910,14 +1957,16 @@ class Registry:
                 settings=self.settings,
                 trace=self.trace,
                 cfg=chosen,
-                fallback=fallback,
-                chain=self.settings.chain(chosen.name, fallback),
+                fallback=fallback or "full",
+                chain=self.settings.chain(chosen.name, fallback or "full"),
                 lane_state=self.lane_state,
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,
                 goal=goal,
                 goal_reviewer=goal_reviewer,
+                delegate_options={"task": task, "instructions": instructions,
+                                  "name": name, "model": model, "fallback": fallback},
             )
             self._agents[claimed] = agent
             return agent

@@ -1,0 +1,14 @@
+# epi serve is managed separately by launchd. Issue a dedicated caller token
+# and allowlist this initialized project there before using this provider.
+[core]
+default_provider = "epi"
+
+[providers.epi]
+driver = "epi"
+binary = "/absolute/path/to/epi"
+token_file = "/absolute/path/to/private/caller.token"
+project_root = "/absolute/path/to/initialized/epi-project"
+experimental = true
+local = true
+run_timeout = 300
+idle_timeout = 900

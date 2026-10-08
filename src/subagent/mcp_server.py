@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -218,7 +219,7 @@ async def delegate(
     wait_seconds: float = 0,
     provider: str | None = None,
     lane: str | None = None,
-    fallback: str = "full",
+    fallback: str | None = None,
     goal: str | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
@@ -267,7 +268,7 @@ async def delegate(
             "error": str(exc),
             "lane": wanted or settings.default_provider,
             "provider": wanted or settings.default_provider,
-            "fallback": fallback,
+            "fallback": fallback or "full",
             "known_providers": list(settings.providers),
             "fallback_modes": list(FALLBACK_MODES),
         }
@@ -305,11 +306,13 @@ async def delegate(
     agent = registry.create_agent(
         name=name,
         workspace=resolved,
-        model=model or chosen.model,
+        model=model,
         provider=chosen.name,
         fallback=fallback,
         goal=parsed_goal,
         goal_reviewer=goal_review,
+        task=task,
+        instructions=instructions,
     )
     start_error = await anyio.to_thread.run_sync(agent.wait_ready, 60.0)
     if start_error is not None:
@@ -410,12 +413,27 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
     for info in agents:
         for key in spent:
             spent[key] += info["usage"][key]
+    provider_views = []
+    from .providers import for_driver
+    from .providers.base import capabilities
+
+    for cfg in settings.providers.values():
+        view = cfg.as_dict()
+        driver = for_driver(cfg.driver)
+        if capabilities(driver).metadata:
+            try:
+                view["extra"] = await anyio.to_thread.run_sync(
+                    partial(driver.metadata, settings, cfg)
+                )
+            except RuntimeError as exc:
+                view["extra"] = {"error": str(exc)}
+        provider_views.append(view)
     return {
         "agents": agents,
         "live": sum(1 for a in agents if a["state"] != "closed"),
         "limit": settings.max_agents,
         "default_provider": settings.default_provider,
-        "providers": [cfg.as_dict() for cfg in settings.providers.values()],
+        "providers": provider_views,
         "default_workspace": str(settings.workspace),
         "tokens_spent": spent,
         "archived_runs": len(registry.archived_runs()),
@@ -474,6 +492,27 @@ async def transcript(run_id: str, limit: int = 60, raw: bool = False) -> dict[st
             the original text lives.
     """
     run = registry.find_run(run_id)
+    from .providers import for_driver
+    from .providers.base import capabilities
+
+    agent = registry.find_agent(run.agent_id)
+    cfg = settings.providers.get(run.lane)
+    driver = agent.driver if agent is not None else (for_driver(cfg.driver) if cfg else None)
+    if capabilities(driver).transcript and run.native_outcome:
+        native_id = run.native_outcome.get("extra", {}).get("epi", {}).get("run_id")
+        if native_id:
+            if agent is not None:
+                session = agent.session()
+            else:
+                error, session = driver.boot(settings, run.agent_id, cfg)
+                if error:
+                    raise RegistryError(error)
+                session.session_id = run.native_outcome["extra"]["epi"].get("agent_id")
+            native = await anyio.to_thread.run_sync(partial(
+                driver.transcript, session, run_id=native_id, limit=limit, raw=raw,
+            ))
+            return {**native, "run_id": run_id, "agent_id": run.agent_id,
+                    "state": run.state, "phase": run.phase, "usage": run.usage.as_dict()}
     lines = list(run.transcript)
     tail = lines[-limit:] if limit > 0 else lines
     out = {

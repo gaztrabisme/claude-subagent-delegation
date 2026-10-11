@@ -32,3 +32,10 @@ Reader: the next session that picks this repo up. Read with `decisions.md` (S11â
 - Open review findings: parallel mode with `max_agents = 1` (MED), hidden-test destination created by the agent (LOW).
 - Bench parsers: the claude parser fills `orch_cost_usd` but leaves `orch_tokens_*` empty (U-B1); Codex orchestrator cells need `-s danger-full-access` (M5) because its sandbox cannot bind the approval socket (U-C3), which also stops Codex children from running socket-backed tests or committing in a worktree (U-C1).
 - Not yet measured: Gemini (not installed), Grok (balance exhausted), Copilot (not installed), and the two self-hosted providers (bppc down, oMLX without a loaded model) as workers; the matrix over harnesses Ã— providers is the next run.
+
+## Windows (2026-10-11, branch `windows-guard`)
+
+- **The Codex guard hook does not fire on Windows** (codex-cli 0.162.0-alpha, Claude desktop app host): every Codex run's trace says `sandbox (hook silent)`. Owner decision pending on how to investigate. Until then a Codex child on Windows is limited only by Codex's sandbox.
+- 7 product bugs on Windows are listed in `wiki/data/windows-test-triage.md` (log-file encoding in `loop/events.py`, the `.exe` suffix in `bench/run.py`, guard spellings in inline source and curl `@` arguments).
+- 134 harness failures remain: the loop fakes' scenarios are bash scripts, not yet ported.
+- Not run on macOS or Linux since the Windows changes; run the suite there before merging into `main`.

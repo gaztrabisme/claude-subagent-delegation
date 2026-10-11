@@ -2,6 +2,23 @@
 
 Reader: anyone tracing why the server is the way it is. Newest first.
 
+## 2026-10-11 — run win-guard-2026-10-11 closed (coordinator)
+
+Owner: Huy. Coordinator: Claude (conductor). Units ran on Codex through the in-process subagent runtime (the MCP tools were not loaded in the coordinating session). Goal file: `wiki/goals/2026-10-11-windows-guard.md`. The Codex units' own entries are at the end of this file.
+
+| Unit | Lane | Verdict | Acceptance (run by the coordinator) | Note |
+|---|---|---|---|---|
+| U1 r1 | codex | FAIL | 17/17 hidden guard cases, but 66 guard tests newly failing on Windows | the coordinator's verification ran only the new test file; the unit replaced the bash reading on Windows |
+| U1 r2 | codex | PASS, `7e64135` | 17/17; 0 newly failing vs `485e14c` | Windows reading made additive |
+| R1 | Claude agent | REFUSED | none | stopped by a safety check before testing; rerouted to a coordinator acceptance script (38 cases) |
+| U2 r1–r3 | codex | FAIL (runtime) | none | subagent decoded Codex output with the Windows code page, then `loop._pid_alive` sent Ctrl-C to the whole console and killed every verification |
+| U1 r3 | codex | PASS, `4b12b41` | 17/17 and 37/38 hidden cases; 0 newly failing | redirects to Windows paths, UTF-8 output, console-safe pid probe; also edited `tests/conftest.py` and `wiki/active-work.md` outside its brief (conftest kept, wiki note reverted) |
+| U2 | codex | PASS, `220db47` | triage covers 155 outcomes (14 unix-only, 134 fake-cli, 7 product bugs); suite 85 failed / 874 passed, 0 newly failing | verified after U1 r3 fixed the runtime |
+
+Goal audit: G1–G6 pass. G7 partial: Unix-only tests are skipped, 134 harness failures remain where the loop fakes' bash scenarios are not ported. G8 fail: no reviewer of another model family completed; the coordinator's bypass script stood in.
+
+Open, owner decision: on this machine the guard hook never fired for any Codex run (`guard: sandbox (hook silent)` in all four traces), so Codex children ran with only Codex's sandbox. The Mac proof was on codex-cli 0.153; this machine has 0.162.0-alpha.
+
 ## 2026-09-18 — built from glm-subagent; five lanes, router, telemetry
 
 Goal: `goals/2026-09-18-unified-subagent.md`. Coordinator: Claude Code (conductor). Build lanes: GLM planned; GLM hit a z.ai 1313 account-level limit on the first two units, so every unit ran on Claude agents (8 of the 8-agent cap).

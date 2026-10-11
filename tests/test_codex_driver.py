@@ -23,6 +23,7 @@ from subagent.providers import codex as codex_driver
 from subagent.providers.codex import (
     REFUSAL_USAGE_LIMIT,
     codex_refusal,
+    guard_hook_command,
     parse_reset,
 )
 from subagent.runs import COMPLETED, FAILED, Registry
@@ -193,11 +194,21 @@ def test_codex_home_is_per_agent_and_isolated(fake_codex, registry, tmp_path: Pa
     hooks = json.loads((home / "hooks.json").read_text())["hooks"]
     assert list(hooks) == ["PreToolUse"]
     commands = [h["command"] for group in hooks["PreToolUse"] for h in group["hooks"]]
-    assert commands == [registry.settings.guard_hook_command(agent.agent_id, "--dialect", "codex")]
+    assert commands == [guard_hook_command(registry.settings, agent.agent_id)]
     assert str(HOOK) in commands[0] and "own-hook.sh" not in json.dumps(hooks)
     env = fake_codex.calls()[0]["env"]
     assert env["SUBAGENT_APPROVAL_SOCKET"] == registry.settings.approval_socket
     assert env["GLM_API_KEY"] is None and env["ANTHROPIC_AUTH_TOKEN"] is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows quoting")
+def test_codex_hook_command_is_quoted_for_windows(tmp_path: Path):
+    """Codex runs hooks through a Windows shell; POSIX single quotes break the path."""
+    settings = make_settings(tmp_path)
+    command = guard_hook_command(settings, "a1-x")
+    assert "'" not in command
+    argv = settings.guard_hook_argv("a1-x", "--dialect", "codex")
+    assert command == subprocess.list2cmdline(argv)
 
 
 def test_provider_model_skips_user_model(fake_codex, tmp_path: Path):

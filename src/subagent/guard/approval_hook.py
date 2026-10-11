@@ -113,10 +113,36 @@ def block(reason: str) -> None:
     emit("deny", reason, code=2)
 
 
-def ask(socket_path: str, request: dict) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+USE_UNIX_SOCKET = hasattr(socket, "AF_UNIX") and sys.platform != "win32"
+
+
+def _connect(socket_path: str) -> socket.socket:
+    """A unix socket, or on Windows the loopback address and token the
+    supervisor wrote into the socket file."""
+    if USE_UNIX_SOCKET:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(TIMEOUT_S)
         sock.connect(socket_path)
+        return sock
+    with open(socket_path, encoding="utf-8") as handle:
+        address = json.load(handle)
+    sock = socket.create_connection((address["host"], int(address["port"])), timeout=TIMEOUT_S)
+    sock.settimeout(TIMEOUT_S)
+    return sock
+
+
+def _token(socket_path: str) -> str | None:
+    if USE_UNIX_SOCKET:
+        return None
+    with open(socket_path, encoding="utf-8") as handle:
+        return json.load(handle).get("token")
+
+
+def ask(socket_path: str, request: dict) -> dict:
+    token = _token(socket_path)
+    if token is not None:
+        request = {**request, "token": token}
+    with _connect(socket_path) as sock:
         sock.sendall((json.dumps(request) + "\n").encode())
         chunks = []
         while b"\n" not in b"".join(chunks):
@@ -161,7 +187,7 @@ def main() -> None:
         }
         try:
             reply = ask(socket_path, request)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             block(f"blocked: supervisor unreachable ({type(exc).__name__}: {exc})")
         reason = reply.get("reason") or "blocked by the supervisor"
         if reply.get("action") != "allow":

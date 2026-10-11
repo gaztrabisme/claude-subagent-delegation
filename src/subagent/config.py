@@ -44,6 +44,16 @@ CONFIG_ENV = "SUBAGENT_CONFIG"
 CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
 
+# Windows has no HOME and finds the user's folders, the system and temp space
+# through these; a child without them cannot start most CLIs. None is a secret.
+WINDOWS_RUNTIME_ENV = frozenset({
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+    "USERNAME", "USERDOMAIN", "COMPUTERNAME", "OS", "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+    "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432", "PUBLIC",
+})
+
 # Names the child must never inherit from this server, whatever the providers
 # declare: the parent's own Claude credentials and endpoint.
 FIXED_LEAKED_KEYS = (
@@ -456,6 +466,8 @@ class Settings:
         PASSWORD are excluded even when explicitly listed.
         """
         allowed = {"PATH", "HOME", "LANG", "TERM", "TMPDIR", *self.child_env_passthrough}
+        if sys.platform == "win32":
+            allowed |= WINDOWS_RUNTIME_ENV
         return {
             name: value
             for name, value in os.environ.items()

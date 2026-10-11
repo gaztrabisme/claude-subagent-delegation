@@ -289,8 +289,9 @@ def is_sensitive(path: Path) -> str | None:
         resolved = path.resolve()
     except (OSError, RuntimeError):
         resolved = path
-    home = str(_home().resolve()).lower().rstrip("/")
-    for candidate in {str(resolved).lower(), os.path.normpath(str(path)).lower()}:
+    home = _slashed(str(_home().resolve())).lower().rstrip("/")
+    candidates = {str(resolved), os.path.normpath(str(path))}
+    for candidate in {_slashed(text).lower() for text in candidates}:
         if candidate != home and not candidate.startswith(home + "/"):
             continue
         rel = candidate[len(home):].lstrip("/")
@@ -338,10 +339,16 @@ def inside(path: Path, root: Path) -> bool:
     return True
 
 
+def _slashed(text: str) -> str:
+    """A path string with Windows separators turned into `/` (POSIX: unchanged)."""
+    return text.replace("\\", "/") if os.sep == "\\" else text
+
+
 def _inside_logically(path: Path, root: Path) -> bool:
     """`path` with `..` removed textually, as bash's `cd` does, under `root`."""
-    logical = os.path.normpath(str(path))
-    for base in {os.path.normpath(str(root)), str(root.resolve())}:
+    logical = _slashed(os.path.normcase(os.path.normpath(str(path))))
+    for raw in {os.path.normpath(str(root)), str(root.resolve())}:
+        base = _slashed(os.path.normcase(raw))
         if logical == base or logical.startswith(base.rstrip("/") + "/"):
             return True
     return False

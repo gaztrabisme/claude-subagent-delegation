@@ -35,7 +35,8 @@ Reader: the next session that picks this repo up. Read with `decisions.md` (S11â
 
 ## Windows (2026-10-11, branch `windows-guard`)
 
-- **The Codex guard hook does not fire on Windows** (codex-cli 0.162.0-alpha, Claude desktop app host): every Codex run's trace says `sandbox (hook silent)`. Owner decision pending on how to investigate. Until then a Codex child on Windows is limited only by Codex's sandbox.
+- **The Codex guard hook fires on Windows** since c5ebd9e (POSIX quoting kept Windows from starting it). Branch `windows-guard-failclosed-pwsh` adds two things: a Codex run whose hook goes silent is stopped at the first tool call the supervisor did not hear about (`guard_hook_silent`, forced kill); and Codex children on Windows get a PowerShell reading that clears Get-Content, Set-Content, Out-File, Get-ChildItem, Select-String and Test-Path on workspace paths. The first unguarded command still runs: Codex announces a command only once it is under way.
+- Open: the older native-read fallback in `classify_bash` allows `Get-Content Env:NAME` (reads an environment variable), `Get-Content file:stream` and the en-dash `â€“Path` spelling.
 - 7 product bugs on Windows are listed in `wiki/data/windows-test-triage.md` (log-file encoding in `loop/events.py`, the `.exe` suffix in `bench/run.py`, guard spellings in inline source and curl `@` arguments).
 - 134 harness failures remain: the loop fakes' scenarios are bash scripts, not yet ported.
 - Not run on macOS or Linux since the Windows changes; run the suite there before merging into `main`.

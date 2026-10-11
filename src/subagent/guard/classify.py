@@ -495,6 +495,9 @@ WINDOWS_WRITERS = {
 }
 
 
+_TYPOGRAPHIC = re.compile("[‐-―−‘-‟]")
+
+
 def _windows_home(word: str) -> str:
     return re.sub(
         r"^(?:~(?=[\\/]|$)|\$(?:HOME|\{HOME\}|env:USERPROFILE|\{env:USERPROFILE\})(?=[\\/]|$))",
@@ -590,6 +593,10 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
         ch in command for ch in "`^%(){}[],@#*?\n"
     ) or any("$" in _windows_home(w) for w in native):
         return verdict
+    # PowerShell reads typographic dashes as `-` and typographic quotes as
+    # quotes, which this reading does not model.
+    if _TYPOGRAPHIC.search(command):
+        return verdict
     base = native[0].lower()
     exposure = _read_only_exposure(base, native)
     if exposure is not None:
@@ -611,6 +618,9 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
         elif word.startswith("-"):
             return verdict
         value = _windows_home(word)
+        # A colon past a drive letter is an Env: drive or an alternate data stream.
+        if ":" in value and not re.fullmatch(r"[A-Za-z]:[\\/][^:]*", value):
+            return verdict
         if _unresolvable(value) or not _inside_both(_resolve(value, cwd), workspace):
             return verdict
         paths.append(value)

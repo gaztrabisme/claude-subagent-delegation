@@ -285,6 +285,7 @@ def _hook(sock, payload: dict, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket server at /tmp")
 def test_hook_claude_shape_allows_with_explicit_decision(supervisor_socket):
     out = _hook(supervisor_socket, {
         "tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/w",
@@ -307,6 +308,7 @@ CODEX_PAYLOAD = {
 }
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket server at /tmp")
 def test_hook_codex_shape_allows_silently(supervisor_socket):
     out = _hook(supervisor_socket, {**CODEX_PAYLOAD, "tool_name": "Bash",
                                     "tool_input": {"command": "ls"}}, "--dialect", "codex")
@@ -315,6 +317,7 @@ def test_hook_codex_shape_allows_silently(supervisor_socket):
     assert supervisor_socket.seen[0]["tool_name"] == "Bash"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket server at /tmp")
 def test_hook_codex_turn_id_detected_without_flag(supervisor_socket):
     out = _hook(supervisor_socket, {**CODEX_PAYLOAD, "tool_name": "exec_command",
                                     "tool_input": {"cmd": ["git", "status"]}})
@@ -323,6 +326,7 @@ def test_hook_codex_turn_id_detected_without_flag(supervisor_socket):
     assert supervisor_socket.seen[0]["tool_input"] == {"command": "git status"}
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket server at /tmp")
 def test_hook_codex_deny_has_reason(supervisor_socket):
     supervisor_socket.answers.append({"action": "deny", "reason": "nope"})
     out = _hook(supervisor_socket, {**CODEX_PAYLOAD, "tool_name": "shell",
@@ -334,6 +338,7 @@ def test_hook_codex_deny_has_reason(supervisor_socket):
     assert decision["permissionDecisionReason"] == "nope"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket server at /tmp")
 def test_hook_codex_apply_patch_asks_per_file(supervisor_socket):
     patch = (
         "*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n"
@@ -370,6 +375,7 @@ def test_translator_counts_items_once():
     assert out[-1]["type"] == "result" and out[-1]["is_error"] is False
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket server at /tmp")
 def test_hook_codex_forwards_workdir_and_payload_cwd(supervisor_socket):
     """H1: the classifier sees where the command runs."""
     out = _hook(supervisor_socket, {**CODEX_PAYLOAD, "tool_name": "exec_command",

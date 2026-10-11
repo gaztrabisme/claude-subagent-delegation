@@ -631,6 +631,7 @@ def _fake_claude():
     return run
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket supervisor harness")
 def test_hook_isolation_check_holds_with_a_fake_claude(tmp_path, monkeypatch):
     monkeypatch.setenv("GLM_API_KEY", "mock-key")
     monkeypatch.setattr(hcheck, "run_claude", _fake_claude())
@@ -648,6 +649,7 @@ def test_hook_isolation_check_fails_when_the_hook_misses(tmp_path, monkeypatch):
     assert hcheck.main(["--lane", "glm"]) == 1
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket supervisor harness")
 def test_hook_isolation_check_points_the_provider_at_the_mock(tmp_path, monkeypatch):
     monkeypatch.setenv("GLM_API_KEY", "mock-key")
     seen: dict[str, Any] = {}
@@ -668,6 +670,7 @@ def test_hook_isolation_check_points_the_provider_at_the_mock(tmp_path, monkeypa
     assert seen["overrides"]["core"]["session_root"].endswith("sessions")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket supervisor harness")
 def test_hook_isolation_check_takes_a_config_naming_the_provider(tmp_path, monkeypatch):
     monkeypatch.setenv("GLM_API_KEY", "mock-key")
     seen: dict[str, Any] = {}

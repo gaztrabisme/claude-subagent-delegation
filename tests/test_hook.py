@@ -8,6 +8,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent" / "guard" / "approval_hook.py"
 
 
@@ -37,6 +39,7 @@ def test_missing_socket_denies_with_json(monkeypatch, tmp_path: Path):
     assert out["permissionDecision"] == "deny"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix-domain socket server at /tmp")
 def test_allow_and_deny_from_unix_socket(tmp_path: Path):
     sock_path = Path("/tmp") / f"sam-hook-test-{tmp_path.name}.sock"
     sock_path.unlink(missing_ok=True)

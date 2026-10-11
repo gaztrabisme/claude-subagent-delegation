@@ -329,13 +329,16 @@ def test_run_with_successful_event_is_not_labelled_rate_limited(
 
 def test_events_drains_stderr_concurrently_and_classifies(tmp_path: Path):
     # >200KB of stderr (far over the 64KB pipe buffer) would deadlock the old
-    # read-after-exit code. Uses `sh`, never `claude`.
+    # read-after-exit code. Use Python so the harness runs on Windows too.
+    import sys
+
     ok_line = '{"type":"result","is_error":false,"result":"ok"}'
     script = (
-        "for i in $(seq 1 4000); do echo '" + WARNING_LINE + "' >&2; done; "
-        "echo '" + ok_line + "'; exit 3"
+        "import sys; "
+        f"sys.stderr.write(({WARNING_LINE!r} + '\\n') * 4000); "
+        f"sys.stderr.flush(); print({ok_line!r}, flush=True); sys.exit(3)"
     )
-    proc = ClaudeProcess(["sh", "-c", script], {}, str(tmp_path))
+    proc = ClaudeProcess([sys.executable, "-c", script], {}, str(tmp_path))
     events: list[dict[str, Any]] = []
     finished = threading.Event()
 

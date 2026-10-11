@@ -23,7 +23,7 @@ def _codex_cfg(binary: str) -> str:
         'default_provider = "codex"\n\n'
         "[providers.codex]\n"
         'driver = "codex"\n'
-        f'binary = "{binary}"\n'
+        f'binary = {json.dumps(binary)}\n'
     )
 
 
@@ -86,7 +86,7 @@ def test_doctor_healthy_local(tmp_path, monkeypatch, mock_endpoint, capsys):
         'default_provider = "local"\n\n'
         "[providers.local]\n"
         'driver = "claude"\n'
-        f'binary = "{sys.executable}"\n'
+        f'binary = {json.dumps(sys.executable)}\n'
         'model = "qwen3.8-27b"\n'
         'api_key = "local"\n'
         "[providers.local.health]\n"
@@ -103,7 +103,7 @@ def test_doctor_health_failure_is_hard(tmp_path, monkeypatch, mock_endpoint, cap
         'default_provider = "local"\n\n'
         "[providers.local]\n"
         'driver = "claude"\n'
-        f'binary = "{sys.executable}"\n'
+        f'binary = {json.dumps(sys.executable)}\n'
         'model = "qwen3.8-27b"\n'
         'api_key = "local"\n'
         "[providers.local.health]\n"

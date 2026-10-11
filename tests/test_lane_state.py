@@ -46,6 +46,55 @@ def test_lane_state_write_is_atomic_and_keeps_other_lanes(tmp_path: Path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["lane_state.json", "lane_state.json.lock"]
 
 
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_lane_state_retries_windows_replace_errors(tmp_path: Path, monkeypatch, winerror):
+    from subagent import lane_state
+
+    state = LaneState(tmp_path)
+    until = datetime.now().astimezone() + timedelta(hours=1)
+    state.close("glm", until, "limit", "a")
+    replace = lane_state.os.replace
+    attempts = []
+
+    def busy_once(source, destination):
+        attempts.append(source)
+        if len(attempts) == 1:
+            error = PermissionError("file is busy")
+            error.winerror = winerror
+            raise error
+        replace(source, destination)
+
+    monkeypatch.setattr(lane_state.os, "replace", busy_once)
+    monkeypatch.setattr(lane_state.time, "sleep", lambda delay: None)
+    state.close("deepseek", until, "balance", "b")
+    assert len(attempts) == 2
+    assert state.closed("glm") is not None
+    assert state.closed("deepseek") is not None
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["lane_state.json", "lane_state.json.lock"]
+
+
+@pytest.mark.parametrize("winerror, expected_attempts", [(32, 6), (None, 1)])
+def test_lane_state_failed_replace_cleans_up(tmp_path: Path, monkeypatch, winerror, expected_attempts):
+    from subagent import lane_state
+
+    state = LaneState(tmp_path)
+    state._write({"glm": {"code": "original"}})
+    attempts = []
+
+    def fail_replace(source, destination):
+        attempts.append(source)
+        error = PermissionError("cannot replace")
+        error.winerror = winerror
+        raise error
+
+    monkeypatch.setattr(lane_state.os, "replace", fail_replace)
+    monkeypatch.setattr(lane_state.time, "sleep", lambda delay: None)
+    state._write({"deepseek": {"code": "new"}})
+    assert len(attempts) == expected_attempts
+    assert state.entries() == {"glm": {"code": "original"}}
+    assert [p.name for p in tmp_path.iterdir()] == ["lane_state.json"]
+
+
 def test_lane_state_expired_entry_is_ignored(tmp_path: Path):
     state = LaneState(tmp_path)
     state.close("glm", datetime.now().astimezone() - timedelta(seconds=1), "zai_1308", "old")

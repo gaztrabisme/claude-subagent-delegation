@@ -89,7 +89,7 @@ class BackgroundAndUndo(Sandbox):
         configured = self.tmp / "shared-approval.sock"
         config_text = self.config.read_text()
         self.config.write_text(config_text.replace(
-            f'approval_socket = "{self.tmp / "approval.sock"}"',
+            f'approval_socket = {json.dumps(str(self.tmp / "approval.sock"))}',
             "approval_socket = " + json.dumps(str(configured)),
         ))
 

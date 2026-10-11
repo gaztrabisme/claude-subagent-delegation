@@ -273,7 +273,7 @@ class Process:
             stdin=subprocess.PIPE if stdin else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             start_new_session=True,
         )
         return self._proc

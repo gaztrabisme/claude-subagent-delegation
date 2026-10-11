@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -481,7 +482,100 @@ def classify_path_write(path_str: str, workspace: Path, context: dict | None = N
     return Verdict(ESCALATE, "write outside the workspace", facts)
 
 
+WINDOWS_READ_ONLY = frozenset({
+    "type", "get-content", "gc", "more", "select-string", "sls",
+})
+
+
+def _windows_home(word: str) -> str:
+    return re.sub(
+        r"^(?:~(?=[\\/]|$)|\$(?:HOME|\{HOME\}|env:USERPROFILE|\{env:USERPROFILE\})(?=[\\/]|$))",
+        lambda _m: str(_home()), word, flags=re.IGNORECASE,
+    )
+
+
+def _windows_words(command: str) -> list[str] | None:
+    """A second reading for native paths; never replace the bash tokenizer."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION)
+    lexer.escape = ""
+    lexer.whitespace_split = True
+    lexer.whitespace = " \t\r"
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
 def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
+                  context: dict | None = None) -> Verdict:
+    """Run bash policy everywhere, with additive native Windows checks."""
+    cwd = cwd or workspace
+    native = _windows_words(command) if sys.platform == "win32" else None
+    if native is not None:
+        for word in native:
+            if _is_operator(word):
+                continue
+            for value in [word, *_values(word)]:
+                value = _windows_home(value)
+                if not (_path_like(value) or "\\" in value) or _unresolvable(value):
+                    continue
+                path = _resolve(value, cwd)
+                why = is_sensitive(path) or protected(path)
+                if why:
+                    return Verdict(DENY, f"refused: {why}", {"sensitive_path": str(path)})
+
+    verdict = _classify_bash(command, workspace, cwd, context)
+    if native is None or verdict.action == DENY:
+        return verdict
+    # Empty lines and bare assignments do not name an executable in the
+    # native shell. Keep the existing Windows policy for these ambiguous forms.
+    if not native or (len(native) == 1 and ASSIGNMENT.match(native[0])):
+        return Verdict(ESCALATE, "Windows command has no executable", verdict.facts)
+    if native[0].lower() == "sort" and any(w.lower() == "/o" for w in native[1:]):
+        return Verdict(ESCALATE, "`sort /o` writes a file", verdict.facts)
+    if native[0].lower() not in WINDOWS_READ_ONLY:
+        return verdict
+    if any(_is_operator(w) for w in native):
+        return verdict
+    verdict = Verdict(ESCALATE, "native read cannot be cleared statically", verdict.facts)
+    # Native reads are the sole new allowance. Do not clear compound syntax,
+    # redirects, expansions or unknown options through this fallback.
+    if any(
+        ch in command for ch in "`^%(){}[],@#*?\n"
+    ) or any("$" in _windows_home(w) for w in native):
+        return verdict
+    base = native[0].lower()
+    exposure = _read_only_exposure(base, native)
+    if exposure is not None:
+        return Verdict(ESCALATE, exposure, verdict.facts)
+    paths = []
+    index = 1
+    while index < len(native):
+        word = native[index]
+        if word.lower() == "-pattern" and base in {"select-string", "sls"}:
+            index += 2
+            if index > len(native):
+                return verdict
+            continue
+        if word.lower() in {"-path", "-literalpath"}:
+            index += 1
+            if index == len(native):
+                return verdict
+            word = native[index]
+        elif word.startswith("-"):
+            return verdict
+        value = _windows_home(word)
+        if _unresolvable(value) or not _inside_both(_resolve(value, cwd), workspace):
+            return verdict
+        paths.append(value)
+        index += 1
+    if not paths:
+        return verdict
+    return Verdict(ALLOW, f"`{native[0]}` reads workspace paths", verdict.facts)
+
+
+def _classify_bash(command: str, workspace: Path, cwd: Path | None = None,
                   context: dict | None = None) -> Verdict:
     """A bash command line.
 

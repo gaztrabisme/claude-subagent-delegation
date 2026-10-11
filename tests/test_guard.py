@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -237,6 +238,7 @@ def test_writes_that_stay_inside_are_not_swept_up(command, ws):
 # --- an escalation must carry what the decision turns on -------------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix absolute /etc root paths")
 def test_an_escalating_command_names_the_paths_it_touches(ws):
     """A supervisor asked to rule on a write must be told where it writes.
 
@@ -258,6 +260,7 @@ def test_an_unexpanded_variable_is_reported_unresolved_not_guessed(ws):
     assert verdict.facts["redirect_targets_outside"] == ["$TMPDIR/out.txt"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix absolute /etc root paths")
 def test_a_redirect_outside_is_named_even_inside_a_compound_line(ws):
     verdict = classify("bash", {"command": "echo x > /etc/hosts | true"}, ws)
     assert verdict.action != ALLOW
@@ -448,6 +451,7 @@ def test_a_cd_inside_an_and_chain_moves_where_paths_resolve(home_ws):
     assert bash("cd sub; echo x > ../x.txt", home_ws).action == DENY
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix shell ~user home expansion")
 def test_a_nonexistent_user_home_does_not_crash_the_classifier(ws):
     from subagent.guard.classify import _describe_path
 

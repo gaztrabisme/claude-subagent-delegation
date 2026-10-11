@@ -9,9 +9,7 @@ FAKE_COPILOT_RECORD (one JSON line per call).
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import sys
 import uuid
 from pathlib import Path
 
@@ -238,8 +236,9 @@ def fake_copilot(tmp_path: Path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     binary = bindir / "copilot"
-    binary.write_text(f"#!{sys.executable}\n{FAKE_COPILOT}")
-    binary.chmod(0o755)
+    from .conftest import write_fake_cli
+
+    binary = write_fake_cli(binary, FAKE_COPILOT)
     record = tmp_path / "copilot-calls.jsonl"
     monkeypatch.setenv("FAKE_COPILOT_RECORD", str(record))
     monkeypatch.setenv("FAKE_COPILOT_FIXTURE", str(FIXTURES / "success.jsonl"))

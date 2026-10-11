@@ -547,9 +547,21 @@ def test_router_trace_writes_one_hop_record_per_lane(tmp_path, lanes_on_mock):
 def test_router_src_never_starts_a_local_model():
     # "docker" as a command word; guard.py names ~/.docker/config.json as a
     # secret path, which starts nothing.
+    import sys
+
+    # Preserve grep's match/no-match statuses without requiring a Unix utility.
+    scan = (
+        "import pathlib, re, sys; "
+        "pattern = re.compile(sys.argv[2]); "
+        "matches = [f'{path}:{n}:{line}' "
+        "for path in pathlib.Path(sys.argv[1]).rglob('*.py') "
+        "for n, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1) "
+        "if pattern.search(line)]; "
+        "print('\\n'.join(matches)) if matches else None; "
+        "sys.exit(0 if matches else 1)"
+    )
     found = subprocess.run(
-        ["grep", "-rnE", "--include=*.py", r"start-llm|llama-server|[\"']docker[\"']",
-         str(SRC)],
+        [sys.executable, "-c", scan, str(SRC), r"start-llm|llama-server|[\"']docker[\"']"],
         capture_output=True, text=True,
     )
     assert found.returncode == 1 and found.stdout == ""

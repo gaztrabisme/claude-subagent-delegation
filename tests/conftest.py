@@ -342,6 +342,39 @@ def mock_endpoint():
 
 CODEX_FIXTURES = Path(__file__).parent / "fixtures" / "codex"
 
+
+def write_fake_cli(binary: Path, source: str) -> Path:
+    """Install a Python fake with a native launcher on Windows."""
+    binary.write_text(f"#!{sys.executable}\n{source}", encoding="utf-8")
+    binary.chmod(0o755)
+    if sys.platform != "win32":
+        return binary
+    script = binary.with_suffix(".py")
+    binary.rename(script)
+    launcher = binary.with_suffix(".cmd")
+    launcher.write_text(
+        f'@echo off\n"{sys.executable}" "{script}" %*\nexit /b %errorlevel%\n',
+        encoding="utf-8",
+    )
+    return launcher
+
+
+@pytest.fixture(autouse=True)
+def _verification_stubs(monkeypatch, tmp_path_factory):
+    """Supply the tests' no-op verification commands to cmd.exe.
+
+    These stand in for the Unix true/false utilities; real verification still
+    goes through the classifier and a subprocess, with its exit status intact.
+    """
+    if sys.platform == "win32":
+        # Keep harness files outside the test's working directory: tests may
+        # assert its exact contents to detect leaked runtime files.
+        bindir = tmp_path_factory.mktemp("verification-bin")
+        for name, code in (("true", 0), ("false", 1)):
+            (bindir / f"{name}.cmd").write_text(f"@exit /b {code}\n")
+        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+
 FAKE_CODEX = """\
 import json, os, sys
 argv = sys.argv[1:]
@@ -373,8 +406,7 @@ def fake_codex(tmp_path: Path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     binary = bindir / "codex"
-    binary.write_text(f"#!{sys.executable}\n{FAKE_CODEX}")
-    binary.chmod(0o755)
+    binary = write_fake_cli(binary, FAKE_CODEX)
     record = tmp_path / "codex-calls.jsonl"
     user_home = tmp_path / "user-codex"
     user_home.mkdir()

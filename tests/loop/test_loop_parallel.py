@@ -1,6 +1,8 @@
 """Parallel rounds: one git worktree per part, merge of owned files only, then the full suite."""
 
 import json
+import shutil
+import stat
 import subprocess
 import unittest
 
@@ -67,7 +69,17 @@ class Parallel(Sandbox):
 
     def test_needs_git(self):
         root = self.project({"ab.test.js": AB_TEST})
-        subprocess.run(["rm", "-rf", ".git"], cwd=root, check=True)
+
+        def remove_readonly(function, path, exc_info):
+            # Git objects can be read-only on Windows; this is fixture cleanup.
+            if not isinstance(exc_info[1], PermissionError):
+                raise exc_info[1]
+            from pathlib import Path
+
+            Path(path).chmod(stat.S_IWRITE)
+            function(path)
+
+        shutil.rmtree(root / ".git", onerror=remove_readonly)
         code, r = self.delegate("run", "--parallel", ".subagent/parallel.json", cwd=root, scenario="par")
         self.assertEqual(r["status"], "unsupported")
 

@@ -4,6 +4,7 @@ review's own commands."""
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -74,6 +75,7 @@ def denied(cmds: list[str], ws: Path) -> None:
 # --- G1: ~+ ~- and unknown ~name are unresolved --------------------------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix shell ~user, ~+ and ~- expansion")
 def test_g1_tilde_plus_minus_are_unresolved(ws):
     denied([
         "cat ~+/../../../../../../Users/GaryT/.ssh/config",

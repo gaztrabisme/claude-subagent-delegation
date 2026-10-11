@@ -9,7 +9,6 @@ guard label, the XAI_API_KEY handoff, and that a spent-balance result (the
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -115,8 +114,9 @@ def fake_grok(tmp_path: Path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     binary = bindir / "grok"
-    binary.write_text(f"#!{sys.executable}\n{FAKE_GROK}")
-    binary.chmod(0o755)
+    from .conftest import write_fake_cli
+
+    binary = write_fake_cli(binary, FAKE_GROK)
     record = tmp_path / "grok-calls.jsonl"
     monkeypatch.setenv("FAKE_GROK_RECORD", str(record))
     monkeypatch.setenv("FAKE_GROK_FIXTURE", str(FIXTURES / "402.jsonl"))

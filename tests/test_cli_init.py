@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from subagent import config
@@ -50,8 +51,9 @@ def test_from_env_codex_on_path(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SAM_CODEX_BIN", raising=False)
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "codex").write_text("#!/bin/sh\n")
-    (bindir / "codex").chmod(0o755)
+    binary = bindir / ("codex.cmd" if sys.platform == "win32" else "codex")
+    binary.write_text("@exit /b 0\n" if sys.platform == "win32" else "#!/bin/sh\n")
+    binary.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     dest = tmp_path / "config.toml"
     assert main(["init", "--from-env", "--path", str(dest)]) == 0

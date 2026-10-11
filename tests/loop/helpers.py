@@ -47,13 +47,19 @@ class Sandbox(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
-        (bin_dir / "copilot").symlink_to(FAKES / "fake_copilot.py")
-        (bin_dir / "claude").symlink_to(FAKES / "fake_claude.py")
+        for name in ("copilot", "claude"):
+            if sys.platform == "win32":
+                (bin_dir / f"{name}.cmd").write_text(
+                    f'@echo off\n"{sys.executable}" "{FAKES / f"fake_{name}.py"}" %*\n'
+                    'exit /b %errorlevel%\n', encoding="utf-8",
+                )
+            else:
+                (bin_dir / name).symlink_to(FAKES / f"fake_{name}.py")
         home = self.tmp / "home"
         home.mkdir()
         src = str(REPO / "src")
         pythonpath = os.pathsep.join([src, os.environ["PYTHONPATH"]]) if os.environ.get("PYTHONPATH") else src
-        self.env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(home),
+        self.env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HOME": str(home),
                     "XDG_CONFIG_HOME": str(home / ".config"), "SUBAGENT_LIVE_VIEW": "off",
                     "PYTHONPATH": pythonpath,
                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
@@ -82,6 +88,11 @@ class Sandbox(unittest.TestCase):
         }
         loop.update(loop_overrides)
         scalars = {k: v for k, v in loop.items() if not isinstance(v, dict)}
+        binaries = {
+            name: str(self.tmp / "bin" / f"{name}.cmd"
+                      if sys.platform == "win32" else FAKES / f"fake_{name}.py")
+            for name in ("copilot", "claude")
+        }
         targets = (("tiers.normal", loop["tiers"]["normal"]), ("tiers.hard", loop["tiers"]["hard"]),
                    ("review", loop["review"]), ("review.hard", loop["review_hard"]),
                    ("test_writer", loop["test_writer"]))
@@ -93,22 +104,22 @@ class Sandbox(unittest.TestCase):
             "[core]",
             "default_provider = \"fake\"",
             "run_timeout = 60",
-            f'session_root = "{self.tmp / "sessions"}"',
+            f'session_root = {json.dumps(str(self.tmp / "sessions"))}',
             ('child_env_passthrough = ["FAKE_SCRIPT", "FAKE_MODEL", "FAKE_PROMPT", '
              '"FAKE_FAIL_MODEL", "AUTO_SCENARIO", "OUT", "REVIEWER", "TR"]'),
             "",
             "[guard]",
             "supervisor = \"deterministic\"",
-            f'approval_socket = "{self.tmp / "approval.sock"}"',
+            f'approval_socket = {json.dumps(str(self.tmp / "approval.sock"))}',
             "",
             "[providers.fake]",
             "driver = \"copilot\"",
-            f'binary = "{FAKES / "fake_copilot.py"}"',
+            f'binary = {json.dumps(binaries["copilot"])}',
             "loop = true",
             "",
             "[providers.fakeclaude]",
             "driver = \"claude\"",
-            f'binary = "{FAKES / "fake_claude.py"}"',
+            f'binary = {json.dumps(binaries["claude"])}',
             "base_url = \"http://127.0.0.1:1\"",
             "api_key = \"fake\"",
             "",

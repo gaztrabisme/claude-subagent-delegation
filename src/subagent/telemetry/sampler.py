@@ -96,7 +96,8 @@ def _http_get(url: str, headers: dict[str, str] | None = None,
 
 def _run(argv: list[str], timeout: float = PROBE_TIMEOUT) -> str:
     """stdout of `argv`. Raises on a non-zero exit, a timeout or a missing binary."""
-    out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    out = subprocess.run(argv, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=timeout)
     if out.returncode != 0:
         detail = (out.stderr or out.stdout).strip()[:200]
         raise RuntimeError(f"{argv[0]} exited {out.returncode}: {detail}")

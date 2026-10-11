@@ -93,7 +93,8 @@ def _http_get(url: str, headers: dict[str, str] | None = None,
 def _run(argv: list[str], timeout: float = RESOLVE_TIMEOUT) -> str:
     """stdout of `argv`, or "" on any failure. Never raises."""
     try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         log.info("resolve command failed: %s", exc)
         return ""

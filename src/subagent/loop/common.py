@@ -85,8 +85,9 @@ GIT_IDENTITY = {
 
 
 def git(root, *args, env=None, check=True, text=True):
+    decoding = {"encoding": "utf-8", "errors": "replace"} if text else {}
     proc = subprocess.run(["git", *args], cwd=root, env={**os.environ, **GIT_IDENTITY, **(env or {})},
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text)
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, **decoding)
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.stdout.strip() if text else proc.stdout
@@ -98,7 +99,8 @@ def git_prefix(root):
         if git(root, "rev-parse", "--is-inside-work-tree") != "true":
             return None
         proc = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=root,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              text=True, encoding="utf-8", errors="replace")
         return proc.stdout.strip()
     except (RuntimeError, FileNotFoundError):
         return None

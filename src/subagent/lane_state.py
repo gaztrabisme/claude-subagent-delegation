@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -108,9 +109,24 @@ class LaneState:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            os.replace(tmp, self.path)
+            # Windows readers and virus scanners can briefly hold a handle
+            # without delete sharing. Keep the atomic replacement, but allow
+            # those handles to close before abandoning the write.
+            for attempt in range(6):
+                try:
+                    os.replace(tmp, self.path)
+                    break
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 5:
+                        raise
+                    time.sleep(0.01 * (2 ** attempt))
         except OSError:
             log.warning("could not write lane state %s", self.path, exc_info=True)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove lane state temp file %s", tmp, exc_info=True)
 
     def closed(self, lane: str, now: datetime | None = None) -> dict[str, Any] | None:
         """The entry closing `lane`, or None when it is open.

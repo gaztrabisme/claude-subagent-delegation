@@ -105,3 +105,42 @@ def test_windows_denial_overrides_bash_allow(home, tmp_path):
 def test_windows_bash_verdict_matches_original_policy(command, tmp_path):
     original = guard._classify_bash(command, tmp_path)
     assert guard.classify_bash(command, tmp_path).action == original.action
+
+
+@pytest.mark.parametrize("form", [
+    'type notes.txt > {target}', 'type notes.txt >> {target}',
+    'type notes.txt 2>{target}', 'type notes.txt &> {target}',
+    'type notes.txt >| {target}', 'Out-File -FilePath {target}',
+    'Set-Content -LiteralPath {target} -Value hello',
+    'Add-Content -Path {target} -Value hello', 'Tee-Object -FilePath {target}',
+    'Copy-Item notes.txt -Destination {target}', 'copy notes.txt {target}',
+    'cp notes.txt {target}', 'Move-Item notes.txt -Destination {target}',
+    'move notes.txt {target}', 'mv notes.txt {target}',
+    'Remove-Item -LiteralPath {target}', 'del {target}', 'rm {target}',
+    'touch {target}', 'mkdir {target}',
+    'type notes.txt | Out-File -FilePath:{target}',
+    'type notes.txt & copy notes.txt {target}',
+    'type notes.txt; Set-Content -Path:{target} -Value hello',
+])
+@pytest.mark.parametrize("outside", [False, True])
+@pytest.mark.parametrize("quoted", [False, True])
+def test_native_write_boundaries(form, outside, quoted, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = (tmp_path if outside else workspace) / "output.txt"
+    spelling = f'"{target}"' if quoted else str(target)
+    verdict = guard.classify_bash(form.format(target=spelling), workspace)
+    if outside:
+        assert verdict.action == guard.DENY
+        assert "outside the workspace" in verdict.reason
+    else:
+        assert verdict.action != guard.DENY
+
+
+def test_native_redirect_protects_context(tmp_path):
+    target = tmp_path / "locked.py"
+    verdict = guard.classify_bash(
+        f'type notes.txt > "{target}"', tmp_path,
+        context={"protected": [str(target)]},
+    )
+    assert verdict.action == guard.DENY

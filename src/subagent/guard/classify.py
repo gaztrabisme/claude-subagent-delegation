@@ -486,6 +486,14 @@ WINDOWS_READ_ONLY = frozenset({
     "type", "get-content", "gc", "more", "select-string", "sls",
 })
 
+# Only used for the additive denial pass; these aliases grant no allowances.
+WINDOWS_WRITERS = {
+    "out-file": "tee", "set-content": "tee", "add-content": "tee",
+    "tee-object": "tee", "copy-item": "cp", "copy": "cp",
+    "move-item": "mv", "move": "mv", "remove-item": "rm", "del": "rm",
+    "mkdir": "touch", "new-item": "touch",
+}
+
 
 def _windows_home(word: str) -> str:
     return re.sub(
@@ -524,6 +532,43 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
                 why = is_sensitive(path) or protected(path)
                 if why:
                     return Verdict(DENY, f"refused: {why}", {"sensitive_path": str(path)})
+
+        # Quote the native tokens back into bash words so its policy sees the
+        # actual Windows paths, without shlex consuming their backslashes.
+        # Reuse its redirect, write, delete and guard-context denials verbatim.
+        # Background and grouping operators also begin command heads, even
+        # though bash policy will escalate those unsupported constructs.
+        segments, _ = _split([";" if w in {"&", "(", ")"} else w for w in native])
+        normalized = []
+        for separator, words in segments:
+            if separator:
+                normalized.append(separator)
+            expanded = []
+            for word in words:
+                word = _windows_home(word).replace("\\", "/")
+                option = re.match(
+                    r"^-(?:Path|LiteralPath|FilePath|Destination|OutFile):(.*)$",
+                    word, re.IGNORECASE,
+                )
+                if option:
+                    expanded.append(word.split(":", 1)[0])
+                    word = option.group(1)
+                if re.match(r"^[A-Za-z]:[^/]", word):
+                    word = str(_resolve(word, cwd)).replace("\\", "/")
+                expanded.append(word)
+            words = expanded
+            executable, _ = _strip_prefixes(words)
+            if executable:
+                index = len(words) - len(executable)
+                name = PurePosixPath(words[index]).name.lower()
+                if name in WINDOWS_WRITERS or name in WRITE_COMMANDS or name in {
+                    "rm", "rmdir", "shred", "unlink",
+                }:
+                    words[index] = WINDOWS_WRITERS.get(name, name)
+            normalized.extend(words)
+        native_verdict = _classify_bash(_join(normalized), workspace, cwd, context)
+        if native_verdict.action == DENY:
+            return native_verdict
 
     verdict = _classify_bash(command, workspace, cwd, context)
     if native is None or verdict.action == DENY:

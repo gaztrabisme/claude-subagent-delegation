@@ -219,7 +219,8 @@ class ClaudeProvider:
         try:
             settings.hooks_config(agent_id, cfg, cfg.model)
             probe = subprocess.run(
-                [binary, "--version"], capture_output=True, text=True, timeout=10
+                [binary, "--version"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=10
             )
             if probe.returncode != 0:
                 return (

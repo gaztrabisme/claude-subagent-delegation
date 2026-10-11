@@ -188,7 +188,8 @@ def run_tests(root, test_cmd, log_dir=None, label="test"):
     """Run the test command; returns {passed, exit_code, cmd, counts, output_tail?, log?}."""
     env = {**os.environ, "CI": "1"}  # keeps vitest/jest out of watch mode
     proc = subprocess.run(test_cmd, shell=True, cwd=root, env=env, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding="utf-8", errors="replace")
     result = {"passed": proc.returncode == 0, "exit_code": proc.returncode, "cmd": test_cmd,
               "counts": parse_test_counts(proc.stdout)}
     if log_dir is not None:

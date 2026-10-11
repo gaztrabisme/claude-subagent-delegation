@@ -62,6 +62,10 @@ def test_workspace_commands(command, tmp_path):
     "type file.txt & mystery", "gc file.txt; mystery", "gc @('file.txt')",
     "gc file.txt,other.txt", "", "# comment",
     "CI=1", "sort README.md /o output.txt", "gc .\\*.txt",
+    "Get-Content Env:OPENAI_API_KEY", "Get-Content notes.txt:stream",
+    "Get-Content –Path notes.txt", "Get-Content —Path notes.txt",
+    "Get-Content “notes.txt”", "Get-Content ‘notes.txt’",
+    "Get-Content C:notes.txt",
 ])
 def test_unreadable_commands_escalate(command, tmp_path):
     assert guard.classify_bash(command, tmp_path).action == guard.ESCALATE

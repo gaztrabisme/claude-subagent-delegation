@@ -48,6 +48,8 @@ KIND_CLI_ERROR = "cli_error"
 # and they are the only items that count as work. An agent_message is the
 # child talking, which a refusal turn also does.
 STEP_ITEMS = frozenset({"command_execution", "file_change"})
+# The translated event for a step item Codex has started.
+TOOL_STARTED = "codex/tool_started"
 
 _USAGE_LIMIT_RE = re.compile(r"usage limit", re.IGNORECASE)
 _CONTEXT_RE = re.compile(r"context window", re.IGNORECASE)
@@ -190,10 +192,23 @@ class Translator:
                 return [self._assistant([{"type": "text", "text": text}])]
             if item_type in STEP_ITEMS:
                 name, args = _tool_use(item)
-                return [self._assistant([{"type": "tool_use", "name": name, "input": args}])]
+                block = {"type": "tool_use", "name": name, "input": args}
+                if item.get("id"):
+                    block["id"] = item["id"]
+                return [self._assistant([block])]
             return [{"type": f"codex/{item_type or 'item'}"}]
-        if kind in ("item.started", "item.updated"):
-            return []  # counted once, at item.completed
+        if kind == "item.started":
+            # Counted as a step at item.completed. Codex calls the guard hook
+            # before it starts a command, so the hook-silence check
+            # (Agent._hook_silence) reads this to stop the run before the
+            # unguarded command gets far.
+            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            if item.get("type") in STEP_ITEMS:
+                return [{"type": TOOL_STARTED, "item_id": item.get("id"),
+                         "name": _tool_use(item)[0]}]
+            return []
+        if kind == "item.updated":
+            return []
         if kind == "turn.completed":
             self.terminal = True
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}

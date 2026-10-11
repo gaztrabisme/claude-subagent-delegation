@@ -316,9 +316,20 @@ class Process:
             if isinstance(event, dict):
                 yield event
 
-    def kill(self) -> None:
+    def kill(self, force: bool = False) -> None:
+        """Stop the child and its tree: politely, then forcefully after 5s.
+
+        `force` skips the polite request, for a child that must not take one
+        more step (a Windows console child ignores taskkill without /F).
+        """
         proc = self._proc
         if proc is None or proc.poll() is not None:
+            return
+        if force:
+            try:
+                kill_tree(proc, force=True)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
             return
         try:
             kill_tree(proc)

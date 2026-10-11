@@ -144,7 +144,7 @@ class Trace:
         extra: dict[str, Any] = {}
         verdicts = self.take_verdicts(run.agent_id)
         guard = guard or getattr(run, "guard", None) or "hook"
-        if (
+        if getattr(run, "finish_reason", None) == "guard_hook_silent" or (
             getattr(run, "driver", None) == "codex"
             and "hook" in guard
             and run.usage.steps > 0

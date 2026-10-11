@@ -302,6 +302,20 @@ def _user_defaults(home: Path) -> dict[str, str]:
     }
 
 
+def _user_windows(home: Path) -> dict[str, str]:
+    """The string settings of the user's [windows] table (sandbox mode), if set."""
+    try:
+        import tomllib
+
+        data = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError, ImportError):
+        return {}
+    table = data.get("windows")
+    if not isinstance(table, dict):
+        return {}
+    return {key: value for key, value in table.items() if isinstance(value, str)}
+
+
 def prepare_home(
     settings: Settings, agent_id: str, cfg: ProviderConfig, source: Path | None = None
 ) -> Path:
@@ -325,6 +339,11 @@ def prepare_home(
         for key, value in _user_defaults(source).items():
             lines.append(f"{key} = {_toml_string(value)}")
     lines.append('approval_policy = "never"')
+    # On Windows the workspace-write sandbox needs the user's sandbox mode;
+    # without it Codex runs the turn read-only.
+    for key, value in _user_windows(source).items():
+        lines.extend(["", "[windows]"] if "[windows]" not in lines else [])
+        lines.append(f"{key} = {_toml_string(value)}")
     (home / "config.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     if settings.supervisor == "off":

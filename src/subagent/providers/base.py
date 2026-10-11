@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import threading
 from collections.abc import Iterator, Mapping
@@ -21,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlsplit
+
+from ..proctree import kill_tree
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..config import Settings
@@ -320,14 +321,14 @@ class Process:
         if proc is None or proc.poll() is not None:
             return
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            kill_tree(proc)
         except (ProcessLookupError, PermissionError, OSError):
             proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                kill_tree(proc, force=True)
             except (ProcessLookupError, PermissionError, OSError):
                 proc.kill()
 

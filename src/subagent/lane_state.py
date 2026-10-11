@@ -19,9 +19,9 @@ processes on one session root cannot lose each other's closures.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
+import sys
 import threading
 from collections.abc import Iterator
 from datetime import datetime, timedelta
@@ -29,6 +29,18 @@ from pathlib import Path
 from typing import Any
 
 from .config import log
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_file(handle: Any) -> None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+else:
+    import fcntl
+
+    def _lock_file(handle: Any) -> None:
+        fcntl.flock(handle, fcntl.LOCK_EX)
 
 FILENAME = "lane_state.json"
 # The longest an entry keeps a lane closed (router.MAX_CLOSE).
@@ -82,7 +94,7 @@ class LaneState:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 handle = open(self.path.with_name(FILENAME + ".lock"), "a")  # noqa: SIM115
-                fcntl.flock(handle, fcntl.LOCK_EX)
+                _lock_file(handle)
             except OSError:
                 log.warning("could not lock lane state %s", self.path, exc_info=True)
             try:

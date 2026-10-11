@@ -3,11 +3,12 @@
 import json
 import os
 import shutil
-import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
+
+from ..proctree import kill_tree
 
 END_MARKER = "=== end"
 
@@ -127,11 +128,11 @@ class LiveLog:
 
 def _kill_group(proc):
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        kill_tree(proc)
         proc.wait(timeout=10)
     except (ProcessLookupError, subprocess.TimeoutExpired):
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            kill_tree(proc, force=True)
         except ProcessLookupError:
             pass
         proc.wait()

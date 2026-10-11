@@ -34,18 +34,25 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shlex
+import socket
 import subprocess
+import sys
 import time
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import anyio
+from anyio.abc import SocketAttribute
 from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapability
 
 from ..config import Settings, log
 from .classify import ALLOW, DENY, ESCALATE, Verdict, classify
+
+# Windows uses loopback TCP plus a token; the hook (approval_hook.py) makes the same choice.
+USE_UNIX_SOCKET = hasattr(socket, "AF_UNIX") and sys.platform != "win32"
 
 
 def _classify(tool_name, tool_input, workspace, cwd=None, guard_context=None):
@@ -91,6 +98,8 @@ class Supervisor:
         # side supplies, and the security boundary should not read it.
         self.registry = registry
         self.socket_path = Path(settings.approval_socket)
+        # Set only on the loopback-TCP transport (no AF_UNIX).
+        self._token: str | None = None
         self._session: Any = None
         # Unresolved until a tool call brings a session to read capabilities
         # from. Reporting DETERMINISTIC before that reads as "escalation will
@@ -340,8 +349,20 @@ class Supervisor:
         if self.socket_path.exists():
             self.socket_path.unlink()
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        listener = await anyio.create_unix_listener(self.socket_path)
-        os.chmod(self.socket_path, 0o600)
+        if USE_UNIX_SOCKET:
+            listener = await anyio.create_unix_listener(self.socket_path)
+            os.chmod(self.socket_path, 0o600)
+        else:
+            # No unix sockets (Windows): listen on loopback and leave the address
+            # and a per-server token in the socket file. A request without the
+            # token is answered with a deny.
+            listener = await anyio.create_tcp_listener(local_host="127.0.0.1", local_port=0)
+            port = listener.listeners[0].extra(SocketAttribute.local_port)
+            self._token = secrets.token_hex(16)
+            self.socket_path.write_text(
+                json.dumps({"host": "127.0.0.1", "port": port, "token": self._token}),
+                encoding="utf-8",
+            )
         task_status.started()
         async with listener:
             await listener.serve(self._handle)
@@ -358,6 +379,10 @@ class Supervisor:
             try:
                 raw = await _read_line(stream)
                 request = json.loads(raw)
+                if self._token is not None and not secrets.compare_digest(
+                    str(request.get("token") or ""), self._token
+                ):
+                    raise PermissionError("approval request without the server token")
                 agent_id = request.get("agent_id") or None
                 workspace, guard_context = self.workspace_for(agent_id, request.get("workspace"))
                 verdict = await self.decide(

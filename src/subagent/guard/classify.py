@@ -620,6 +620,273 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
     return Verdict(ALLOW, f"`{native[0]}` reads workspace paths", verdict.facts)
 
 
+# --- PowerShell -----------------------------------------------------------------
+#
+# Codex on Windows runs its shell calls in PowerShell. The bash reading above
+# still judges every such line first and keeps its denials; this reading can
+# only add an allowance, for a short list of cmdlets on workspace paths and
+# pipelines of them. Anything it cannot read exactly returns None.
+
+POWERSHELL = "powershell"
+
+
+@dataclass(frozen=True)
+class _Cmdlet:
+    name: str
+    writes: bool = False
+    switches: frozenset[str] = frozenset()
+    values: frozenset[str] = frozenset()  # parameters whose value is data, not a path
+    numbers: frozenset[str] = frozenset()  # parameters whose value is a whole number
+    paths: frozenset[str] = frozenset({"path", "literalpath"})
+    # What bare (positional) words mean, in order; the last entry repeats.
+    positional: tuple[str, ...] = ("path",)
+
+
+_PS_CMDLETS = {
+    cmdlet.name: cmdlet
+    for cmdlet in (
+        _Cmdlet("Get-Content", switches=frozenset({"raw"}), values=frozenset({"encoding"}),
+                numbers=frozenset({"totalcount", "head", "first", "tail"})),
+        _Cmdlet("Set-Content", writes=True, switches=frozenset({"nonewline"}),
+                values=frozenset({"encoding", "value"}), positional=("path", "value", None)),
+        _Cmdlet("Out-File", writes=True, switches=frozenset({"nonewline", "append"}),
+                values=frozenset({"encoding"}),
+                paths=frozenset({"filepath", "literalpath", "path"}),
+                positional=("path", None)),
+        _Cmdlet("Get-ChildItem",
+                switches=frozenset({"recurse", "file", "directory", "name", "force"}),
+                values=frozenset({"filter", "include", "exclude"}),
+                numbers=frozenset({"depth"}), positional=("path", "filter", None)),
+        _Cmdlet("Select-String",
+                switches=frozenset({"simplematch", "casesensitive", "notmatch", "list",
+                                    "quiet", "allmatches"}),
+                values=frozenset({"pattern", "encoding"}), numbers=frozenset({"context"}),
+                positional=("pattern", "path")),
+        _Cmdlet("Test-Path", values=frozenset({"pathtype"})),
+    )
+}
+_PS_ALIASES = {
+    "get-content": "Get-Content", "gc": "Get-Content", "cat": "Get-Content",
+    "type": "Get-Content",
+    "set-content": "Set-Content",
+    "out-file": "Out-File",
+    "get-childitem": "Get-ChildItem", "gci": "Get-ChildItem", "ls": "Get-ChildItem",
+    "dir": "Get-ChildItem",
+    "select-string": "Select-String", "sls": "Select-String",
+    "test-path": "Test-Path",
+}
+# Unquoted, these start PowerShell syntax this reading does not follow:
+# statements, script blocks, subexpressions, arrays, variables, redirection,
+# comments, escapes, wildcard classes and the stop-parsing token.
+_PS_UNQUOTED = set(";&(){}@$`,<>#[]%=!")
+# PowerShell reads typographic dashes as `-` and typographic quotes as quotes.
+_PS_LOOKALIKES = set("–—―‘’‚‛“”„")
+
+
+def _ps_tokens(command: str) -> list[tuple[str, bool]] | None:
+    """`(text, quoted)` words and `("|", False)` pipes, or None when the line
+    uses anything beyond bare words, plain quotes and pipes.
+
+    Single quotes are literal (`''` is one quote). Double quotes are accepted
+    only without `$` or a backtick, where PowerShell does not expand them.
+    """
+    if any(ch in _PS_LOOKALIKES or ch in "\r\n\0" for ch in command):
+        return None
+    tokens: list[tuple[str, bool]] = []
+    index, length = 0, len(command)
+    while index < length:
+        ch = command[index]
+        if ch in " \t":
+            index += 1
+            continue
+        if ch == "|":
+            if command[index + 1:index + 2] == "|":
+                return None
+            tokens.append(("|", False))
+            index += 1
+            continue
+        text, quoted = "", False
+        while index < length and command[index] not in " \t|":
+            ch = command[index]
+            if ch == "'":
+                quoted = True
+                index += 1
+                while True:
+                    if index >= length:
+                        return None
+                    if command[index] == "'":
+                        if command[index + 1:index + 2] == "'":
+                            text += "'"
+                            index += 2
+                            continue
+                        index += 1
+                        break
+                    text += command[index]
+                    index += 1
+            elif ch == '"':
+                quoted = True
+                end = command.find('"', index + 1)
+                if end < 0:
+                    return None
+                inner = command[index + 1:end]
+                if "$" in inner or "`" in inner:
+                    return None
+                text += inner
+                index = end + 1
+            elif ch in _PS_UNQUOTED:
+                return None
+            else:
+                text += ch
+                index += 1
+        tokens.append((text, quoted))
+    return tokens
+
+
+def _ps_path(word: str, cwd: Path, workspace: Path) -> Path | None:
+    """A cmdlet path argument as a workspace path, or None.
+
+    Refuses provider paths (`Env:`, `HKLM:`, `Function:`), alternate data
+    streams, UNC and device paths: anything with a colon other than a drive
+    letter, or a leading `\\\\`.
+    """
+    if not word or word.startswith(("\\\\", "//")):
+        return None
+    if ":" in (word[2:] if re.match(r"^[A-Za-z]:[\\/]", word) else word):
+        return None
+    if _unresolvable(word) and not word.startswith("~"):
+        return None
+    path = _resolve(_windows_home(word), cwd)
+    if not _inside_both(path, workspace):
+        return None
+    if is_sensitive(path) or protected(path) or _protected_git_state(path, workspace):
+        return None
+    return path
+
+
+def _ps_segment(
+    words: list[tuple[str, bool]], workspace: Path, cwd: Path, context: dict | None,
+) -> tuple[str, list[Path], list[Path]] | None:
+    """`(cmdlet, read paths, written paths)` for one pipeline element, or None."""
+    if not words or words[0][1]:
+        return None
+    name = _PS_ALIASES.get(words[0][0].lower())
+    if name is None:
+        return None
+    cmdlet = _PS_CMDLETS[name]
+    named: dict[str, str] = {}
+    bare: list[str] = []
+    index = 1
+    while index < len(words):
+        text, quoted = words[index]
+        index += 1
+        if quoted or not text.startswith("-") or len(text) < 2:
+            bare.append(text)
+            continue
+        parameter, colon, glued = text[1:].partition(":")
+        parameter = parameter.lower()
+        if parameter in cmdlet.switches:
+            if colon:  # `-Recurse:$false` and friends
+                return None
+            named[parameter] = ""
+            continue
+        if parameter not in cmdlet.values | cmdlet.numbers | cmdlet.paths:
+            return None  # unknown, abbreviated or common parameter
+        if parameter in named:
+            return None
+        if colon:
+            value = glued
+        elif index < len(words) and words[index][0] != "|":
+            value = words[index][0]
+            index += 1
+        else:
+            return None
+        if parameter in cmdlet.numbers and not value.isdigit():
+            return None
+        named[parameter] = value
+
+    targets = [named[p] for p in cmdlet.paths if p in named]
+
+    def filled(slot: str) -> bool:
+        return bool(targets) if slot == "path" else slot in named
+
+    # PowerShell binds bare words to the positional parameters not already
+    # named, in order; the last slot takes every remaining word.
+    position, last = 0, len(cmdlet.positional) - 1
+    for text in bare:
+        while position < last and cmdlet.positional[position] is not None and filled(
+            cmdlet.positional[position]
+        ):
+            position += 1
+        slot = cmdlet.positional[min(position, last)]
+        position += 1
+        if slot is None:
+            return None
+        if slot == "path":
+            targets.append(text)
+        else:
+            named[slot] = text
+    if len(targets) > 1 and cmdlet.writes:
+        return None  # a write names one target
+    paths = []
+    for word in targets:
+        path = _ps_path(word, cwd, workspace)
+        if path is None:
+            return None
+        paths.append(path)
+    if cmdlet.writes:
+        if not paths:
+            return None
+        protected_paths, state_allow, state_root = _guard_rules(context, workspace)
+        target = paths[0]
+        if context and (_under_folded(target, protected_paths) or (
+            _under_folded(target, state_root) and not _under_folded(target, state_allow)
+        )):
+            return None
+        return name, [], paths
+    if name == "Select-String" and "pattern" not in named:
+        return None
+    return name, paths, []
+
+
+def classify_powershell(
+    command: str, workspace: Path, cwd: Path | None = None, context: dict | None = None,
+) -> Verdict | None:
+    """ALLOW for a PowerShell line this reading can clear, else None.
+
+    Cleared: Get-Content, Set-Content, Out-File, Get-ChildItem, Select-String
+    and Test-Path on workspace paths, alone or piped into each other. None
+    means "not cleared here": the caller keeps its own verdict.
+    """
+    cwd = cwd or workspace
+    tokens = _ps_tokens(command)
+    if not tokens:
+        return None
+    segments: list[list[tuple[str, bool]]] = [[]]
+    for token in tokens:
+        if token == ("|", False):
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    programs, reads, writes = [], [], []
+    for words in segments:
+        judged = _ps_segment(words, workspace, cwd, context)
+        if judged is None:
+            return None
+        programs.append(judged[0])
+        reads.extend(str(p) for p in judged[1])
+        writes.extend(str(p) for p in judged[2])
+    facts: dict[str, object] = {
+        "shell": POWERSHELL, "command_length": len(command), "programs": programs,
+        "compound": len(segments) > 1,
+    }
+    if reads:
+        facts["reads"] = reads
+    if writes:
+        facts["writes"] = writes
+    verb = "writes inside" if writes else "reads"
+    return Verdict(ALLOW, f"PowerShell `{' | '.join(programs)}` {verb} the workspace", facts)
+
+
 def _classify_bash(command: str, workspace: Path, cwd: Path | None = None,
                   context: dict | None = None) -> Verdict:
     """A bash command line.
@@ -1705,7 +1972,7 @@ def _working_dir(
 
 def classify(
     tool_name: str, tool_input: dict, workspace: Path, cwd: str | Path | None = None,
-    context: dict | None = None,
+    context: dict | None = None, shell: str | None = None,
 ) -> Verdict:
     """Classify one proposed tool call. Unknown shapes escalate, never allow.
 
@@ -1716,6 +1983,11 @@ def classify(
     `context` is `Agent.guard_context`: `protected` test paths (absolute) and
     `state_allow` state files (absolute). With it present, writes to protected
     paths or to the state dir outside the allowlist are denied here.
+
+    `shell` is the shell the child's commands run in, as the server knows it
+    (never a field the child supplies). With "powershell" a shell call the
+    bash reading did not deny gets a second, PowerShell reading, which can
+    only clear it (classify_powershell).
     """
     name = (tool_name or "").strip()
     protected, state_allow, state_root = _guard_rules(context, workspace)
@@ -1754,6 +2026,10 @@ def classify(
                 return Verdict(refused.action, refused.reason, {"tool": name, **refused.facts})
             base = own or base
         verdict = classify_bash(str(command), workspace, cwd=base, context=context)
+        if shell == POWERSHELL and verdict.action != DENY:
+            cleared = classify_powershell(str(command), workspace, cwd=base, context=context)
+            if cleared is not None:
+                verdict = cleared
         return Verdict(verdict.action, verdict.reason, {"tool": name, **verdict.facts})
     if name in WRITE_TOOLS or (context and name == "MultiEdit"):
         paths = _tool_paths(name, tool_input)

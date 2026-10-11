@@ -447,10 +447,13 @@ class Settings:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def guard_hook_argv(self, agent_id: str, *extra: str) -> list[str]:
+        """The PreToolUse guard hook argv for one agent, any driver."""
+        return [sys.executable, str(APPROVAL_HOOK), "--agent", agent_id, *extra]
+
     def guard_hook_command(self, agent_id: str, *extra: str) -> str:
-        """The PreToolUse guard hook command line for one agent, any driver."""
-        parts = [sys.executable, str(APPROVAL_HOOK), "--agent", agent_id, *extra]
-        return " ".join(shlex.quote(p) for p in parts)
+        """The guard hook as one POSIX shell command line (Claude Code runs it in bash)."""
+        return " ".join(shlex.quote(p) for p in self.guard_hook_argv(agent_id, *extra))
 
     @property
     def leaked_keys(self) -> tuple[str, ...]:

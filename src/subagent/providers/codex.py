@@ -22,7 +22,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
+import subprocess
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
@@ -316,6 +318,17 @@ def _user_windows(home: Path) -> dict[str, str]:
     return {key: value for key, value in table.items() if isinstance(value, str)}
 
 
+def guard_hook_command(settings: Settings, agent_id: str) -> str:
+    """The guard hook command line, quoted for the shell Codex runs hooks in.
+
+    On Windows Codex runs hook commands through a Windows shell, where POSIX
+    single quotes are literal characters: a single-quoted python path is not
+    found, the hook fails, and Codex runs the tool call anyway.
+    """
+    argv = settings.guard_hook_argv(agent_id, "--dialect", "codex")
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
 def prepare_home(
     settings: Settings, agent_id: str, cfg: ProviderConfig, source: Path | None = None
 ) -> Path:
@@ -355,9 +368,7 @@ def prepare_home(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": settings.guard_hook_command(
-                                agent_id, "--dialect", "codex"
-                            ),
+                            "command": guard_hook_command(settings, agent_id),
                             "timeout": int(settings.supervisor_timeout + 30),
                         }
                     ]

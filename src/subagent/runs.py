@@ -26,6 +26,7 @@ from .config import Settings, log
 from .guard.classify import protect
 from .lane_state import LaneState
 from .providers.base import ProviderConfig, Session
+from .providers.codex import TOOL_STARTED
 
 # classify_exit and exit_event are re-exported: they were part of this
 # module's surface before the drivers moved into providers/.
@@ -62,7 +63,9 @@ KILL_BUDGET = "budget"
 KILL_STEPS = "steps"
 KILL_SHUTDOWN = "shutdown"
 KILL_IDLE = "idle"
-KILL_IS_FAILURE = frozenset({KILL_TIMEOUT, KILL_LOOP, KILL_BUDGET, KILL_STEPS})
+# A Codex tool call the guard hook never reported: the hook did not run.
+KILL_HOOK_SILENT = "guard_hook_silent"
+KILL_IS_FAILURE = frozenset({KILL_TIMEOUT, KILL_LOOP, KILL_BUDGET, KILL_STEPS, KILL_HOOK_SILENT})
 
 DISTIL_PROMPT = """\
 Stop working on the task. Summarize what you did, for a different engineer who \
@@ -612,6 +615,13 @@ class Agent:
         self.delegate_verification: str | None = None
         # Tool-call signatures across every run of this agent (loop detector).
         self.signatures: Counter[str] = Counter()
+        # Guard hook invocations the supervisor received for this agent, and
+        # the Codex tool calls seen in its event stream. Compared only when a
+        # supervisor counts hooks (Registry.hooks_counted sets this).
+        self.hooks_counted = False
+        self.hook_calls = 0
+        self.tool_calls = 0
+        self._hook_lock = threading.Lock()
         self.created_at = _now()
         self._runs: dict[str, Run] = {}
         self._order: list[str] = []
@@ -632,6 +642,64 @@ class Agent:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def saw_hook(self) -> None:
+        """The supervisor received one guard hook invocation from this agent."""
+        with self._hook_lock:
+            self.hook_calls += 1
+
+    def _hook_silence(
+        self, run: Run, event: dict[str, Any], counted: set[str]
+    ) -> tuple[str, str] | None:
+        """The trip for a Codex tool call the guard hook did not report.
+
+        Codex runs a tool call anyway when its PreToolUse hook fails to start,
+        so a broken hook would otherwise leave the child guarded only by the
+        sandbox. Codex calls the hook, which asks the supervisor, before it
+        reports a command or patch as started, so by then every tool call must
+        have a hook invocation counted. The first one without stops the run.
+
+        A tool call is counted once, at its start event or, when Codex sent
+        none, at its completion; `counted` holds this attempt's item ids.
+        """
+        if (
+            not self.hooks_counted
+            or self.driver.name != providers.DRIVER_CODEX
+            or "hook" not in (run.guard or "")
+        ):
+            return None
+        kind = event.get("type")
+        if kind == TOOL_STARTED:
+            calls = [(str(event.get("name") or "?"), event.get("item_id"))]
+        elif kind == "assistant":
+            calls = [
+                (str(block.get("name") or "?"), block.get("id"))
+                for block in (event.get("message") or {}).get("content") or []
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            ]
+        else:
+            return None
+        fresh = []
+        for name, item in calls:
+            if item and item in counted:
+                continue
+            if item:
+                counted.add(item)
+            fresh.append(name)
+        if not fresh:
+            return None
+        with self._hook_lock:
+            self.tool_calls += len(fresh)
+            seen, made = self.hook_calls, self.tool_calls
+        if seen >= made:
+            return None
+        return (
+            KILL_HOOK_SILENT,
+            f"stopped: the guard hook did not run for Codex tool call {made} "
+            f"({fresh[-1]}); {seen} hook call(s) for {made} tool call(s). Without the "
+            "hook only Codex's sandbox guards the child, so the run was stopped. Check "
+            "the hook command in the agent's codex-home/hooks.json",
+        )
 
     @property
     def busy(self) -> bool:
@@ -1134,6 +1202,7 @@ class Agent:
             self._current = proc
             collected: list[dict[str, Any]] = []
             watch = _Watch(run, self.settings, self.signatures, self.cfg.max_steps)
+            counted: set[str] = set()  # Codex item ids counted by _hook_silence
             try:
                 for event in proc.events():
                     self.last_activity = _now()
@@ -1152,9 +1221,13 @@ class Agent:
                     # Trips are decided here, while the child still runs, so
                     # the kill below lands; deciding them after the stream
                     # ended could only relabel a run that had already finished.
-                    trip = watch.see(event)
+                    trip = self._hook_silence(run, event, counted) or watch.see(event)
                     if trip is not None and run.trip is None:
                         run.trip = trip
+                    if run.trip and run.trip[0] == KILL_HOOK_SILENT:
+                        # Unguarded: no grace period for one more tool call.
+                        proc.kill(force=True)
+                        break
                     if run.trip or self._closing:
                         proc.kill()
                         break
@@ -1269,7 +1342,7 @@ class Agent:
 
     def _ingest(self, run: Run, event: dict[str, Any]) -> None:
         kind = event.get("type")
-        if kind == "stream_event":
+        if kind in ("stream_event", TOOL_STARTED):
             return
         session = event.get("session_id")
         if isinstance(session, str) and session:
@@ -1394,6 +1467,9 @@ class Registry:
         protect(settings.session_root)
         self.lane_state = LaneState(settings.session_root)
         self._agents: dict[str, Agent] = {}
+        # Set by a Supervisor serving this registry: it counts each agent's
+        # guard hook calls, so a Codex run whose hook goes silent is stopped.
+        self.hooks_counted = False
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
@@ -1525,6 +1601,7 @@ class Registry:
                 telemetry=self.telemetry,
                 on_event=on_event,
             )
+            agent.hooks_counted = self.hooks_counted
             self._agents[claimed] = agent
             return agent
 
@@ -1612,6 +1689,7 @@ class Registry:
                 telemetry=self.telemetry,
                 on_event=on_event,
             )
+            agent.hooks_counted = self.hooks_counted
             session_id = record.get("session_id")
             if session_id:
                 # The authoritative resume id: `_spawn` re-applies it to the

@@ -177,7 +177,7 @@ def main() -> None:
     workspace = payload.get("cwd") or os.getcwd()
 
     reason = "allowed"
-    for name, args in requests(tool_name, tool_input, codex):
+    for part, (name, args) in enumerate(requests(tool_name, tool_input, codex)):
         request = {
             "tool_name": name,
             "tool_input": args,
@@ -185,6 +185,9 @@ def main() -> None:
             "cwd": payload.get("cwd"),
             "agent_id": agent_id(),
         }
+        if part:
+            # The supervisor counts hook invocations, not questions.
+            request["part"] = part
         try:
             reply = ask(socket_path, request)
         except (OSError, ValueError, KeyError, TypeError) as exc:

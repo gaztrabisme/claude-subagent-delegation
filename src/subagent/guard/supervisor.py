@@ -49,16 +49,16 @@ from anyio.abc import SocketAttribute
 from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapability
 
 from ..config import Settings, log
-from .classify import ALLOW, DENY, ESCALATE, Verdict, classify
+from .classify import ALLOW, DENY, ESCALATE, POWERSHELL, Verdict, classify
 
 # Windows uses loopback TCP plus a token; the hook (approval_hook.py) makes the same choice.
 USE_UNIX_SOCKET = hasattr(socket, "AF_UNIX") and sys.platform != "win32"
 
 
-def _classify(tool_name, tool_input, workspace, cwd=None, guard_context=None):
+def _classify(tool_name, tool_input, workspace, cwd=None, guard_context=None, shell=None):
     """`classify()` has no guard-context parameter yet (P2b adds the rules);
     this seam is where the supervisor passes it, so tests can observe it."""
-    return classify(tool_name, tool_input, workspace, cwd)
+    return classify(tool_name, tool_input, workspace, cwd, shell=shell)
 
 TIER_UNRESOLVED = "unresolved"
 TIER_AGENT = "agent"
@@ -97,6 +97,10 @@ class Supervisor:
         # against. The hook reports one too, but that is a field the supervised
         # side supplies, and the security boundary should not read it.
         self.registry = registry
+        if registry is not None and settings.supervisor != "off":
+            # Agents created from now on compare their tool calls with the hook
+            # calls counted here (saw_hook) and stop when the hook goes silent.
+            registry.hooks_counted = True
         self.socket_path = Path(settings.approval_socket)
         # Set only on the loopback-TCP transport (no AF_UNIX).
         self._token: str | None = None
@@ -166,6 +170,27 @@ class Supervisor:
             return self.settings.workspace, {}
         return (Path(fallback) if fallback else self.settings.workspace), {}
 
+    def shell_for(self, agent_id: str | None) -> str | None:
+        """The shell an agent's commands run in, from its driver: Codex on
+        Windows runs them in PowerShell. None means bash, the default reading."""
+        if sys.platform != "win32" or not agent_id or self.registry is None:
+            return None
+        agent = self.registry.find_agent(agent_id)
+        driver = getattr(getattr(agent, "driver", None), "name", None)
+        return POWERSHELL if driver == "codex" else None
+
+    def saw_hook(self, agent_id: str | None) -> None:
+        """Count a hook request against its agent, before it is judged.
+
+        The run loop compares this count with the child's tool calls and stops
+        a run whose hook went silent (Agent.hook_calls).
+        """
+        if not agent_id or self.registry is None:
+            return
+        agent = self.registry.find_agent(agent_id)
+        if agent is not None and hasattr(agent, "saw_hook"):
+            agent.saw_hook()
+
     async def decide(
         self,
         tool_name: str,
@@ -176,7 +201,9 @@ class Supervisor:
         guard_context: dict | None = None,
     ) -> Verdict:
         started = time.monotonic()
-        verdict = _classify(tool_name, tool_input, workspace, cwd, guard_context=guard_context)
+        shell = self.shell_for(agent_id)
+        verdict = _classify(tool_name, tool_input, workspace, cwd, guard_context=guard_context,
+                            **({"shell": shell} if shell else {}))
         if verdict.action != ESCALATE:
             self._record(verdict, tier="policy", tool=tool_name, agent_id=agent_id,
                          started=started)
@@ -384,6 +411,10 @@ class Supervisor:
                 ):
                     raise PermissionError("approval request without the server token")
                 agent_id = request.get("agent_id") or None
+                # One hook invocation may ask several questions (one per file
+                # of a patch); only its first counts as a hook call.
+                if not request.get("part"):
+                    self.saw_hook(agent_id)
                 workspace, guard_context = self.workspace_for(agent_id, request.get("workspace"))
                 verdict = await self.decide(
                     request.get("tool_name") or "",

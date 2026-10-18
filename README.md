@@ -49,12 +49,17 @@ The `delegate` tool's `model` argument selects any model the provider serves; `m
 is only the default.
 
 For servers such as oMLX that own generation settings, set `adapter = "strip_sampling"` on the
-provider. The relay removes top-level `temperature`, `top_p`, `top_k`, `min_p`, `max_tokens`,
+provider. The relay removes top-level `temperature`, `top_p`, `top_k`, `min_p`,
 `stop_sequences`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, and
 `thinking` from `/v1/messages` requests so client defaults cannot override the server's settings.
+oMLX requires `max_tokens`, so the relay pins it to the requested model's `max_model_len`
+from the upstream's `/v1/models`, using the request's authentication headers. The model map
+is cached per relay and refreshed once on a missing model id. If discovery fails or the
+model has no reported limit, the relay keeps the client's `max_tokens` and logs a warning.
+`/v1/messages/count_tokens` is unchanged by `strip_sampling`.
 Chain adapters in order with a comma-separated string, such as
-`adapter = "fold_system,strip_sampling"`. If rewriting fails, requests using `strip_sampling`
-are rejected rather than sent with generation settings.
+`adapter = "fold_system,strip_sampling"`. If body rewriting fails, requests using
+`strip_sampling` return HTTP 502.
 
 If you want to add an example provider that is not already configured, select it as the
 default, and check it:

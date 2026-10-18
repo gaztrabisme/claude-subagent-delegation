@@ -23,7 +23,9 @@ fold_system  llama.cpp's chat template for Qwen3.8 raises "System message must
              user message. The top-level `system` stays first and unchanged.
 
 strip_sampling  Removes generation settings so the model server owns sampling,
-                output limits, thinking budgets and stop sequences.
+                thinking budgets and stop sequences. Pins max_tokens to the
+                requested model's max_model_len from /v1/models because oMLX
+                requires the field. If discovery fails, keeps the client's value.
 """
 
 from __future__ import annotations
@@ -119,11 +121,18 @@ def fold_system(body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def strip_sampling(body: dict[str, Any]) -> dict[str, Any]:
-    """Remove top-level generation settings, preserving identity on a no-op."""
-    if _SAMPLING_KEYS.isdisjoint(body):
+def strip_sampling(body: dict[str, Any], limit: int | None = None) -> dict[str, Any]:
+    """Strip generation settings and pin max_tokens, or keep its client value.
+
+    Preserve identity on a no-op; discovery is the proxy handler's responsibility.
+    """
+    removed = _SAMPLING_KEYS - {"max_tokens"}
+    if removed.isdisjoint(body) and (limit is None or body.get("max_tokens") == limit):
         return body
-    return {key: value for key, value in body.items() if key not in _SAMPLING_KEYS}
+    out = {key: value for key, value in body.items() if key not in removed}
+    if limit is not None:
+        out["max_tokens"] = limit
+    return out
 
 
 ADAPTERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
@@ -132,7 +141,7 @@ ADAPTERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 }
 
 
-def adapt_body(name: str, path: str, raw: bytes) -> bytes:
+def adapt_body(name: str, path: str, raw: bytes, limit: int | None = None) -> bytes:
     """The body to forward for a request to `path`. Anything that is not a
     JSON object sent to /v1/messages passes through byte for byte. fold_system
     also applies to /v1/messages/count_tokens for compatibility."""
@@ -150,9 +159,12 @@ def adapt_body(name: str, path: str, raw: bytes) -> bytes:
         return raw
     adapted = body
     for adapter_name in names:
-        if adapter_name == STRIP_SAMPLING and path != "/v1/messages":
-            continue
-        adapted = ADAPTERS[adapter_name](adapted)
+        if adapter_name == STRIP_SAMPLING:
+            if path != "/v1/messages":
+                continue
+            adapted = strip_sampling(adapted, limit)
+        else:
+            adapted = ADAPTERS[adapter_name](adapted)
     if adapted is body:
         return raw
     # json.loads accepts escaped lone surrogates; keep them escaped on the wire.
@@ -177,6 +189,10 @@ class AdapterProxy:
         prefix = parts.path.rstrip("/")
         adapter = name
         strip_required = STRIP_SAMPLING in names
+        cls = http.client.HTTPSConnection if https else http.client.HTTPConnection
+        model_limits: dict[str, int | None] = {}
+        model_revision = 0
+        model_lock = threading.Lock()
 
         class Handler(BaseHTTPRequestHandler):
             # HTTP/1.0: one request per connection, so a streamed answer ends
@@ -199,12 +215,62 @@ class AdapterProxy:
                 length = int(self.headers.get("Content-Length") or 0)
                 return self.rfile.read(length) if length else b""
 
+            def _model_limit(self, model: Any) -> int | None:
+                limit = None
+                if isinstance(model, str):
+                    revision = model_revision
+                    # Cache hits never wait for discovery of a different model.
+                    if model not in model_limits:
+                        with model_lock:
+                            # Share an overlapping attempt even when it failed.
+                            if model not in model_limits and revision == model_revision:
+                                self._refresh_models()
+                    limit = model_limits.get(model)
+                if limit is None:
+                    log.warning("strip_sampling: model %r has no available max_model_len; "
+                                "forwarding client max_tokens",
+                                model if isinstance(model, str) else "<missing or invalid>")
+                return limit
+
+            def _refresh_models(self) -> None:
+                nonlocal model_limits, model_revision
+                headers = {k: v for k, v in self.headers.items()
+                           if k.lower() in ("authorization", "x-api-key")}
+                conn = cls(host, port, timeout=10)
+                try:
+                    conn.request("GET", prefix + "/v1/models", headers=headers)
+                    resp = conn.getresponse()
+                    info = json.loads(resp.read()) if resp.status == 200 else None
+                    data = info.get("data") if isinstance(info, dict) else None
+                    if isinstance(data, list):
+                        refreshed: dict[str, int | None] = {}
+                        for entry in data:
+                            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                                continue
+                            value = entry.get("max_model_len")
+                            refreshed[entry["id"]] = (
+                                value if type(value) is int and value > 0 else None)
+                        model_limits = refreshed
+                except (OSError, http.client.HTTPException, ValueError):
+                    pass  # discovery must not prevent forwarding the message
+                finally:
+                    conn.close()
+                    model_revision += 1
+
             def _forward(self) -> None:
                 raw = self._body()
                 has_body = self.command in ("POST", "PUT", "PATCH")
                 if has_body:
                     try:
-                        raw = adapt_body(adapter, self.path, raw)
+                        limit = None
+                        if strip_required and self.path.split("?", 1)[0] == "/v1/messages":
+                            try:
+                                body = json.loads(raw)
+                            except ValueError:
+                                body = None
+                            if isinstance(body, dict):
+                                limit = self._model_limit(body.get("model"))
+                        raw = adapt_body(adapter, self.path, raw, limit)
                     except Exception:  # noqa: BLE001
                         if strip_required and self.path.split("?", 1)[0] == "/v1/messages":
                             log.warning("adapter %s failed; request blocked", adapter,
@@ -215,7 +281,6 @@ class AdapterProxy:
                                     exc_info=True)
                 headers = {k: v for k, v in self.headers.items()
                            if k.lower() not in _HOP_BY_HOP}
-                cls = http.client.HTTPSConnection if https else http.client.HTTPConnection
                 conn = cls(host, port, timeout=3600)
                 try:
                     conn.request(self.command, prefix + self.path,

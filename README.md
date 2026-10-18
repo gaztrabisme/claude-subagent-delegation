@@ -45,6 +45,17 @@ you choose detected CLIs and example providers. `--yes` writes without prompts a
 detected CLIs; `--from EXAMPLE` selects a seed, `--path PATH` changes the config destination, and
 `--force` overwrites an existing destination.
 
+The `delegate` tool's `model` argument selects any model the provider serves; `model` in config
+is only the default.
+
+For servers such as oMLX that own generation settings, set `adapter = "strip_sampling"` on the
+provider. The relay removes top-level `temperature`, `top_p`, `top_k`, `min_p`, `max_tokens`,
+`stop_sequences`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, and
+`thinking` from `/v1/messages` requests so client defaults cannot override the server's settings.
+Chain adapters in order with a comma-separated string, such as
+`adapter = "fold_system,strip_sampling"`. If rewriting fails, requests using `strip_sampling`
+are rejected rather than sent with generation settings.
+
 If you want to add an example provider that is not already configured, select it as the
 default, and check it:
 

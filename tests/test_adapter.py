@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import http.client
 import json
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 
-from subagent import adapter, health
+from subagent import adapter, config, health
 
 from .conftest import make_settings, provider_cfg
 
@@ -27,6 +28,33 @@ CLAUDE_CODE_BODY = {
         {"role": "system", "content": [{"type": "text", "text": "# Environment\ncwd: /ws"}]},
     ],
 }
+
+SAMPLING_SETTINGS = {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 40,
+    "min_p": 0.05,
+    "max_tokens": 1024,
+    "stop_sequences": ["STOP"],
+    "seed": 0,
+    "presence_penalty": 0,
+    "frequency_penalty": None,
+    "repetition_penalty": 1.1,
+    "thinking": {"type": "enabled", "budget_tokens": 512},
+}
+
+
+@pytest.fixture
+def sampling_body():
+    return {
+        **deepcopy(CLAUDE_CODE_BODY),
+        "tools": [{"name": "example", "input_schema": {
+            "type": "object", "properties": {"temperature": {"type": "number"}},
+        }}],
+        "metadata": {"user_id": "example", "seed": 42},
+        "custom": {"max_tokens": 10},
+        **deepcopy(SAMPLING_SETTINGS),
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +103,140 @@ def test_adapter_passes_other_bodies_byte_for_byte():
     assert adapter.adapt_body("fold_system", "/v1/messages", b"not json") == b"not json"
     folded = json.loads(adapter.adapt_body("fold_system", "/v1/messages?beta=true", raw))
     assert all(m["role"] != "system" for m in folded["messages"])
+
+
+def test_adapter_strip_sampling_removes_only_generation_settings(sampling_body):
+    original = deepcopy(sampling_body)
+    expected = {key: value for key, value in original.items() if key not in SAMPLING_SETTINGS}
+    out = adapter.strip_sampling(sampling_body)
+    assert out == expected
+    assert sampling_body == original
+    for key in expected:
+        assert out[key] is sampling_body[key]
+
+
+@pytest.mark.parametrize("key", SAMPLING_SETTINGS)
+def test_adapter_strip_sampling_removes_each_setting_individually(key):
+    body = {**CLAUDE_CODE_BODY, key: SAMPLING_SETTINGS[key]}
+    assert adapter.strip_sampling(body) == CLAUDE_CODE_BODY
+
+
+def test_adapter_strip_sampling_without_settings_preserves_identity_and_bytes():
+    assert adapter.strip_sampling(CLAUDE_CODE_BODY) is CLAUDE_CODE_BODY
+    raw = json.dumps(CLAUDE_CODE_BODY, indent=2).encode() + b"\n"
+    assert adapter.adapt_body("strip_sampling", "/v1/messages", raw) is raw
+    raw = b'{ "messages": [] }\n'
+    assert adapter.adapt_body("fold_system,strip_sampling", "/v1/messages", raw) is raw
+
+
+def test_adapter_strip_sampling_preserves_escaped_surrogates():
+    raw = b'{"temperature":0.7,"metadata":{"user_id":"\\ud800"}}'
+    assert json.loads(adapter.adapt_body("strip_sampling", "/v1/messages", raw)) == {
+        "metadata": {"user_id": "\ud800"},
+    }
+
+
+@pytest.mark.parametrize("raw", [b"not json", b"", b"null", b"[]", b'"text"', b"\xff"])
+def test_adapter_strip_sampling_passes_non_object_bodies_through(raw):
+    assert adapter.adapt_body("strip_sampling", "/v1/messages", raw) is raw
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/models", "/v1/chat/completions", "/v1/messages/count_tokens",
+    "/other/v1/messages", "/v1/messages/other",
+])
+def test_adapter_strip_sampling_passes_other_paths_through(path, sampling_body):
+    raw = json.dumps(sampling_body).encode()
+    assert adapter.adapt_body("strip_sampling", path, raw) is raw
+
+
+def test_adapter_sequence_folds_system_then_strips_sampling(sampling_body):
+    raw = json.dumps(sampling_body).encode()
+    out = json.loads(adapter.adapt_body(
+        "fold_system, strip_sampling", "/v1/messages?beta=true", raw))
+    expected = adapter.fold_system({key: value for key, value in sampling_body.items()
+                                    if key not in SAMPLING_SETTINGS})
+    assert out == expected
+
+
+def test_adapter_sequence_preserves_fold_system_on_count_tokens(sampling_body):
+    raw = json.dumps(sampling_body).encode()
+    out = json.loads(adapter.adapt_body(
+        "fold_system,strip_sampling", "/v1/messages/count_tokens", raw))
+    assert out == adapter.fold_system(sampling_body)
+
+
+def test_adapter_sequence_applies_transforms_in_listed_order(monkeypatch):
+    monkeypatch.setitem(adapter.ADAPTERS, "first", lambda body: {**body, "step": "first"})
+    monkeypatch.setitem(adapter.ADAPTERS, "second", lambda body: {**body, "step": body["step"] + ",second"})
+    assert json.loads(adapter.adapt_body("first,second", "/v1/messages", b"{}")) == {
+        "step": "first,second",
+    }
+
+
+@pytest.mark.parametrize("name", ["unknown", "fold_system,unknown", "unknown,strip_sampling"])
+def test_adapter_proxy_refuses_unknown_names(name):
+    with pytest.raises(ValueError, match="unknown adapter 'unknown'; known:"):
+        adapter.AdapterProxy(name, "http://127.0.0.1")
+
+
+@pytest.mark.parametrize("name", ["strip_sampling", "fold_system,strip_sampling"])
+def test_adapter_provider_config_accepts_adapter_names(tmp_path, name):
+    settings = make_settings(tmp_path, providers={"omlx": {
+        "driver": "claude", "base_url": "http://127.0.0.1", "adapter": name,
+    }})
+    assert settings.provider("omlx").adapter == name
+
+
+@pytest.mark.parametrize("name", ["strip_sampling", "fold_system,strip_sampling"])
+def test_adapter_proxy_delivers_stripped_body_using_omlx_example(mock_endpoint, sampling_body, name):
+    path = "/omlx/v1/messages?beta=true"
+    mock_endpoint.routes[path] = (200, {"type": "message"})
+    example = Path(__file__).resolve().parents[1] / "examples" / "config.omlx.toml"
+    cfg = config.load(extra=example).provider("omlx")
+    assert cfg.adapter == "strip_sampling"
+    # Preserve the example's upstream path while substituting only the origin.
+    cfg = replace(cfg, adapter=name,
+                  base_url=mock_endpoint.url("omlx") + urlsplit(cfg.base_url).path)
+    parts = urlsplit(adapter.child_base_url(cfg))
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    try:
+        conn.request("POST", "/v1/messages?beta=true", body=json.dumps(sampling_body),
+                     headers={"content-type": "application/json"})
+        resp = conn.getresponse()
+        assert resp.status == 200 and json.loads(resp.read()) == {"type": "message"}
+    finally:
+        conn.close()
+    expected = {key: value for key, value in sampling_body.items() if key not in SAMPLING_SETTINGS}
+    if name.startswith("fold_system"):
+        expected = adapter.fold_system(expected)
+    assert json.loads(mock_endpoint.bodies[path]) == expected
+
+
+@pytest.mark.parametrize("name,status", [
+    ("fold_system", 200),
+    ("fold_system,strip_sampling", 502),
+    ("strip_sampling,fold_system", 502),
+])
+def test_adapter_proxy_never_forwards_sampling_when_a_transform_fails(
+    mock_endpoint, sampling_body, monkeypatch, name, status,
+):
+    def broken_transform(body):
+        raise ValueError("transform failed")
+
+    monkeypatch.setitem(adapter.ADAPTERS, "fold_system", broken_transform)
+    path = "/omlx/v1/messages"
+    mock_endpoint.routes[path] = (200, {"type": "message"})
+    parts = urlsplit(adapter.proxy_url(name, mock_endpoint.url("omlx")))
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    try:
+        conn.request("POST", "/v1/messages", body=json.dumps(sampling_body))
+        resp = conn.getresponse()
+        assert resp.status == status
+        resp.read()
+    finally:
+        conn.close()
+    assert mock_endpoint.hits[path] == (1 if status == 200 else 0)
 
 
 def test_adapter_proxy_rewrites_and_forwards_headers(mock_endpoint):

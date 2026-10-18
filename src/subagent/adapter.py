@@ -3,10 +3,10 @@ child and a backend that cannot take Claude Code's requests as sent.
 
 A provider that sets `adapter` gets its child's ANTHROPIC_BASE_URL pointed at one
 of these proxies instead of at the backend. The proxy rewrites the JSON body
-of each POST to /v1/messages (and /v1/messages/count_tokens) with the named
-adapter and forwards everything else untouched: method, path, query, headers
-(the key included) and the answer, streamed back as it arrives. It never logs
-bodies or headers.
+of each POST to /v1/messages with the named adapters, in order. fold_system
+also handles /v1/messages/count_tokens. Everything else is forwarded untouched:
+method, path, query, headers (the key included) and the answer, streamed back
+as it arrives. It never logs bodies or headers.
 
 The provider's own base_url stays the backend's, so the health gate and
 telemetry keep probing the real host. One proxy per (adapter, upstream) is
@@ -21,6 +21,11 @@ fold_system  llama.cpp's chat template for Qwen3.8 raises "System message must
              and its text folded into the next user message, or the previous
              one when none follows, or the top-level system when there is no
              user message. The top-level `system` stays first and unchanged.
+
+strip_sampling  Removes generation settings so the model server owns sampling,
+                thinking budgets and stop sequences. Pins max_tokens to the
+                requested model's max_model_len from /v1/models because oMLX
+                requires the field. If discovery fails, keeps the client's value.
 """
 
 from __future__ import annotations
@@ -38,6 +43,12 @@ from urllib.parse import urlsplit
 log = logging.getLogger("sam")
 
 FOLD_SYSTEM = "fold_system"
+STRIP_SAMPLING = "strip_sampling"
+
+_SAMPLING_KEYS = frozenset({
+    "temperature", "top_p", "top_k", "min_p", "max_tokens", "stop_sequences", "seed",
+    "presence_penalty", "frequency_penalty", "repetition_penalty", "thinking",
+})
 
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
                "trailer", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
@@ -110,14 +121,35 @@ def fold_system(body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-ADAPTERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {FOLD_SYSTEM: fold_system}
+def strip_sampling(body: dict[str, Any], limit: int | None = None) -> dict[str, Any]:
+    """Strip generation settings and pin max_tokens, or keep its client value.
+
+    Preserve identity on a no-op; discovery is the proxy handler's responsibility.
+    """
+    removed = _SAMPLING_KEYS - {"max_tokens"}
+    if removed.isdisjoint(body) and (limit is None or body.get("max_tokens") == limit):
+        return body
+    out = {key: value for key, value in body.items() if key not in removed}
+    if limit is not None:
+        out["max_tokens"] = limit
+    return out
 
 
-def adapt_body(name: str, path: str, raw: bytes) -> bytes:
+ADAPTERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    FOLD_SYSTEM: fold_system,
+    STRIP_SAMPLING: strip_sampling,
+}
+
+
+def adapt_body(name: str, path: str, raw: bytes, limit: int | None = None) -> bytes:
     """The body to forward for a request to `path`. Anything that is not a
-    JSON object sent to /v1/messages passes through byte for byte."""
-    transform = ADAPTERS.get(name)
-    if transform is None or not raw or "/v1/messages" not in path.split("?", 1)[0]:
+    JSON object sent to /v1/messages passes through byte for byte. fold_system
+    also applies to /v1/messages/count_tokens for compatibility."""
+    names = [part.strip() for part in name.split(",")]
+    path = path.split("?", 1)[0]
+    if any(n not in ADAPTERS for n in names) or not raw or path not in (
+        "/v1/messages", "/v1/messages/count_tokens",
+    ):
         return raw
     try:
         body = json.loads(raw)
@@ -125,18 +157,29 @@ def adapt_body(name: str, path: str, raw: bytes) -> bytes:
         return raw
     if not isinstance(body, dict):
         return raw
-    adapted = transform(body)
+    adapted = body
+    for adapter_name in names:
+        if adapter_name == STRIP_SAMPLING:
+            if path != "/v1/messages":
+                continue
+            adapted = strip_sampling(adapted, limit)
+        else:
+            adapted = ADAPTERS[adapter_name](adapted)
     if adapted is body:
         return raw
-    return json.dumps(adapted, ensure_ascii=False).encode("utf-8")
+    # json.loads accepts escaped lone surrogates; keep them escaped on the wire.
+    return json.dumps(adapted, ensure_ascii=False).encode("utf-8", errors="backslashreplace")
 
 
 class AdapterProxy:
     """127.0.0.1:<free port> -> `upstream`, rewriting bodies with adapter `name`."""
 
     def __init__(self, name: str, upstream: str):
-        if name not in ADAPTERS:
-            raise ValueError(f"unknown adapter {name!r}; known: {', '.join(ADAPTERS)}")
+        names = [part.strip() for part in name.split(",")]
+        for adapter_name in names:
+            if adapter_name not in ADAPTERS:
+                raise ValueError(
+                    f"unknown adapter {adapter_name!r}; known: {', '.join(ADAPTERS)}")
         parts = urlsplit(upstream)
         self.name = name
         self.upstream = upstream
@@ -145,6 +188,11 @@ class AdapterProxy:
         https = parts.scheme == "https"
         prefix = parts.path.rstrip("/")
         adapter = name
+        strip_required = STRIP_SAMPLING in names
+        cls = http.client.HTTPSConnection if https else http.client.HTTPConnection
+        model_limits: dict[str, int | None] = {}
+        model_revision = 0
+        model_lock = threading.Lock()
 
         class Handler(BaseHTTPRequestHandler):
             # HTTP/1.0: one request per connection, so a streamed answer ends
@@ -167,18 +215,72 @@ class AdapterProxy:
                 length = int(self.headers.get("Content-Length") or 0)
                 return self.rfile.read(length) if length else b""
 
+            def _model_limit(self, model: Any) -> int | None:
+                limit = None
+                if isinstance(model, str):
+                    revision = model_revision
+                    # Cache hits never wait for discovery of a different model.
+                    if model not in model_limits:
+                        with model_lock:
+                            # Share an overlapping attempt even when it failed.
+                            if model not in model_limits and revision == model_revision:
+                                self._refresh_models()
+                    limit = model_limits.get(model)
+                if limit is None:
+                    log.warning("strip_sampling: model %r has no available max_model_len; "
+                                "forwarding client max_tokens",
+                                model if isinstance(model, str) else "<missing or invalid>")
+                return limit
+
+            def _refresh_models(self) -> None:
+                nonlocal model_limits, model_revision
+                headers = {k: v for k, v in self.headers.items()
+                           if k.lower() in ("authorization", "x-api-key")}
+                conn = cls(host, port, timeout=10)
+                try:
+                    conn.request("GET", prefix + "/v1/models", headers=headers)
+                    resp = conn.getresponse()
+                    info = json.loads(resp.read()) if resp.status == 200 else None
+                    data = info.get("data") if isinstance(info, dict) else None
+                    if isinstance(data, list):
+                        refreshed: dict[str, int | None] = {}
+                        for entry in data:
+                            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                                continue
+                            value = entry.get("max_model_len")
+                            refreshed[entry["id"]] = (
+                                value if type(value) is int and value > 0 else None)
+                        model_limits = refreshed
+                except (OSError, http.client.HTTPException, ValueError):
+                    pass  # discovery must not prevent forwarding the message
+                finally:
+                    conn.close()
+                    model_revision += 1
+
             def _forward(self) -> None:
                 raw = self._body()
                 has_body = self.command in ("POST", "PUT", "PATCH")
                 if has_body:
                     try:
-                        raw = adapt_body(adapter, self.path, raw)
-                    except Exception:  # noqa: BLE001 - never block a request on a rewrite
+                        limit = None
+                        if strip_required and self.path.split("?", 1)[0] == "/v1/messages":
+                            try:
+                                body = json.loads(raw)
+                            except ValueError:
+                                body = None
+                            if isinstance(body, dict):
+                                limit = self._model_limit(body.get("model"))
+                        raw = adapt_body(adapter, self.path, raw, limit)
+                    except Exception:  # noqa: BLE001
+                        if strip_required and self.path.split("?", 1)[0] == "/v1/messages":
+                            log.warning("adapter %s failed; request blocked", adapter,
+                                        exc_info=True)
+                            self.send_error(502, "request adapter failed")
+                            return
                         log.warning("adapter %s failed; forwarding the body as sent", adapter,
                                     exc_info=True)
                 headers = {k: v for k, v in self.headers.items()
                            if k.lower() not in _HOP_BY_HOP}
-                cls = http.client.HTTPSConnection if https else http.client.HTTPConnection
                 conn = cls(host, port, timeout=3600)
                 try:
                     conn.request(self.command, prefix + self.path,

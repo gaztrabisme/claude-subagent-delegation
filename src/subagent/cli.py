@@ -6,6 +6,9 @@ reports (`done` -> 0, `running` -> 3, anything else -> 2), except `watch`, which
 streams the live log. `init` writes a starter config from the examples in
 `examples/`; `doctor` checks the configured providers against this machine.
 
+`doctor` reads keys from the same provider env file the MCP wrapper sources, so
+a key that lives only there (see `load_provider_env`) still answers 200.
+
 The delegating loop commands (`run`, `wait`, `review`) stand up an in-process
 server (Settings -> Registry -> Supervisor) so their workers run through the
 provider Registry, not a hand-built child process. The read-only ones (`detect`,
@@ -19,10 +22,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -142,6 +146,93 @@ def _needed_exports(settings: Settings) -> list[str]:
         for name in cfg.api_key_envs:
             lines.append(f"export {name}=...")
     return lines
+
+
+# --- the provider env file ------------------------------------------------------
+
+# The MCP wrapper starts the server after `set -a; . <file>`, the file being
+# $SUBAGENT_ENV_FILE or ~/.config/agent-capabilities/subagent.env. On a machine
+# where the keys live only in that file, a `subagent doctor` typed in a plain
+# shell has none of them and a keyed health check answers HTTP 401. The name and
+# the default path live here, not in config.py: this is a convenience of the
+# command line, not something the server reads.
+PROVIDER_ENV_FILE = "SUBAGENT_ENV_FILE"
+PROVIDER_ENV_DEFAULT = (".config", "agent-capabilities", "subagent.env")
+
+# `FOO=bar` and `export FOO=bar` both match; `set -a`, a bare word and a name
+# that is not a valid variable name do not.
+_ASSIGNMENT = re.compile(r"\A([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)\Z")
+_EXPORT = re.compile(r"\Aexport[ \t]+")
+_TRAILING_COMMENT = re.compile(r"[ \t]+#")
+
+
+def _provider_env_path(env: Mapping[str, str]) -> Path:
+    """The env file to read: `$SUBAGENT_ENV_FILE`, else the wrapper's default."""
+    named = (env.get(PROVIDER_ENV_FILE) or "").strip()
+    if named:
+        return Path(named).expanduser()
+    home = (env.get("HOME") or "").strip()
+    base = Path(home).expanduser() if home else Path.home()
+    return base.joinpath(*PROVIDER_ENV_DEFAULT)
+
+
+def _shell_value(raw: str) -> str:
+    """A shell assignment value with its outer quoting removed. No expansion."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        inner = value[1:-1]
+        if value[0] == '"':
+            inner = inner.replace('\\"', '"').replace("\\`", "`").replace("\\\\", "\\")
+        return inner
+    # Unquoted, a `#` that follows whitespace starts a comment, as in the shell.
+    return _TRAILING_COMMENT.split(value, maxsplit=1)[0].strip()
+
+
+def _env_assignments(text: str) -> list[tuple[str, str]]:
+    """The assignments in an env file.
+
+    Comments, blank lines and anything that is not a `KEY=VALUE` line (a `set -a`
+    line, a bare word, a name that is not a valid variable) are ignored, and an
+    `export ` prefix is dropped. Nothing in the file is executed.
+    """
+    found: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = _EXPORT.sub("", line, count=1)
+        match = _ASSIGNMENT.match(line)
+        if match is None:
+            continue
+        found.append((match.group(1), _shell_value(match.group(2))))
+    return found
+
+
+def load_provider_env(env: MutableMapping[str, str] | None = None) -> Path | None:
+    """Import the wrapper's provider env file into `env` (this process by default).
+
+    The same file, and the same net effect, as the wrapper's `set -a; . <file>`,
+    with two deliberate differences: the file is parsed for `KEY=VALUE` lines
+    instead of run as shell, so nothing in it executes, and a variable that
+    already has a value in the environment keeps it, so an explicit `export` in
+    the calling shell wins over the file (a variable set to an empty string
+    holds no value and is filled). Only names are ever seen here, never values:
+    nothing is printed, and a missing or unreadable file is skipped silently.
+
+    Returns the path read, or None when there was no file to read.
+    """
+    target: MutableMapping[str, str] = os.environ if env is None else env
+    path = _provider_env_path(target)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    for name, value in _env_assignments(text):
+        current = target.get(name)
+        if current is not None and current.strip():
+            continue
+        target[name] = value
+    return path
 
 
 # --- doctor ---------------------------------------------------------------------
@@ -343,6 +434,10 @@ def _print_table(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    # Before the config is loaded: `load` reports a provider with no key, and a
+    # health probe that sends one, from this process's environment.
+    load_provider_env()
+
     goal: Goal | None = None
     if args.goal is not None:
         workspace = Path(args.root or ".").expanduser().resolve()

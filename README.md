@@ -115,6 +115,12 @@ subagent doctor
 `subagent doctor --provider NAME` checks one provider; `--prompt` also runs a small provider turn,
 `--no-probe` checks config and binaries only, and `--json` returns structured results.
 
+When the keys are set for the MCP server by a sourced file rather than by your shell, name that
+file in `SUBAGENT_ENV_FILE`; `doctor` reads it before checking providers, defaulting to
+`$HOME/.config/agent-capabilities/subagent.env`. It imports `KEY=VALUE` lines only, keeps any
+variable your shell already set, prints no values, and skips a file that is not there. Other
+commands use the environment as it is; the file is a convenience for the command line.
+
 ## The delegation workflow
 
 Use `/delegate` for implementation work. The installed skill checks `[loop].auto`, detects the

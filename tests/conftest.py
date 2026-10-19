@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from subagent import config
+from subagent import cli, config
 from subagent.config import Settings
 
 # Every provider's key variable. Tests never see the machine's real keys.
@@ -40,7 +40,9 @@ def _provider_keys(monkeypatch, tmp_path_factory):
 
     The machine's own config files are out of reach too: XDG_CONFIG_HOME
     points at an empty directory and SUBAGENT_CONFIG is unset, so `config.load`
-    sees only what a test writes.
+    sees only what a test writes. So is the provider env file `doctor` sources:
+    it is named at a path that is not there, and a test that wants one writes
+    its own.
     """
     for name in KEY_ENVS:
         monkeypatch.delenv(name, raising=False)
@@ -50,6 +52,7 @@ def _provider_keys(monkeypatch, tmp_path_factory):
     empty = tmp_path_factory.mktemp("xdg-config")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(empty))
     monkeypatch.delenv(config.CONFIG_ENV, raising=False)
+    monkeypatch.setenv(cli.PROVIDER_ENV_FILE, str(empty / "subagent.env"))
 
 
 @pytest.fixture(autouse=True)

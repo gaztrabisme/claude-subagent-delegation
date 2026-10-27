@@ -669,7 +669,7 @@ def _protected_git_state(path: Path, workspace: Path) -> bool:
     # A `.git` file has no children on disk, but file tools can still name
     # the conventional `.git/...` spelling. Protect those virtual paths too.
     dot_git = workspace.resolve() / ".git"
-    protected_roots.update({dot_git / "refs" / "subagent", dot_git / "worktrees"})
+    protected_roots.add(dot_git)
     return _under_folded(path, frozenset(protected_roots))
 
 

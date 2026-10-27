@@ -153,7 +153,29 @@ and validation data. Children never call autoresearch.
 
 On macOS, a nonempty `deny_read` wraps the child and its descendants in
 `sandbox-exec`, denying reads and writes under each canonical path, including
-access through symlinks. Other platforms refuse requests with `deny_read` set.
+access through symlinks. It also denies writes to each ancestor directory up to
+but excluding `/`, preventing those directories from being renamed or unlinked
+to reach an excluded subtree under another name. These ancestor rules match
+the directory itself; writes to other children still follow the write policy.
+Other platforms refuse requests with `deny_read` set, and sandbox startup
+failure never falls back to an unsandboxed child.
+
+For Codex, this outer profile also confines writes to the workspace, the
+per-agent `CODEX_HOME`, `/private/tmp`, the real `TMPDIR`, `/dev`, and the real
+user cache directory returned by `getconf DARWIN_USER_CACHE_DIR` (omitted if
+discovery fails). Explicit write denies override those allows for `.git`
+itself and its contents, a worktree pointer's git directory and common directory,
+and the agent's `hooks.json`, `config.toml`, `auth.json` and installed guard
+script. Symlink entries and their resolved targets are protected. Runtime files
+in `CODEX_HOME` remain writable; ancestor directories of write-protected paths
+are also locked against renaming. Codex uses `danger-full-access` inside this
+outer profile to avoid nesting Seatbelt sandboxes. The shared guard also denies
+file-tool writes to the workspace's `.git` for every driver.
+
+This is macOS-only path isolation: reads outside `deny_read` paths remain
+allowed by the outer profile. It does not provide a general read allowlist or
+restrict network access. Paths are resolved when the child starts; copies of
+excluded data at other paths are not covered by that exclusion.
 Providers can also set `deny_read = ["~/.autoresearch"]` in their TOML table;
 provider and per-call restrictions are merged and kept across continuations and
 fallback. The MCP `delegate` tool does not expose this argument.

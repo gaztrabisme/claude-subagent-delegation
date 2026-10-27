@@ -205,6 +205,8 @@ def test_codex_merged_deny_read_uses_outer_write_allow_without_nested_sandbox(
     temp_alias = tmp_path / "temp-alias"
     temp_alias.symlink_to(temp, target_is_directory=True)
     monkeypatch.setenv("TMPDIR", str(temp_alias))
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(codex_driver, "_darwin_user_cache_dir", lambda: str(cache), raising=False)
     provider_path = str(tmp_path / "provider-private")
     call_path = str(tmp_path / "call-private")
     registry.settings.providers["codex"] = replace(
@@ -248,12 +250,113 @@ def test_codex_merged_deny_read_uses_outer_write_allow_without_nested_sandbox(
         home = Path(process.env["CODEX_HOME"]).resolve()
         assert home == registry.settings.session_root / "agents" / agent.agent_id / "codex-home"
         allowed = [workspace.resolve(), Path("/private/tmp"), temp.resolve(), home,
-                   Path("/dev"), Path("/private/var/folders")]
+                   Path("/dev"), cache]
         assert rules[3] == '(allow file-write* ' + " ".join(
             f'(subpath "{path}")' for path in allowed
         ) + ')'
         assert (f'(deny file-read* (subpath "{provider_path}"))' in rules) == configured
         assert (f'(deny file-read* (subpath "{call_path}"))' in rules) == per_call
+
+
+@pytest.fixture
+def codex_sandbox(fake_codex, tmp_path, monkeypatch):
+    from subagent.providers.base import Session
+
+    monkeypatch.setattr("subagent.sandbox.sys.platform", "darwin")
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1, "", ""),
+    )
+    settings = make_settings(tmp_path, supervisor="auto")
+    cfg = replace(settings.provider("codex"), deny_read=(str(tmp_path / "private"),))
+    workspace = _workspace(tmp_path)
+
+    def spawn():
+        return codex_driver.CODEX_PROVIDER.spawn(
+            cfg, settings, "a1", "edit target.txt", workspace, Session(provider="codex"), None,
+        )
+
+    return workspace, settings, spawn
+
+
+@pytest.mark.parametrize("kind", ["directory", "worktree-absolute", "worktree-relative", "symlink"])
+def test_codex_deny_read_protects_git_entry_gitdir_and_common_dir(codex_sandbox, tmp_path, kind):
+    workspace, _, spawn = codex_sandbox
+    dot_git = workspace / ".git"
+    roots = [dot_git]
+    if kind.startswith("worktree"):
+        common = tmp_path / "common.git"
+        gitdir = common / "worktrees" / "project"
+        gitdir.mkdir(parents=True)
+        relative = kind.endswith("relative")
+        dot_git.write_text(f"gitdir: {'../common.git/worktrees/project' if relative else gitdir}\n")
+        (gitdir / "commondir").write_text("../..\n" if relative else f"{common}\n")
+        roots.extend([gitdir, common])
+    elif kind == "symlink":
+        metadata = workspace / "metadata"
+        metadata.mkdir()
+        dot_git.symlink_to(metadata, target_is_directory=True)
+        roots.append(metadata)
+    else:
+        dot_git.mkdir()
+    process = spawn()
+    rules = process.argv[2].splitlines()
+    for root in roots:
+        for filter_kind in ("literal", "subpath"):
+            rule = f'(deny file-write* ({filter_kind} "{root}"))'
+            assert rules.index(rule) > 3  # follows workspace allow
+    assert f'(deny file-read* (subpath "{dot_git}"))' not in rules
+
+
+def test_codex_deny_read_protects_hook_config_auth_and_script(codex_sandbox, fake_codex):
+    _, settings, spawn = codex_sandbox
+    process = spawn()
+    home = Path(process.env["CODEX_HOME"]).resolve()
+    rules = process.argv[2].splitlines()
+    protected = [home / name for name in ("hooks.json", "config.toml", "auth.json")]
+    protected.extend([fake_codex.home / "auth.json", HOOK])
+    for path in protected:
+        assert rules.index(f'(deny file-write* (literal "{path}"))') > 3
+    assert settings.guard_hook_command("a1", "--dialect", "codex") in (home / "hooks.json").read_text()
+    assert f'(subpath "{home}")' in rules[3]  # runtime state remains writable
+
+
+def test_codex_deny_read_allows_only_real_user_temp_and_cache_roots(codex_sandbox, tmp_path, monkeypatch):
+    _, _, spawn = codex_sandbox
+    temp, cache = tmp_path / "temp", tmp_path / "cache"
+    temp.mkdir()
+    cache.mkdir()
+    temp_alias, cache_alias = tmp_path / "temp-alias", tmp_path / "cache-alias"
+    temp_alias.symlink_to(temp, target_is_directory=True)
+    cache_alias.symlink_to(cache, target_is_directory=True)
+    monkeypatch.setenv("TMPDIR", str(temp_alias))
+
+    def getconf(argv, **kwargs):
+        assert argv == ["getconf", "DARWIN_USER_CACHE_DIR"]
+        assert kwargs["timeout"] > 0
+        return subprocess.CompletedProcess(argv, 0, stdout=f"{cache_alias}\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", getconf)
+    rules = spawn().argv[2].splitlines()
+    for path in (temp, cache, Path("/private/tmp"), Path("/dev")):
+        assert f'(subpath "{path}")' in rules[3]
+    for path in (temp_alias, cache_alias, Path("/private/var/folders")):
+        assert f'(subpath "{path}")' not in rules[3]
+
+
+@pytest.mark.parametrize("failure", ["exit", "missing", "timeout", "empty", "relative"])
+def test_codex_user_cache_dir_lookup_failure_omits_allow(monkeypatch, failure):
+    def getconf(argv, **kwargs):
+        if failure == "missing":
+            raise FileNotFoundError("getconf")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            argv, 1 if failure == "exit" else 0,
+            stdout="relative\n" if failure == "relative" else "\n", stderr="failed",
+        )
+
+    monkeypatch.setattr(subprocess, "run", getconf)
+    assert codex_driver._darwin_user_cache_dir() is None
 
 
 def test_codex_deny_read_wrapper_failure_never_spawns_child(

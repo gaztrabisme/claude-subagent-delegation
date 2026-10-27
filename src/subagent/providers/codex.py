@@ -25,13 +25,15 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..config import Settings, log
+from ..config import APPROVAL_HOOK, Settings, log
+from ..guard.classify import _git_metadata_roots
 from ..router import Refusal, codex_reset
 from ..sandbox import wrap_argv
 from .base import DRIVER_CODEX, Process, ProviderConfig, Session
@@ -394,6 +396,20 @@ def codex_env(settings: Settings, agent_id: str, home: Path) -> dict[str, str]:
     return env
 
 
+def _darwin_user_cache_dir() -> str | None:
+    """Only allow the current user's cache root; failed discovery adds nothing."""
+    try:
+        result = subprocess.run(
+            ["getconf", "DARWIN_USER_CACHE_DIR"], capture_output=True, text=True, timeout=5,
+        )
+        path = result.stdout.strip()
+        if result.returncode == 0 and path and Path(path).is_absolute():
+            return str(Path(path).resolve())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 class CodexProvider:
     """Runs a turn as ``codex exec --json``. The session id is Codex's thread_id."""
 
@@ -469,10 +485,20 @@ class CodexProvider:
         if cfg.deny_read:
             # The outer profile supplies write confinement; a second Seatbelt
             # sandbox inside it prevents Codex from initializing or editing.
-            argv = wrap_argv(argv, cfg.deny_read, write_allow=[
+            write_allow = [
                 str(cwd), "/private/tmp", env.get("TMPDIR") or "/private/tmp",
-                env["CODEX_HOME"], "/dev", "/private/var/folders",
-            ])
+                env["CODEX_HOME"], "/dev",
+            ]
+            cache = _darwin_user_cache_dir()
+            if cache:
+                write_allow.append(cache)
+            home = Path(env["CODEX_HOME"])
+            write_deny = [
+                str(cwd / ".git"), *(str(root) for root in sorted(_git_metadata_roots(cwd))),
+                *(str(home / name) for name in ("hooks.json", "config.toml", "auth.json")),
+                str(APPROVAL_HOOK),
+            ]
+            argv = wrap_argv(argv, cfg.deny_read, write_allow=write_allow, write_deny=write_deny)
         return _spawn_codex(argv, env, str(cwd), prompt)
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:

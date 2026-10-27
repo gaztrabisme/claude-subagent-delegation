@@ -23,7 +23,11 @@ def test_profile_denies_reads_and_writes_for_each_realpath(tmp_path: Path, monke
         f'(deny file-read* (subpath "{target.resolve()}"))\n'
         f'(deny file-write* (subpath "{target.resolve()}"))\n'
         f'(deny file-read* (subpath "{tmp_path.resolve()}/second"))\n'
-        f'(deny file-write* (subpath "{tmp_path.resolve()}/second"))'
+        f'(deny file-write* (subpath "{tmp_path.resolve()}/second"))\n'
+        + "\n".join(
+            f'(deny file-write* (literal "{parent}"))'
+            for parent in target.resolve().parents if parent != Path("/")
+        )
     )
 
 
@@ -52,7 +56,56 @@ def test_profile_write_allow_precedes_deny_read_and_resolves_paths(tmp_path: Pat
         f'(allow file-write* (subpath "{escaped}"))',
         f'(deny file-read* (subpath "{denied.resolve()}"))',
         f'(deny file-write* (subpath "{denied.resolve()}"))',
+        *(f'(deny file-write* (literal "{parent}"))'
+          for parent in denied.resolve().parents if parent != Path("/")),
     ]
+
+
+def test_profile_locks_each_deny_read_ancestor_after_allows_without_blocking_siblings(tmp_path):
+    first = tmp_path / "parent" / "session"
+    second = tmp_path / "parent" / "other" / "session"
+    profile = sandbox.build_profile([str(first), str(second)], write_allow=[str(tmp_path)])
+    rules = profile.splitlines()
+    ancestors = set(first.resolve().parents) | set(second.resolve().parents)
+    ancestors.discard(Path("/"))
+    for ancestor in ancestors:
+        rule = f'(deny file-write* (literal "{ancestor}"))'
+        assert rules.count(rule) == 1
+        assert rules.index(rule) > 3  # after the write allow
+        assert f'(deny file-write* (subpath "{ancestor}"))' not in rules
+    assert '(deny file-write* (literal "/"))' not in rules
+
+
+def test_profile_escapes_ancestor_literals(tmp_path):
+    profile = sandbox.build_profile([str(tmp_path / 'parent"\\\n' / "session")])
+    escaped = str(tmp_path.resolve()) + '/parent\\"\\\\\\n'
+    assert f'(deny file-write* (literal "{escaped}"))' in profile
+
+
+def test_profile_write_denies_protect_symlink_entry_and_target_after_allow(tmp_path):
+    target = tmp_path / "source-auth.json"
+    target.write_text("{}")
+    link = tmp_path / "home" / "auth.json"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    profile = sandbox.build_profile([], write_allow=[str(tmp_path)], write_deny=[str(link)])
+    rules = profile.splitlines()
+    for path in (link, target):
+        for kind in ("literal", "subpath"):
+            rule = f'(deny file-write* ({kind} "{path}"))'
+            assert rules.index(rule) > 3
+    assert "deny file-read*" not in profile
+
+
+def test_profile_write_denies_lock_ancestors_without_blocking_runtime_files(tmp_path):
+    home = tmp_path / "codex-home"
+    profile = sandbox.build_profile(
+        [], write_allow=[str(home)], write_deny=[str(home / "hooks.json")],
+    )
+    rules = profile.splitlines()
+    assert rules.index(f'(deny file-write* (literal "{home}"))') > 3
+    assert f'(deny file-write* (subpath "{home}"))' not in rules
+    assert "runtime.jsonl" not in profile
 
 
 def test_profile_empty_write_allow_denies_all_writes():
@@ -93,6 +146,16 @@ def test_wrap_argv_passes_write_allow_into_profile(tmp_path: Path, monkeypatch):
     allowed = [str(tmp_path)]
     assert sandbox.wrap_argv(argv, denied, write_allow=allowed) == [
         "/usr/bin/sandbox-exec", "-p", sandbox.build_profile(denied, write_allow=allowed), *argv,
+    ]
+
+
+def test_wrap_argv_passes_write_deny_into_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    denied = [str(tmp_path / "private")]
+    writes = [str(tmp_path / "home" / "hooks.json")]
+    argv = ["python3", "worker.py"]
+    assert sandbox.wrap_argv(argv, denied, write_deny=writes) == [
+        "/usr/bin/sandbox-exec", "-p", sandbox.build_profile(denied, write_deny=writes), *argv,
     ]
 
 
@@ -190,3 +253,86 @@ def test_macos_write_allow_permits_inside_and_blocks_outside_and_denied_paths(
     assert result.returncode != 0
     assert "Operation not permitted" in result.stderr
     assert "hidden" not in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
+def test_macos_deny_read_blocks_ancestor_rename_and_allows_sibling_writes(
+    tmp_path: Path, macos_sandbox_available,
+):
+    denied = tmp_path / "parent" / "nested" / "session"
+    denied.mkdir(parents=True)
+    (denied / "secret.txt").write_text("hidden-token")
+    profile = sandbox.build_profile([str(denied)], write_allow=[str(tmp_path)])
+    for ancestor in (denied.parent, denied.parent.parent):
+        renamed = ancestor.with_name(ancestor.name + "-renamed")
+        secret = renamed / (denied / "secret.txt").relative_to(ancestor)
+        result = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c",
+             f"import os; os.rename({str(ancestor)!r}, {str(renamed)!r}); "
+             f"print(open({str(secret)!r}).read())"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode != 0
+        assert "Operation not permitted" in result.stderr
+        assert "hidden-token" not in result.stdout
+        assert ancestor.is_dir() and not renamed.exists()
+    sibling = denied.parent / "sibling.txt"
+    result = subprocess.run(
+        ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c",
+         f"open({str(sibling)!r}, 'w').write('edited')"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert sibling.read_text() == "edited"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
+def test_macos_write_deny_protects_metadata_and_symlinks_but_allows_workspace_edit(
+    tmp_path: Path, macos_sandbox_available,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    metadata = workspace / ".git"
+    metadata.mkdir()
+    config = metadata / "config"
+    config.write_text("original")
+    hook = workspace / "hook.py"
+    hook.write_text("original")
+    protected = [hook]
+    for name in ("hooks.json", "config.toml", "auth.json"):
+        path = home / name
+        path.write_text("original")
+        protected.append(path)
+    auth_source = tmp_path / "source-auth.json"
+    auth_source.write_text("original")
+    protected[-1].unlink()
+    protected[-1].symlink_to(auth_source)
+    profile = sandbox.build_profile(
+        [str(tmp_path / "private")], write_allow=[str(tmp_path)],
+        write_deny=[str(metadata), *(str(path) for path in protected)],
+    )
+    operations = [
+        *(f"open({str(path)!r}, 'w').write('changed')" for path in [config, *protected, auth_source]),
+        f"import os; os.unlink({str(protected[-1])!r})",
+        f"import os; os.rename({str(metadata)!r}, {str(workspace / 'moved-git')!r})",
+        f"import os; os.rename({str(home)!r}, {str(tmp_path / 'moved-home')!r})",
+    ]
+    for code in operations:
+        result = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode != 0, code
+        assert "Operation not permitted" in result.stderr
+    assert all(path.read_text() == "original" for path in [config, *protected, auth_source])
+    for target in (workspace / "target.txt", home / "runtime.jsonl"):
+        target.write_text("old")
+        result = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c",
+             f"open({str(target)!r}, 'w').write('new')"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.read_text() == "new"

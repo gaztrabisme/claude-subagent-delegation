@@ -188,6 +188,27 @@ def test_file_tools_deny_checkpoint_refs_and_worktree_metadata(ws, ctx):
             assert "git" in verdict.reason.lower()
 
 
+@pytest.mark.parametrize("kind", ["absent", "directory", "worktree", "symlink"])
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+@pytest.mark.parametrize("with_context", [False, True])
+def test_file_tools_deny_dot_git_itself(ws, ctx, kind, tool, with_context):
+    dot_git = ws / ".git"
+    if kind == "directory":
+        dot_git.mkdir()
+    elif kind == "worktree":
+        dot_git.write_text("gitdir: metadata\n")
+    elif kind == "symlink":
+        metadata = ws / "metadata"
+        metadata.mkdir()
+        dot_git.symlink_to(metadata, target_is_directory=True)
+    for name in (".git", ".GIT", str(dot_git)):
+        payload = {"file_path": name}
+        verdict = classify(tool, payload, ws, context=ctx if with_context else None)
+        assert verdict.action == DENY, (kind, tool, name, verdict.reason)
+        assert "git" in verdict.reason.lower()
+    assert classify("Write", {"file_path": "src/ordinary.py"}, ws).action == ALLOW
+
+
 def test_file_tools_resolve_worktree_gitdir_before_protecting_refs(ws, ctx, tmp_path):
     common = tmp_path / "common.git"
     worktree_git = common / "worktrees" / "project"

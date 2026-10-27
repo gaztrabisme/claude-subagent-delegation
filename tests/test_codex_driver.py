@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -188,6 +189,92 @@ def test_argv_is_sandboxed_and_never_bypasses(fake_codex, registry, tmp_path: Pa
     assert argv[argv.index("-m") + 1] == "gpt-5.3-codex-spark"
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
     assert "--ignore-user-config" not in argv  # it would skip the per-agent config.toml too
+
+
+@pytest.mark.parametrize("configured,per_call", [
+    (False, False), (True, False), (False, True), (True, True),
+])
+def test_codex_merged_deny_read_uses_outer_write_allow_without_nested_sandbox(
+    fake_codex, registry, tmp_path: Path, monkeypatch, configured, per_call,
+):
+    from .test_runs import FakeProcess, _result
+
+    monkeypatch.setattr("subagent.sandbox.sys.platform", "darwin")
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    temp_alias = tmp_path / "temp-alias"
+    temp_alias.symlink_to(temp, target_is_directory=True)
+    monkeypatch.setenv("TMPDIR", str(temp_alias))
+    provider_path = str(tmp_path / "provider-private")
+    call_path = str(tmp_path / "call-private")
+    registry.settings.providers["codex"] = replace(
+        registry.settings.providers["codex"],
+        deny_read=(provider_path,) if configured else (),
+    )
+    captured = []
+
+    def spawn(argv, env, cwd, prompt):
+        process = FakeProcess(_result("done"), argv, env)
+        captured.append(process)
+        return process
+
+    monkeypatch.setattr(codex_driver, "_spawn_codex", spawn)
+    workspace = _workspace(tmp_path)
+    agent = registry.create_agent(
+        "c", workspace, provider="codex", deny_read=[call_path] if per_call else None,
+    )
+    _run(agent)
+    # The frozen agent policy survives a provider config change and continuation.
+    registry.settings.providers["codex"] = replace(
+        registry.settings.providers["codex"], deny_read=(),
+    )
+    agent.cfg = registry.settings.providers["codex"]
+    _run(agent, prompt="continue")
+
+    for process in captured:
+        argv = process.argv
+        assert argv.count("/usr/bin/sandbox-exec") == int(configured or per_call)
+        assert argv[argv.index("-s") + 1] == (
+            "danger-full-access" if configured or per_call else "workspace-write"
+        )
+        if not (configured or per_call):
+            assert argv[0] == str(tmp_path / "bin" / "codex")
+            continue
+        assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+        rules = argv[2].splitlines()
+        assert rules[:3] == [
+            '(version 1)', '(allow default)', '(deny file-write* (subpath "/"))',
+        ]
+        home = Path(process.env["CODEX_HOME"]).resolve()
+        assert home == registry.settings.session_root / "agents" / agent.agent_id / "codex-home"
+        allowed = [workspace.resolve(), Path("/private/tmp"), temp.resolve(), home,
+                   Path("/dev"), Path("/private/var/folders")]
+        assert rules[3] == '(allow file-write* ' + " ".join(
+            f'(subpath "{path}")' for path in allowed
+        ) + ')'
+        assert (f'(deny file-read* (subpath "{provider_path}"))' in rules) == configured
+        assert (f'(deny file-read* (subpath "{call_path}"))' in rules) == per_call
+
+
+def test_codex_deny_read_wrapper_failure_never_spawns_child(
+    fake_codex, tmp_path: Path, monkeypatch,
+):
+    from subagent.providers.base import Session
+
+    settings = make_settings(tmp_path)
+    cfg = replace(settings.provider("codex"), deny_read=(str(tmp_path / "private"),))
+    spawned = []
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("sandbox unavailable")
+
+    monkeypatch.setattr(codex_driver, "wrap_argv", unavailable)
+    monkeypatch.setattr(codex_driver, "_spawn_codex", lambda *args: spawned.append(args))
+    with pytest.raises(RuntimeError, match="sandbox unavailable"):
+        codex_driver.CODEX_PROVIDER.spawn(
+            cfg, settings, "a1", "do it", _workspace(tmp_path), Session(provider="codex"), None,
+        )
+    assert not spawned
 
 
 def test_no_model_means_no_m_flag(fake_codex, registry, tmp_path: Path):

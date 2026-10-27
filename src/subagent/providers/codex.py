@@ -8,9 +8,11 @@ Codex's JSONL events are translated into the claude stream-json shapes
 Agent._ingest already reads, so a codex run fills the same Run fields a claude
 run does.
 
-Two guards stand between a codex child and the machine: Codex's own
-`workspace-write` sandbox, and the same PreToolUse hook the claude driver
-installs, which asks this server's supervisor over SUBAGENT_APPROVAL_SOCKET.
+Two guards stand between a codex child and the machine: a filesystem sandbox,
+and the same PreToolUse hook the claude driver installs, which asks this server's
+supervisor over SUBAGENT_APPROVAL_SOCKET. With deny_read the outer Seatbelt
+profile restricts writes as well as reads, replacing Codex's workspace-write
+sandbox to avoid initializing a nested Seatbelt sandbox.
 
 The child runs with CODEX_HOME set to a per-agent directory holding a symlink
 to the user's auth.json, a config.toml this module writes (no hooks, no MCP
@@ -31,6 +33,7 @@ from uuid import uuid4
 
 from ..config import Settings, log
 from ..router import Refusal, codex_reset
+from ..sandbox import wrap_argv
 from .base import DRIVER_CODEX, Process, ProviderConfig, Session
 
 GUARD = "sandbox+hook"
@@ -434,7 +437,10 @@ class CodexProvider:
         model: str | None,
     ) -> list[str]:
         effort = "low" if cfg.thinking == "low" else cfg.effort
-        return codex_argv(cwd, model or None, session.session_id, self.binary(cfg), effort)
+        argv = codex_argv(cwd, model or None, session.session_id, self.binary(cfg), effort)
+        if cfg.deny_read:
+            argv[argv.index("-s") + 1] = "danger-full-access"
+        return argv
 
     def env(
         self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,
@@ -460,6 +466,13 @@ class CodexProvider:
     ) -> CodexProcess:
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session, model)
+        if cfg.deny_read:
+            # The outer profile supplies write confinement; a second Seatbelt
+            # sandbox inside it prevents Codex from initializing or editing.
+            argv = wrap_argv(argv, cfg.deny_read, write_allow=[
+                str(cwd), "/private/tmp", env.get("TMPDIR") or "/private/tmp",
+                env["CODEX_HOME"], "/dev", "/private/var/folders",
+            ])
         return _spawn_codex(argv, env, str(cwd), prompt)
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:

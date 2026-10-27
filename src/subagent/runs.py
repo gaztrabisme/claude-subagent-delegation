@@ -28,7 +28,7 @@ from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import protect
 from .lane_state import LaneState
-from .providers.base import Process, ProviderConfig, RunContext, Session, capabilities
+from .providers.base import DRIVER_CODEX, Process, ProviderConfig, RunContext, Session, capabilities
 
 # classify_exit and exit_event are re-exported: they were part of this
 # module's surface before the drivers moved into providers/.
@@ -1145,13 +1145,17 @@ class Agent:
                 request_id=run.request_id, deadline=run.deadline,
                 **(self.delegate_options if resume is None else {}),
             )
+        # Codex must coordinate its inner sandbox mode with its outer profile.
+        # Give it the frozen agent policy plus the current provider's exclusions.
+        spawn_cfg = (dataclasses.replace(self.cfg, deny_read=paths)
+                     if self.cfg.driver == DRIVER_CODEX else self.cfg)
         process = self.driver.spawn(
-            self.cfg, self.settings, self.agent_id, prompt, self.workspace,
+            spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
             session, self.model, **kwargs,
         )
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
-        if paths:
+        if paths and self.cfg.driver != DRIVER_CODEX:
             process.argv = wrap_argv(process.argv, paths)
         if capabilities(self.driver).cancel and isinstance(process, Process):
             process.enable_cancel_fence()

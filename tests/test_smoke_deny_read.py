@@ -13,8 +13,9 @@ from .conftest import make_settings
 
 
 @pytest.mark.parametrize("leak_source", [None, "event", "native_transcript"])
+@pytest.mark.parametrize("edit_result", [None, "new", "old", "missing"])
 def test_smoke_checks_all_events_and_native_transcripts_and_cleans_up(
-    tmp_path: Path, monkeypatch, capsys, leak_source
+    tmp_path: Path, monkeypatch, capsys, leak_source, edit_result,
 ):
     home = tmp_path / "home"
     home.mkdir()
@@ -41,6 +42,16 @@ def test_smoke_checks_all_events_and_native_transcripts_and_cleans_up(
             assert verification == "true"
             assert provider == "glm"
             assert "python3 leak.py" in task
+            target = workspace / "target.txt"
+            if edit_result is not None:
+                assert "target.txt" in task and "old" in task and "new" in task
+                assert target.read_text() == "old"
+                if edit_result == "missing":
+                    target.unlink()
+                else:
+                    target.write_text(edit_result)
+            else:
+                assert not target.exists()
             assert len(deny_read) == 1
             secret = Path(deny_read[0]) / "secret.txt"
             assert str(secret.resolve()) in task
@@ -63,9 +74,13 @@ def test_smoke_checks_all_events_and_native_transcripts_and_cleans_up(
 
     monkeypatch.setattr(smoke, "InProcessServer", Server)
 
-    assert smoke.main(["--provider", "glm"]) == (1 if leak_source else 0)
+    args = ["--provider", "glm"] + (["--edit-check"] if edit_result is not None else [])
+    expected_failure = bool(leak_source) or edit_result in ("old", "missing")
+    assert smoke.main(args) == (1 if expected_failure else 0)
     output = capsys.readouterr().out
     assert f"token_in_output_or_transcript: {str(bool(leak_source)).lower()}" in output
+    if edit_result is not None:
+        assert f"edit_landed: {str(edit_result == 'new').lower()}" in output
     assert instances[0].stopped
     assert not instances[0].session_root.parent.exists()
     assert list((home / ".autoresearch").iterdir()) == []

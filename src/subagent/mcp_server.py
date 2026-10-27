@@ -52,6 +52,10 @@ The child's tool calls are gated by a policy classifier before they execute, and
 anything the classifier cannot settle is escalated to you. It still works
 unattended between escalations, so point it at a branch, a worktree, or a
 scratch directory rather than anything you cannot afford to have edited.
+
+Autoresearch is a separate MCP server that drives experiment loops and uses this
+server only as a dispatcher through InProcessServer with deny_read set to its
+session folder; children never call autoresearch.
 """
 
 

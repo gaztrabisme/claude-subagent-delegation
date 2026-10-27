@@ -72,10 +72,11 @@ class InProcessServer:
         return self
 
     def delegate(self, *, provider: str, task: str, verification: str, workspace: Path,
-                 fallback: str = "none", name: str | None = None) -> Run:
-        """Create an agent on `provider` and submit its delegate run."""
+                 fallback: str = "none", name: str | None = None,
+                 deny_read: list[str] | None = None) -> Run:
+        """Submit a run, optionally excluding paths from child reads and writes."""
         agent = self.registry.create_agent(
-            name, workspace.resolve(), provider=provider, fallback=fallback
+            name, workspace.resolve(), provider=provider, fallback=fallback, deny_read=deny_read
         )
         error = agent.wait_ready(60.0)
         if error is not None:

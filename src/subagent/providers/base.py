@@ -156,6 +156,8 @@ class ProviderConfig:
     # extra_args, grok's hooks.
     extra: dict[str, Any] = field(default_factory=dict)
     effort: str | None = None
+    # Optional OS-enforced child read/write exclusions, expanded by config.py.
+    deny_read: tuple[str, ...] = ()
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         """The first set key in `api_key_envs`, else `api_key_default`."""

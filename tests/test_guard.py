@@ -326,6 +326,16 @@ def test_read_of_a_secret_is_denied(ws):
     assert classify("Read", {"file_path": str(ws / ".env")}, ws).action == DENY
 
 
+@pytest.mark.parametrize("tool,args", [
+    ("Read", {"file_path": "~/.autoresearch/x/measure.sh"}),
+    ("Bash", {"command": "cat ~/.autoresearch/x/measure.sh"}),
+])
+def test_autoresearch_direct_reads_are_denied(tool, args, ws):
+    verdict = classify(tool, args, ws)
+    assert verdict.action == DENY
+    assert ".autoresearch" in verdict.reason
+
+
 def test_guard_custom_root_protection_can_be_released(ws):
     """A temporary owner config root stays protected only for the child run."""
     owner_config = ws.parent / "custom-claude-config"

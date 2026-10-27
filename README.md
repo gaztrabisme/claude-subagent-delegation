@@ -144,6 +144,20 @@ subagent run --plan .subagent/PLAN.md --goal GOAL.md --auto --wait 540
 Run `uv run subagent --help` for the command list. The installed harness integration is the
 usual path; individual loop commands are available for manual workflows.
 
+## Autoresearch integration
+
+`autoresearch` is a separate MCP server that drives experiment loops. It uses
+`subagent` only as a dispatcher through `InProcessServer.delegate`, setting
+`deny_read=[str(session_folder)]` for its `~/.autoresearch/<session>/` scoring scripts
+and validation data. Children never call autoresearch.
+
+On macOS, a nonempty `deny_read` wraps the child and its descendants in
+`sandbox-exec`, denying reads and writes under each canonical path, including
+access through symlinks. Other platforms refuse requests with `deny_read` set.
+Providers can also set `deny_read = ["~/.autoresearch"]` in their TOML table;
+provider and per-call restrictions are merged and kept across continuations and
+fallback. The MCP `delegate` tool does not expose this argument.
+
 ## Goal files
 
 `/plan` writes a plan that ends with a `## Goal block`; `/goal` writes a workspace-root

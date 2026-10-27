@@ -8,7 +8,20 @@ import sys
 import threading
 from pathlib import Path
 
+from subagent.guard.approval_hook import requests
+from subagent.guard.classify import DENY, classify
+
 HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent" / "guard" / "approval_hook.py"
+
+
+def test_codex_exec_command_autoresearch_read_is_denied(tmp_path: Path):
+    mapped = requests(
+        "exec_command", {"cmd": "cat ~/.autoresearch/x/measure.sh"}, codex=True
+    )
+    assert mapped == [("Bash", {"command": "cat ~/.autoresearch/x/measure.sh"})]
+    verdict = classify(*mapped[0], tmp_path)
+    assert verdict.action == DENY
+    assert ".autoresearch" in verdict.reason
 
 
 def _run_hook(env: dict, stdin: str, extra_args: list[str] | None = None) -> subprocess.CompletedProcess:

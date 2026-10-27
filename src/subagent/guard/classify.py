@@ -96,7 +96,7 @@ SENSITIVE_HOME = (
     ".config/gh", ".claude.json", ".claude",
     "Library/Keychains",
     # git's plain-text credential store, and this server's own config.
-    ".git-credentials", ".subagent",
+    ".git-credentials", ".subagent", ".autoresearch",
     # Shell and REPL history: commands typed with tokens in them.
     ".zsh_history", ".bash_history", ".history", ".python_history",
     ".node_repl_history", ".psql_history", ".mysql_history", ".sqlite_history",

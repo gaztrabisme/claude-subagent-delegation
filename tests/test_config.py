@@ -87,6 +87,23 @@ def _load(tmp_path: Path, tables: dict, name: str = "c.toml"):
     return config.load(extra=write_config(tmp_path / name, tables))
 
 
+def test_config_provider_deny_read_expands_home(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings = _load(tmp_path, {"providers": {"glm": {
+        **GLM, "deny_read": ["~/.autoresearch/session", str(tmp_path / "other")],
+    }}})
+    assert settings.provider("glm").deny_read == (
+        str(tmp_path / ".autoresearch/session"), str(tmp_path / "other"),
+    )
+    assert "deny_read" not in settings.provider("glm").extra
+
+
+@pytest.mark.parametrize("value", ["~/private", [1], [""], ["   "], False])
+def test_config_provider_deny_read_requires_list_of_nonempty_paths(tmp_path: Path, value):
+    with pytest.raises(ConfigError, match="deny_read"):
+        _load(tmp_path, {"providers": {"glm": {**GLM, "deny_read": value}}})
+
+
 # --- layering and merging ---------------------------------------------------------
 
 

@@ -40,6 +40,7 @@ from .providers.claude import (  # noqa: F401
 )
 from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
+from .sandbox import check_platform, normalize_paths, wrap_argv
 from .secrets import redact_secrets
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
@@ -743,6 +744,7 @@ class Agent:
         goal: Goal | None = None,
         goal_reviewer: GoalReviewer | None = None,
         delegate_options: dict[str, Any] | None = None,
+        deny_read: list[str] | None = None,
     ):
         self.trace = trace
         self.telemetry = telemetry
@@ -750,6 +752,9 @@ class Agent:
         # along `chain` (Settings.chain) when a provider refuses before work;
         # after that every continue stays on the provider that ran.
         self.cfg = cfg or settings.provider()
+        # Keep the initial policy across continuations and provider fallback.
+        self.deny_read = normalize_paths([*self.cfg.deny_read, *(deny_read or [])])
+        check_platform(self.deny_read)
         self.fallback = fallback
         self.driver = providers.for_driver(self.cfg.driver)
         # Provider name -> its boot result (None when it can run) and session.
@@ -1128,6 +1133,8 @@ class Agent:
 
     def _spawn(self, run: Run, prompt: str, resume: str | None) -> Process:
         """One turn's child process, on the current provider's driver."""
+        paths = normalize_paths([*self.deny_read, *self.cfg.deny_read])
+        check_platform(paths)
         session = self.session()
         session.session_id = resume
         kwargs = {}
@@ -1142,6 +1149,10 @@ class Agent:
             self.cfg, self.settings, self.agent_id, prompt, self.workspace,
             session, self.model, **kwargs,
         )
+        # Driver processes start lazily in events(), through Process._start().
+        # Wrap before publishing or consuming one so all descendants inherit it.
+        if paths:
+            process.argv = wrap_argv(process.argv, paths)
         if capabilities(self.driver).cancel and isinstance(process, Process):
             process.enable_cancel_fence()
         return process
@@ -2093,6 +2104,7 @@ class Registry:
         goal_reviewer: GoalReviewer | None = None,
         task: str | None = None,
         instructions: str | None = None,
+        deny_read: list[str] | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -2131,6 +2143,7 @@ class Registry:
                 goal_reviewer=goal_reviewer,
                 delegate_options={"task": task, "instructions": instructions,
                                   "name": name, "model": model, "fallback": fallback},
+                deny_read=deny_read,
             )
             self._agents[claimed] = agent
             return agent

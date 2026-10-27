@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,60 @@ def test_agent_guard_context_contains_configured_and_driver_injected_secret_name
 
     assert "OMLX_API_KEY" in names
     assert "ANTHROPIC_AUTH_TOKEN" in names
+
+
+@pytest.mark.parametrize("configured,per_call", [
+    (False, False), (True, False), (False, True), (True, True),
+])
+def test_deny_read_merges_and_wraps_only_when_nonempty(
+    registry, tmp_path: Path, monkeypatch, configured, per_call
+):
+    monkeypatch.setattr("subagent.sandbox.sys.platform", "darwin")
+    provider_path = str(tmp_path / "provider-private")
+    call_path = str(tmp_path / "call-private")
+    registry.settings.providers["glm"] = replace(
+        registry.settings.providers["glm"], deny_read=(provider_path,) if configured else (),
+    )
+    paths = [call_path] if per_call else None
+    agent = registry.create_agent("t", tmp_path, provider="glm", deny_read=paths)
+    if paths is not None:
+        paths.clear()  # A caller cannot remove the running agent's restriction.
+    _wait(agent.submit("first", verification="true"))
+    _wait(agent.submit("continue", verification="true"))
+    for process in registry.captured:
+        argv = process.argv
+        if not (configured or per_call):
+            assert argv[0] != "/usr/bin/sandbox-exec"
+            continue
+        assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+        assert (provider_path in argv[2]) == configured
+        assert (call_path in argv[2]) == per_call
+        assert "--dangerously-skip-permissions" in argv[3:]
+
+
+def test_deny_read_preserves_initial_policy_after_provider_change(
+    registry, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr("subagent.sandbox.sys.platform", "darwin")
+    original = str(tmp_path / "original")
+    fallback = str(tmp_path / "fallback")
+    registry.settings.providers["glm"] = replace(
+        registry.settings.providers["glm"], deny_read=(original,),
+    )
+    agent = registry.create_agent("t", tmp_path, provider="glm", fallback="none")
+    _wait(agent.submit("first", verification="true"))
+    agent.cfg = replace(agent.cfg, name="fallback", deny_read=(fallback,))
+    _wait(agent.submit("after provider change", verification="true"))
+    profile = registry.captured[-1].argv[2]
+    assert original in profile
+    assert fallback in profile
+
+
+def test_deny_read_on_non_macos_fails_before_child_spawn(registry, tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("subagent.sandbox.sys.platform", "linux")
+    with pytest.raises(RuntimeError, match="deny_read.*macOS"):
+        registry.create_agent("t", tmp_path, provider="glm", deny_read=[str(tmp_path / "secret")])
+    assert not registry.captured
 
 
 def test_boot_experimental_gate_is_checked_per_provider_on_the_same_driver(

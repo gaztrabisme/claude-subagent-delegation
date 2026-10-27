@@ -273,7 +273,7 @@ _PROVIDER_KEYS = frozenset({
     "driver", "vendor", "base_url", "model", "effort", "api_key_env", "api_key", "local",
     "send_sampling", "max_agents", "compact_window", "max_steps", "run_timeout",
     "idle_timeout", "adapter", "binary", "experimental", "health", "probe",
-    "pricing", "thinking",
+    "pricing", "thinking", "deny_read",
 })
 
 
@@ -316,6 +316,11 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         raise ConfigError(f"provider {name!r} thinking must be 'off' or 'low'")
     api_key_envs = _strings(table, "api_key_env")
     api_key_default = None if auth == "login" else _str(table, "api_key", None)
+    deny_read = table.get("deny_read", [])
+    if not isinstance(deny_read, list) or not all(
+        isinstance(path, str) and path.strip() for path in deny_read
+    ):
+        raise ConfigError(f"provider {name!r} deny_read must be a list of nonempty paths")
     return ProviderConfig(
         name=name,
         driver=driver,
@@ -342,6 +347,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         probe=_probe(table),
         pricing=_pricing(table),
         thinking=thinking,
+        deny_read=tuple(str(Path(path).expanduser()) for path in deny_read),
         extra={k: v for k, v in table.items() if k not in _PROVIDER_KEYS},
     )
 

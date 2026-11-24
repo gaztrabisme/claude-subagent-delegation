@@ -208,6 +208,14 @@ class ClaudeProvider:
     """Runs a turn as ``claude -p`` against the provider's endpoint."""
 
     name = DRIVER_CLAUDE
+    # Claude's stream-json pass-through event types accepted by this driver.
+    # Pinning the set lets harness verification flag fixture drift without
+    # mistaking passthrough for support of every future event name.
+    known_event_types = frozenset({
+        "system", "assistant", "user", "result", "stream_event",
+        "rate_limit_event", "tool_progress", "auth_status", "prompt_suggestion",
+        "task_started", "task_progress", "task_notification", "files_persisted",
+    })
     # Whether a run needs the provider's API key in this server's environment.
     needs_api_key = True
     prompt_on_stdin = False

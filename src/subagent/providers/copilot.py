@@ -257,6 +257,12 @@ class CopilotProvider:
     """Runs a turn as ``copilot -p``. The session id is a minted uuid."""
 
     name = DRIVER_COPILOT
+    known_event_types = frozenset({
+        "assistant.turn_start", "assistant.message", "tool.execution_start",
+        "tool.execution_partial_result", "tool.execution_complete",
+        "session.usage_checkpoint", "assistant.error", "session.error",
+        "tool.execution_error",
+    })
     needs_api_key = False  # the Copilot CLI logs in with its own credentials
     prompt_on_stdin = False
 

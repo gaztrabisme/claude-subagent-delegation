@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -127,6 +128,15 @@ def check_updates(
         check_cmd = _argv(harness_cfg.get("update_check"))
         if check_cmd is None:
             continue
+        if _contains_sudo(check_cmd):
+            results[lane] = {
+                "current": None,
+                "available": None,
+                "checked_at": current_time.isoformat(),
+                "refused": True,
+                "reason": "sudo is refused",
+            }
+            continue
         saved = store.harness_record(lane).get("harness_check")
         checked_at = _parse_time(saved.get("checked_at")) if isinstance(saved, dict) else None
         try:
@@ -187,10 +197,9 @@ def _translator(cfg: Any, lane: str) -> Any:
 
 
 def _event_type(event: Any) -> str:
-    return (
-        str(event.get("type") or "(missing type)")
-        if isinstance(event, dict) else "(invalid event)"
-    )
+    if not isinstance(event, dict):
+        return "(invalid event)"
+    return str(event.get("type") or event.get("event") or "(missing type)")
 
 
 def _missing_expected(expected: Any, actual: Any, path: str = "") -> tuple[str, Any, Any] | None:
@@ -245,20 +254,22 @@ def _verify_fixtures(cfg: Any, lane: str, fixtures_dir: Path) -> list[str]:
 
         try:
             translator = _translator(cfg, lane)
+            from .providers import for_driver
+
+            known_event_types = getattr(for_driver(cfg.driver), "known_event_types", None)
             actual: list[dict[str, Any]] = []
             unknown: list[str] = []
             for event in inputs:
                 if not isinstance(event, dict):
                     raise ValueError("fixture event must be a JSON object")
+                event_type = _event_type(event)
+                if known_event_types is not None and event_type not in known_event_types:
+                    unknown.append(event_type)
+                    continue
                 produced = [event] if translator is None else translator.feed(event)
                 if not isinstance(produced, list):
                     raise ValueError(f"translator returned a non-list for {_event_type(event)}")
-                for item in produced:
-                    if isinstance(item, dict) and str(item.get("type", "")).startswith(
-                        f"{cfg.driver}/"
-                    ):
-                        unknown.append(_event_type(event))
-                    actual.append(item)
+                actual.extend(produced)
             if unknown:
                 errors.append(
                     f"{fixture.stem}: event type {unknown[0]} is not translated by {cfg.driver}"
@@ -296,6 +307,14 @@ def verify(
     if cfg is None:
         return {"ok": False, "lane": lane, "errors": [f"unknown lane {lane!r}"]}
     store = LaneStatusStore(settings.session_root, redact_keys=settings.leaked_keys)
+    smoke = _argv(_harness(cfg).get("smoke"))
+    if smoke is not None and _contains_sudo(smoke):
+        return {
+            "ok": False,
+            "refused": True,
+            "lane": lane,
+            "errors": ["sudo is refused in smoke command"],
+        }
     version = detect_version(cfg, runner)
     store.record_harness_version(lane, version)
     errors: list[str] = []
@@ -306,7 +325,6 @@ def verify(
         Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "conformance"
     )
     errors.extend(_verify_fixtures(cfg, lane, conformance))
-    smoke = _argv(_harness(cfg).get("smoke"))
     if smoke is not None:
         result = _invoke(runner, smoke)
         if result is None or result[0] != 0:
@@ -319,11 +337,133 @@ def verify(
         closure = memory.closed(lane)
         if closure is not None and closure.get("code") == "harness_unverified":
             memory.reopen(lane)
+            store.record_probe(lane, True, detail="harness verification passed")
     return {"ok": ok, "lane": lane, "version": version, "errors": errors}
 
 
+_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "ash"})
+_SHELL_SEPARATORS = frozenset({";", "&", "&&", "|", "||", "(", ")", "\n"})
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
+
+
+def _is_sudo_word(value: str) -> bool:
+    return Path(value).name.lower() == "sudo"
+
+
+def _env_command(argv: list[str]) -> list[str]:
+    """Return the command after env options and variable assignments."""
+    index = 0
+    while index < len(argv):
+        part = argv[index]
+        if part == "--":
+            return argv[index + 1:]
+        if part in ("-u", "--unset", "-C", "--chdir"):
+            index += 2
+            continue
+        if part in ("-S", "--split-string"):
+            if index + 1 >= len(argv):
+                return []
+            try:
+                split = shlex.split(argv[index + 1])
+            except ValueError:
+                return []
+            return [*split, *argv[index + 2:]]
+        if part.startswith("-") or _ASSIGNMENT.match(part):
+            index += 1
+            continue
+        return argv[index:]
+    return []
+
+
+def _shell_script(argv: list[str]) -> str | None:
+    """Read the script passed to a POSIX shell's -c/--command option."""
+    index = 1
+    while index < len(argv):
+        part = argv[index]
+        if part == "--":
+            return None
+        if part == "--command":
+            return argv[index + 1] if index + 1 < len(argv) else ""
+        if part.startswith("--command="):
+            return part.partition("=")[2]
+        if part.startswith("-") and part != "-":
+            if "c" in part[1:]:
+                return argv[index + 1] if index + 1 < len(argv) else ""
+            index += 1
+            continue
+        index += 1
+    return None
+
+
+def _script_commands(script: str) -> list[list[str]]:
+    """Split shell text into command words while respecting quotes/comments."""
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=";&|()<>\n")
+    lexer.whitespace = lexer.whitespace.replace("\n", "")
+    lexer.whitespace_split = True
+    commands: list[list[str]] = []
+    current: list[str] = []
+    for token in lexer:
+        if token in _SHELL_SEPARATORS:
+            if current:
+                commands.append(current)
+                current = []
+        elif token in (">", ">>", "<", "<<", "<>", "<&", ">&"):
+            # Redirection targets are not command words. They are harmless to
+            # sudo detection, so retain them for the leading-word parser.
+            current.append(token)
+        else:
+            current.append(token)
+    if current:
+        commands.append(current)
+    return commands
+
+
+def _command_word(words: list[str]) -> list[str]:
+    """Skip shell assignments, control keywords and leading redirections."""
+    index = 0
+    control = {"!", "if", "then", "else", "elif", "while", "until", "do"}
+    while index < len(words):
+        word = words[index]
+        if word in control or _ASSIGNMENT.match(word):
+            index += 1
+            continue
+        if word in (">", ">>", "<", "<<", "<>", "<&", ">&"):
+            index += 2
+            continue
+        return words[index:]
+    return []
+
+
+def _contains_sudo_argv(command: list[str]) -> bool:
+    words = _command_word(command)
+    if not words:
+        return False
+    executable = Path(words[0]).name.lower()
+    if executable == "sudo" or _is_sudo_word(words[0]):
+        return True
+    if executable == "env":
+        return _contains_sudo_argv(_env_command(words[1:]))
+    if executable in _SHELLS:
+        script = _shell_script(words)
+        return _contains_sudo_script(script) if script is not None else False
+    if executable in {"command", "exec", "nohup", "time"}:
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            index += 1
+        return _contains_sudo_argv(words[index:])
+    return False
+
+
+def _contains_sudo_script(script: str) -> bool:
+    try:
+        return any(_contains_sudo_argv(words) for words in _script_commands(script))
+    except ValueError:  # malformed shell quoting is refused if it names sudo
+        return bool(re.search(r"(?<![\w.-])(?:[^\s;&|()<>]*/)?sudo(?=$|[\s;&|()<>])", script))
+
+
 def _contains_sudo(command: list[str]) -> bool:
-    return any(Path(part).name.lower() == "sudo" for part in command)
+    """Whether argv invokes sudo directly or in a supported shell wrapper."""
+    return _contains_sudo_argv(command)
 
 
 def update(
@@ -337,6 +477,7 @@ def update(
         return {"ok": False, "lane": lane, "errors": [f"unknown lane {lane!r}"]}
     harness_cfg = _harness(cfg)
     update_cmd = _argv(harness_cfg.get("update_cmd"))
+    rollback_cmd = _argv(harness_cfg.get("rollback_cmd"))
     if str(harness_cfg.get("kind", "")).lower() == "app":
         return {
             "ok": False,
@@ -344,7 +485,8 @@ def update(
             "lane": lane,
             "reason": "app updates stay with the owner",
         }
-    if update_cmd is not None and _contains_sudo(update_cmd):
+    if ((update_cmd is not None and _contains_sudo(update_cmd))
+            or (rollback_cmd is not None and _contains_sudo(rollback_cmd))):
         return {"ok": False, "refused": True, "lane": lane, "reason": "sudo is refused"}
     if update_cmd is None:
         return {"ok": False, "lane": lane, "errors": ["no update_cmd is configured"]}
@@ -376,7 +518,6 @@ def update(
             "verification": verification,
         }
 
-    rollback_cmd = _argv(harness_cfg.get("rollback_cmd"))
     rollback_ok = False
     rollback_message: str | None = None
     if rollback_cmd is not None:

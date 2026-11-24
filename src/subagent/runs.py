@@ -2262,6 +2262,7 @@ class Registry:
         task: str | None = None,
         instructions: str | None = None,
         deny_read: list[str] | None = None,
+        provider_explicit: bool | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -2301,7 +2302,10 @@ class Registry:
                 goal_reviewer=goal_reviewer,
                 delegate_options={"task": task, "instructions": instructions,
                                   "name": name, "model": model, "fallback": fallback,
-                                  "provider_explicit": provider is not None},
+                                  "provider_explicit": (
+                                      provider is not None
+                                      if provider_explicit is None else provider_explicit
+                                  )},
                 deny_read=deny_read,
             )
             self._agents[claimed] = agent

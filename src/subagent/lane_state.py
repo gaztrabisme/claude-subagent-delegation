@@ -8,8 +8,9 @@ without spending a call to hear the same refusal. The file is
     {"glm": {"closed_until": "2026-09-18T15:00:00+07:00", "code": "zai_1308",
              "message": "...", "set_at": "2026-09-18T10:12:03+07:00"}}
 
-Entries whose closed_until has passed are ignored, and no entry keeps a lane
-closed more than 7 days past its set_at, whatever it says. reopen() clears a
+Entries whose closed_until has passed are ignored, and no ordinary entry keeps
+a lane closed more than 7 days past its set_at. A `harness_unverified` entry
+stays closed until a passing harness verification reopens it. reopen() clears a
 lane's entry (scripts/reopen_lane.py is its command line). A file that cannot
 be read or parsed is treated as empty and logged; lane memory never fails a
 run. Read-modify-write holds an fcntl lock on <file>.lock, so two server
@@ -113,6 +114,8 @@ class LaneState:
         until = _parse(entry.get("closed_until"))
         if until is None:
             return None
+        if entry.get("code") == "harness_unverified":
+            return {**entry, "closed_until": until}
         set_at = _parse(entry.get("set_at"))
         cap = (set_at or (now or _now())) + MAX_CLOSE
         until = min(until, cap)
@@ -131,6 +134,9 @@ class LaneState:
                 continue
             until = _parse(entry.get("closed_until"))
             if until is None:
+                continue
+            if entry.get("code") == "harness_unverified":
+                result[lane] = {**entry, "closed_until": until}
                 continue
             set_at = _parse(entry.get("set_at"))
             until = min(until, (set_at or current) + MAX_CLOSE)
@@ -155,6 +161,9 @@ class LaneState:
                 verified[lane] = version
             until = _parse(entry.get("closed_until"))
             if until is None:
+                continue
+            if entry.get("code") == "harness_unverified":
+                closures[lane] = {**entry, "closed_until": until}
                 continue
             set_at = _parse(entry.get("set_at"))
             until = min(until, (set_at or current) + MAX_CLOSE)

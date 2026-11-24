@@ -322,6 +322,12 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
             "global instructions, commands and skills may load"
         )
         warning = f"{warning}\n{login_warning}" if warning else login_warning
+        if cfg.max_agents > 1:
+            concurrency_warning = (
+                f"warning: provider {cfg.name!r} max_agents = {cfg.max_agents}; concurrent "
+                "login children share ~/.claude.json and one OAuth refresh token"
+            )
+            warning = f"{warning}\n{concurrency_warning}"
     if warning:
         row["warning"] = warning
     if cfg.driver == "epi" and not args.no_probe:

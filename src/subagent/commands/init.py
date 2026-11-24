@@ -33,6 +33,7 @@ def _provider_table(name: str) -> dict[str, Any]:
     }
     if name == "claude":
         table["auth"] = "login"
+        table["max_agents"] = 1
     return table
 
 

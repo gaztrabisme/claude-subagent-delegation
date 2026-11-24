@@ -646,7 +646,7 @@ class Settings:
             # old default was ~/.claude) makes Claude Code skip its credential
             # store, which on macOS is the login Keychain: the child then reports
             # "Not logged in" while the parent shell is authenticated.
-            parent_config = os.environ.get("CLAUDE_CONFIG_DIR")
+            parent_config = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
             if parent_config:
                 env["CLAUDE_CONFIG_DIR"] = str(Path(parent_config).expanduser().resolve())
             else:
@@ -655,6 +655,13 @@ class Settings:
             env.pop("ANTHROPIC_AUTH_TOKEN", None)
             env.pop("ANTHROPIC_API_KEY", None)
             env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            # A login child runs as the owner, so it needs the owner's identity
+            # for tools that key off it; the owner's Claude credential is still
+            # never copied.
+            for var in ("USER", "LOGNAME"):
+                value = os.environ.get(var)
+                if value:
+                    env[var] = value
         else:
             env.update({
                 "CLAUDE_CONFIG_DIR": str(self.agent_home(agent_id)),

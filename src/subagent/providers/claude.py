@@ -313,7 +313,7 @@ class ClaudeProvider:
         if cfg.extra.get("auth") == "login":
             # The dir may be unset: the child must then read the login store the
             # way the CLI does. Protect it from the child's writes either way.
-            root = env.get("CLAUDE_CONFIG_DIR")
+            root = (env.get("CLAUDE_CONFIG_DIR") or "").strip()
             process.protected_root = Path(root) if root else Path.home() / ".claude"
         return process
 

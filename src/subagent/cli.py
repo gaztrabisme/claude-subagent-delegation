@@ -29,6 +29,7 @@ import sys
 import time
 import tomllib
 from collections.abc import Mapping, MutableMapping
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -583,6 +584,45 @@ def cmd_lanes(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_harness(args: argparse.Namespace) -> int:
+    """Inspect or explicitly maintain configured provider CLIs."""
+    from . import harness
+
+    root = Path(getattr(args, "root", None) or ".").expanduser().resolve()
+    project_root = root if getattr(args, "root", None) else _project_config_root(root)
+    try:
+        settings = config.load(project_root=project_root)
+        settings.require_providers()
+    except ConfigError as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
+
+    if args.harness_command == "status":
+        rows = harness.status(settings)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            print("lane  harness version  state     verified version")
+            for row in rows:
+                print(
+                    f"{row['lane']}  {row['harness_version'] or '-'}  "
+                    f"{row['harness_state']}  {row['verified_version'] or '-'}"
+                )
+        return 0
+    if args.harness_command == "check":
+        results = harness.check_updates(settings, now=datetime.now(UTC))
+        print(json.dumps(results, indent=2))
+        return 1 if any(
+            row.get("current") is None or row.get("available") is None
+            for row in results.values()
+        ) else 0
+    if args.harness_command == "verify":
+        result = harness.verify(args.lane, settings)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 1
+    return 2
+
+
 # --- the delegate loop ----------------------------------------------------------
 
 
@@ -667,6 +707,14 @@ def _parser() -> argparse.ArgumentParser:
     lanes = sub.add_parser("lanes", help="show stored provider lane status")
     lanes.add_argument("--json", action="store_true", help="print JSON instead of a table")
     lanes.add_argument("--probe", action="store_true", help="refresh stale idle lanes first")
+
+    harness_command = sub.add_parser("harness", help="check and verify provider CLI versions")
+    harness_sub = harness_command.add_subparsers(dest="harness_command", required=True)
+    harness_status = harness_sub.add_parser("status", help="show stored harness versions")
+    harness_status.add_argument("--json", action="store_true", help="print JSON")
+    harness_sub.add_parser("check", help="check configured update sources")
+    harness_verify = harness_sub.add_parser("verify", help="verify one provider harness")
+    harness_verify.add_argument("lane", metavar="LANE")
 
     sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",
                    add_help=False)
@@ -756,6 +804,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args)
     if args.command == "lanes":
         return cmd_lanes(args)
+    if args.command == "harness":
+        return cmd_harness(args)
     handler = getattr(args, "command_handler", None)
     if handler is not None:
         return handler(args)

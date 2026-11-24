@@ -580,6 +580,7 @@ class Run:
     finish_reason: str | None = None
     error: str | None = None
     error_detail: str | None = None
+    warning: str | None = None
     event_count: int = 0
     transcript: deque[str] = field(default_factory=lambda: deque(maxlen=400))
     status_ready: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -683,6 +684,8 @@ class Run:
             "usage": self.usage.as_dict(),
             "last_activity": self.transcript[-1] if self.transcript else None,
         }
+        if self.warning:
+            out["warning"] = self.warning
         if self.native_outcome is not None:
             for key in ("needs_human", "human_action", "plan_id", "usage_unreported",
                         "credits", "credits_unit", "cash_usd", "extra"):
@@ -1267,7 +1270,9 @@ class Agent:
             kwargs["context"] = RunContext(
                 verification=run.verification, goal=run.goal,
                 request_id=run.request_id, deadline=run.deadline,
-                **(self.delegate_options if resume is None else {}),
+                **({key: self.delegate_options.get(key) for key in (
+                    "task", "instructions", "name", "model", "fallback"
+                )} if resume is None else {}),
             )
         # Codex must coordinate its inner sandbox mode with its outer profile.
         # Give it the frozen agent policy plus the current provider's exclusions.
@@ -1461,6 +1466,10 @@ class Agent:
         """
         primary_model = self.model
         last_refusal: str | None = None
+        harness_status = (
+            self.lane_status.snapshot(self.settings) if self.lane_status is not None else {}
+        )
+        explicitly_named = bool(self.delegate_options.get("provider_explicit"))
         for index, cfg in enumerate(self.chain):
             if self._closing:
                 return False
@@ -1468,6 +1477,13 @@ class Agent:
             driver = providers.for_driver(cfg.driver)
             hop = router.Hop(index, cfg.name, cfg.vendor, model, router.HOP_UNAVAILABLE,
                              driver=driver.name, guard=driver.guard(self.settings, cfg))
+            harness_state = harness_status.get(cfg.name, {}).get("harness_state")
+            explicit_primary = index == 0 and explicitly_named
+            if router.skip_unverified_harness(harness_state, explicit=explicit_primary):
+                hop.code = "harness_unverified"
+                hop.message = f"provider {cfg.name!r} has an unverified harness"
+                self._hop(run, hop)
+                continue
             reason = cfg.unavailable()
             if (
                 reason is None
@@ -1554,6 +1570,10 @@ class Agent:
             run.deadline = _now() + cfg.run_timeout + extra
             run.worked = False
             run.attempted_lane = cfg.name
+            if explicit_primary and harness_state == "unverified":
+                run.warning = (
+                    f"provider {cfg.name!r} is running with an unverified harness version"
+                )
             events = self._collect(run, run.prompt, resume=None)
             refusal = None
             if not run.worked and run.trip is None and not self._closing:
@@ -2280,7 +2300,8 @@ class Registry:
                 goal=goal,
                 goal_reviewer=goal_reviewer,
                 delegate_options={"task": task, "instructions": instructions,
-                                  "name": name, "model": model, "fallback": fallback},
+                                  "name": name, "model": model, "fallback": fallback,
+                                  "provider_explicit": provider is not None},
                 deny_read=deny_read,
             )
             self._agents[claimed] = agent

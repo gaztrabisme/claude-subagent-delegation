@@ -91,6 +91,15 @@ HOP_SKIPPED_CLOSED = "skipped_closed"
 HOP_HEALTH_FAILED = "health_failed"
 HOP_UNAVAILABLE = "unavailable"
 
+
+def skip_unverified_harness(harness_state: str | None, *, explicit: bool = False) -> bool:
+    """Whether routing should skip a lane whose CLI version has not verified.
+
+    An explicitly named primary remains available to the caller; automatic
+    primary selection and every fallback hop skip an unverified CLI.
+    """
+    return harness_state == "unverified" and not explicit
+
 # Refusal code of a hop skipped by an enforced admission threshold. Not a lane
 # closure: the next dispatch probes the lane again.
 ADMISSION = "admission"

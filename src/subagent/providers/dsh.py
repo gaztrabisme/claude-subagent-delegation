@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
+import selectors
 import shutil
-import threading
 from collections.abc import Iterator
 from contextlib import suppress
 from pathlib import Path
@@ -27,10 +28,11 @@ DEFAULT_BINARY = "dsh"
 GUARD = "hook"
 PATCH_MARKER = "__SUBAGENT_DSH_GUARD_ENTRY__"
 READY_MARKER = "__SUBAGENT_DSH_GUARD_READY__"
+NONCE_ENV = "SUBAGENT_DSH_GUARD_NONCE"
 _GUARD_INACTIVE = re.compile(
     r"(?=.*subagent-dsh-guard)(?=.*(?:did not activate|failed to activate|failed to load|"
     r"failed to import|could not load|could not import|unable to load))",
-    re.IGNORECASE,
+    re.IGNORECASE | re.DOTALL,
 )
 USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
 AUTH_CODES = (
@@ -87,6 +89,11 @@ def _agent_dir(settings: Settings, agent_id: str) -> Path:
 def _dsh_home(settings: Settings, agent_id: str) -> Path:
     path = _agent_dir(settings, agent_id) / "dsh-home"
     path.mkdir(parents=True, exist_ok=True)
+    # DSH's profile bootstrap creates this directory before it loads patches.
+    # Prepare it outside Seatbelt so a fresh isolated home can boot read-only.
+    headless = path / "profiles" / "headless"
+    headless.mkdir(parents=True, exist_ok=True)
+    (headless / "cordis.yml").touch(exist_ok=True)
     return path
 
 
@@ -459,7 +466,7 @@ class DshProcess(Process):
         if self.protected_root is not None:
             protect(self.protected_root, temporary=True)
         proc = None
-        stderr_thread = None
+        selector: selectors.BaseSelector | None = None
         login_patch = self.login_patch
         try:
             proc = self._start(stdin=True)
@@ -473,46 +480,94 @@ class DshProcess(Process):
                     proc.stdin.close()
             assert proc.stdout is not None
             stderr_buf: list[str] = []
-            guard_ready = threading.Event()
-            guard_inactive = threading.Event()
+            guard_ready = False
+            guard_inactive = False
+            expected_ready = f"{READY_MARKER}{self.env.get(NONCE_ENV, '')}"
+            selector = selectors.DefaultSelector()
+            buffers = {"stdout": bytearray(), "stderr": bytearray()}
+            streams = {"stdout": proc.stdout, "stderr": proc.stderr}
+            for name, stream in streams.items():
+                if stream is not None:
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, name)
 
-            def drain_stderr() -> None:
-                if proc is None or proc.stderr is None:
+            def stderr_line(line: bytes) -> None:
+                nonlocal guard_ready, guard_inactive
+                text = line.decode("utf-8", errors="replace")
+                if text.rstrip("\r\n") == expected_ready and self.env.get(NONCE_ENV):
+                    guard_ready = True
                     return
-                for line in proc.stderr:
-                    if READY_MARKER in line:
-                        guard_ready.set()
-                        continue
-                    stderr_buf.append(line)
-                    if _GUARD_INACTIVE.search(line):
-                        guard_inactive.set()
-                        self.dsh_translator.error_message = (
-                            "DSH reported that subagent-dsh-guard did not activate"
-                        )
-                        self.kill()
+                stderr_buf.append(text)
+                if _GUARD_INACTIVE.search("".join(stderr_buf)):
+                    guard_inactive = True
+                    self.dsh_translator.error_message = (
+                        "DSH reported that subagent-dsh-guard did not activate"
+                    )
+                    self.kill()
 
-            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-            stderr_thread.start()
-            for native in self._json_lines(proc.stdout):
-                if guard_inactive.is_set():
-                    break
-                if not guard_ready.wait(timeout=0.5):
-                    if not guard_inactive.is_set():
-                        self.dsh_translator.error_message = (
-                            "DSH guard readiness proof was not received before the first event"
-                        )
-                        self.kill()
-                    break
-                if guard_inactive.is_set():
-                    break
+            def stdout_line(line: bytes) -> Iterator[dict[str, Any]]:
+                nonlocal guard_inactive
+                if guard_inactive:
+                    return
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    return
+                try:
+                    native = json.loads(raw)
+                except json.JSONDecodeError:
+                    return
+                if not isinstance(native, dict):
+                    return
+                # The selector handles stderr first whenever both pipes are
+                # readable. No event is translated before its nonce proof.
+                if not guard_ready:
+                    self.dsh_translator.error_message = (
+                        "DSH guard readiness proof was not received before the first event"
+                    )
+                    self.kill()
+                    guard_inactive = True
+                    return
                 yield from self.dsh_translator.feed(native)
+
+            while selector.get_map() and not guard_inactive:
+                ready = selector.select()
+                # Read proof and activation diagnostics before events when both
+                # file descriptors became readable in the same poll cycle.
+                ready.sort(key=lambda item: item[0].data != "stderr")
+                for key, _mask in ready:
+                    name = key.data
+                    stream = key.fileobj
+                    try:
+                        chunk = os.read(stream.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        pending = bytes(buffers[name])
+                        if pending:
+                            if name == "stderr":
+                                stderr_line(pending)
+                            else:
+                                yield from stdout_line(pending)
+                        continue
+                    buffers[name].extend(chunk)
+                    while b"\n" in buffers[name]:
+                        line, _, tail = buffers[name].partition(b"\n")
+                        buffers[name] = bytearray(tail)
+                        if name == "stderr":
+                            stderr_line(line + b"\n")
+                        else:
+                            yield from stdout_line(line)
+                        if guard_inactive:
+                            break
+            selector.close()
+            selector = None
             code = proc.wait()
-            stderr_thread.join(timeout=5)
-            if guard_inactive.is_set():
+            if guard_inactive:
                 self.dsh_translator.error_message = (
                     "DSH reported that subagent-dsh-guard did not activate"
                 )
-            elif not guard_ready.is_set():
+            elif not guard_ready:
                 self.dsh_translator.error_message = (
                     "DSH guard readiness proof was not received"
                 )
@@ -524,8 +579,8 @@ class DshProcess(Process):
         finally:
             if proc is not None and proc.poll() is None:
                 self.kill()
-            if stderr_thread is not None:
-                stderr_thread.join(timeout=5)
+            if selector is not None:
+                selector.close()
             if self.protected_root is not None:
                 release(self.protected_root)
             if login_patch is not None:
@@ -544,9 +599,12 @@ class DshProvider:
         return GUARD
 
     def secret_files(self, cfg: ProviderConfig) -> tuple[Path, ...]:
-        """Protect the owner's DSH credential and storage paths from guard reads."""
+        """Protect every path under the owner's DSH home from guard reads."""
         owner_home = _owner_dsh_home()
-        return (owner_home / ".credentials.yaml", owner_home / "storages")
+        # Keep the prior leaf declarations as explicit entries for consumers
+        # that display declared secrets, while the root closes scans of all
+        # other DSH state (sessions, config, and future files).
+        return (owner_home, owner_home / ".credentials.yaml", owner_home / "storages")
 
     @staticmethod
     def binary(cfg: ProviderConfig) -> str:
@@ -595,44 +653,59 @@ class DshProvider:
         argv.extend([
             "--json",
             "--approval-policy", "never",
-            "--permission-mode", "danger-full-access" if cfg.deny_read else "workspace-write",
+            # Seatbelt is the authority for this driver; DSH's own sandbox
+            # would otherwise block its isolated runtime state.
+            "--permission-mode", "danger-full-access",
         ])
         session_id = _session_text(session)
         if session_id:
             argv.extend(["--session-id", session_id])
         argv.append("-")
-        if cfg.deny_read:
-            agent_dir = _agent_dir(settings, agent_id)
-            bridge_root, bridge_entry, bridge_patch = _bridge_bundle()
-            write_allow = [
-                str(cwd),
-                "/private/tmp",
-                os.environ.get("TMPDIR") or "/private/tmp",
-                str(dsh_home / "sessions"),
-                str(dsh_home / "storages"),
-                str(dsh_home / "spills"),
-                str(dsh_home / ".anonymous-user-id"),
-                "/dev",
-            ]
-            write_deny = [
-                str(cwd / ".git"),
-                *(str(root) for root in sorted(_git_metadata_roots(cwd))),
-                str(APPROVAL_HOOK),
-                str(dsh_home / "cordis.patch.yml"),
-                str(dsh_home / ".env"),
-                str(dsh_home / "profiles"),
-                str(dsh_home / "dsh-guard"),
-                str(guard_patch),
-                str(bridge_root),
-                str(bridge_entry),
-                str(bridge_patch),
-                str(agent_dir / "dsh-login.patch.yml"),
-                str(agent_dir / "dsh-model.patch.yml"),
-            ]
-            deny_paths = list(cfg.deny_read)
-            if login:
-                deny_paths.append(str((_owner_dsh_home() / "storages").resolve()))
-            argv = wrap_argv(argv, deny_paths, write_allow=write_allow, write_deny=write_deny)
+        agent_dir = _agent_dir(settings, agent_id)
+        bridge_root, bridge_entry, bridge_patch = _bridge_bundle()
+        headless_profile = dsh_home / "profiles" / "headless"
+        headless_cordis = headless_profile / "cordis.yml"
+        # DSH rewrites only this generated bootstrap file on every launch.
+        # The profile directory and every patch remain write-denied.
+        write_allow = [
+            str(cwd),
+            "/private/tmp",
+            os.environ.get("TMPDIR") or "/private/tmp",
+            str(dsh_home / "sessions"),
+            str(dsh_home / "storages"),
+            str(dsh_home / "spills"),
+            str(dsh_home / ".anonymous-user-id"),
+            "/dev",
+        ]
+        write_deny = [
+            str(cwd / ".env"),
+            str(cwd / ".git"),
+            *(str(root) for root in sorted(_git_metadata_roots(cwd))),
+            str(APPROVAL_HOOK),
+            str(dsh_home / "cordis.patch.yml"),
+            str(dsh_home / ".env"),
+            str(dsh_home / "profiles"),
+            str(dsh_home / "dsh-guard"),
+            str(guard_patch),
+            str(agent_dir / "dsh-login.patch.yml"),
+            str(agent_dir / "dsh-model.patch.yml"),
+            str(bridge_root),
+            str(bridge_entry),
+            str(bridge_patch),
+        ]
+        owner_home = _owner_dsh_home().resolve()
+        deny_paths = [*cfg.deny_read, str(owner_home), str(owner_home / "storages")]
+        read_allow = [str(owner_home / ".credentials.yaml")] if login else []
+        argv = wrap_argv(
+            argv,
+            deny_paths,
+            write_allow=write_allow,
+            write_deny=write_deny,
+            read_allow=read_allow,
+            write_allow_exact=[str(headless_cordis)],
+        )
+        if argv[:2] != ["/usr/bin/sandbox-exec", "-p"]:
+            raise RuntimeError("DSH requires the outer macOS sandbox-exec profile")
         return argv
 
     def env(
@@ -644,11 +717,11 @@ class DshProvider:
         env["SUBAGENT_GUARD_HOOK"] = settings.guard_hook_command(agent_id)
         env["SUBAGENT_APPROVAL_SOCKET"] = settings.approval_socket
         env["SUBAGENT_HOOK_TIMEOUT"] = str(settings.supervisor_timeout + 20)
+        env[NONCE_ENV] = secrets.token_urlsafe(32)
         env.pop("DSH_OWNER_HOME", None)
         if cfg.extra.get("auth") == "login":
-            # Keep DSH's dotenv loader from populating this unset variable.
-            # Login mode uses the account-token provider instead.
-            env.pop("DEEPSEEK_API_KEY", None)
+            # An empty value shadows DSH's workspace and home dotenv fallbacks.
+            env["DEEPSEEK_API_KEY"] = ""
             env.pop("DEEPSEEK_BASE_URL", None)
         else:
             env["DEEPSEEK_API_KEY"] = cfg.api_key() or ""

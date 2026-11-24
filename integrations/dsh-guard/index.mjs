@@ -28,6 +28,9 @@ const DEFAULT_TIMEOUT_SECONDS = 150;
 const MAX_TIMEOUT_SECONDS = 300;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const READY_MARKER = '__SUBAGENT_DSH_GUARD_READY__';
+const READY_NONCE_ENV = 'SUBAGENT_DSH_GUARD_NONCE';
+const READY_NONCE = process.env[READY_NONCE_ENV] || '';
+delete process.env[READY_NONCE_ENV];
 
 function deny(reason) {
   return { allow: false, reason: String(reason || 'blocked: subagent guard denied the call') };
@@ -107,7 +110,9 @@ async function runHook(command, serializedPayload, env, signal) {
   if (signal?.aborted) return { cancelled: true };
   const hookEnv = { ...process.env, ...env };
   for (const name of Object.keys(hookEnv)) {
-    if (/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) delete hookEnv[name];
+    if (name === READY_NONCE_ENV || /(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) {
+      delete hookEnv[name];
+    }
   }
 
   return await new Promise((resolve, reject) => {
@@ -234,7 +239,7 @@ export function apply(ctx) {
 
   const register = () => {
     const dispose = ctx.on('tools/pre-execute', handler, { prepend: true });
-    process.stderr.write(`${READY_MARKER}\n`);
+    if (READY_NONCE) process.stderr.write(`${READY_MARKER}${READY_NONCE}\n`);
     return dispose;
   };
   if (typeof ctx.effect === 'function') {

@@ -33,7 +33,8 @@ def _filter(path: str, kind: str) -> str:
 
 def build_profile(
     deny_paths: Sequence[str], write_allow: Sequence[str] | None = None,
-    write_deny: Sequence[str] = (),
+    write_deny: Sequence[str] = (), *,
+    read_allow: Sequence[str] = (), write_allow_exact: Sequence[str] = (),
 ) -> str:
     """Restrict writes, deny excluded realpaths, and prevent ancestor renames."""
     rules = ["(version 1)", "(allow default)"]
@@ -56,6 +57,12 @@ def build_profile(
     for path in write_paths:
         for kind in ("literal", "subpath"):
             rules.append(f'(deny file-write* {_filter(path, kind)})')
+    # Narrow exceptions follow subtree denials. Literal filters cannot grant
+    # access to siblings or descendants of the exception path.
+    for path in normalize_paths(read_allow):
+        rules.append(f'(allow file-read* {_filter(path, "literal")})')
+    for path in normalize_paths(write_allow_exact):
+        rules.append(f'(allow file-write* {_filter(path, "literal")})')
     ancestors = dict.fromkeys(
         str(parent) for path in (*denied, *write_paths)
         for parent in Path(path).parents if parent != Path("/")
@@ -74,10 +81,16 @@ def check_platform(paths: Sequence[str]) -> None:
 
 def wrap_argv(
     argv: list[str], paths: Sequence[str], write_allow: Sequence[str] | None = None,
-    write_deny: Sequence[str] = (),
+    write_deny: Sequence[str] = (), *,
+    read_allow: Sequence[str] = (), write_allow_exact: Sequence[str] = (),
 ) -> list[str]:
     """Pass arguments directly to sandbox-exec; never fall back on sandbox failure."""
     if not paths:
         return argv
     check_platform(paths)
-    return ["/usr/bin/sandbox-exec", "-p", build_profile(paths, write_allow, write_deny), *argv]
+    return [
+        "/usr/bin/sandbox-exec", "-p",
+        build_profile(paths, write_allow, write_deny, read_allow=read_allow,
+                      write_allow_exact=write_allow_exact),
+        *argv,
+    ]

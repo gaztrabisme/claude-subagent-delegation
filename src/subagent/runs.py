@@ -786,9 +786,10 @@ class Agent:
         self.guard_context: dict[str, Any] = {
             "secret_env_names": list(settings.guard_secret_env_names),
         }
-        from .guard.classify import provider_secret_files
+        from .guard.classify import provider_homes, provider_secret_files
 
         self.guard_context["secret_files"] = [str(p) for p in provider_secret_files(settings)]
+        self.guard_context["provider_homes"] = list(provider_homes(settings))
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace

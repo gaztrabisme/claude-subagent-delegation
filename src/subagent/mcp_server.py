@@ -19,7 +19,6 @@ from . import __version__, config
 from .config import ConfigError, configure_logging, log
 from .goal import GoalError, parse_goal
 from .goal_runtime import goal_error_messages
-from .guard.classify import protect_provider_homes
 from .guard.supervisor import Supervisor
 from .router import FALLBACK_MODES
 from .runs import TERMINAL_STATES, Registry, RegistryError, Run
@@ -79,7 +78,6 @@ def _instructions() -> str:
 
 
 settings = config.load(Path.cwd())
-protect_provider_homes(settings)
 registry = Registry(settings)
 supervisor = Supervisor(settings, registry, trace=registry.trace)
 

@@ -233,7 +233,7 @@ class Worker:
             None, self.root, provider=provider, model=model, fallback=fallback,
             on_event=self._on_event(), agent_id=_new_loop_agent_id(),
         )
-        agent.guard_context = self._guard_context()
+        agent.guard_context.update(self._guard_context())
         return agent
 
     def _guard_context(self):
@@ -277,7 +277,7 @@ class Worker:
         # adopt validates the recorded id first; only then is it the loop's own.
         self.agent = self.registry.adopt(record, workspace=self.root, on_event=self._on_event())
         copilot_driver.allow_loop_agent(self.agent.agent_id)
-        self.agent.guard_context = self._guard_context()
+        self.agent.guard_context.update(self._guard_context())
         self.run = self.agent.follow_up(
             prompt, verification=self.test_cmd, pre_verify=self._release,
             on_event=self._on_event(), distill=False, source_chars=source_chars,
@@ -1176,8 +1176,11 @@ found by the
             None, root, provider=target.provider, model=target.model, fallback="none",
             on_event=live.feed, agent_id=_new_loop_agent_id(),
         )
-    agent.guard_context = {"protected": [], "state_allow": [f"{STATE_DIR}/test_writer_result.json"]}
-    agent.guard_context["secret_env_names"] = list(server.settings.guard_secret_env_names)
+    agent.guard_context.update({
+        "protected": [],
+        "state_allow": [f"{STATE_DIR}/test_writer_result.json"],
+        "secret_env_names": list(server.settings.guard_secret_env_names),
+    })
     if previous_record and previous_record.get("agent_id"):
         run = agent.follow_up(prompt, verification="true", on_event=live.feed, distill=False)
     else:
@@ -1951,15 +1954,15 @@ Returns a result dict."""
             None, root, provider=provider, model=model, fallback="none",
             on_event=live.feed, agent_id=_new_loop_agent_id(),
         )
-        agent.guard_context = {
+        agent.guard_context.update({
             "protected": [],
-                "state_allow": [
-                    f"{STATE_DIR}/review/result.json",
-                    f"{STATE_DIR}/review/tests_result.json",
-                    f"{STATE_DIR}/review/goal_result.json",
+            "state_allow": [
+                f"{STATE_DIR}/review/result.json",
+                f"{STATE_DIR}/review/tests_result.json",
+                f"{STATE_DIR}/review/goal_result.json",
             ],
             "secret_env_names": list(server.settings.guard_secret_env_names),
-        }
+        })
         run = agent.delegate(text, "true", on_event=live.feed, distill=False)
         if not run.done.wait(agent.cfg.run_timeout):
             agent.close("run deadline exceeded", kind="timeout")

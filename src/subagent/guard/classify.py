@@ -149,14 +149,8 @@ def provider_secret_files(settings) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def protect_provider_homes(settings) -> None:
-    """Protect credential homes and declared files of every provider in `settings`.
-
-    Replaces the previous set (it does not accumulate): a home is off-limits
-    only while a provider that uses it is configured.
-    """
-    global _provider_homes, _provider_secret_files
-    secret_files = provider_secret_files(settings)
+def provider_homes(settings) -> tuple[str, ...]:
+    """Return the configured provider-home names for a run's guard context."""
     labels = {
         label
         for cfg in settings.providers.values()
@@ -167,8 +161,18 @@ def protect_provider_homes(settings) -> None:
         for home in PROVIDER_HOMES.get(label, ()):
             if home not in homes:
                 homes.append(home)
-    _provider_homes = tuple(homes)
-    _provider_secret_files = secret_files
+    return tuple(homes)
+
+
+def protect_provider_homes(settings) -> None:
+    """Set the legacy process-wide provider protection for direct classifiers.
+
+    Runtime agents carry these values in their own guard contexts. This helper
+    remains for callers that classify outside an agent run.
+    """
+    global _provider_homes, _provider_secret_files
+    _provider_homes = provider_homes(settings)
+    _provider_secret_files = provider_secret_files(settings)
 # Basenames that carry secrets wherever they appear, including in a workspace.
 SENSITIVE_NAMES = frozenset({
     ".env", ".env.local", ".env.production", ".netrc", ".npmrc", ".pypirc",
@@ -195,6 +199,19 @@ _PERMANENT_PROTECTED_ROOTS: set[Path] = set()
 _TEMP_PROTECTED_ROOT_COUNTS: dict[Path, int] = {}
 _TEMP_PROTECTED_ROOT_SPELLINGS: dict[Path, dict[Path, int]] = {}
 _PROTECTED_ROOT_LOCK = threading.Lock()
+
+
+def _dsh_bridge_roots() -> tuple[Path, ...]:
+    """Locate the source or packaged DSH bridge without importing its provider."""
+    source = Path(__file__).resolve()
+    candidates = (
+        source.parents[1] / "integrations" / "dsh-guard",
+        source.parents[3] / "integrations" / "dsh-guard",
+    )
+    return tuple(dict.fromkeys(path.resolve() for path in candidates if path.exists()))
+
+
+_DSH_BRIDGE_ROOTS = _dsh_bridge_roots()
 
 # Commands that are never routine for a delegated coding agent.
 NEVER = frozenset({
@@ -320,9 +337,17 @@ def _home() -> Path:
 
 def _secret_paths(context: dict | None = None) -> tuple[Path, ...]:
     """Current lexical and resolved secret paths, including subprocess context."""
-    paths = list(_provider_secret_files)
-    if context:
-        paths.extend(Path(value) for value in context.get("secret_files", ()))
+    if context is None:
+        paths = list(_provider_secret_files)
+        homes = _provider_homes
+    else:
+        declared = context.get("secret_files")
+        paths = list(_provider_secret_files) if declared is None else []
+        paths.extend(Path(value) for value in (declared or ()))
+        homes = tuple(context.get("provider_homes", _provider_homes))
+    paths.extend(_temporary_roots())
+    for home in homes:
+        paths.append(_home() / home)
     for path in tuple(paths):
         with suppress(OSError, RuntimeError):
             paths.append(path.resolve())
@@ -462,7 +487,10 @@ def is_sensitive(path: Path, context: dict | None = None, *, provider: bool = Tr
         if candidate != home and not candidate.startswith(home + "/"):
             continue
         rel = candidate[len(home):].lstrip("/")
-        for entry in SENSITIVE_HOME + _provider_homes:
+        homes = _provider_homes if context is None else tuple(
+            context.get("provider_homes", _provider_homes)
+        )
+        for entry in SENSITIVE_HOME + homes:
             folded = entry.lower()
             if rel == folded or rel.startswith(folded + "/"):
                 return f"~/{entry} is off-limits to a delegated agent"
@@ -541,6 +569,8 @@ def _redact_private_paths(value):
 def protected(path: Path) -> str | None:
     """Why a write to `path` is refused wherever it sits, or None."""
     for candidate in (Path(os.path.normpath(str(path))), path.resolve()):
+        if any(inside(candidate, root) for root in _DSH_BRIDGE_ROOTS):
+            return "the DSH guard bridge is protected from worker writes"
         parts = [p.lower() for p in candidate.parts]
         for index, part in enumerate(parts[:-1]):
             following = parts[index + 1]

@@ -20,11 +20,13 @@ binds the approval socket, which they never use and which some homes forbid
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
 import shutil
 import sys
+import time
 import tomllib
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
@@ -38,6 +40,7 @@ from .commands import providers as providers_command
 from .config import ConfigError, Settings
 from .goal import Goal, GoalError, parse_goal
 from .health import check as health_check
+from .lane_status import LaneStatusStore, probe_stale_lanes
 from .loop import loop
 from .providers.base import ProviderConfig
 
@@ -245,7 +248,13 @@ def _key_envs(cfg: ProviderConfig) -> list[dict[str, Any]]:
     ]
 
 
-def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
+def _prompt_turn(
+    settings: Settings,
+    cfg: ProviderConfig,
+    *,
+    stop: Any = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
     """One cheap turn on `cfg` through an in-process server, for `--prompt`."""
     import tempfile
 
@@ -266,7 +275,16 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
     workspace = epi_workspace or tmp / "workspace"
     if epi_workspace is None:
         workspace.mkdir()
-    server = InProcessServer(tmp / "sessions", settings)
+    probe_settings = dataclasses.replace(settings, trace="off")
+    server = InProcessServer(tmp / "sessions", probe_settings)
+    stopped = False
+
+    def stop_server() -> None:
+        nonlocal stopped
+        if not stopped:
+            stopped = True
+            server.stop()
+
     try:
         server.start()
         run = server.delegate(
@@ -276,8 +294,25 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
             workspace=workspace,
             fallback="none",
         )
-        run.done.wait(timeout=cfg.run_timeout + 60)
+        deadline = time.monotonic() + min(max(timeout, 0.1), max(cfg.run_timeout, 0.1))
+        while not run.done.is_set():
+            if stop is not None and stop.is_set():
+                stop_server()
+                return {"ok": False, "state": "cancelled", "error": "probe stopped"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_server()
+                return {"ok": False, "state": "timeout", "error": "probe timed out"}
+            run.done.wait(timeout=min(0.1, remaining))
         ok = run.state == "completed"
+        usage = None
+        if cfg.driver == "codex":
+            from .lane_status import codex_usage
+
+            if run.agent_id:
+                usage = codex_usage(
+                    tmp / "sessions" / "agents" / run.agent_id / "codex-home"
+                )
         return {
             "ok": ok,
             "state": run.state,
@@ -285,6 +320,7 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
             "output_tokens": run.usage.output,
             "ttft_seconds": round(run.ttft_seconds, 3) if run.ttft_seconds is not None else None,
             "wall_seconds": round((run.finished_at or 0) - (run.started_at or 0), 3),
+            "usage": usage,
         }
     except Exception as exc:  # noqa: BLE001 - a failed turn is reported, not fatal
         return {
@@ -296,7 +332,7 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
             "wall_seconds": 0.0,
         }
     finally:
-        server.stop()
+        stop_server()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -511,6 +547,42 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if hard else 0
 
 
+def cmd_lanes(args: argparse.Namespace) -> int:
+    """Print persisted lane state, optionally refreshing stale idle lanes."""
+    if args.probe:
+        load_provider_env()
+    root = Path(getattr(args, "root", None) or ".").expanduser().resolve()
+    project_root = root if getattr(args, "root", None) else _project_config_root(root)
+    try:
+        settings = config.load(project_root=project_root)
+        settings.require_providers()
+    except ConfigError as exc:
+        if args.json:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 1
+    store = LaneStatusStore(settings.session_root, redact_keys=settings.leaked_keys)
+    if args.probe:
+        snapshot = probe_stale_lanes(settings, store, _prompt_turn)
+    else:
+        snapshot = store.snapshot(settings)
+    if args.json:
+        print(json.dumps(snapshot, indent=2))
+    else:
+        print("lane  state    source  stale  live/limit  spend USD")
+        for name, view in snapshot.items():
+            spend = view["spend"]["month_usd"]
+            spend_text = "unknown" if spend is None else f"{spend:.4f}"
+            slots = view["slots"]
+            print(
+                f"{name}  {view['state']:<8} {view['source'] or '-':<6} "
+                f"{str(view['stale']).lower():<5}  {slots['live']}/{slots['limit']}"
+                f"        {spend_text}"
+            )
+    return 0
+
+
 # --- the delegate loop ----------------------------------------------------------
 
 
@@ -591,6 +663,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="only validate the file and check binaries")
     doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
     doctor.add_argument("--goal", metavar="VALUE", help="validate goal-block text or GOAL.md")
+
+    lanes = sub.add_parser("lanes", help="show stored provider lane status")
+    lanes.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    lanes.add_argument("--probe", action="store_true", help="refresh stale idle lanes first")
 
     sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",
                    add_help=False)
@@ -678,6 +754,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(raw)
     if args.command == "doctor":
         return cmd_doctor(args)
+    if args.command == "lanes":
+        return cmd_lanes(args)
     handler = getattr(args, "command_handler", None)
     if handler is not None:
         return handler(args)

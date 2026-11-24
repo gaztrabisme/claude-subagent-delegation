@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from functools import partial
@@ -21,8 +22,12 @@ from .goal import GoalError, parse_goal
 from .goal_runtime import goal_error_messages
 from .guard.classify import protect_provider_homes
 from .guard.supervisor import Supervisor
+from .lane_status import probe_stale_lanes
+from .providers import for_driver
+from .providers.base import capabilities
 from .router import FALLBACK_MODES
 from .runs import TERMINAL_STATES, Registry, RegistryError, Run
+from .secrets import redact_secrets
 
 SERVER_INSTRUCTIONS = """\
 Delegate self-contained engineering work to a subagent running in its own
@@ -87,13 +92,47 @@ supervisor = Supervisor(settings, registry, trace=registry.trace)
 @asynccontextmanager
 async def _lifespan(_app):
     """Run the approval socket for as long as the server is up."""
-    async with anyio.create_task_group() as tg:
-        await tg.start(supervisor.serve)
+    probe_stop = threading.Event()
+    probe_thread = None
+    if settings.lane_status_ttl_seconds > 0:
+        probe_thread = threading.Thread(
+            target=_lane_probe_loop,
+            args=(probe_stop,),
+            name="sam-lane-probe",
+            daemon=True,
+        )
+        probe_thread.start()
+    try:
+        async with anyio.create_task_group() as tg:
+            try:
+                await tg.start(supervisor.serve)
+                yield {}
+            finally:
+                tg.cancel_scope.cancel()
+                supervisor.cleanup()
+    finally:
+        probe_stop.set()
+        if probe_thread is not None:
+            probe_thread.join(timeout=8.0)
+
+
+def _lane_probe_loop(stop: threading.Event) -> None:
+    """Refresh stale statuses off the MCP request path."""
+    interval = settings.lane_status_ttl_seconds
+    while not stop.wait(interval):
         try:
-            yield {}
-        finally:
-            tg.cancel_scope.cancel()
-            supervisor.cleanup()
+            from .cli import _prompt_turn
+
+            live_by_lane: dict[str, int] = {}
+            for agent in registry.agents():
+                if not agent.closed:
+                    live_by_lane[agent.cfg.name] = live_by_lane.get(agent.cfg.name, 0) + 1
+            probe_stale_lanes(
+                settings, registry.lane_status, _prompt_turn,
+                live_by_lane=live_by_lane, stop=stop,
+            )
+        except Exception:  # noqa: BLE001 - an observation must not stop the server
+            log.warning("background lane probe failed", exc_info=True)
 
 
 app = MCPServer(
@@ -465,27 +504,34 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
     # first call rather than a placeholder that reads like a resolved answer.
     if ctx is not None:
         supervisor.bind(ctx.session)
-    agents = [a.info() for a in registry.agents()]
+    live_agents = await anyio.to_thread.run_sync(registry.agents)
+    agents = await anyio.to_thread.run_sync(lambda: [a.info() for a in live_agents])
     spent = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0, "steps": 0}
     for info in agents:
         for key in spent:
             spent[key] += info["usage"][key]
     provider_views = []
-    from .providers import for_driver
-    from .providers.base import capabilities
-
+    live_by_lane: dict[str, int] = {}
+    for agent in live_agents:
+        if not agent.closed:
+            live_by_lane[agent.cfg.name] = live_by_lane.get(agent.cfg.name, 0) + 1
+    statuses = await anyio.to_thread.run_sync(
+        partial(registry.lane_status.snapshot, settings, live_by_lane=live_by_lane)
+    )
     for cfg in settings.providers.values():
         view = cfg.as_dict()
         driver = for_driver(cfg.driver)
         if capabilities(driver).metadata:
             try:
-                view["extra"] = await anyio.to_thread.run_sync(
-                    partial(driver.metadata, settings, cfg)
-                )
-            except RuntimeError as exc:
-                view["extra"] = {"error": str(exc)}
+                extra = await anyio.to_thread.run_sync(partial(driver.metadata, settings, cfg))
+            except Exception:  # noqa: BLE001 - metadata is optional list decoration
+                log.warning("provider metadata unavailable for %s", cfg.name, exc_info=True)
+            else:
+                if isinstance(extra, dict):
+                    view["extra"] = extra
+        view["status"] = statuses[cfg.name]
         provider_views.append(view)
-    return {
+    result = {
         "agents": agents,
         "live": sum(1 for a in agents if a["state"] != "closed"),
         "limit": settings.max_agents,
@@ -507,6 +553,24 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
             "recent_decisions": supervisor.decisions[-10:],
         },
     }
+    return _sanitize_mcp_output(result)
+
+
+def _sanitize_mcp_output(value: Any) -> Any:
+    """Scrub credentials and replace the caller home prefix in list output."""
+    if isinstance(value, str):
+        text = redact_secrets(value, settings.leaked_keys)
+        home = str(Path.home())
+        if home and home != "/":
+            text = text.replace(home, "~")
+        return text
+    if isinstance(value, list):
+        return [_sanitize_mcp_output(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_mcp_output(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_mcp_output(item) for key, item in value.items()}
+    return value
 
 
 @app.tool(name="cancel")

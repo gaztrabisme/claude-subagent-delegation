@@ -242,6 +242,19 @@ compaction. The default is 1,000,000 tokens; a provider value overrides the core
 and `antigravity` support `low`. Unsupported combinations use the driver's default and produce a
 doctor warning. `[core].chars_per_token` defaults to `3.5` and controls source-token estimates.
 
+Lane health and recent usage are persisted under the configured session root and included in the
+MCP `list` provider entries. `[core].lane_status_ttl_seconds` defaults to `1800`; the server
+refreshes stale, idle lanes in the background at that interval. Set it to `0` to disable those
+background probes. Local providers receive a health check only, so refreshes never start a model
+on a shared GPU. A provider may set `monthly_usd_cap` to expose its optional monthly spend cap in
+lane status. Inspect the current snapshot without probing with:
+
+```sh
+subagent lanes --json
+```
+
+Add `--probe` to refresh stale idle lanes before printing the snapshot.
+
 Turn records retain the provider's input, output, cache, and reasoning totals. They also add
 `source_usage` for visible `harness_prompt`, `plan`, `tool_results`, and `test_output` input
 characters and estimated tokens, plus provider-reported output and reasoning tokens under

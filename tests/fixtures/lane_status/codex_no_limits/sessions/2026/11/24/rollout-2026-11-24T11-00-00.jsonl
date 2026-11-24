@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-24T11:00:00.000Z","type":"session_meta","payload":{"id":"synth-empty"}}
+{"timestamp":"2026-11-24T11:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"no rate limit events here"}}

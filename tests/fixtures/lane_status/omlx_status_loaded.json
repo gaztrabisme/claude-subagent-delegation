@@ -1,0 +1,5 @@
+{
+  "status": "ok",
+  "models_loaded": 1,
+  "loaded_models": ["Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B"]
+}

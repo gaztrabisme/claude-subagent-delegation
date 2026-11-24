@@ -1,0 +1,4 @@
+{"timestamp":"2026-11-24T10:00:00.000Z","type":"session_meta","payload":{"id":"synth-new"}}
+{"timestamp":"2026-11-24T10:05:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":42.0,"window_minutes":43200,"resets_at":1796743800},"secondary":null,"credits":null}}}
+{"timestamp":"2026-11-24T10:15:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":67.5,"window_minutes":43200,"resets_at":1796743897},"secondary":null,"credits":null}}}
+{"timestamp":"2026-11-24T10:16:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"synthetic turn done"}}

@@ -19,6 +19,7 @@ import uuid
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import protect
 from .lane_state import LaneState
+from .lane_status import LaneStatusStore, codex_usage
 from .providers.base import DRIVER_CODEX, Process, ProviderConfig, RunContext, Session, capabilities
 
 # classify_exit and exit_event are re-exported: they were part of this
@@ -738,6 +740,7 @@ class Agent:
         fallback: str = "full",
         chain: list[ProviderConfig] | None = None,
         lane_state: LaneState | None = None,
+        lane_status: LaneStatusStore | None = None,
         provider_load: Callable[[str, Agent], int] | None = None,
         telemetry: Telemetry | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -764,6 +767,7 @@ class Agent:
         self._sessions: dict[str, Session] = {}
         self.chain = list(chain) if chain else [self.cfg]
         self.lane_state = lane_state
+        self.lane_status = lane_status
         self._provider_load = provider_load
         # Called for every parsed event of every turn, as it arrives.
         self.on_event = on_event
@@ -1938,6 +1942,30 @@ class Agent:
                 self.trace.run(run, str(self.workspace), self.model)
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
+        if self.lane_status is not None:
+            try:
+                observed = datetime.fromtimestamp(run.finished_at or _now(), UTC)
+                for hop in run.hops:
+                    if hop.get("outcome") == router.HOP_REFUSED and hop.get("lane"):
+                        self.lane_status.record_run(
+                            hop["lane"], "refused", code=hop.get("code"),
+                            detail=hop.get("message"), at=observed,
+                        )
+                if run.lane:
+                    self.lane_status.record_run(
+                        run.lane,
+                        run.finish_reason or run.state or "error",
+                        detail=run.error_detail or run.error,
+                        at=observed,
+                    )
+                    if run.driver == DRIVER_CODEX:
+                        from .providers.codex import source_codex_home
+
+                        usage = codex_usage(source_codex_home())
+                        if usage is not None:
+                            self.lane_status.record_usage(run.lane, usage, at=observed)
+            except Exception:  # noqa: BLE001 - status memory must never fail a run
+                log.warning("lane status update failed for %s", run.run_id, exc_info=True)
         run.done.set()
         run.await_ready.set()
 
@@ -1974,6 +2002,7 @@ class Registry:
         protect(APPROVAL_HOOK)
         protect(OMP_HOOK)
         self.lane_state = LaneState(settings.session_root)
+        self.lane_status = LaneStatusStore(settings.session_root)
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()
@@ -2140,6 +2169,7 @@ class Registry:
                 fallback=fallback or "full",
                 chain=self.settings.chain(chosen.name, fallback or "full"),
                 lane_state=self.lane_state,
+                lane_status=self.lane_status,
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,
@@ -2234,6 +2264,7 @@ class Registry:
                 fallback=fallback,
                 chain=self.settings.chain(chosen.name, fallback),
                 lane_state=self.lane_state,
+                lane_status=self.lane_status,
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,

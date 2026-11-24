@@ -38,6 +38,7 @@ from .commands import providers as providers_command
 from .config import ConfigError, Settings
 from .goal import Goal, GoalError, parse_goal
 from .health import check as health_check
+from .lane_status import LaneStatusStore, probe_stale_lanes
 from .loop import loop
 from .providers.base import ProviderConfig
 
@@ -505,6 +506,38 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if hard else 0
 
 
+def cmd_lanes(args: argparse.Namespace) -> int:
+    """Print persisted lane state, optionally refreshing stale idle lanes."""
+    try:
+        settings = config.load()
+        settings.require_providers()
+    except ConfigError as exc:
+        if args.json:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 1
+    store = LaneStatusStore(settings.session_root)
+    if args.probe:
+        snapshot = probe_stale_lanes(settings, store, _prompt_turn)
+    else:
+        snapshot = store.snapshot(settings)
+    if args.json:
+        print(json.dumps(snapshot, indent=2))
+    else:
+        print("lane  state    source  stale  live/limit  spend USD")
+        for name, view in snapshot.items():
+            spend = view["spend"]["month_usd"]
+            spend_text = "unknown" if spend is None else f"{spend:.4f}"
+            slots = view["slots"]
+            print(
+                f"{name}  {view['state']:<8} {view['source'] or '-':<6} "
+                f"{str(view['stale']).lower():<5}  {slots['live']}/{slots['limit']}"
+                f"        {spend_text}"
+            )
+    return 0
+
+
 # --- the delegate loop ----------------------------------------------------------
 
 
@@ -585,6 +618,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="only validate the file and check binaries")
     doctor.add_argument("--json", action="store_true", help="print JSON instead of a table")
     doctor.add_argument("--goal", metavar="VALUE", help="validate goal-block text or GOAL.md")
+
+    lanes = sub.add_parser("lanes", help="show stored provider lane status")
+    lanes.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    lanes.add_argument("--probe", action="store_true", help="refresh stale idle lanes first")
 
     sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",
                    add_help=False)
@@ -672,6 +709,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(raw)
     if args.command == "doctor":
         return cmd_doctor(args)
+    if args.command == "lanes":
+        return cmd_lanes(args)
     handler = getattr(args, "command_handler", None)
     if handler is not None:
         return handler(args)

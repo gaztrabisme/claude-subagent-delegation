@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from functools import partial
@@ -21,6 +22,7 @@ from .goal import GoalError, parse_goal
 from .goal_runtime import goal_error_messages
 from .guard.classify import protect_provider_homes
 from .guard.supervisor import Supervisor
+from .lane_status import probe_stale_lanes
 from .router import FALLBACK_MODES
 from .runs import TERMINAL_STATES, Registry, RegistryError, Run
 
@@ -87,13 +89,44 @@ supervisor = Supervisor(settings, registry, trace=registry.trace)
 @asynccontextmanager
 async def _lifespan(_app):
     """Run the approval socket for as long as the server is up."""
+    probe_stop = threading.Event()
+    probe_thread = None
+    if settings.lane_status_ttl_seconds > 0:
+        probe_thread = threading.Thread(
+            target=_lane_probe_loop,
+            args=(probe_stop,),
+            name="sam-lane-probe",
+            daemon=True,
+        )
+        probe_thread.start()
     async with anyio.create_task_group() as tg:
         await tg.start(supervisor.serve)
         try:
             yield {}
         finally:
+            probe_stop.set()
+            if probe_thread is not None:
+                probe_thread.join(timeout=1.0)
             tg.cancel_scope.cancel()
             supervisor.cleanup()
+
+
+def _lane_probe_loop(stop: threading.Event) -> None:
+    """Refresh stale statuses off the MCP request path."""
+    interval = settings.lane_status_ttl_seconds
+    while not stop.wait(interval):
+        try:
+            from .cli import _prompt_turn
+
+            live_by_lane: dict[str, int] = {}
+            for agent in registry.agents():
+                if not agent.closed:
+                    live_by_lane[agent.cfg.name] = live_by_lane.get(agent.cfg.name, 0) + 1
+            probe_stale_lanes(
+                settings, registry.lane_status, _prompt_turn, live_by_lane=live_by_lane
+            )
+        except Exception:  # noqa: BLE001 - an observation must not stop the server
+            log.warning("background lane probe failed", exc_info=True)
 
 
 app = MCPServer(
@@ -471,19 +504,14 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
         for key in spent:
             spent[key] += info["usage"][key]
     provider_views = []
-    from .providers import for_driver
-    from .providers.base import capabilities
-
+    live_by_lane: dict[str, int] = {}
+    for agent in registry.agents():
+        if not agent.closed:
+            live_by_lane[agent.cfg.name] = live_by_lane.get(agent.cfg.name, 0) + 1
+    statuses = registry.lane_status.snapshot(settings, live_by_lane=live_by_lane)
     for cfg in settings.providers.values():
         view = cfg.as_dict()
-        driver = for_driver(cfg.driver)
-        if capabilities(driver).metadata:
-            try:
-                view["extra"] = await anyio.to_thread.run_sync(
-                    partial(driver.metadata, settings, cfg)
-                )
-            except RuntimeError as exc:
-                view["extra"] = {"error": str(exc)}
+        view["status"] = statuses[cfg.name]
         provider_views.append(view)
     return {
         "agents": agents,

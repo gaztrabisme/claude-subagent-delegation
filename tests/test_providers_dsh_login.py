@@ -103,6 +103,7 @@ DSH_TEST_ENV_PASSTHROUGH = (
     "FAKE_DSH_FIXTURE",
     "FAKE_DSH_STDERR",
     "FAKE_DSH_EXIT",
+    "FAKE_DSH_NO_READY",
 )
 
 
@@ -276,6 +277,7 @@ def fake_dsh(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("FAKE_DSH_RECORD", str(record))
     monkeypatch.setenv("FAKE_DSH_FIXTURE", str(DSH_FIXTURES / "success_tools_usage.jsonl"))
     monkeypatch.delenv("FAKE_DSH_STDERR", raising=False)
+    monkeypatch.delenv("FAKE_DSH_NO_READY", raising=False)
     monkeypatch.setenv("FAKE_DSH_EXIT", "0")
 
     class FakeDsh:
@@ -287,6 +289,7 @@ def fake_dsh(tmp_path: Path, monkeypatch):
             *,
             exit_code: int = 0,
             stderr: str = "",
+            guard_ready: bool = True,
         ) -> None:
             if not fixture:
                 monkeypatch.setenv("FAKE_DSH_FIXTURE", "")
@@ -300,6 +303,10 @@ def fake_dsh(tmp_path: Path, monkeypatch):
                 monkeypatch.setenv("FAKE_DSH_STDERR", stderr)
             else:
                 monkeypatch.delenv("FAKE_DSH_STDERR", raising=False)
+            if guard_ready:
+                monkeypatch.delenv("FAKE_DSH_NO_READY", raising=False)
+            else:
+                monkeypatch.setenv("FAKE_DSH_NO_READY", "1")
 
         def calls(self) -> list[dict]:
             if not record.exists():

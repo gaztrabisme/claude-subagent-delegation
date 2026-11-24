@@ -3,9 +3,10 @@
 
 Records its invocation (argv, cwd, stdin read to EOF, and selected environment
 variables plus every present env key) to ``FAKE_DSH_RECORD`` as one JSON line
-per call, replays the synthetic NDJSON stream named by ``FAKE_DSH_FIXTURE`` on
-stdout, optionally writes ``FAKE_DSH_STDERR`` to stderr, and exits with
-``FAKE_DSH_EXIT`` (default 0).
+per call, emits ``__SUBAGENT_DSH_GUARD_READY__`` on stderr by default (unless
+``FAKE_DSH_NO_READY=1``), replays the synthetic NDJSON stream named by
+``FAKE_DSH_FIXTURE`` on stdout, optionally writes ``FAKE_DSH_STDERR`` to stderr,
+and exits with ``FAKE_DSH_EXIT`` (default 0).
 
 Reading stdin to EOF mirrors ``dsh --profile headless -``: a driver that fails
 to close child stdin after writing the prompt will hang here.
@@ -51,6 +52,10 @@ def main() -> int:
         }
         with open(record_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
+
+    if os.environ.get("FAKE_DSH_NO_READY") != "1":
+        sys.stderr.write("__SUBAGENT_DSH_GUARD_READY__\n")
+        sys.stderr.flush()
 
     fixture_path = os.environ.get("FAKE_DSH_FIXTURE")
     if fixture_path:

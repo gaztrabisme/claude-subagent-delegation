@@ -111,7 +111,7 @@ def test_auth_login_configuration_errors_are_reported(
     cases = (
         (
             'driver = "codex"\nauth = "login"\n',
-            "error: provider 'test' auth = 'login' requires driver = 'claude'",
+            "error: provider 'test' auth = 'login' requires driver = 'claude' or 'dsh'",
         ),
         (
             'driver = "claude"\nauth = "oauth"\n',

@@ -51,6 +51,7 @@ DSH_REVIEW_ENV_PASSTHROUGH = (
     "FAKE_DSH_FIXTURE",
     "FAKE_DSH_STDERR",
     "FAKE_DSH_EXIT",
+    "FAKE_DSH_NO_READY",
     "FAKE_DSH_PAUSE_SUBSTR",
     "FAKE_DSH_PAUSE_SECONDS",
     "FAKE_DSH_AFTER_PAUSE_MARKER",
@@ -143,12 +144,20 @@ def fake_dsh(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("FAKE_DSH_RECORD", str(record))
     monkeypatch.setenv("FAKE_DSH_FIXTURE", str(REVIEW_FIXTURES / "session_turn_final.jsonl"))
     monkeypatch.delenv("FAKE_DSH_STDERR", raising=False)
+    monkeypatch.delenv("FAKE_DSH_NO_READY", raising=False)
     monkeypatch.setenv("FAKE_DSH_EXIT", "0")
 
     class FakeDsh:
         path = str(binary)
 
-        def use(self, fixture: Path | str | None, *, exit_code: int = 0, stderr: str = "") -> None:
+        def use(
+            self,
+            fixture: Path | str | None,
+            *,
+            exit_code: int = 0,
+            stderr: str = "",
+            guard_ready: bool = True,
+        ) -> None:
             if not fixture:
                 monkeypatch.setenv("FAKE_DSH_FIXTURE", "")
             else:
@@ -161,6 +170,10 @@ def fake_dsh(tmp_path: Path, monkeypatch):
                 monkeypatch.setenv("FAKE_DSH_STDERR", stderr)
             else:
                 monkeypatch.delenv("FAKE_DSH_STDERR", raising=False)
+            if guard_ready:
+                monkeypatch.delenv("FAKE_DSH_NO_READY", raising=False)
+            else:
+                monkeypatch.setenv("FAKE_DSH_NO_READY", "1")
 
         def calls(self) -> list[dict[str, Any]]:
             if not record.exists():
@@ -191,6 +204,10 @@ pause_sub = os.environ.get("FAKE_DSH_PAUSE_SUBSTR", "")
 pause_sec = float(os.environ.get("FAKE_DSH_PAUSE_SECONDS") or "0")
 after_marker = os.environ.get("FAKE_DSH_AFTER_PAUSE_MARKER", "")
 paused = False
+
+if os.environ.get("FAKE_DSH_NO_READY") != "1":
+    sys.stderr.write("__SUBAGENT_DSH_GUARD_READY__\\n")
+    sys.stderr.flush()
 
 if fixture and Path(fixture).exists():
     for line in Path(fixture).read_text(encoding="utf-8").splitlines():
@@ -427,7 +444,7 @@ def test_review_1_driver_fails_closed_without_readiness_proof(
     """Finding 1: when fake dsh emits session/turn events without bridge readiness proof,
     DshProcess must fail closed instead of succeeding."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-review-1")
-    fake_dsh.use("session_turn_final.jsonl", exit_code=0)
+    fake_dsh.use("session_turn_final.jsonl", exit_code=0, guard_ready=False)
     ws = _workspace(tmp_path)
     driver = _driver()
     settings = _dsh_settings(tmp_path)
@@ -453,6 +470,7 @@ def test_review_1_driver_kills_child_when_turn_starts_without_readiness_proof(
     monkeypatch.setenv("FAKE_DSH_PAUSE_SUBSTR", '"turn_start"')
     monkeypatch.setenv("FAKE_DSH_PAUSE_SECONDS", "2.5")
     monkeypatch.setenv("FAKE_DSH_AFTER_PAUSE_MARKER", str(after_marker))
+    monkeypatch.setenv("FAKE_DSH_NO_READY", "1")
     monkeypatch.setenv("FAKE_DSH_EXIT", "0")
 
     ws = _workspace(tmp_path)
@@ -481,6 +499,7 @@ def test_review_1_driver_fails_closed_when_stderr_reports_guard_inactive(
         "session_turn_final.jsonl",
         exit_code=0,
         stderr="dsh: warning: 1 entry did not activate (subagent-dsh-guard)",
+        guard_ready=False,
     )
     ws = _workspace(tmp_path)
     reg = _registry_with_dsh(tmp_path, fake_dsh.path)
@@ -868,6 +887,7 @@ def test_review_5_turn_token_budget_trips_mid_run(tmp_path: Path, monkeypatch) -
     monkeypatch.setenv("FAKE_DSH_PAUSE_SUBSTR", '"step_end"')
     monkeypatch.setenv("FAKE_DSH_PAUSE_SECONDS", "2.5")
     monkeypatch.setenv("FAKE_DSH_AFTER_PAUSE_MARKER", str(after_marker))
+    monkeypatch.delenv("FAKE_DSH_NO_READY", raising=False)
     monkeypatch.setenv("FAKE_DSH_EXIT", "0")
 
     ws = _workspace(tmp_path)

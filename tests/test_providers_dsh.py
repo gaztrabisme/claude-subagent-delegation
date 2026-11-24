@@ -19,6 +19,7 @@ import pytest
 from subagent import config, router
 from subagent.providers import for_driver
 from subagent.providers.base import ProviderConfig, Session
+from subagent.providers.dsh import _bridge_bundle
 from subagent.runs import COMPLETED, FAILED, Agent, Registry
 from subagent.telemetry.trace import Trace
 
@@ -37,6 +38,7 @@ DSH_TEST_ENV_PASSTHROUGH = (
     "FAKE_DSH_FIXTURE",
     "FAKE_DSH_STDERR",
     "FAKE_DSH_EXIT",
+    "FAKE_DSH_NO_READY",
 )
 
 
@@ -110,18 +112,30 @@ def fake_dsh(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("FAKE_DSH_RECORD", str(record))
     monkeypatch.setenv("FAKE_DSH_FIXTURE", str(FIXTURES / "success_tools_usage.jsonl"))
     monkeypatch.delenv("FAKE_DSH_STDERR", raising=False)
+    monkeypatch.delenv("FAKE_DSH_NO_READY", raising=False)
     monkeypatch.setenv("FAKE_DSH_EXIT", "0")
 
     class FakeDsh:
         path = str(binary)
 
-        def use(self, fixture: str, *, exit_code: int = 0, stderr: str = "") -> None:
+        def use(
+            self,
+            fixture: str,
+            *,
+            exit_code: int = 0,
+            stderr: str = "",
+            guard_ready: bool = True,
+        ) -> None:
             monkeypatch.setenv("FAKE_DSH_FIXTURE", str(FIXTURES / fixture) if fixture else "")
             monkeypatch.setenv("FAKE_DSH_EXIT", str(exit_code))
             if stderr:
                 monkeypatch.setenv("FAKE_DSH_STDERR", stderr)
             else:
                 monkeypatch.delenv("FAKE_DSH_STDERR", raising=False)
+            if guard_ready:
+                monkeypatch.delenv("FAKE_DSH_NO_READY", raising=False)
+            else:
+                monkeypatch.setenv("FAKE_DSH_NO_READY", "1")
 
         def calls(self) -> list[dict]:
             if not record.exists():
@@ -253,6 +267,36 @@ def test_permission_mode_workspace_write_without_outer_sandbox(tmp_path: Path):
     assert _flag_value(process.argv, "--permission-mode") == "workspace-write"
 
 
+def _sbpl_allows_write(profile: str, target: Path) -> bool:
+    """Evaluate macOS Seatbelt `(allow|deny) file-write*` rules in order (last match wins)."""
+    target_strs = {str(target), str(target.resolve())}
+    allowed = "(allow default)" in profile
+    rule_re = re.compile(r'^\((allow|deny)\s+file-write\*\s+(.+)\)$')
+    filter_re = re.compile(r'\((subpath|literal)\s+"((?:[^"\\]|\\.)*)"\)')
+
+    def _matches(kind: str, raw_path: str) -> bool:
+        rule_path = raw_path.replace('\\"', '"').replace("\\\\", "\\").rstrip("/") or "/"
+        for candidate in target_strs:
+            cand = candidate.rstrip("/") or "/"
+            if kind == "literal" and cand == rule_path:
+                return True
+            if kind == "subpath" and (
+                rule_path == "/" or cand == rule_path or cand.startswith(rule_path + "/")
+            ):
+                return True
+        return False
+
+    for raw_line in profile.splitlines():
+        match = rule_re.match(raw_line.strip())
+        if not match:
+            continue
+        decision, body = match.group(1), match.group(2)
+        for kind, raw_path in filter_re.findall(body):
+            if _matches(kind, raw_path):
+                allowed = decision == "allow"
+    return allowed
+
+
 def test_permission_mode_danger_full_access_when_outer_sandbox_active(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("subagent.sandbox.sys.platform", "darwin")
     driver = _driver()
@@ -272,8 +316,39 @@ def test_permission_mode_danger_full_access_when_outer_sandbox_active(tmp_path: 
     assert f'(deny file-read* (subpath "{private.resolve()}"))' in profile
     assert '(deny file-write* (subpath "/"))' in profile
     assert f'(subpath "{ws.resolve()}")' in profile
+    assert _sbpl_allows_write(profile, ws / "out.txt")
+
     dsh_home = Path(process.env["DSH_HOME"]).resolve()
-    assert f'(subpath "{dsh_home}")' in profile
+    agent_dir = (settings.session_root / "agents" / "a1").resolve()
+    bridge_root, bridge_entry, bridge_patch = _bridge_bundle()
+
+    # DSH runtime paths remain writable; the whole DSH home is NOT writable.
+    for writable in (
+        dsh_home / "sessions" / "s1.json",
+        dsh_home / "storages" / "state.json",
+        dsh_home / "spills" / "spill.txt",
+        dsh_home / ".anonymous-user-id",
+    ):
+        assert _sbpl_allows_write(profile, writable), f"expected runtime path writable: {writable}"
+
+    assert not _sbpl_allows_write(profile, dsh_home)
+    assert f'(subpath "{dsh_home}")' not in profile
+
+    # Profile patches, .env, profiles, and bridge files must be write-denied.
+    for denied in (
+        dsh_home / "cordis.patch.yml",
+        dsh_home / ".env",
+        dsh_home / "profiles",
+        dsh_home / "profiles" / "custom.yml",
+        dsh_home / "dsh-guard",
+        dsh_home / "dsh-guard" / "cordis.patch.yml",
+        agent_dir / "dsh-login.patch.yml",
+        agent_dir / "dsh-model.patch.yml",
+        bridge_root,
+        bridge_entry,
+        bridge_patch,
+    ):
+        assert not _sbpl_allows_write(profile, denied), f"expected path write-denied: {denied}"
 
 
 def test_registry_deny_read_uses_outer_sandbox_without_double_wrapping(
@@ -642,11 +717,14 @@ def test_step_without_usage_marks_run_usage_unreported_instead_of_partial_sum(
         run = agent.submit("do work", verification="true")
         assert run.done.wait(10), f"run did not finish: {run.state} {run.error}"
         assert run.state == COMPLETED, run.error
-        # Step 1 had 100 input / 20 output, step 2 had no usage sample: must NOT
-        # present step 1's partial sum as complete.
-        assert run.usage.input == 0
-        assert run.usage.output == 0
-        assert run.usage.total == 0
+        # Step 1 streamed 100 input / 20 output / 10 cache_read; step 2 had no
+        # usage sample, so known step 1 totals are retained while missing fields
+        # are marked in usage_unreported.
+        assert run.usage.input == 100
+        assert run.usage.output == 20
+        assert run.usage.cache_read == 10
+        assert run.usage.cache_write == 0
+        assert run.usage.total == 130
     finally:
         reg.shutdown()
 

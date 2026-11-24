@@ -693,7 +693,7 @@ def probe_stale_lanes(
 
 
 def _probe_allowed(cfg: Any) -> bool:
-    """Keep automatic probes away from unavailable, credentialless, or login lanes."""
+    """Keep automatic probes away from unavailable, login, or unknown-driver lanes."""
     if cfg.driver == "epi" or cfg.extra.get("auth") == "login":
         return False
     if cfg.unavailable() is not None:
@@ -701,10 +701,10 @@ def _probe_allowed(cfg: Any) -> bool:
     try:
         from .providers import for_driver
 
-        driver = for_driver(cfg.driver)
+        for_driver(cfg.driver)
     except (KeyError, ImportError):
         return False
-    return not (driver.needs_api_key and cfg.extra.get("auth") != "login" and not cfg.api_key())
+    return True
 
 
 def _probe_local(cfg: Any, store: LaneStatusStore, name: str) -> tuple[bool, str | None]:

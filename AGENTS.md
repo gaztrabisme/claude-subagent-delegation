@@ -22,7 +22,8 @@ comes from the user's config file.
 | Path | What lives there |
 |---|---|
 | `src/subagent/config.py` | TOML config loading and layering, `Settings`, the child-process environment allowlist |
-| `src/subagent/providers/` | One module per driver (`claude`, `codex`, `copilot`, `grok`, `gemini`); `base.py` holds the `Provider` protocol and `ProviderConfig` |
+| `src/subagent/providers/` | One module per driver (`claude`, `codex`, `copilot`, `grok`, `gemini`, `antigravity`, `omp`, `epi`, `dsh`); `base.py` holds the `Provider` protocol and `ProviderConfig` |
+| `integrations/dsh-guard/` | The DeepSeek Harness plugin that forwards every DSH tool call to the guard (the `dsh` driver's bridge) |
 | `src/subagent/runs.py` | `Registry` and `Agent`: spawning a worker, collecting its events, verification, cost at run end |
 | `src/subagent/router.py`, `health.py`, `lane_state.py` | Provider choice, endpoint health, throttle/closure memory |
 | `src/subagent/lane_status.py` | Shared lane status per provider (open/closed/unknown, usage left, free slots, spend), read by `list` and `subagent lanes`; background probe of stale lanes |

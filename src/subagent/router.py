@@ -429,6 +429,8 @@ def close_until(
         until = now + timedelta(hours=balance_close_hours)
     elif refusal.code == ZAI_1313_EXHAUSTED:
         until = now + timedelta(minutes=throttle_close_minutes)
+    elif refusal.code.startswith("dsh_auth"):
+        until = now + timedelta(hours=balance_close_hours)
     else:
         until = None
     return min(until, now + MAX_CLOSE) if until is not None else None

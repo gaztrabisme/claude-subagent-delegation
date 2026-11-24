@@ -30,6 +30,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 DRIVER_CLAUDE = "claude"
 DRIVER_CODEX = "codex"
+DRIVER_DSH = "dsh"
 DRIVER_COPILOT = "copilot"
 DRIVER_GEMINI = "gemini"
 DRIVER_GROK = "grok"
@@ -41,7 +42,7 @@ DRIVER_ANTIGRAVITY = "antigravity"
 # refuse at boot, not at load: a config naming one is valid, it just cannot
 # run on this build.
 DRIVERS = (
-    DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK,
+    DRIVER_CLAUDE, DRIVER_CODEX, DRIVER_DSH, DRIVER_COPILOT, DRIVER_GEMINI, DRIVER_GROK,
     DRIVER_ANTIGRAVITY, DRIVER_OMP, DRIVER_EPI,
 )
 
@@ -52,6 +53,7 @@ NOT_PORTED = "driver not yet ported"
 VENDOR_BY_DRIVER = {
     DRIVER_EPI: "epi",
     DRIVER_CODEX: "codex",
+    DRIVER_DSH: "deepseek",
     DRIVER_COPILOT: "copilot",
     DRIVER_GROK: "grok",
     DRIVER_OMP: "omp",

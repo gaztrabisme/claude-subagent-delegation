@@ -9,6 +9,7 @@ from .base import (
     DRIVER_CLAUDE,
     DRIVER_CODEX,
     DRIVER_COPILOT,
+    DRIVER_DSH,
     DRIVER_EPI,
     DRIVER_GEMINI,
     DRIVER_GROK,
@@ -39,6 +40,8 @@ def for_driver(name: str) -> Any:
         from .claude import CLAUDE_PROVIDER as provider
     elif name == DRIVER_CODEX:
         from .codex import CODEX_PROVIDER as provider
+    elif name == DRIVER_DSH:
+        from .dsh import DSH_PROVIDER as provider
     elif name == DRIVER_COPILOT:
         from .copilot import COPILOT_PROVIDER as provider
     elif name == DRIVER_GEMINI:
@@ -61,6 +64,7 @@ __all__ = [
     "DRIVERS",
     "DRIVER_CLAUDE",
     "DRIVER_CODEX",
+    "DRIVER_DSH",
     "DRIVER_OMP",
     "DRIVER_ANTIGRAVITY",
     "HealthSpec",

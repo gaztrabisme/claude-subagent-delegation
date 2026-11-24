@@ -453,7 +453,7 @@ def is_sensitive(path: Path, context: dict | None = None, *, provider: bool = Tr
     except (OSError, RuntimeError):
         resolved = path
     if any(inside(resolved, root) for root in _temporary_roots()):
-        return "the owner's Claude config directory is protected during login runs"
+        return "the owner's login credential home is protected during login runs"
     home = str(_home().resolve()).lower().rstrip("/")
     for candidate in {str(resolved).lower(), os.path.normpath(str(path)).lower()}:
         if candidate != home and not candidate.startswith(home + "/"):
@@ -534,7 +534,7 @@ def protected(path: Path) -> str | None:
                 )
         for root in _temporary_roots():
             if inside(candidate, root):
-                return "the owner's Claude config directory is protected during login runs"
+                return "the owner's login credential home is protected during login runs"
         with _PROTECTED_ROOT_LOCK:
             roots = tuple(PROTECTED_ROOTS)
         for root in roots:

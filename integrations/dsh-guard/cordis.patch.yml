@@ -1,0 +1,4 @@
+# The DSH driver replaces this marker with the packaged bridge entry URL.
+- insert:
+    - id: subagent-dsh-guard
+      name: "__SUBAGENT_DSH_GUARD_ENTRY__"

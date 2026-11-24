@@ -30,6 +30,7 @@ from typing import Any
 from . import adapter
 from .providers.base import (
     DRIVER_CLAUDE,
+    DRIVER_DSH,
     DRIVER_GROK,
     DRIVER_OMP,
     DRIVERS,
@@ -301,7 +302,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
     auth = table.get("auth")
     if auth is not None and auth != "login":
         raise ConfigError(f"provider {name!r} auth must be 'login'")
-    if auth == "login" and driver != DRIVER_CLAUDE:
+    if auth == "login" and driver not in (DRIVER_CLAUDE, DRIVER_DSH):
         raise ConfigError(f"provider {name!r} auth = 'login' requires driver = 'claude'")
     if auth == "login" and "api_key_env" in table:
         raise ConfigError(f"provider {name!r} auth = 'login' cannot set api_key_env")

@@ -20,11 +20,13 @@ binds the approval socket, which they never use and which some homes forbid
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
 import shutil
 import sys
+import time
 import tomllib
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
@@ -246,7 +248,13 @@ def _key_envs(cfg: ProviderConfig) -> list[dict[str, Any]]:
     ]
 
 
-def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
+def _prompt_turn(
+    settings: Settings,
+    cfg: ProviderConfig,
+    *,
+    stop: Any = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
     """One cheap turn on `cfg` through an in-process server, for `--prompt`."""
     import tempfile
 
@@ -267,7 +275,16 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
     workspace = epi_workspace or tmp / "workspace"
     if epi_workspace is None:
         workspace.mkdir()
-    server = InProcessServer(tmp / "sessions", settings)
+    probe_settings = dataclasses.replace(settings, trace="off")
+    server = InProcessServer(tmp / "sessions", probe_settings)
+    stopped = False
+
+    def stop_server() -> None:
+        nonlocal stopped
+        if not stopped:
+            stopped = True
+            server.stop()
+
     try:
         server.start()
         run = server.delegate(
@@ -277,8 +294,25 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
             workspace=workspace,
             fallback="none",
         )
-        run.done.wait(timeout=cfg.run_timeout + 60)
+        deadline = time.monotonic() + min(max(timeout, 0.1), max(cfg.run_timeout, 0.1))
+        while not run.done.is_set():
+            if stop is not None and stop.is_set():
+                stop_server()
+                return {"ok": False, "state": "cancelled", "error": "probe stopped"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_server()
+                return {"ok": False, "state": "timeout", "error": "probe timed out"}
+            run.done.wait(timeout=min(0.1, remaining))
         ok = run.state == "completed"
+        usage = None
+        if cfg.driver == "codex":
+            from .lane_status import codex_usage
+
+            if run.agent_id:
+                usage = codex_usage(
+                    tmp / "sessions" / "agents" / run.agent_id / "codex-home"
+                )
         return {
             "ok": ok,
             "state": run.state,
@@ -286,6 +320,7 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
             "output_tokens": run.usage.output,
             "ttft_seconds": round(run.ttft_seconds, 3) if run.ttft_seconds is not None else None,
             "wall_seconds": round((run.finished_at or 0) - (run.started_at or 0), 3),
+            "usage": usage,
         }
     except Exception as exc:  # noqa: BLE001 - a failed turn is reported, not fatal
         return {
@@ -297,7 +332,7 @@ def _prompt_turn(settings: Settings, cfg: ProviderConfig) -> dict[str, Any]:
             "wall_seconds": 0.0,
         }
     finally:
-        server.stop()
+        stop_server()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -508,8 +543,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_lanes(args: argparse.Namespace) -> int:
     """Print persisted lane state, optionally refreshing stale idle lanes."""
+    if args.probe:
+        load_provider_env()
+    root = Path(getattr(args, "root", None) or ".").expanduser().resolve()
+    project_root = root if getattr(args, "root", None) else _project_config_root(root)
     try:
-        settings = config.load()
+        settings = config.load(project_root=project_root)
         settings.require_providers()
     except ConfigError as exc:
         if args.json:
@@ -517,7 +556,7 @@ def cmd_lanes(args: argparse.Namespace) -> int:
         else:
             print(f"error: {exc}", file=sys.stderr)
         return 1
-    store = LaneStatusStore(settings.session_root)
+    store = LaneStatusStore(settings.session_root, redact_keys=settings.leaked_keys)
     if args.probe:
         snapshot = probe_stale_lanes(settings, store, _prompt_turn)
     else:

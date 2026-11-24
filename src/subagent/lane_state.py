@@ -120,6 +120,24 @@ class LaneState:
             return None
         return {**entry, "closed_until": until}
 
+    def closed_entries(self, now: datetime | None = None) -> dict[str, dict[str, Any]]:
+        """Return all active closures from one read of the shared state file."""
+        current = now or _now()
+        with self._lock:
+            data = self._load()
+        result: dict[str, dict[str, Any]] = {}
+        for lane, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            until = _parse(entry.get("closed_until"))
+            if until is None:
+                continue
+            set_at = _parse(entry.get("set_at"))
+            until = min(until, (set_at or current) + MAX_CLOSE)
+            if until > current:
+                result[lane] = {**entry, "closed_until": until}
+        return result
+
     def close(self, lane: str, until: datetime, code: str, message: str) -> None:
         """Close `lane` until `until` (at most MAX_CLOSE). Written atomically;
         errors are logged."""

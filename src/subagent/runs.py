@@ -7,6 +7,7 @@ re-enters the same session via ``--resume``.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -535,6 +536,24 @@ def _round(value: float | None) -> float | None:
     return round(value, 3) if value is not None else None
 
 
+class _DoneEvent(threading.Event):
+    """Signal terminal state immediately, with a tiny bounded status flush grace."""
+
+    def __init__(self, status_ready: threading.Event):
+        super().__init__()
+        self._status_ready = status_ready
+
+    def wait(self, timeout: float | None = None) -> bool:
+        started = time.monotonic()
+        if not super().wait(timeout):
+            return False
+        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
+        grace = 0.02 if remaining is None else min(0.02, remaining)
+        if grace > 0:
+            self._status_ready.wait(grace)
+        return True
+
+
 @dataclass
 class Run:
     run_id: str
@@ -563,6 +582,7 @@ class Run:
     error_detail: str | None = None
     event_count: int = 0
     transcript: deque[str] = field(default_factory=lambda: deque(maxlen=400))
+    status_ready: threading.Event = field(default_factory=threading.Event, repr=False)
     done: threading.Event = field(default_factory=threading.Event)
     # MCP waits end at a human gate as well as at a terminal result. `done`
     # continues to mean terminal, for callers that require completion.
@@ -621,6 +641,9 @@ class Run:
     # Known lengths for source-tagged prompt text; absent metadata means the
     # entire submitted prompt is treated as harness text.
     source_chars: dict[str, int] | None = None
+
+    def __post_init__(self) -> None:
+        self.done = _DoneEvent(self.status_ready)
 
     def observe_native_wait(self, outcome: dict[str, Any], observed_at: float) -> None:
         """Charge active work only; repeated human-wait snapshots add no time."""
@@ -768,6 +791,8 @@ class Agent:
         self.chain = list(chain) if chain else [self.cfg]
         self.lane_state = lane_state
         self.lane_status = lane_status
+        self._active_lane_context = None
+        self._active_lane: str | None = None
         self._provider_load = provider_load
         # Called for every parsed event of every turn, as it arrives.
         self.on_event = on_event
@@ -1059,6 +1084,7 @@ class Agent:
                 run.finished_at = _now()
                 run.done.set()
                 run.await_ready.set()
+                self._record_lane_status(run)
         self._thread.join(timeout=8)
         self._closed = not any(r.cancel_pending for r in self.runs())
         # A second close may resolve a previously uncertain native cancel after
@@ -1096,6 +1122,85 @@ class Agent:
             self._sessions[self.cfg.name] = found
         return found
 
+    def _set_active_lane(self, lane: str | None) -> None:
+        if lane == self._active_lane:
+            return
+        self._release_active_lane()
+        if lane is None or self.lane_status is None:
+            return
+        lease = self.lane_status.active_run(lane)
+        try:
+            lease.__enter__()
+        except Exception:  # noqa: BLE001 - a lease must never fail a run
+            log.warning("could not hold active lane lease for %s", lane, exc_info=True)
+            return
+        self._active_lane_context = lease
+        self._active_lane = lane
+
+    def _release_active_lane(self) -> None:
+        lease, self._active_lane_context = self._active_lane_context, None
+        self._active_lane = None
+        if lease is not None:
+            with contextlib.suppress(Exception):
+                lease.__exit__(None, None, None)
+
+    def _record_lane_status(self, run: Run) -> None:
+        """Persist completed run observations after its public done signals."""
+        store = self.lane_status
+        if store is None:
+            self._release_active_lane()
+            run.status_ready.set()
+            return
+        try:
+            observed = datetime.fromtimestamp(run.finished_at or _now(), UTC)
+            observations: list[dict[str, Any]] = []
+            for hop in run.hops:
+                lane = hop.get("lane")
+                if not isinstance(lane, str) or not lane:
+                    continue
+                outcome = hop.get("outcome")
+                if outcome == router.HOP_REFUSED and hop.get("code") != router.ADMISSION:
+                    observations.append({
+                        "lane": lane, "kind": "run", "finish_reason": "refused",
+                        "code": hop.get("code"), "detail": hop.get("message"),
+                        "at": observed,
+                    })
+                elif outcome == router.HOP_HEALTH_FAILED:
+                    observations.append({
+                        "lane": lane, "kind": "probe", "ok": False,
+                        "detail": hop.get("message") or hop.get("code") or "health failed",
+                        "at": observed,
+                    })
+            ran_lanes = {
+                hop.get("lane") for hop in run.hops
+                if hop.get("outcome") == router.HOP_RAN
+            }
+            if run.lane and (not run.hops or run.lane in ran_lanes):
+                observations.append({
+                    "lane": run.lane, "kind": "run",
+                    "finish_reason": run.finish_reason or run.state or "error",
+                    "detail": run.error_detail or run.error, "at": observed,
+                })
+                if run.driver == DRIVER_CODEX:
+                    from .providers.codex import source_codex_home
+
+                    session = self._sessions.get(run.lane)
+                    home = session.home if session is not None else None
+                    usage = codex_usage(home) if home is not None else None
+                    if usage is None:
+                        usage = codex_usage(source_codex_home())
+                    if usage is not None:
+                        observations.append({
+                            "lane": run.lane, "kind": "usage", "usage": usage,
+                            "at": observed,
+                        })
+            store.record_observations(observations)
+        except Exception:  # noqa: BLE001 - status memory must never fail a run
+            log.warning("lane status update failed for %s", run.run_id, exc_info=True)
+        finally:
+            self._release_active_lane()
+            run.status_ready.set()
+
     def _worker(self) -> None:
         self._boot()
         while True:
@@ -1132,8 +1237,8 @@ class Agent:
                 )
                 run.phase = PHASE_DONE
                 run.finished_at = _now()
-                run.done.set()
-                run.await_ready.set()
+                run.finish_reason = "error"
+                self._finish(run)
 
     def _spawn(self, run: Run, prompt: str, resume: str | None) -> Process:
         """One turn's child process, on the current provider's driver."""
@@ -1204,12 +1309,11 @@ class Agent:
             ):
                 run.state = FAILED
                 run.error = self._missing_key(self.cfg)
-                run.phase = PHASE_DONE
-                run.finished_at = _now()
+                run.finish_reason = "auth"
                 self._run_pre_verify(run)
-                run.done.set()
-                run.await_ready.set()
+                self._finish(run)
                 return
+            self._set_active_lane(self.cfg.name)
             self._turn(run, run.prompt, resume=self.session_id)
         if (capabilities(self.driver).confirmed_cancel
                 and self.session().data.pop("cancellation_required", False)):
@@ -1423,6 +1527,7 @@ class Agent:
             self.driver = driver
             self.model = model
             self.session_id = None
+            self._set_active_lane(cfg.name)
             run.lane = cfg.name
             run.provider = cfg.vendor
             run.driver = hop.driver
@@ -1458,6 +1563,7 @@ class Agent:
                 hop.closed_until = until
             self._hop(run, hop)
             last_refusal = message
+            self._set_active_lane(None)
         if self._closing:
             return False
         tried = "; ".join(
@@ -1896,13 +2002,17 @@ class Agent:
     def _finish(self, run: Run) -> None:
         # Cancellation can return the last accounting snapshot. Finish and
         # write the trace only after its bounded hook has returned.
+        finished = False
         while True:
             self._cancel_complete.wait()
             with self._dispatch_lock:
                 if self._closing and not self._cancel_complete.is_set():
                     continue
                 self._finish_locked(run)
-                return
+                finished = run.done.is_set() and not run.cancel_pending
+                break
+        if finished:
+            self._record_lane_status(run)
 
     def _finish_locked(self, run: Run) -> None:
         run.admission_ready.set()
@@ -1942,30 +2052,6 @@ class Agent:
                 self.trace.run(run, str(self.workspace), self.model)
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
-        if self.lane_status is not None:
-            try:
-                observed = datetime.fromtimestamp(run.finished_at or _now(), UTC)
-                for hop in run.hops:
-                    if hop.get("outcome") == router.HOP_REFUSED and hop.get("lane"):
-                        self.lane_status.record_run(
-                            hop["lane"], "refused", code=hop.get("code"),
-                            detail=hop.get("message"), at=observed,
-                        )
-                if run.lane:
-                    self.lane_status.record_run(
-                        run.lane,
-                        run.finish_reason or run.state or "error",
-                        detail=run.error_detail or run.error,
-                        at=observed,
-                    )
-                    if run.driver == DRIVER_CODEX:
-                        from .providers.codex import source_codex_home
-
-                        usage = codex_usage(source_codex_home())
-                        if usage is not None:
-                            self.lane_status.record_usage(run.lane, usage, at=observed)
-            except Exception:  # noqa: BLE001 - status memory must never fail a run
-                log.warning("lane status update failed for %s", run.run_id, exc_info=True)
         run.done.set()
         run.await_ready.set()
 
@@ -2002,7 +2088,9 @@ class Registry:
         protect(APPROVAL_HOOK)
         protect(OMP_HOOK)
         self.lane_state = LaneState(settings.session_root)
-        self.lane_status = LaneStatusStore(settings.session_root)
+        self.lane_status = LaneStatusStore(
+            settings.session_root, redact_keys=settings.leaked_keys
+        )
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()

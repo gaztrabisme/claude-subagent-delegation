@@ -414,6 +414,10 @@ class CodexProvider:
     """Runs a turn as ``codex exec --json``. The session id is Codex's thread_id."""
 
     name = DRIVER_CODEX
+    known_event_types = frozenset({
+        "thread.started", "item.completed", "item.started", "item.updated",
+        "turn.completed", "turn.failed", "error",
+    })
     needs_api_key = False  # the Codex CLI logs in with its own auth.json
     prompt_on_stdin = True
 

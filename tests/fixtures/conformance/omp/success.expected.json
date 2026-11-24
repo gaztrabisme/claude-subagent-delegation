@@ -1,0 +1,290 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": null
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "\nI'm checking the tool_call"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": " directory to see what's"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": " already there, then I"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "'ll create hello.txt with \""
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "hi\" in it.\n"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "\n\n"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "call_2b66c830",
+          "name": "write",
+          "input": {
+            "path": "hello.txt",
+            "content": "hi"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_2b66c830",
+          "content": "[hello.txt#A564]\nSuccessfully wrote 2 bytes to hello.txt",
+          "is_error": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "\nThe file was created"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": " successfully. The user said \"and"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": " then stop,\" so"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": " I won't do anything else"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": " and will provide a concise confirmation"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": ".\n"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "\n\nCreated "
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "`"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "hello.txt"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "`"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": " containing "
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "`"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "hi"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "`"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "."
+        }
+      ]
+    }
+  }
+]

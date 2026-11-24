@@ -8,8 +8,9 @@ without spending a call to hear the same refusal. The file is
     {"glm": {"closed_until": "2026-09-18T15:00:00+07:00", "code": "zai_1308",
              "message": "...", "set_at": "2026-09-18T10:12:03+07:00"}}
 
-Entries whose closed_until has passed are ignored, and no entry keeps a lane
-closed more than 7 days past its set_at, whatever it says. reopen() clears a
+Entries whose closed_until has passed are ignored, and no ordinary entry keeps
+a lane closed more than 7 days past its set_at. A `harness_unverified` entry
+stays closed until a passing harness verification reopens it. reopen() clears a
 lane's entry (scripts/reopen_lane.py is its command line). A file that cannot
 be read or parsed is treated as empty and logged; lane memory never fails a
 run. Read-modify-write holds an fcntl lock on <file>.lock, so two server
@@ -113,6 +114,8 @@ class LaneState:
         until = _parse(entry.get("closed_until"))
         if until is None:
             return None
+        if entry.get("code") == "harness_unverified":
+            return {**entry, "closed_until": until}
         set_at = _parse(entry.get("set_at"))
         cap = (set_at or (now or _now())) + MAX_CLOSE
         until = min(until, cap)
@@ -132,11 +135,41 @@ class LaneState:
             until = _parse(entry.get("closed_until"))
             if until is None:
                 continue
+            if entry.get("code") == "harness_unverified":
+                result[lane] = {**entry, "closed_until": until}
+                continue
             set_at = _parse(entry.get("set_at"))
             until = min(until, (set_at or current) + MAX_CLOSE)
             if until > current:
                 result[lane] = {**entry, "closed_until": until}
         return result
+
+    def status_entries(
+        self, now: datetime | None = None
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        """Return active closures and verified versions from one state read."""
+        current = now or _now()
+        with self._lock:
+            data = self._load()
+        closures: dict[str, dict[str, Any]] = {}
+        verified: dict[str, str] = {}
+        for lane, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            version = entry.get("verified_version")
+            if isinstance(version, str) and version:
+                verified[lane] = version
+            until = _parse(entry.get("closed_until"))
+            if until is None:
+                continue
+            if entry.get("code") == "harness_unverified":
+                closures[lane] = {**entry, "closed_until": until}
+                continue
+            set_at = _parse(entry.get("set_at"))
+            until = min(until, (set_at or current) + MAX_CLOSE)
+            if until > current:
+                closures[lane] = {**entry, "closed_until": until}
+        return closures, verified
 
     def close(self, lane: str, until: datetime, code: str, message: str) -> None:
         """Close `lane` until `until` (at most MAX_CLOSE). Written atomically;
@@ -145,22 +178,60 @@ class LaneState:
         until = min(until, now + MAX_CLOSE)
         with self._locked():
             data = self._load()
-            data[lane] = {
+            entry = data.get(lane)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry.update({
                 "closed_until": until.isoformat(),
                 "code": code,
                 "message": message,
                 "set_at": now.isoformat(),
-            }
+            })
+            data[lane] = entry
             self._write(data)
 
-    def reopen(self, lane: str) -> dict[str, Any] | None:
-        """Clear `lane`'s closure. Returns the entry removed, or None."""
+    def record_verified(self, lane: str, version: str) -> None:
+        """Remember the harness version that passed conformance checks."""
+        if not isinstance(version, str) or not version:
+            return
         with self._locked():
             data = self._load()
-            entry = data.pop(lane, None)
-            if entry is not None:
-                self._write(data)
-        return entry if isinstance(entry, dict) else None
+            entry = data.get(lane)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry["verified_version"] = version
+            data[lane] = entry
+            self._write(data)
+
+    def verified_version(self, lane: str) -> str | None:
+        """The last verified harness version for `lane`, if recorded."""
+        with self._lock:
+            entry = self._load().get(lane)
+        if not isinstance(entry, dict):
+            return None
+        version = entry.get("verified_version")
+        return version if isinstance(version, str) and version else None
+
+    def reopen(self, lane: str) -> dict[str, Any] | None:
+        """Clear `lane`'s closure while preserving its other lane memory."""
+        with self._locked():
+            data = self._load()
+            entry = data.get(lane)
+            if not isinstance(entry, dict):
+                return None
+            previous = dict(entry)
+            closure = {key: entry[key] for key in (
+                "closed_until", "code", "message", "set_at"
+            ) if key in entry}
+            if not closure:
+                return None
+            updated = dict(entry)
+            for key in closure:
+                updated.pop(key, None)
+            if updated:
+                data[lane] = updated
+            else:
+                data.pop(lane, None)
+            self._write(data)
+        return previous
 
     def entries(self) -> dict[str, Any]:
         """Every entry on disk, open or not, as stored."""

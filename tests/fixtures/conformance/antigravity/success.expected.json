@@ -1,0 +1,129 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc"
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc:2",
+          "name": "view_file",
+          "input": {
+            "AbsolutePath": "<WORKSPACE>/a.py"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "session_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc",
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc:2",
+          "content": "2 lines, 6 bytes",
+          "is_error": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc:4",
+          "name": "replace_file_content",
+          "input": {
+            "TargetFile": "<WORKSPACE>/a.py"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "session_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc",
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc:4",
+          "content": "",
+          "is_error": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc:6",
+          "name": "run_command",
+          "input": {
+            "CommandLine": "python3 a.py && echo done"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "session_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc",
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc:6",
+          "content": "done\r\n",
+          "is_error": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "OK"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "\n"
+        }
+      ]
+    }
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "result": "OK\n",
+    "usage": {
+      "input_tokens": 17510,
+      "cache_read_input_tokens": 24406,
+      "output_tokens": 430
+    },
+    "num_turns": 1,
+    "session_id": "013c3dfb-618f-44cf-8000-d9a9dd0182fc"
+  }
+]

@@ -289,6 +289,34 @@ class LaneStatusStore:
         except (OSError, TimeoutError):
             log.warning("lane status update skipped after lock/read failure: %s", self.path)
 
+    def harness_record(self, lane: str) -> dict[str, Any]:
+        """Return stored harness observations without probing the provider."""
+        try:
+            record = self._load().get(lane)
+        except OSError:
+            return {}
+        return dict(record) if isinstance(record, dict) else {}
+
+    def record_harness_version(self, lane: str, version: str | None) -> None:
+        """Persist the last detected harness version for read-only status views."""
+        self._update(lane, lambda entry: entry.update(harness_version=version))
+
+    def record_harness_previous(self, lane: str, version: str | None) -> None:
+        """Remember the version present before an operator-triggered update."""
+        self._update(lane, lambda entry: entry.update(previous_harness_version=version))
+
+    def record_harness_check(
+        self, lane: str, result: Mapping[str, Any], *, version: str | None
+    ) -> None:
+        """Persist one update check and the version observed alongside it."""
+        safe_result = _safe_json(dict(result), self.redact_keys)
+
+        def update(entry: dict[str, Any]) -> None:
+            entry["harness_version"] = version
+            entry["harness_check"] = safe_result
+
+        self._update(lane, update)
+
     @staticmethod
     def _observed_time(previous: Any, observed: datetime) -> datetime | None:
         checked = _parse_time(previous)
@@ -456,7 +484,8 @@ class LaneStatusStore:
             records = {}
         live = live_by_lane or {}
         ttl = max(0.0, float(getattr(settings, "lane_status_ttl_seconds", 1800)))
-        closures = LaneState(settings.session_root).closed_entries(now=current)
+        lane_state = LaneState(settings.session_root)
+        closures, verified_versions = lane_state.status_entries(now=current)
         spend = _month_spend(settings, current)
         result: dict[str, dict[str, Any]] = {}
         for name, cfg in settings.providers.items():
@@ -491,6 +520,14 @@ class LaneStatusStore:
                 if isinstance(cap, (int, float)) and not isinstance(cap, bool)
                 else None
             )
+            harness_version = entry.get("harness_version")
+            if not isinstance(harness_version, str) or not harness_version:
+                harness_version = None
+            verified_version = verified_versions.get(name)
+            harness_state = (
+                "unknown" if harness_version is None else
+                "verified" if harness_version == verified_version else "unverified"
+            )
             result[name] = {
                 "state": state,
                 "checked_at": checked.isoformat() if checked else None,
@@ -509,6 +546,8 @@ class LaneStatusStore:
                 "spend": {"month_usd": spend.get(name), "cap_usd": cap},
                 "local": bool(getattr(cfg, "local", False)),
                 "driver": getattr(cfg, "driver", None),
+                "harness_version": harness_version,
+                "harness_state": harness_state,
             }
         return result
 

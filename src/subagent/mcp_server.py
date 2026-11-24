@@ -364,6 +364,7 @@ async def delegate(
             name=name, workspace=resolved, model=model, provider=chosen.name,
             fallback=fallback, goal=parsed_goal, goal_reviewer=goal_review,
             task=task, instructions=instructions,
+            provider_explicit=wanted is not None,
         )
         start_error = agent.wait_ready(60.0)
         if start_error is not None:
@@ -402,7 +403,10 @@ async def delegate(
     out["lane"] = run.lane or chosen.name
     out["fallback"] = agent.fallback if agent is not None else run.fallback
     if deprecated:
-        out["warning"] = LANE_DEPRECATED
+        run_warning = out.get("warning")
+        out["warning"] = (
+            f"{LANE_DEPRECATED}; {run_warning}" if run_warning else LANE_DEPRECATED
+        )
     return out
 
 

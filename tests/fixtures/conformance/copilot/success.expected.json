@@ -1,0 +1,49 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": null
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "1",
+          "name": "bash",
+          "input": {
+            "command": "uv run pytest -q"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "1",
+          "content": "",
+          "is_error": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "session_id": null,
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "the tests pass"
+        }
+      ]
+    }
+  }
+]

@@ -283,6 +283,7 @@ class AntigravityProvider:
     """Runs Google Antigravity CLI under the `antigravity` driver name."""
 
     name = DRIVER_ANTIGRAVITY
+    known_event_types = frozenset({"init", "step_update", "result", "error"})
     needs_api_key = False  # agy owns its login
     prompt_on_stdin = False
     experimental = True

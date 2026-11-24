@@ -112,6 +112,8 @@ PROVIDER_HOMES = {
     "claude": (".claude",),
     "codex": (".codex",),
     "copilot": (".copilot",),
+    "deepseek": (".dsh",),
+    "dsh": (".dsh",),
     "gemini": (".gemini",),
     "grok": (".grok",),
     "omlx": (".omlx",),
@@ -147,14 +149,8 @@ def provider_secret_files(settings) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def protect_provider_homes(settings) -> None:
-    """Protect credential homes and declared files of every provider in `settings`.
-
-    Replaces the previous set (it does not accumulate): a home is off-limits
-    only while a provider that uses it is configured.
-    """
-    global _provider_homes, _provider_secret_files
-    secret_files = provider_secret_files(settings)
+def provider_homes(settings) -> tuple[str, ...]:
+    """Return the configured provider-home names for a run's guard context."""
     labels = {
         label
         for cfg in settings.providers.values()
@@ -165,8 +161,27 @@ def protect_provider_homes(settings) -> None:
         for home in PROVIDER_HOMES.get(label, ()):
             if home not in homes:
                 homes.append(home)
-    _provider_homes = tuple(homes)
-    _provider_secret_files = secret_files
+    return tuple(homes)
+
+
+def provider_guard_context(settings) -> dict[str, list[str]]:
+    """Build the settings-derived guard context shared by agents and callers."""
+    return {
+        "secret_env_names": list(settings.guard_secret_env_names),
+        "secret_files": [str(path) for path in provider_secret_files(settings)],
+        "provider_homes": list(provider_homes(settings)),
+    }
+
+
+def protect_provider_homes(settings) -> None:
+    """Set the legacy process-wide provider protection for direct classifiers.
+
+    Runtime agents carry these values in their own guard contexts. This helper
+    remains for callers that classify outside an agent run.
+    """
+    global _provider_homes, _provider_secret_files
+    _provider_homes = provider_homes(settings)
+    _provider_secret_files = provider_secret_files(settings)
 # Basenames that carry secrets wherever they appear, including in a workspace.
 SENSITIVE_NAMES = frozenset({
     ".env", ".env.local", ".env.production", ".netrc", ".npmrc", ".pypirc",
@@ -191,7 +206,21 @@ SECRET_ENV_NAMES = frozenset({
 PROTECTED_ROOTS: set[Path] = set()
 _PERMANENT_PROTECTED_ROOTS: set[Path] = set()
 _TEMP_PROTECTED_ROOT_COUNTS: dict[Path, int] = {}
+_TEMP_PROTECTED_ROOT_SPELLINGS: dict[Path, dict[Path, int]] = {}
 _PROTECTED_ROOT_LOCK = threading.Lock()
+
+
+def _dsh_bridge_roots() -> tuple[Path, ...]:
+    """Locate the source or packaged DSH bridge without importing its provider."""
+    source = Path(__file__).resolve()
+    candidates = (
+        source.parents[1] / "integrations" / "dsh-guard",
+        source.parents[3] / "integrations" / "dsh-guard",
+    )
+    return tuple(dict.fromkeys(path.resolve() for path in candidates if path.exists()))
+
+
+_DSH_BRIDGE_ROOTS = _dsh_bridge_roots()
 
 # Commands that are never routine for a delegated coding agent.
 NEVER = frozenset({
@@ -317,9 +346,17 @@ def _home() -> Path:
 
 def _secret_paths(context: dict | None = None) -> tuple[Path, ...]:
     """Current lexical and resolved secret paths, including subprocess context."""
-    paths = list(_provider_secret_files)
-    if context:
-        paths.extend(Path(value) for value in context.get("secret_files", ()))
+    if context is None:
+        paths = list(_provider_secret_files)
+        homes = _provider_homes
+    else:
+        declared = context.get("secret_files")
+        paths = list(_provider_secret_files) if declared is None else []
+        paths.extend(Path(value) for value in (declared or ()))
+        homes = tuple(context.get("provider_homes", _provider_homes))
+    paths.extend(_temporary_roots())
+    for home in homes:
+        paths.append(_home() / home)
     for path in tuple(paths):
         with suppress(OSError, RuntimeError):
             paths.append(path.resolve())
@@ -453,13 +490,16 @@ def is_sensitive(path: Path, context: dict | None = None, *, provider: bool = Tr
     except (OSError, RuntimeError):
         resolved = path
     if any(inside(resolved, root) for root in _temporary_roots()):
-        return "the owner's Claude config directory is protected during login runs"
+        return "the owner's login credential home is protected during login runs"
     home = str(_home().resolve()).lower().rstrip("/")
     for candidate in {str(resolved).lower(), os.path.normpath(str(path)).lower()}:
         if candidate != home and not candidate.startswith(home + "/"):
             continue
         rel = candidate[len(home):].lstrip("/")
-        for entry in SENSITIVE_HOME + _provider_homes:
+        homes = _provider_homes if context is None else tuple(
+            context.get("provider_homes", _provider_homes)
+        )
+        for entry in SENSITIVE_HOME + homes:
             folded = entry.lower()
             if rel == folded or rel.startswith(folded + "/"):
                 return f"~/{entry} is off-limits to a delegated agent"
@@ -468,10 +508,13 @@ def is_sensitive(path: Path, context: dict | None = None, *, provider: bool = Tr
 
 def protect(path: Path, *, temporary: bool = False) -> None:
     """Refuse writes under `path`, permanently or until `release`."""
-    root = Path(path).expanduser().resolve()
+    spelling = Path(path).expanduser().absolute()
+    root = spelling.resolve()
     with _PROTECTED_ROOT_LOCK:
         if temporary:
             _TEMP_PROTECTED_ROOT_COUNTS[root] = _TEMP_PROTECTED_ROOT_COUNTS.get(root, 0) + 1
+            aliases = _TEMP_PROTECTED_ROOT_SPELLINGS.setdefault(root, {})
+            aliases[spelling] = aliases.get(spelling, 0) + 1
         else:
             _PERMANENT_PROTECTED_ROOTS.add(root)
         PROTECTED_ROOTS.add(root)
@@ -479,11 +522,19 @@ def protect(path: Path, *, temporary: bool = False) -> None:
 
 def release(path: Path) -> None:
     """Drop one protection reference without unprotecting another active run."""
-    root = Path(path).expanduser().resolve()
+    spelling = Path(path).expanduser().absolute()
+    root = spelling.resolve()
     with _PROTECTED_ROOT_LOCK:
         count = _TEMP_PROTECTED_ROOT_COUNTS.get(root, 0)
+        aliases = _TEMP_PROTECTED_ROOT_SPELLINGS.get(root, {})
+        alias_count = aliases.get(spelling, 0)
+        if alias_count <= 1:
+            aliases.pop(spelling, None)
+        else:
+            aliases[spelling] = alias_count - 1
         if count <= 1:
             _TEMP_PROTECTED_ROOT_COUNTS.pop(root, None)
+            _TEMP_PROTECTED_ROOT_SPELLINGS.pop(root, None)
             if root not in _PERMANENT_PROTECTED_ROOTS:
                 PROTECTED_ROOTS.discard(root)
         else:
@@ -495,6 +546,18 @@ def _temporary_roots() -> tuple[Path, ...]:
         return tuple(_TEMP_PROTECTED_ROOT_COUNTS)
 
 
+def _temporary_root_spellings() -> tuple[Path, ...]:
+    """Resolved and caller-supplied spellings used for active-root redaction."""
+    with _PROTECTED_ROOT_LOCK:
+        roots = list(_TEMP_PROTECTED_ROOT_COUNTS)
+        roots.extend(
+            spelling
+            for aliases in _TEMP_PROTECTED_ROOT_SPELLINGS.values()
+            for spelling in aliases
+        )
+    return tuple(dict.fromkeys(roots))
+
+
 def _redact_private_paths(value):
     """Remove temporary owner config paths from supervisor trace facts."""
     if isinstance(value, dict):
@@ -504,19 +567,19 @@ def _redact_private_paths(value):
     if isinstance(value, tuple):
         return tuple(_redact_private_paths(item) for item in value)
     if isinstance(value, str):
-        for root in _temporary_roots():
-            try:
-                if inside(Path(value), root):
-                    return "<owner Claude config path>"
-            except (OSError, RuntimeError, ValueError):
-                continue
-            value = value.replace(str(root), "<owner Claude config>")
+        roots = sorted(
+            _temporary_root_spellings(), key=lambda path: len(str(path)), reverse=True
+        )
+        for root in roots:
+            value = value.replace(str(root), "<owner provider home>")
     return value
 
 
 def protected(path: Path) -> str | None:
     """Why a write to `path` is refused wherever it sits, or None."""
     for candidate in (Path(os.path.normpath(str(path))), path.resolve()):
+        if any(inside(candidate, root) for root in _DSH_BRIDGE_ROOTS):
+            return "the DSH guard bridge is protected from worker writes"
         parts = [p.lower() for p in candidate.parts]
         for index, part in enumerate(parts[:-1]):
             following = parts[index + 1]
@@ -534,7 +597,7 @@ def protected(path: Path) -> str | None:
                 )
         for root in _temporary_roots():
             if inside(candidate, root):
-                return "the owner's Claude config directory is protected during login runs"
+                return "the owner's login credential home is protected during login runs"
         with _PROTECTED_ROOT_LOCK:
             roots = tuple(PROTECTED_ROOTS)
         for root in roots:
@@ -1997,7 +2060,9 @@ def _tool_paths(name: str, payload: dict) -> list | None:
     return [path] if path is not None else None
 
 
-def classify_verification(command: str, workspace: Path) -> Verdict:
+def classify_verification(
+    command: str, workspace: Path, context: dict | None = None,
+) -> Verdict:
     """Classify a caller's acceptance command.
 
     This is deliberately the same policy the child's own calls get, rather than
@@ -2008,7 +2073,7 @@ def classify_verification(command: str, workspace: Path) -> Verdict:
     """
     if not command.strip():
         return Verdict(ESCALATE, "empty verification command", {"command": command})
-    return classify_bash(command, workspace)
+    return classify_bash(command, workspace, context=context)
 
 
 def _clip_command(text: str, limit: int = 60) -> str:

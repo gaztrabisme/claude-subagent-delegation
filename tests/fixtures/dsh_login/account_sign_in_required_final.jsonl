@@ -1,0 +1,5 @@
+{"type":"session","sessionId":"session-dsh-login-err","cwd":"/work/tree"}
+{"type":"status","phase":"turn_start","turn":1}
+{"type":"status","phase":"step_start","turn":1,"step":1}
+{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"name":"LlmError","code":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in to DeepSeek to use the account provider. The request destination must allow account authentication."}}}
+{"type":"final","sessionId":"session-dsh-login-err","reason":{"kind":"error","error":{"name":"LlmError","code":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in to DeepSeek to use the account provider. The request destination must allow account authentication."}},"text":""}

@@ -28,10 +28,18 @@ from . import adapter, health, providers, router
 from .config import APPROVAL_HOOK, Settings, log
 from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
-from .guard.classify import protect
+from .guard.classify import protect, provider_guard_context
 from .lane_state import LaneState
 from .lane_status import LaneStatusStore, codex_usage
-from .providers.base import DRIVER_CODEX, Process, ProviderConfig, RunContext, Session, capabilities
+from .providers.base import (
+    DRIVER_CODEX,
+    DRIVER_DSH,
+    Process,
+    ProviderConfig,
+    RunContext,
+    Session,
+    capabilities,
+)
 
 # classify_exit and exit_event are re-exported: they were part of this
 # module's surface before the drivers moved into providers/.
@@ -592,6 +600,7 @@ class Run:
     cancel_pending: bool = False
     native_outcome: dict[str, Any] | None = None
     native_usage: bool = False
+    usage_unreported: list[str] = field(default_factory=list)
     native_verification: bool = False
     signatures: Counter[str] = field(default_factory=Counter)
     usage: Usage = field(default_factory=Usage)
@@ -688,6 +697,8 @@ class Run:
                         "credits", "credits_unit", "cash_usd", "extra"):
                 if key in self.native_outcome:
                     out[key] = copy.deepcopy(self.native_outcome[key])
+        if self.usage_unreported and "usage_unreported" not in out:
+            out["usage_unreported"] = list(self.usage_unreported)
         return out
 
     def detail(self) -> dict[str, Any]:
@@ -804,12 +815,7 @@ class Agent:
         self.delegate_options = delegate_options or {}
         # Guard context carries configured child-secret names even before the
         # loop adds its protected tests and state allowlist.
-        self.guard_context: dict[str, Any] = {
-            "secret_env_names": list(settings.guard_secret_env_names),
-        }
-        from .guard.classify import provider_secret_files
-
-        self.guard_context["secret_files"] = [str(p) for p in provider_secret_files(settings)]
+        self.guard_context: dict[str, Any] = provider_guard_context(settings)
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace
@@ -1272,14 +1278,14 @@ class Agent:
         # Codex must coordinate its inner sandbox mode with its outer profile.
         # Give it the frozen agent policy plus the current provider's exclusions.
         spawn_cfg = (dataclasses.replace(self.cfg, deny_read=paths)
-                     if self.cfg.driver == DRIVER_CODEX else self.cfg)
+                     if self.cfg.driver in (DRIVER_CODEX, DRIVER_DSH) else self.cfg)
         process = self.driver.spawn(
             spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
             session, self.model, **kwargs,
         )
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
-        if paths and self.cfg.driver != DRIVER_CODEX:
+        if paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
             process.argv = wrap_argv(process.argv, paths)
         if capabilities(self.driver).cancel and isinstance(process, Process):
             process.enable_cancel_fence()
@@ -1881,6 +1887,11 @@ class Agent:
             usage = event.get("usage")
             if isinstance(usage, dict):
                 run.usage.add({"credits": usage.get("credits")})
+            unreported = event.get("usage_unreported")
+            if isinstance(unreported, list):
+                run.usage_unreported = list(dict.fromkeys(
+                    [*run.usage_unreported, *(key for key in unreported if isinstance(key, str))]
+                ))
             if isinstance(event.get("num_turns"), int):
                 run.usage.turns += event["num_turns"]
             if _hit_max_turns(event) and run.trip is None:

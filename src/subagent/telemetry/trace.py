@@ -160,12 +160,14 @@ class Trace:
                     extra[key] = native[key]
             if not native_verification and getattr(run, "goal", None) is not None:
                 extra["uat"] = run.uat
+        if getattr(run, "usage_unreported", None):
+            extra["usage_unreported"] = list(run.usage_unreported)
         if getattr(run, "native_usage", False):
             extra["native_usage"] = True
         verdicts = self.take_verdicts(run.agent_id)
         guard = guard or getattr(run, "guard", None) or "hook"
         if (
-            getattr(run, "driver", None) == "codex"
+            getattr(run, "driver", None) in ("codex", "dsh")
             and "hook" in guard
             and run.usage.steps > 0
             and not any(verdicts.values())

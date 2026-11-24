@@ -45,7 +45,7 @@ import anyio
 from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapability
 
 from ..config import Settings, log
-from .classify import ALLOW, DENY, ESCALATE, Verdict, classify
+from .classify import ALLOW, DENY, ESCALATE, Verdict, classify, provider_guard_context
 
 
 def _classify(tool_name, tool_input, workspace, cwd=None, guard_context=None):
@@ -84,6 +84,7 @@ class Supervisor:
 
     def __init__(self, settings: Settings, registry: Any = None, trace: Any = None):
         self.settings = settings
+        self.default_guard_context = provider_guard_context(settings)
         self.trace = trace
         # The registry is how a verdict resolves the workspace it is judging
         # against. The hook reports one too, but that is a field the supervised
@@ -151,10 +152,16 @@ class Supervisor:
         if agent_id and self.registry is not None:
             agent = self.registry.find_agent(agent_id)
             if agent is not None:
-                return agent.workspace, getattr(agent, "guard_context", None) or {}
+                return (
+                    agent.workspace,
+                    getattr(agent, "guard_context", None) or self.default_guard_context,
+                )
             log.warning("verdict for unknown agent %r; using the server workspace", agent_id)
-            return self.settings.workspace, {}
-        return (Path(fallback) if fallback else self.settings.workspace), {}
+            return self.settings.workspace, self.default_guard_context
+        return (
+            Path(fallback) if fallback else self.settings.workspace,
+            self.default_guard_context,
+        )
 
     async def decide(
         self,

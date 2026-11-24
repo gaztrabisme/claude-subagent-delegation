@@ -352,11 +352,21 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
     }
     warning = _thinking_warning(cfg)
     if cfg.extra.get("auth") == "login":
-        login_warning = (
-            f"warning: provider {cfg.name!r} uses the owner's Claude login and plan quota; "
-            "worker sessions are written into the owner's Claude history, and the owner's "
-            "global instructions, commands and skills may load"
-        )
+        if cfg.driver == "dsh":
+            login_warning = (
+                f"warning: provider {cfg.name!r} uses the owner's DSH login; "
+                "the worker's DSH_HOME is isolated while the owner credential store is used"
+            )
+            if cfg.max_agents > 1:
+                login_warning += (
+                    f"; max_agents = {cfg.max_agents} shares one owner login and credential store"
+                )
+        else:
+            login_warning = (
+                f"warning: provider {cfg.name!r} uses the owner's Claude login and plan quota; "
+                "worker sessions are written into the owner's Claude history, and the owner's "
+                "global instructions, commands and skills may load"
+            )
         warning = f"{warning}\n{login_warning}" if warning else login_warning
         if cfg.max_agents > 1:
             concurrency_warning = (

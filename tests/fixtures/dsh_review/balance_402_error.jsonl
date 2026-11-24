@@ -1,0 +1,5 @@
+{"type":"session","sessionId":"session-review-6-402","cwd":"/work/tree"}
+{"type":"status","phase":"turn_start","turn":1}
+{"type":"error","message":"402 Insufficient Balance"}
+{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"code":"HTTP_402","message":"402 Insufficient Balance"}}}
+{"type":"final","sessionId":"session-review-6-402","reason":{"kind":"error","error":{"code":"HTTP_402","message":"402 Insufficient Balance"}},"text":""}

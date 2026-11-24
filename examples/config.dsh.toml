@@ -1,0 +1,21 @@
+[core]
+default_provider = "deepseek"
+
+# API-key authentication. The driver maps this configured key name to the
+# DEEPSEEK_API_KEY variable consumed by DSH headless.
+[providers.deepseek]
+driver = "dsh"
+vendor = "deepseek"
+model = "deepseek-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+experimental = true
+
+# Account-login authentication uses the owner's local DSH credential store.
+# Keep concurrency at one when sharing the account session.
+[providers.deepseek-login]
+driver = "dsh"
+vendor = "deepseek"
+auth = "login"
+model = "deepseek-flash"
+max_agents = 1
+experimental = true

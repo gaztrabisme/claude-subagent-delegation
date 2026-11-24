@@ -1,0 +1,8 @@
+{
+  "name": "@subagent/dsh-guard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "description": "Fail-closed DeepSeek Harness bridge to subagent's approval hook"
+}

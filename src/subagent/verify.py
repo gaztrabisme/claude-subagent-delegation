@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings, log
-from .guard.classify import ALLOW, classify_verification
+from .guard.classify import ALLOW, classify_verification, provider_guard_context
 
 OUTPUT_TAIL_CHARS = 2000
 
@@ -77,7 +77,16 @@ def run_verification(
     if not command:
         return VerificationResult(command, False, "no verification command was given")
 
-    verdict = classify_verification(command, workspace)
+    try:
+        guard_context = provider_guard_context(settings)
+    except Exception as exc:  # noqa: BLE001 - missing protections must block execution
+        log.warning("verification blocked because guard context could not be built", exc_info=True)
+        return VerificationResult(
+            command,
+            False,
+            f"blocked before execution: guard context unavailable ({type(exc).__name__})",
+        )
+    verdict = classify_verification(command, workspace, context=guard_context)
     if verdict.action != ALLOW:
         log.warning("verification blocked (%s): %s", verdict.action, verdict.reason)
         return VerificationResult(

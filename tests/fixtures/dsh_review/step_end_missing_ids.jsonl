@@ -1,0 +1,10 @@
+{"type":"session","sessionId":"session-review-5-ids","cwd":"/work/tree"}
+{"type":"status","phase":"turn_start","turn":1}
+{"type":"tool_call","callId":"call-1","tool":"bash","input":{"command":"pwd","description":"Pwd"}}
+{"type":"tool_result","callId":"call-1","status":"completed","result":"/work/tree\n"}
+{"type":"status","phase":"step_end","usage":{"inputTokens":100,"outputTokens":20,"totalTokens":120}}
+{"type":"tool_call","callId":"call-2","tool":"read","input":{"file_path":"README.md"}}
+{"type":"tool_result","callId":"call-2","status":"completed","result":"# readme\n"}
+{"type":"status","phase":"step_end","usage":{"inputTokens":200,"outputTokens":40,"totalTokens":240}}
+{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"completed"}}
+{"type":"final","sessionId":"session-review-5-ids","reason":{"kind":"completed"},"text":"Done."}

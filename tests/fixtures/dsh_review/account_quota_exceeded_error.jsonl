@@ -1,0 +1,5 @@
+{"type":"session","sessionId":"session-review-6-quota","cwd":"/work/tree"}
+{"type":"status","phase":"turn_start","turn":1}
+{"type":"error","message":"ACCOUNT_QUOTA_EXCEEDED: DeepSeek account quota exceeded"}
+{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"code":"ACCOUNT_QUOTA_EXCEEDED","message":"DeepSeek account quota exceeded"}}}
+{"type":"final","sessionId":"session-review-6-quota","reason":{"kind":"error","error":{"code":"ACCOUNT_QUOTA_EXCEEDED","message":"DeepSeek account quota exceeded"}},"text":""}

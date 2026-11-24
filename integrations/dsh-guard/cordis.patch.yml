@@ -1,0 +1,28 @@
+# The DSH driver replaces this marker with the packaged bridge entry URL.
+- id: subagent
+  disabled: true
+- id: agent-team
+  disabled: true
+- id: tool-agent-team
+  disabled: true
+- id: subagent-spawn-in-process
+  disabled: true
+- id: subagent-fork-in-process
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: ptc-runtime
+  disabled: true
+- id: workflow-ptc
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-executor-ptc
+  disabled: true
+- insert:
+    - id: subagent-dsh-guard
+      name: "__SUBAGENT_DSH_GUARD_ENTRY__"

@@ -656,7 +656,11 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
             args.pop(0)
         if base in _DATA_COMMANDS:
             continue
-        recursive = base in _TREE_COMMANDS
+        ls_recursive = base == 'ls' and any(
+            arg.value == '--recursive' or re.fullmatch(r'-[a-zA-Z]*R[a-zA-Z]*', arg.value)
+            for arg in args
+        )
+        recursive = base in _TREE_COMMANDS or ls_recursive
         search = base in _SEARCH
         path_options = _SEARCH_PATHS if search else _PATH_OPTIONS.get(base, set())
         data_options = _SEARCH_VALUES if search else _DATA_OPTIONS.get(base, set())
@@ -673,11 +677,25 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
         curl_uploads: list[Word] = []
         curl_globoff = False
         curl_uncertain = False
+        find_roots: list[Word] = []
+        find_expression_started = False
+        find_option_value = False
         index = 0
         options = True
         while index < len(args):
             word = args[index]
             value = word.value
+            if base == 'find' and not find_expression_started:
+                if find_option_value:
+                    find_option_value = False
+                elif value in {'-D', '-O'}:
+                    find_option_value = True
+                elif value in {'-H', '-L', '-P'} or re.fullmatch(r'-O[0-9]+', value):
+                    pass
+                elif value in {'!', '(', ')'} or value.startswith('-'):
+                    find_expression_started = True
+                else:
+                    find_roots.append(word)
             if options and value == '--':
                 options = False
                 index += 1
@@ -780,6 +798,11 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
                 roots.extend(positionals or [Word('.', '.', '.')])
                 if uncertain:
                     roots.append(Word('.', '.', '.'))
+        if base == 'find':
+            # `find` recursively visits its starting path even without an
+            # explicit `-r` option. Every starting path before the expression
+            # is a root; looking at only the first misses `find /tmp ~ ...`.
+            roots.extend(find_roots or [Word('.', '.', '.')])
         for word in positionals:
             if base == 'dd' and word.value.startswith(('if=', 'of=')):
                 word = word.tail(3)

@@ -91,6 +91,47 @@ kind = "flat_plan"
 The worker uses the owner's existing Claude login. `subagent doctor` warns about the shared
 history and quota; select it with `subagent use claude`. See [Limitations](#limitations).
 
+### DeepSeek Harness
+
+The experimental `dsh` driver runs DeepSeek Harness in headless JSON mode. Install the DSH CLI
+and set `binary` if it is not named `dsh` on `PATH`. The driver writes prompts to stdin, resumes
+the returned DSH session id, translates DSH events for subagent's run and usage tracking, and
+installs the packaged bridge from `integrations/dsh-guard/` on every run.
+
+The bridge uses DSH's prepended `tools/pre-execute` listener to send each supported Bash, Read,
+Write, Edit, Grep, or Glob call to subagent's approval hook. Unmapped tools and hook failures are
+denied. The bridge is required to start the worker, and DSH's direct PTC executor stays disabled.
+With an outer macOS Seatbelt profile, DSH uses `danger-full-access` inside that outer boundary to
+avoid nesting Seatbelt; otherwise it keeps DSH's `workspace-write` permission mode.
+
+Configure API-key authentication with a key variable that the driver maps to `DEEPSEEK_API_KEY`:
+
+```toml
+[providers.deepseek]
+driver = "dsh"
+vendor = "deepseek"
+api_key_env = "DEEPSEEK_API_KEY"
+experimental = true
+```
+
+`base_url` maps to `DEEPSEEK_BASE_URL` when set. When the configured key is absent, the driver
+passes an empty `DEEPSEEK_API_KEY` to suppress DSH's `.env` fallback. For account-login
+authentication, use `auth = "login"` without `api_key_env`:
+
+```toml
+[providers.deepseek-login]
+driver = "dsh"
+vendor = "deepseek"
+auth = "login"
+max_agents = 1
+experimental = true
+```
+
+Login mode uses `DSH_OWNER_HOME` when set, otherwise `~/.dsh`, for the owner's `.credentials.yaml`.
+The worker's own `DSH_HOME` remains under the session root, and subagent protects the owner DSH
+home from worker tool calls while the run is active. `subagent doctor` warns when a DSH login
+provider has `max_agents > 1`. See [Limitations](#limitations).
+
 To discover a local OpenAI-compatible or oMLX endpoint, set `LOCAL_LLM_BASE_URL` to its base URL
 and run:
 
@@ -378,6 +419,7 @@ Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](
   | Codex (`codex`) | Classifier hook plus Codex `workspace-write` sandbox. |
   | Copilot (`copilot`) | No guard hook. Direct MCP worker use requires `[guard].allow_unguarded = true`. |
   | Grok (`grok`) | Built-in sandbox by default; uses Grok's native hook path when configured. |
+  | DeepSeek Harness (`dsh`) | Packaged pre-execute bridge to the subagent approval hook; fails closed. |
   | Oh My Pi (`omp`) | Packaged tool-call hook reaches the subagent classifier. |
   | Gemini (`gemini`) | No tool-call guard; runs with `--yolo` and is experimental. |
   | Antigravity (`antigravity`) | No installed approval hook; relies on its CLI sandbox and is experimental. |
@@ -389,6 +431,9 @@ Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](
   uses the owner's Claude login and plan quota. Worker sessions are written into the owner's
   Claude history. The owner's global instructions, commands, and skills may also load in that
   worker; `subagent doctor` warns when it checks this provider.
+- **DSH login uses the owner's DeepSeek account.** The opt-in DSH provider setting `auth = "login"`
+  reads the owner's `.credentials.yaml` from `DSH_OWNER_HOME` or `~/.dsh`; worker sessions use an
+  isolated `DSH_HOME`. Keep `max_agents = 1` unless concurrent runs on that account are intended.
 - Workers edit the workspace you give them. The loop checkpoints work and protects detected test
   files, but review and tests cannot guarantee that every defect is found. Inspect important
   changes before relying on them.

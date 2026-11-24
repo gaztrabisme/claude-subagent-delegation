@@ -95,15 +95,19 @@ def test_all_dsh_patches_follow_profile_before_headless_app_options(
         cfg.model,
     )
 
-    assert argv[1:3] == ["--profile", "headless"]
-    patch_count = len(_patch_values(argv))
+    assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert isinstance(argv[2], str) and argv[2].strip()
+    dsh_argv = argv[3:]
+    assert dsh_argv[0] == cfg.binary
+    assert dsh_argv[1:3] == ["--profile", "headless"]
+    patch_count = len(_patch_values(dsh_argv))
     assert patch_count == 2
-    assert argv[3 : 3 + 2 * patch_count : 2] == ["--patch"] * patch_count
+    assert dsh_argv[3 : 3 + 2 * patch_count : 2] == ["--patch"] * patch_count
     first_app_option = 3 + 2 * patch_count
-    assert argv[first_app_option] == "--json"
-    assert "--patch" not in argv[first_app_option:]
-    assert argv[-1] == "-"
-    assert argv[argv.index("--session-id") + 1] == "session-order-check"
+    assert dsh_argv[first_app_option] == "--json"
+    assert "--patch" not in dsh_argv[first_app_option:]
+    assert dsh_argv[-1] == "-"
+    assert dsh_argv[dsh_argv.index("--session-id") + 1] == "session-order-check"
 
 
 def test_generated_guard_patch_disables_every_headless_delegation_plugin(

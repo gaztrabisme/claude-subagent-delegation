@@ -19,7 +19,7 @@ import pytest
 from subagent import config, router
 from subagent.providers import for_driver
 from subagent.providers.base import ProviderConfig, Session
-from subagent.providers.dsh import _bridge_bundle
+from subagent.providers.dsh import DshProcess, _bridge_bundle
 from subagent.runs import COMPLETED, FAILED, Agent, Registry
 from subagent.telemetry.trace import Trace
 
@@ -149,6 +149,26 @@ def fake_dsh(tmp_path: Path, monkeypatch):
     return FakeDsh()
 
 
+def _assert_and_strip_outer_sandbox(argv: list[str], expected_binary: str) -> list[str]:
+    """Assert outer Seatbelt wrapper + profile and return the unwrapped DSH argv."""
+    assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert isinstance(argv[2], str) and argv[2].strip()
+    dsh_argv = argv[3:]
+    assert dsh_argv[0] == expected_binary
+    return dsh_argv
+
+
+def _strip_outer_sandbox_for_fake_dsh(monkeypatch: pytest.MonkeyPatch, fake_binary: str) -> None:
+    """Assert outer Seatbelt wrapper + profile, then strip only when launching fake_dsh."""
+    real_start = DshProcess._start
+
+    def _start_fake(self: DshProcess, *args, **kwargs):
+        self.argv = _assert_and_strip_outer_sandbox(self.argv, fake_binary)
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(DshProcess, "_start", _start_fake)
+
+
 def _registry_with_dsh(
     tmp_path: Path,
     fake_dsh,
@@ -205,7 +225,9 @@ def test_no_machine_specific_dsh_path_in_src(tmp_path: Path):
         argv = driver.argv(cfg, settings, "a1", "prompt", _workspace(tmp_path), Session(provider="deepseek"), None)
     except Exception:
         return  # refusing missing binary is also valid
-    assert not Path(argv[0]).is_absolute(), f"unexpected default absolute binary path: {argv[0]!r}"
+    assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert isinstance(argv[2], str) and argv[2].strip()
+    assert not Path(argv[3]).is_absolute(), f"unexpected default absolute binary path: {argv[3]!r}"
 
 
 # --- argv, stdin, permission-mode & outer sandbox (points 1, 2) --------------
@@ -219,16 +241,16 @@ def test_argv_shape_uses_config_binary_headless_json_never_guard_patch_and_stdin
 
     argv = driver.argv(cfg, settings, "a1", "do the task", ws, Session(provider="deepseek"), None)
 
-    assert argv[0] == "/custom/path/dsh"
-    assert _flag_value(argv, "--profile") == "headless"
-    assert "--json" in argv
-    assert _flag_value(argv, "--approval-policy") == "never"
-    assert _flag_value(argv, "--permission-mode") == "workspace-write"
-    assert argv[-1] == "-"
-    assert "do the task" not in argv  # prompt goes on stdin, not argv
-    assert "--session-id" not in argv
+    dsh_argv = _assert_and_strip_outer_sandbox(argv, "/custom/path/dsh")
+    assert _flag_value(dsh_argv, "--profile") == "headless"
+    assert "--json" in dsh_argv
+    assert _flag_value(dsh_argv, "--approval-policy") == "never"
+    assert _flag_value(dsh_argv, "--permission-mode") == "danger-full-access"
+    assert dsh_argv[-1] == "-"
+    assert "do the task" not in dsh_argv  # prompt goes on stdin, not argv
+    assert "--session-id" not in dsh_argv
 
-    patches = _patch_values(argv)
+    patches = _patch_values(dsh_argv)
     assert len(patches) == 1
     guard_patch = Path(patches[0])
     assert guard_patch.is_file(), f"guard patch does not exist: {guard_patch}"
@@ -244,6 +266,7 @@ def test_prompt_is_delivered_on_stdin_and_closed(fake_dsh, tmp_path: Path, monke
 
     prompt = "Inspect the repo\nand report status."
     process = driver.spawn(cfg, settings, "a1", prompt, ws, Session(provider="deepseek"), None)
+    process.argv = _assert_and_strip_outer_sandbox(process.argv, fake_dsh.path)
     events = list(process.events())
 
     assert any(e.get("type") == "result" and not e.get("is_error") for e in events)
@@ -262,9 +285,8 @@ def test_permission_mode_workspace_write_without_outer_sandbox(tmp_path: Path):
 
     process = driver.spawn(cfg, settings, "a1", "hello", ws, Session(provider="deepseek"), None)
 
-    assert "/usr/bin/sandbox-exec" not in process.argv
-    assert process.argv[0] == cfg.binary
-    assert _flag_value(process.argv, "--permission-mode") == "workspace-write"
+    dsh_argv = _assert_and_strip_outer_sandbox(process.argv, cfg.binary)
+    assert _flag_value(dsh_argv, "--permission-mode") == "danger-full-access"
 
 
 def _sbpl_allows_write(profile: str, target: Path) -> bool:
@@ -642,6 +664,7 @@ def test_translator_emits_init_text_tool_use_tool_result_and_one_final_result():
 
 def test_translator_and_run_sum_step_end_usage_fields(fake_dsh, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dsh-key")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     ws = _workspace(tmp_path)
     reg = _registry_with_dsh(tmp_path, fake_dsh)
     try:
@@ -671,6 +694,7 @@ def test_run_completes_captures_session_id_and_resumes_next_round(
     fake_dsh, tmp_path: Path, monkeypatch
 ):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dsh-key")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     ws = _workspace(tmp_path)
     reg = _registry_with_dsh(tmp_path, fake_dsh)
     try:
@@ -706,6 +730,7 @@ def test_step_without_usage_marks_run_usage_unreported_instead_of_partial_sum(
     fake_dsh, tmp_path: Path, monkeypatch
 ):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dsh-key")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use("step_without_usage.jsonl")
     ws = _workspace(tmp_path)
     trace_path = tmp_path / "trace.jsonl"
@@ -759,6 +784,7 @@ def test_missing_credential_and_auth_error_are_auth_refusals_that_close_lane(
     fake_dsh, tmp_path: Path, monkeypatch, fixture: str, stderr_text: str
 ):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-rejected-test-key")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use(fixture, exit_code=1, stderr=stderr_text)
     ws = _workspace(tmp_path)
 
@@ -793,6 +819,7 @@ def test_nonzero_exit_fails_with_dsh_stderr_diagnostic_without_closing_lane(
     fake_dsh, tmp_path: Path, monkeypatch
 ):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dsh-key")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     diag = "dsh: INTERNAL_ERROR: upstream stream closed"
     fake_dsh.use("nonzero_error.jsonl", exit_code=1, stderr=diag)
     ws = _workspace(tmp_path)
@@ -815,6 +842,7 @@ def test_nonzero_exit_without_final_event_fails_with_dsh_stderr_diagnostic(
     fake_dsh, tmp_path: Path, monkeypatch
 ):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dsh-key")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     diag = "dsh: profile load failed: unknown plugin"
     fake_dsh.use("", exit_code=1, stderr=diag)
     ws = _workspace(tmp_path)

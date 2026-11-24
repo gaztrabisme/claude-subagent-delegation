@@ -80,6 +80,7 @@ from subagent.config import APPROVAL_HOOK
 from subagent.guard.classify import ALLOW, DENY, ESCALATE, classify
 from subagent.providers import for_driver
 from subagent.providers.base import ProviderConfig, Session
+from subagent.providers.dsh import DshProcess
 from subagent.runs import COMPLETED, FAILED, Registry
 
 from .conftest import TEST_CHILD_ENV_PASSTHROUGH, make_settings
@@ -338,6 +339,26 @@ def _make_synthetic_owner_home(base: Path) -> tuple[Path, Path, Path]:
     return owner_home, cred_file, storage_file
 
 
+def _assert_and_strip_outer_sandbox(argv: list[str], expected_binary: str) -> list[str]:
+    """Assert outer Seatbelt wrapper + profile and return the unwrapped DSH argv."""
+    assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert isinstance(argv[2], str) and argv[2].strip()
+    dsh_argv = argv[3:]
+    assert dsh_argv[0] == expected_binary
+    return dsh_argv
+
+
+def _strip_outer_sandbox_for_fake_dsh(monkeypatch: pytest.MonkeyPatch, fake_binary: str) -> None:
+    """Assert outer Seatbelt wrapper + profile, then strip only when launching fake_dsh."""
+    real_start = DshProcess._start
+
+    def _start_fake(self: DshProcess, *args, **kwargs):
+        self.argv = _assert_and_strip_outer_sandbox(self.argv, fake_binary)
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(DshProcess, "_start", _start_fake)
+
+
 def _registry_with_dsh_login(
     tmp_path: Path,
     fake_dsh,
@@ -573,9 +594,10 @@ def test_login_env_omits_deepseek_api_key_and_all_secret_values(
     login_env = driver.env(settings, "a-login", login_cfg, Session(provider="deepseek-login"))
     api_env = driver.env(settings, "a-api", api_cfg, Session(provider="deepseek-api"))
 
-    assert "DEEPSEEK_API_KEY" not in login_env
+    assert login_env.get("DEEPSEEK_API_KEY") == ""
     for secret_name, secret_val in secret_vars.items():
-        assert secret_name not in login_env, f"secret env {secret_name!r} leaked into login env"
+        if secret_name != "DEEPSEEK_API_KEY":
+            assert secret_name not in login_env, f"secret env {secret_name!r} leaked into login env"
         assert all(secret_val not in str(v) for v in login_env.values()), (
             f"secret value for {secret_name!r} leaked into login env values"
         )
@@ -601,13 +623,14 @@ def test_login_spawned_child_receives_no_deepseek_api_key_in_env(
     process = driver.spawn(
         cfg, settings, "a-login-run", "hello", ws, Session(provider="deepseek-login"), None
     )
+    process.argv = _assert_and_strip_outer_sandbox(process.argv, fake_dsh.path)
     events = list(process.events())
     assert any(e.get("type") == "result" and not e.get("is_error") for e in events)
 
     calls = fake_dsh.calls()
     assert len(calls) == 1
-    assert "DEEPSEEK_API_KEY" not in calls[0]["env_keys"]
-    assert calls[0]["env"]["DEEPSEEK_API_KEY"] is None
+    assert calls[0]["env"]["DEEPSEEK_API_KEY"] == ""
+    assert all("sk-must-never-reach-login-child" not in str(v) for v in calls[0]["env"].values())
     assert "GLM_API_KEY" not in calls[0]["env_keys"]
 
 
@@ -681,6 +704,7 @@ def test_login_run_keeps_owner_dsh_home_isolated_and_untouched(
     orig_cred = cred_file.read_text(encoding="utf-8")
     orig_storage = storage_file.read_text(encoding="utf-8")
     monkeypatch.setenv("DSH_OWNER_HOME", str(owner_home))
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
 
     ws = _workspace(tmp_path)
     reg = _registry_with_dsh_login(tmp_path, fake_dsh)
@@ -787,6 +811,7 @@ def test_login_default_home_dot_dsh_is_protected_during_run(
     process = driver.spawn(
         cfg, settings, "guard-login-default", "prompt", ws, Session(provider="deepseek-login"), None
     )
+    process.argv = _assert_and_strip_outer_sandbox(process.argv, fake_dsh.path)
 
     real_start = process._start
     saw_protected = False
@@ -852,6 +877,7 @@ def test_login_protects_owner_dsh_home_through_bridge_during_run_and_releases_af
     process = driver.spawn(
         cfg, settings, "dsh-login-bridge", "task", ws, Session(provider="deepseek-login"), None
     )
+    process.argv = _assert_and_strip_outer_sandbox(process.argv, fake_dsh.path)
 
     real_start = process._start
     during_run: dict[str, dict[str, Any]] = {}
@@ -914,6 +940,7 @@ def test_account_sign_in_required_is_auth_refusal_that_closes_lane(
     is classified as an auth refusal and closes the lane like `MISSING_CREDENTIAL`."""
     owner_home, _, _ = _make_synthetic_owner_home(tmp_path)
     monkeypatch.setenv("DSH_OWNER_HOME", str(owner_home))
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use(fixture, exit_code=1, stderr=stderr_text)
     ws = _workspace(tmp_path)
 

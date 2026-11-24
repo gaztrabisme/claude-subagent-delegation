@@ -33,7 +33,7 @@ from subagent.guard.classify import (
 )
 from subagent.providers import for_driver
 from subagent.providers.base import ProviderConfig, Session
-from subagent.providers.dsh import DshProvider, _bridge_bundle
+from subagent.providers.dsh import DshProcess, DshProvider, _bridge_bundle
 from subagent.runs import COMPLETED, FAILED, KILL_BUDGET, KILL_LOOP, Registry, Run
 from subagent.telemetry.trace import Trace
 
@@ -206,8 +206,10 @@ after_marker = os.environ.get("FAKE_DSH_AFTER_PAUSE_MARKER", "")
 paused = False
 
 if os.environ.get("FAKE_DSH_NO_READY") != "1":
-    sys.stderr.write("__SUBAGENT_DSH_GUARD_READY__\\n")
-    sys.stderr.flush()
+    nonce = os.environ.get("SUBAGENT_DSH_GUARD_NONCE", "")
+    if nonce:
+        sys.stderr.write(f"__SUBAGENT_DSH_GUARD_READY__{{nonce}}\\n")
+        sys.stderr.flush()
 
 if fixture and Path(fixture).exists():
     for line in Path(fixture).read_text(encoding="utf-8").splitlines():
@@ -231,6 +233,20 @@ raise SystemExit(int(os.environ.get("FAKE_DSH_EXIT") or "0"))
     )
     binary.chmod(0o755)
     return binary
+
+
+def _strip_outer_sandbox_for_fake_dsh(monkeypatch: pytest.MonkeyPatch, fake_binary: str) -> None:
+    """Assert outer Seatbelt wrapper + profile, then strip only when launching fake_dsh."""
+    real_start = DshProcess._start
+
+    def _start_fake(self: DshProcess, *args: Any, **kwargs: Any):
+        assert self.argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
+        assert isinstance(self.argv[2], str) and self.argv[2].strip()
+        assert self.argv[3] == fake_binary
+        self.argv = self.argv[3:]
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(DshProcess, "_start", _start_fake)
 
 
 def _registry_with_dsh(
@@ -858,6 +874,7 @@ def test_review_5_killed_run_preserves_completed_step_usage(
 ) -> None:
     """Finding 5: killing a DSH run mid-stream (e.g. loop trip) must preserve completed step usage."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-review-5")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use("loop_after_step1_usage.jsonl")
     ws = _workspace(tmp_path)
     reg = _registry_with_dsh(tmp_path, fake_dsh.path, loop_strikes=3)
@@ -881,6 +898,7 @@ def test_review_5_turn_token_budget_trips_mid_run(tmp_path: Path, monkeypatch) -
     killing the child before step 2 runs."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-review-5")
     binary = _install_streaming_fake_dsh(tmp_path)
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, str(binary))
     after_marker = tmp_path / "reached-step-2"
     monkeypatch.setenv("FAKE_DSH_RECORD", str(tmp_path / "calls.jsonl"))
     monkeypatch.setenv("FAKE_DSH_FIXTURE", str(REVIEW_FIXTURES / "step1_high_usage_then_step2.jsonl"))
@@ -913,6 +931,7 @@ def test_review_5_trace_turns_not_split_into_phantom_zero_token_turns(
     """Finding 5: a 3-step DSH run must produce 3 `turn` trace records (not 4 with a 0-token phantom turn),
     with each step's `tool_calls` attached to its usage turn."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-review-5")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use(DSH_FIXTURES / "success_tools_usage.jsonl")
     ws = _workspace(tmp_path)
     trace_path = tmp_path / "trace.jsonl"
@@ -942,6 +961,7 @@ def test_review_5_step_end_without_turn_or_step_numbers_do_not_collide(
 ) -> None:
     """Finding 5: two `step_end` events omitting `turn`/`step` must use distinct message IDs in `_Meter`."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-review-5")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use("step_end_missing_ids.jsonl")
     ws = _workspace(tmp_path)
     trace_path = tmp_path / "trace.jsonl"
@@ -988,6 +1008,7 @@ def test_review_6_refusal_handles_deepseek_402_balance_and_closes_lane(
     assert router.close_until(refusal, balance_close_hours=6, throttle_close_minutes=15) is not None
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-review-6")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use("balance_402_error.jsonl", exit_code=1, stderr="dsh: 402 Insufficient Balance")
     ws = _workspace(tmp_path)
     reg = _registry_with_dsh(tmp_path, fake_dsh.path)
@@ -1024,6 +1045,7 @@ def test_review_6_refusal_handles_account_quota_exceeded_and_closes_lane(
     assert refusal is not None, "DshProvider.refusal() ignored ACCOUNT_QUOTA_EXCEEDED"
     assert router.close_until(refusal, balance_close_hours=6, throttle_close_minutes=15) is not None
 
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use(
         "account_quota_exceeded_error.jsonl",
         exit_code=1,
@@ -1214,6 +1236,7 @@ def test_review_9_run_summary_and_detail_include_usage_unreported_for_dsh(
 ) -> None:
     """Finding 9: `Run.summary()` and `Run.detail()` must surface `usage_unreported` for DSH runs."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-review-9")
+    _strip_outer_sandbox_for_fake_dsh(monkeypatch, fake_dsh.path)
     fake_dsh.use(DSH_FIXTURES / "step_without_usage.jsonl")
     ws = _workspace(tmp_path)
     reg = _registry_with_dsh(tmp_path, fake_dsh.path)

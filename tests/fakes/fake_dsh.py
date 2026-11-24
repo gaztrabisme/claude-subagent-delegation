@@ -3,7 +3,7 @@
 
 Records its invocation (argv, cwd, stdin read to EOF, and selected environment
 variables plus every present env key) to ``FAKE_DSH_RECORD`` as one JSON line
-per call, emits ``__SUBAGENT_DSH_GUARD_READY__`` on stderr by default (unless
+per call, emits ``__SUBAGENT_DSH_GUARD_READY__<nonce>`` on stderr by default (unless
 ``FAKE_DSH_NO_READY=1``), replays the synthetic NDJSON stream named by
 ``FAKE_DSH_FIXTURE`` on stdout, optionally writes ``FAKE_DSH_STDERR`` to stderr,
 and exits with ``FAKE_DSH_EXIT`` (default 0).
@@ -54,8 +54,10 @@ def main() -> int:
             fh.write(json.dumps(record) + "\n")
 
     if os.environ.get("FAKE_DSH_NO_READY") != "1":
-        sys.stderr.write("__SUBAGENT_DSH_GUARD_READY__\n")
-        sys.stderr.flush()
+        nonce = os.environ.get("SUBAGENT_DSH_GUARD_NONCE", "")
+        if nonce:
+            sys.stderr.write(f"__SUBAGENT_DSH_GUARD_READY__{nonce}\n")
+            sys.stderr.flush()
 
     fixture_path = os.environ.get("FAKE_DSH_FIXTURE")
     if fixture_path:

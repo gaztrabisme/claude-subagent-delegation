@@ -603,10 +603,14 @@ def test_r3_n2_driver_rejects_static_or_wrong_nonce_and_accepts_run_nonce(
     assert res_wrong["is_error"] is True, f"wrong nonce was accepted: {res_wrong}"
 
     # 4. Exact bridge readiness line for this run's nonce -> accepted.
-    p_good = driver.spawn(cfg, settings, "n2-good", "task", ws, Session(provider="deepseek"), None)
-    run_nonce = p_good.env[nonce_key]
-    good_line = _capture_bridge_stderr(ws, {nonce_key: run_nonce}).strip()
+    import secrets
+
+    expected_nonce = secrets.token_urlsafe(32)
+    good_line = _capture_bridge_stderr(ws, {nonce_key: expected_nonce}).strip()
     monkeypatch.setenv("FAKE_DSH_READY_LINE", good_line)
+    monkeypatch.setattr("subagent.providers.dsh.secrets.token_urlsafe", lambda _n=32: expected_nonce)
+    p_good = driver.spawn(cfg, settings, "n2-good", "task", ws, Session(provider="deepseek"), None)
+    assert p_good.env[nonce_key] == expected_nonce
     _strip_sandbox_prefix(p_good)
     res_good = [e for e in p_good.events() if e.get("type") == "result"][-1]
     assert res_good["is_error"] is False, f"valid run nonce was rejected: {res_good}"
@@ -920,6 +924,7 @@ def test_r3_n5_login_mode_sets_empty_deepseek_api_key_in_child_env(
     assert env_without_parent["DEEPSEEK_API_KEY"] == ""
 
     # Case 3: end-to-end spawn delivers DEEPSEEK_API_KEY="" to the child process.
+    monkeypatch.setenv("FAKE_DSH_RECORD", str(record))
     monkeypatch.setenv("FAKE_DSH_FIXTURE", str(REVIEW_FIXTURES / "session_turn_final.jsonl"))
     process = driver.spawn(cfg, settings, "n5-spawn", "task", ws, Session(provider=cfg.name), None)
     assert process.env.get("DEEPSEEK_API_KEY") == ""

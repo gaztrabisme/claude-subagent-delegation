@@ -102,16 +102,18 @@ async def _lifespan(_app):
             daemon=True,
         )
         probe_thread.start()
-    async with anyio.create_task_group() as tg:
-        await tg.start(supervisor.serve)
-        try:
-            yield {}
-        finally:
-            probe_stop.set()
-            if probe_thread is not None:
-                probe_thread.join(timeout=8.0)
-            tg.cancel_scope.cancel()
-            supervisor.cleanup()
+    try:
+        async with anyio.create_task_group() as tg:
+            try:
+                await tg.start(supervisor.serve)
+                yield {}
+            finally:
+                tg.cancel_scope.cancel()
+                supervisor.cleanup()
+    finally:
+        probe_stop.set()
+        if probe_thread is not None:
+            probe_thread.join(timeout=8.0)
 
 
 def _lane_probe_loop(stop: threading.Event) -> None:

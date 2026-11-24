@@ -216,6 +216,7 @@ class LaneStatusStore:
     def active_run(self, lane: str) -> Iterator[None]:
         """Hold a shared lane lease so another process cannot prompt-probe it."""
         probe_handle = active_handle = None
+        active_path: Path | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             probe_handle = open(  # noqa: SIM115 - held for the cross-process lease
@@ -243,6 +244,9 @@ class LaneStatusStore:
         finally:
             if active_handle is not None:
                 active_handle.close()
+                if active_path is not None:
+                    with contextlib.suppress(OSError):
+                        active_path.unlink(missing_ok=True)
             if probe_handle is not None:
                 probe_handle.close()
 

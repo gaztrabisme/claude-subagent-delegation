@@ -603,6 +603,9 @@ class Run:
     _timeout_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     session_id: str | None = None
     lane: str | None = None
+    # The lane whose _collect() was entered for the current run, even if it
+    # crashes or is cancelled before the router can append a HOP_RAN record.
+    attempted_lane: str | None = field(default=None, repr=False)
     fallback: str | None = None
     provider: str | None = None
     # The driver ("claude" / "codex") and guard ("hook" / "sandbox+hook") of
@@ -857,6 +860,9 @@ class Agent:
                     run.trip = (KILL_TIMEOUT, "provider admission timed out before submission")
                     self._finish_locked(run)
             if queued:
+                # This run never owned the agent's active lane lease; an
+                # earlier human-waiting run may still be using it.
+                self._record_lane_status(run, release_active_lane=False)
                 raise RegistryError("provider admission timed out before submission")
             self.close("provider admission timed out", kind=KILL_TIMEOUT)
             raise RegistryError("provider admission timed out; cancellation requested")
@@ -1144,11 +1150,14 @@ class Agent:
             with contextlib.suppress(Exception):
                 lease.__exit__(None, None, None)
 
-    def _record_lane_status(self, run: Run) -> None:
+    def _record_lane_status(
+        self, run: Run, *, release_active_lane: bool = True
+    ) -> None:
         """Persist completed run observations after its public done signals."""
         store = self.lane_status
         if store is None:
-            self._release_active_lane()
+            if release_active_lane:
+                self._release_active_lane()
             run.status_ready.set()
             return
         try:
@@ -1175,7 +1184,12 @@ class Agent:
                 hop.get("lane") for hop in run.hops
                 if hop.get("outcome") == router.HOP_RAN
             }
-            if run.lane and (not run.hops or run.lane in ran_lanes):
+            hopped_lanes = {hop.get("lane") for hop in run.hops}
+            if run.lane and (
+                not run.hops
+                or run.lane in ran_lanes
+                or (run.attempted_lane == run.lane and run.lane not in hopped_lanes)
+            ):
                 observations.append({
                     "lane": run.lane, "kind": "run",
                     "finish_reason": run.finish_reason or run.state or "error",
@@ -1198,7 +1212,8 @@ class Agent:
         except Exception:  # noqa: BLE001 - status memory must never fail a run
             log.warning("lane status update failed for %s", run.run_id, exc_info=True)
         finally:
-            self._release_active_lane()
+            if release_active_lane:
+                self._release_active_lane()
             run.status_ready.set()
 
     def _worker(self) -> None:
@@ -1538,6 +1553,7 @@ class Agent:
             extra = self.settings.cold_load_seconds(cfg.name) if gate.cold_load else 0.0
             run.deadline = _now() + cfg.run_timeout + extra
             run.worked = False
+            run.attempted_lane = cfg.name
             events = self._collect(run, run.prompt, resume=None)
             refusal = None
             if not run.worked and run.trip is None and not self._closing:

@@ -332,7 +332,9 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         api_key_default=api_key_default,
         local=_bool(table, "local", False),
         send_sampling=_bool(table, "send_sampling", True),
-        max_agents=int(_int(table, "max_agents", core["max_agents"])),
+        max_agents=int(_int(
+            table, "max_agents", 1 if auth == "login" else core["max_agents"]
+        )),
         compact_window=int(_positive_int_knob(
             table, "compact_window", f"[providers.{name}].compact_window",
             core["compact_window"],

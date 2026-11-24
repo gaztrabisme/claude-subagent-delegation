@@ -642,13 +642,15 @@ class Settings:
             "SUBAGENT_HOOK_TIMEOUT": str(self.supervisor_timeout + 20),
         })
         if login:
+            # Only honour a config dir the parent already uses. Forcing one (the
+            # old default was ~/.claude) makes Claude Code skip its credential
+            # store, which on macOS is the login Keychain: the child then reports
+            # "Not logged in" while the parent shell is authenticated.
             parent_config = os.environ.get("CLAUDE_CONFIG_DIR")
-            config_dir = (
-                Path(parent_config).expanduser()
-                if parent_config
-                else Path.home() / ".claude"
-            )
-            env["CLAUDE_CONFIG_DIR"] = str(config_dir.resolve())
+            if parent_config:
+                env["CLAUDE_CONFIG_DIR"] = str(Path(parent_config).expanduser().resolve())
+            else:
+                env.pop("CLAUDE_CONFIG_DIR", None)
             env.pop("ANTHROPIC_BASE_URL", None)
             env.pop("ANTHROPIC_AUTH_TOKEN", None)
             env.pop("ANTHROPIC_API_KEY", None)

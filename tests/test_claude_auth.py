@@ -78,7 +78,10 @@ def test_auth_login_is_opt_in(tmp_path: Path, monkeypatch) -> None:
     assert login.base_url is None
     assert login.unavailable() is None
     env = _login_settings(tmp_path / "child").child_env("agent", login)
-    assert env["CLAUDE_CONFIG_DIR"] == str((tmp_path / "home" / ".claude").resolve())
+    # No config dir is forced when the parent set none: the child must read the
+    # CLI's own credential store (the login Keychain on macOS). An explicit dir
+    # makes Claude Code skip that store and report "Not logged in".
+    assert "CLAUDE_CONFIG_DIR" not in env
     assert not {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",

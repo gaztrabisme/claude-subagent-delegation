@@ -311,7 +311,10 @@ class ClaudeProvider:
         env = self.env(settings, agent_id, cfg, session, model)
         process = _spawn_claude(argv, env, str(cwd))
         if cfg.extra.get("auth") == "login":
-            process.protected_root = Path(env["CLAUDE_CONFIG_DIR"])
+            # The dir may be unset: the child must then read the login store the
+            # way the CLI does. Protect it from the child's writes either way.
+            root = env.get("CLAUDE_CONFIG_DIR")
+            process.protected_root = Path(root) if root else Path.home() / ".claude"
         return process
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:

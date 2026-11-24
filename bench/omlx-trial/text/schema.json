@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SupportTicketAnswer",
+  "type": "object",
+  "properties": {
+    "product": {
+      "type": "string",
+      "enum": ["router", "camera", "thermostat", "doorbell", "speaker"]
+    },
+    "issue": {
+      "type": "string",
+      "enum": ["setup", "connectivity", "billing", "hardware", "other"]
+    },
+    "order_number": {
+      "anyOf": [
+        {"type": "string", "pattern": "^ORD-[0-9]{5}$"},
+        {"type": "null"}
+      ]
+    },
+    "refund_requested": {
+      "type": "boolean"
+    }
+  },
+  "required": ["product", "issue", "order_number", "refund_requested"],
+  "additionalProperties": false
+}

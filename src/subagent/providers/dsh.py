@@ -48,6 +48,28 @@ AUTH_WORDS = (
     "authentication failed",
     "unauthorized",
 )
+_HEADLESS_PROFILE_PACKAGE = (
+    '{\n'
+    '  "name": "dsh-profile-headless",\n'
+    '  "private": true,\n'
+    '  "dependencies": {},\n'
+    '  "dsh": {\n'
+    '    "profile": {\n'
+    '      "bundles": [\n'
+    '        "@deepseek-ai/dsh-base",\n'
+    '        "@deepseek-ai/dsh-headless"\n'
+    '      ]\n'
+    '    }\n'
+    '  }\n'
+    '}\n'
+)
+_HEADLESS_PROFILE_PNPM_WORKSPACE = (
+    "packages:\n"
+    "  - .\n"
+    "\n"
+    "nodeLinker: hoisted\n"
+    "autoInstallPeers: false\n"
+)
 
 
 def _bridge_bundle() -> tuple[Path, Path, Path]:
@@ -93,6 +115,10 @@ def _dsh_home(settings: Settings, agent_id: str) -> Path:
     # Prepare it outside Seatbelt so a fresh isolated home can boot read-only.
     headless = path / "profiles" / "headless"
     headless.mkdir(parents=True, exist_ok=True)
+    (headless / "package.json").write_text(_HEADLESS_PROFILE_PACKAGE, encoding="utf-8")
+    (headless / "pnpm-workspace.yaml").write_text(
+        _HEADLESS_PROFILE_PNPM_WORKSPACE, encoding="utf-8",
+    )
     (headless / "cordis.yml").touch(exist_ok=True)
     return path
 
@@ -696,12 +722,14 @@ class DshProvider:
         owner_home = _owner_dsh_home().resolve()
         deny_paths = [*cfg.deny_read, str(owner_home), str(owner_home / "storages")]
         read_allow = [str(owner_home / ".credentials.yaml")] if login else []
+        read_metadata_allow = [str(owner_home)] if login else []
         argv = wrap_argv(
             argv,
             deny_paths,
             write_allow=write_allow,
             write_deny=write_deny,
             read_allow=read_allow,
+            read_metadata_allow=read_metadata_allow,
             write_allow_exact=[str(headless_cordis)],
         )
         if argv[:2] != ["/usr/bin/sandbox-exec", "-p"]:

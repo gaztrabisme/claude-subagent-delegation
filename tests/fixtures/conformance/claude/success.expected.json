@@ -1,0 +1,32 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "01a0c7f2-db1c-7a73-9834-c3570d1f0dd9",
+    "model": "claude-sonnet-4-6"
+  },
+  {
+    "type": "assistant",
+    "session_id": "01a0c7f2-db1c-7a73-9834-c3570d1f0dd9",
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "ok"
+        }
+      ]
+    }
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "result": "ok",
+    "session_id": "01a0c7f2-db1c-7a73-9834-c3570d1f0dd9",
+    "num_turns": 1,
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 40
+    }
+  }
+]

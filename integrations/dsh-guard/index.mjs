@@ -27,6 +27,7 @@ const DELEGATION_TOOLS = new Set([
 const DEFAULT_TIMEOUT_SECONDS = 150;
 const MAX_TIMEOUT_SECONDS = 300;
 const MAX_OUTPUT_BYTES = 64 * 1024;
+const READY_MARKER = '__SUBAGENT_DSH_GUARD_READY__';
 
 function deny(reason) {
   return { allow: false, reason: String(reason || 'blocked: subagent guard denied the call') };
@@ -100,9 +101,10 @@ function hookPayload(call, toolName) {
   };
 }
 
-async function runHook(command, payload, env) {
+async function runHook(command, serializedPayload, env, signal) {
   const args = commandArguments(command);
   if (!args.length || !args[0]) throw new Error('guard hook command is empty');
+  if (signal?.aborted) return { cancelled: true };
   const hookEnv = { ...process.env, ...env };
   for (const name of Object.keys(hookEnv)) {
     if (/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) delete hookEnv[name];
@@ -124,16 +126,26 @@ async function runHook(command, payload, env) {
     let stdout = '';
     let outputTooLarge = false;
     let settled = false;
+    let timer;
+    const onAbort = () => {
+      child.kill('SIGKILL');
+      finish({ cancelled: true });
+    };
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       resolve(result);
     };
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       child.kill('SIGKILL');
       finish({ error: 'blocked: subagent guard hook timed out' });
     }, timeoutMilliseconds(env));
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }
 
     child.on('error', (error) => finish({ error: `blocked: could not start subagent guard hook (${error.message})` }));
     child.stdout.on('data', (chunk) => {
@@ -146,7 +158,7 @@ async function runHook(command, payload, env) {
     });
     child.on('close', (code) => finish({ code, stdout, outputTooLarge }));
     child.stdin.on('error', () => {});
-    child.stdin.end(`${JSON.stringify(payload)}\n`);
+    if (!settled) child.stdin.end(`${serializedPayload}\n`);
   });
 }
 
@@ -155,7 +167,7 @@ export async function decide(call, env = {}) {
   if (DELEGATION_TOOLS.has(tool)) {
     return deny(`blocked: DSH delegation tool ${tool} is disabled by subagent`);
   }
-  const toolName = TOOL_NAMES[tool];
+  const toolName = Object.hasOwn(TOOL_NAMES, tool) ? TOOL_NAMES[tool] : undefined;
   if (!toolName) return deny(`blocked: unsupported DSH tool ${tool || '(unnamed)'}`);
 
   const command = env.SUBAGENT_GUARD_HOOK;
@@ -164,18 +176,24 @@ export async function decide(call, env = {}) {
   }
 
   let payload;
+  let serializedPayload;
   try {
     payload = hookPayload(call, toolName);
+    serializedPayload = JSON.stringify(payload);
+    if (typeof serializedPayload !== 'string') {
+      throw new Error('DSH tool arguments could not be serialized');
+    }
   } catch (error) {
     return deny(`blocked: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   let result;
   try {
-    result = await runHook(command, payload, env);
+    result = await runHook(command, serializedPayload, env, call?.signal);
   } catch (error) {
     return deny(`blocked: could not run subagent guard hook (${error instanceof Error ? error.message : String(error)})`);
   }
+  if (result.cancelled) return { allow: false, kind: 'cancel', reason: 'blocked: DSH tool call was cancelled' };
   if (result.error) return deny(result.error);
   if (result.outputTooLarge) return deny('blocked: subagent guard hook output exceeded its limit');
 
@@ -207,12 +225,18 @@ export function apply(ctx) {
       cwd: exec?.cwd || exec?.agent?.session?.header?.cwd,
       sessionId: exec?.sessionId || exec?.agent?.session?.id || exec?.agent?.id,
       agent: exec?.agent,
+      signal: exec?.signal,
     }, process.env);
+    if (decision.kind === 'cancel') return { kind: 'cancel' };
     if (!decision.allow) return { kind: 'deny', reason: decision.reason };
     return await next();
   };
 
-  const register = () => ctx.on('tools/pre-execute', handler, { prepend: true });
+  const register = () => {
+    const dispose = ctx.on('tools/pre-execute', handler, { prepend: true });
+    process.stderr.write(`${READY_MARKER}\n`);
+    return dispose;
+  };
   if (typeof ctx.effect === 'function') {
     ctx.effect(function* () {
       yield register();

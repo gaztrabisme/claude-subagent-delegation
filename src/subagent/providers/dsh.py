@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import threading
 from collections.abc import Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from ..config import APPROVAL_HOOK, Settings
-from ..guard.classify import _git_metadata_roots, protect, release
+from ..guard.classify import _git_metadata_roots, _redact_private_paths, protect, release
 from ..router import Refusal, clip
 from ..sandbox import wrap_argv
 from .base import DRIVER_DSH, Process, ProviderConfig, Session
@@ -23,6 +26,12 @@ from .base import DRIVER_DSH, Process, ProviderConfig, Session
 DEFAULT_BINARY = "dsh"
 GUARD = "hook"
 PATCH_MARKER = "__SUBAGENT_DSH_GUARD_ENTRY__"
+READY_MARKER = "__SUBAGENT_DSH_GUARD_READY__"
+_GUARD_INACTIVE = re.compile(
+    r"(?=.*subagent-dsh-guard)(?=.*(?:did not activate|failed to activate|failed to load|"
+    r"failed to import|could not load|could not import|unable to load))",
+    re.IGNORECASE,
+)
 USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
 AUTH_CODES = (
     "MISSING_CREDENTIAL",
@@ -81,12 +90,23 @@ def _dsh_home(settings: Settings, agent_id: str) -> Path:
     return path
 
 
-def _guard_patch(settings: Settings, agent_id: str, dsh_home: Path) -> Path:
+def _owner_dsh_home() -> Path:
+    return Path(os.environ.get("DSH_OWNER_HOME") or (Path.home() / ".dsh")).expanduser()
+
+
+def _guard_patch(
+    settings: Settings, agent_id: str, dsh_home: Path, *, login: bool = False,
+) -> Path:
     _root, entry, source = _bridge_bundle()
     template = source.read_text(encoding="utf-8")
     if template.count(PATCH_MARKER) != 1:
         raise RuntimeError("DSH guard bridge patch has an invalid entry marker")
     generated = template.replace(PATCH_MARKER, entry.as_uri())
+    if login:
+        generated += (
+            "\n- id: web-search-deepseek\n"
+            "  disabled: true\n"
+        )
     path = dsh_home / "dsh-guard" / "cordis.patch.yml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(generated, encoding="utf-8")
@@ -227,11 +247,21 @@ class DshTranslator:
         self.session_id = _session_text(session)
         self.final: dict[str, Any] | None = None
         self.error_message = ""
-        self.step_usage: list[tuple[int, int, dict[str, int]]] = []
+        self.step_usage: list[tuple[str, dict[str, int]]] = []
         self.unreported: set[str] = set()
         self.step_ends = 0
         self.turn_starts = 0
         self.text_fragments: list[str] = []
+        self._step_sequence = 0
+        self._active_step_id: str | None = None
+        self._last_step_id: str | None = None
+
+    def _message_id(self) -> str:
+        if self._active_step_id is None:
+            self._step_sequence += 1
+            self._active_step_id = f"dsh-step-{self._step_sequence}"
+        self._last_step_id = self._active_step_id
+        return self._active_step_id
 
     def feed(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         kind = event.get("type")
@@ -248,18 +278,32 @@ class DshTranslator:
             }]
         if kind == "status":
             phase = event.get("phase")
-            turn = _usage_number(event.get("turn")) or 0
-            step = _usage_number(event.get("step")) or 0
             if phase == "turn_start":
                 self.turn_starts += 1
+            elif phase == "step_start":
+                self._step_sequence += 1
+                self._active_step_id = f"dsh-step-{self._step_sequence}"
+                self._last_step_id = self._active_step_id
             elif phase == "step_end":
                 self.step_ends += 1
+                message_id = self._message_id()
                 usage, missing = _usage_sample(event.get("usage"))
                 self.unreported.update(missing)
                 if not isinstance(event.get("usage"), dict):
                     self.unreported.update(USAGE_KEYS)
-                else:
-                    self.step_usage.append((turn, step, usage))
+                elif not missing:
+                    self.step_usage.append((message_id, usage))
+                self._active_step_id = None
+                if isinstance(event.get("usage"), dict) and not missing:
+                    return [{"type": "assistant", "message": {
+                        "id": message_id,
+                        "content": [],
+                        "usage": _to_meter_usage(usage),
+                    }}]
+                return [{"type": "assistant", "message": {
+                    "id": message_id,
+                    "content": [],
+                }}]
             elif phase == "turn_end":
                 error = _reason_error(event.get("reason"))
                 if error:
@@ -269,7 +313,7 @@ class DshTranslator:
             text = event.get("text")
             if not isinstance(text, str) or not text:
                 return []
-            return [{"type": "assistant", "message": {"content": [{
+            return [{"type": "assistant", "message": {"id": self._message_id(), "content": [{
                 "type": "thinking", "thinking": text,
             }]}}]
         if kind == "text":
@@ -277,13 +321,13 @@ class DshTranslator:
             if not isinstance(text, str) or not text:
                 return []
             self.text_fragments.append(text)
-            return [{"type": "assistant", "message": {"content": [{
+            return [{"type": "assistant", "message": {"id": self._message_id(), "content": [{
                 "type": "text", "text": text,
             }]}}]
         if kind == "tool_call":
             name = str(event.get("tool") or "")
             call_id = event.get("callId") or f"dsh-tool-{self.step_ends + 1}"
-            return [{"type": "assistant", "message": {"content": [{
+            return [{"type": "assistant", "message": {"id": self._message_id(), "content": [{
                 "type": "tool_use",
                 "id": str(call_id),
                 "name": name[:1].upper() + name[1:],
@@ -319,17 +363,8 @@ class DshTranslator:
         return []
 
     def usage_events(self) -> list[dict[str, Any]]:
-        """Return complete step samples, suppressing partial totals on any gap."""
-        if not self.step_usage or self.unreported or len(self.step_usage) != self.step_ends:
-            return []
-        events = []
-        for turn, step, usage in self.step_usage:
-            events.append({"type": "assistant", "message": {
-                "id": f"dsh-{turn}-{step}",
-                "content": [],
-                "usage": _to_meter_usage(usage),
-            }})
-        return events
+        """Usage is emitted with each `step_end`; no buffered events remain."""
+        return []
 
     def final_text_event(self) -> dict[str, Any] | None:
         """Preserve final text if the runtime omitted committed text events."""
@@ -337,7 +372,11 @@ class DshTranslator:
         if not isinstance(text, str) or not text or self.text_fragments:
             return None
         self.text_fragments.append(text)
-        return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+        message_id = self._active_step_id or self._last_step_id or self._message_id()
+        return {"type": "assistant", "message": {
+            "id": message_id,
+            "content": [{"type": "text", "text": text}],
+        }}
 
     def finish(self, exit_code: int | None, stderr: str) -> dict[str, Any]:
         """Return the one terminal event after status, final and process status agree."""
@@ -351,10 +390,10 @@ class DshTranslator:
             self.text_fragments.append(final_text)
 
         completed = reason.get("kind") == "completed"
-        diagnostic = self.error_message
+        diagnostic = _redact_private_paths(self.error_message)
         if not completed and not diagnostic and self.final is not None:
             diagnostic = _reason_error(reason)
-        stderr = (stderr or "").strip()
+        stderr = _redact_private_paths((stderr or "").strip())
         if diagnostic and stderr and stderr not in diagnostic:
             diagnostic = f"{diagnostic}\n{stderr}"
         if not diagnostic and stderr and (exit_code not in (0, None) or self.final is None):
@@ -366,6 +405,7 @@ class DshTranslator:
         failed = bool(diagnostic) or not completed or exit_code not in (0, None)
         if failed and not diagnostic:
             diagnostic = "dsh did not complete the requested turn"
+        diagnostic = _redact_private_paths(diagnostic)
 
         result: dict[str, Any] = {
             "type": "result",
@@ -380,7 +420,7 @@ class DshTranslator:
             result["error_kind"] = "auth" if is_auth_error(diagnostic) else "cli_error"
         elif self.step_usage and not self.unreported:
             total = dict.fromkeys(USAGE_KEYS, 0)
-            for _turn, _step, sample in self.step_usage:
+            for _step_id, sample in self.step_usage:
                 for key in USAGE_KEYS:
                     total[key] += sample[key]
             result["usage"] = _to_meter_usage(total)
@@ -408,16 +448,19 @@ class DshProcess(Process):
         prompt: str,
         translator: DshTranslator,
         protected_root: Path | None = None,
+        login_patch: Path | None = None,
     ):
         super().__init__(argv, env, cwd, prompt)
         self.dsh_translator = translator
         self.protected_root = protected_root
+        self.login_patch = login_patch
 
     def events(self) -> Iterator[dict[str, Any]]:
         if self.protected_root is not None:
             protect(self.protected_root, temporary=True)
         proc = None
         stderr_thread = None
+        login_patch = self.login_patch
         try:
             proc = self._start(stdin=True)
             if proc.stdin is not None:
@@ -430,15 +473,53 @@ class DshProcess(Process):
                     proc.stdin.close()
             assert proc.stdout is not None
             stderr_buf: list[str] = []
-            stderr_thread = self._drain_thread(proc, stderr_buf)
+            guard_ready = threading.Event()
+            guard_inactive = threading.Event()
+
+            def drain_stderr() -> None:
+                if proc is None or proc.stderr is None:
+                    return
+                for line in proc.stderr:
+                    if READY_MARKER in line:
+                        guard_ready.set()
+                        continue
+                    stderr_buf.append(line)
+                    if _GUARD_INACTIVE.search(line):
+                        guard_inactive.set()
+                        self.dsh_translator.error_message = (
+                            "DSH reported that subagent-dsh-guard did not activate"
+                        )
+                        self.kill()
+
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+            stderr_thread.start()
             for native in self._json_lines(proc.stdout):
+                if guard_inactive.is_set():
+                    break
+                if not guard_ready.wait(timeout=0.5):
+                    if not guard_inactive.is_set():
+                        self.dsh_translator.error_message = (
+                            "DSH guard readiness proof was not received before the first event"
+                        )
+                        self.kill()
+                    break
+                if guard_inactive.is_set():
+                    break
                 yield from self.dsh_translator.feed(native)
             code = proc.wait()
             stderr_thread.join(timeout=5)
-            final_text = self.dsh_translator.final_text_event()
-            if final_text is not None:
-                yield final_text
-            yield from self.dsh_translator.usage_events()
+            if guard_inactive.is_set():
+                self.dsh_translator.error_message = (
+                    "DSH reported that subagent-dsh-guard did not activate"
+                )
+            elif not guard_ready.is_set():
+                self.dsh_translator.error_message = (
+                    "DSH guard readiness proof was not received"
+                )
+            else:
+                final_text = self.dsh_translator.final_text_event()
+                if final_text is not None:
+                    yield final_text
             yield self.dsh_translator.finish(code, "".join(stderr_buf))
         finally:
             if proc is not None and proc.poll() is None:
@@ -447,6 +528,9 @@ class DshProcess(Process):
                 stderr_thread.join(timeout=5)
             if self.protected_root is not None:
                 release(self.protected_root)
+            if login_patch is not None:
+                with suppress(OSError):
+                    login_patch.unlink(missing_ok=True)
 
 
 class DshProvider:
@@ -458,6 +542,11 @@ class DshProvider:
 
     def guard(self, settings: Settings, cfg: ProviderConfig) -> str:
         return GUARD
+
+    def secret_files(self, cfg: ProviderConfig) -> tuple[Path, ...]:
+        """Protect the owner's DSH credential and storage paths from guard reads."""
+        owner_home = _owner_dsh_home()
+        return (owner_home / ".credentials.yaml", owner_home / "storages")
 
     @staticmethod
     def binary(cfg: ProviderConfig) -> str:
@@ -488,7 +577,7 @@ class DshProvider:
     ) -> list[str]:
         login = cfg.extra.get("auth") == "login"
         dsh_home = _dsh_home(settings, agent_id)
-        guard_patch = _guard_patch(settings, agent_id, dsh_home)
+        guard_patch = _guard_patch(settings, agent_id, dsh_home, login=login)
         selected_model = model or cfg.model
         argv = [
             self.binary(cfg),
@@ -496,8 +585,7 @@ class DshProvider:
             "--patch", str(guard_patch),
         ]
         if login:
-            owner_home = Path(os.environ.get("DSH_OWNER_HOME") or (Path.home() / ".dsh"))
-            owner_home = owner_home.expanduser().resolve()
+            owner_home = _owner_dsh_home().resolve()
             login_model = selected_model or "deepseek-flash"
             login_patch = _login_patch(settings, agent_id, owner_home, login_model)
             argv.extend(["--patch", str(login_patch)])
@@ -515,22 +603,36 @@ class DshProvider:
         argv.append("-")
         if cfg.deny_read:
             agent_dir = _agent_dir(settings, agent_id)
+            bridge_root, bridge_entry, bridge_patch = _bridge_bundle()
             write_allow = [
                 str(cwd),
                 "/private/tmp",
                 os.environ.get("TMPDIR") or "/private/tmp",
-                str(dsh_home),
+                str(dsh_home / "sessions"),
+                str(dsh_home / "storages"),
+                str(dsh_home / "spills"),
+                str(dsh_home / ".anonymous-user-id"),
                 "/dev",
             ]
             write_deny = [
                 str(cwd / ".git"),
                 *(str(root) for root in sorted(_git_metadata_roots(cwd))),
                 str(APPROVAL_HOOK),
+                str(dsh_home / "cordis.patch.yml"),
+                str(dsh_home / ".env"),
+                str(dsh_home / "profiles"),
+                str(dsh_home / "dsh-guard"),
                 str(guard_patch),
+                str(bridge_root),
+                str(bridge_entry),
+                str(bridge_patch),
                 str(agent_dir / "dsh-login.patch.yml"),
                 str(agent_dir / "dsh-model.patch.yml"),
             ]
-            argv = wrap_argv(argv, cfg.deny_read, write_allow=write_allow, write_deny=write_deny)
+            deny_paths = list(cfg.deny_read)
+            if login:
+                deny_paths.append(str((_owner_dsh_home() / "storages").resolve()))
+            argv = wrap_argv(argv, deny_paths, write_allow=write_allow, write_deny=write_deny)
         return argv
 
     def env(
@@ -544,6 +646,8 @@ class DshProvider:
         env["SUBAGENT_HOOK_TIMEOUT"] = str(settings.supervisor_timeout + 20)
         env.pop("DSH_OWNER_HOME", None)
         if cfg.extra.get("auth") == "login":
+            # Keep DSH's dotenv loader from populating this unset variable.
+            # Login mode uses the account-token provider instead.
             env.pop("DEEPSEEK_API_KEY", None)
             env.pop("DEEPSEEK_BASE_URL", None)
         else:
@@ -572,11 +676,13 @@ class DshProvider:
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session)
         protected_root = None
+        login_patch = None
         if cfg.extra.get("auth") == "login":
-            owner_home = os.environ.get("DSH_OWNER_HOME") or str(Path.home() / ".dsh")
-            protected_root = Path(owner_home).expanduser().resolve()
+            protected_root = _owner_dsh_home()
+            login_patch = _agent_dir(settings, agent_id) / "dsh-login.patch.yml"
         return DshProcess(
             argv, env, str(cwd), prompt, self.translator(session), protected_root,
+            login_patch,
         )
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:
@@ -594,6 +700,13 @@ class DshProvider:
         text = "\n".join(parts)
         if text and is_auth_error(text):
             return Refusal("dsh_auth", clip(text, 300))
+        from .. import router
+
+        refusal = router.classify_refusal(cfg.vendor, events)
+        if refusal is not None:
+            return refusal
+        if "ACCOUNT_QUOTA_EXCEEDED" in text.upper():
+            return Refusal(router.DEEPSEEK_BALANCE, clip(text, 300))
         return None
 
 

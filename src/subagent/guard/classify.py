@@ -112,6 +112,8 @@ PROVIDER_HOMES = {
     "claude": (".claude",),
     "codex": (".codex",),
     "copilot": (".copilot",),
+    "deepseek": (".dsh",),
+    "dsh": (".dsh",),
     "gemini": (".gemini",),
     "grok": (".grok",),
     "omlx": (".omlx",),
@@ -191,6 +193,7 @@ SECRET_ENV_NAMES = frozenset({
 PROTECTED_ROOTS: set[Path] = set()
 _PERMANENT_PROTECTED_ROOTS: set[Path] = set()
 _TEMP_PROTECTED_ROOT_COUNTS: dict[Path, int] = {}
+_TEMP_PROTECTED_ROOT_SPELLINGS: dict[Path, dict[Path, int]] = {}
 _PROTECTED_ROOT_LOCK = threading.Lock()
 
 # Commands that are never routine for a delegated coding agent.
@@ -468,10 +471,13 @@ def is_sensitive(path: Path, context: dict | None = None, *, provider: bool = Tr
 
 def protect(path: Path, *, temporary: bool = False) -> None:
     """Refuse writes under `path`, permanently or until `release`."""
-    root = Path(path).expanduser().resolve()
+    spelling = Path(path).expanduser().absolute()
+    root = spelling.resolve()
     with _PROTECTED_ROOT_LOCK:
         if temporary:
             _TEMP_PROTECTED_ROOT_COUNTS[root] = _TEMP_PROTECTED_ROOT_COUNTS.get(root, 0) + 1
+            aliases = _TEMP_PROTECTED_ROOT_SPELLINGS.setdefault(root, {})
+            aliases[spelling] = aliases.get(spelling, 0) + 1
         else:
             _PERMANENT_PROTECTED_ROOTS.add(root)
         PROTECTED_ROOTS.add(root)
@@ -479,11 +485,19 @@ def protect(path: Path, *, temporary: bool = False) -> None:
 
 def release(path: Path) -> None:
     """Drop one protection reference without unprotecting another active run."""
-    root = Path(path).expanduser().resolve()
+    spelling = Path(path).expanduser().absolute()
+    root = spelling.resolve()
     with _PROTECTED_ROOT_LOCK:
         count = _TEMP_PROTECTED_ROOT_COUNTS.get(root, 0)
+        aliases = _TEMP_PROTECTED_ROOT_SPELLINGS.get(root, {})
+        alias_count = aliases.get(spelling, 0)
+        if alias_count <= 1:
+            aliases.pop(spelling, None)
+        else:
+            aliases[spelling] = alias_count - 1
         if count <= 1:
             _TEMP_PROTECTED_ROOT_COUNTS.pop(root, None)
+            _TEMP_PROTECTED_ROOT_SPELLINGS.pop(root, None)
             if root not in _PERMANENT_PROTECTED_ROOTS:
                 PROTECTED_ROOTS.discard(root)
         else:
@@ -495,6 +509,18 @@ def _temporary_roots() -> tuple[Path, ...]:
         return tuple(_TEMP_PROTECTED_ROOT_COUNTS)
 
 
+def _temporary_root_spellings() -> tuple[Path, ...]:
+    """Resolved and caller-supplied spellings used for active-root redaction."""
+    with _PROTECTED_ROOT_LOCK:
+        roots = list(_TEMP_PROTECTED_ROOT_COUNTS)
+        roots.extend(
+            spelling
+            for aliases in _TEMP_PROTECTED_ROOT_SPELLINGS.values()
+            for spelling in aliases
+        )
+    return tuple(dict.fromkeys(roots))
+
+
 def _redact_private_paths(value):
     """Remove temporary owner config paths from supervisor trace facts."""
     if isinstance(value, dict):
@@ -504,13 +530,11 @@ def _redact_private_paths(value):
     if isinstance(value, tuple):
         return tuple(_redact_private_paths(item) for item in value)
     if isinstance(value, str):
-        for root in _temporary_roots():
-            try:
-                if inside(Path(value), root):
-                    return "<owner Claude config path>"
-            except (OSError, RuntimeError, ValueError):
-                continue
-            value = value.replace(str(root), "<owner Claude config>")
+        roots = sorted(
+            _temporary_root_spellings(), key=lambda path: len(str(path)), reverse=True
+        )
+        for root in roots:
+            value = value.replace(str(root), "<owner provider home>")
     return value
 
 

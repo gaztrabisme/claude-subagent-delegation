@@ -303,7 +303,9 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
     if auth is not None and auth != "login":
         raise ConfigError(f"provider {name!r} auth must be 'login'")
     if auth == "login" and driver not in (DRIVER_CLAUDE, DRIVER_DSH):
-        raise ConfigError(f"provider {name!r} auth = 'login' requires driver = 'claude'")
+        raise ConfigError(
+            f"provider {name!r} auth = 'login' requires driver = 'claude' or 'dsh'"
+        )
     if auth == "login" and "api_key_env" in table:
         raise ConfigError(f"provider {name!r} auth = 'login' cannot set api_key_env")
     base_url = _str(table, "base_url", None)

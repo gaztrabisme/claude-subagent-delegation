@@ -780,6 +780,10 @@ def operands(command: str) -> tuple[list[tuple[Word, bool]], list[Word]]:
                 roots.extend(positionals or [Word('.', '.', '.')])
                 if uncertain:
                     roots.append(Word('.', '.', '.'))
+        if base == 'find':
+            # `find` recursively visits its starting path even without an
+            # explicit `-r` option. Its expression operands remain data.
+            roots.append(positionals[0] if positionals else Word('.', '.', '.'))
         for word in positionals:
             if base == 'dd' and word.value.startswith(('if=', 'of=')):
                 word = word.tail(3)

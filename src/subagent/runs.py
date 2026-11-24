@@ -669,6 +669,8 @@ class Run:
                         "credits", "credits_unit", "cash_usd", "extra"):
                 if key in self.native_outcome:
                     out[key] = copy.deepcopy(self.native_outcome[key])
+        if self.usage_unreported and "usage_unreported" not in out:
+            out["usage_unreported"] = list(self.usage_unreported)
         return out
 
     def detail(self) -> dict[str, Any]:

@@ -167,7 +167,7 @@ class Trace:
         verdicts = self.take_verdicts(run.agent_id)
         guard = guard or getattr(run, "guard", None) or "hook"
         if (
-            getattr(run, "driver", None) == "codex"
+            getattr(run, "driver", None) in ("codex", "dsh")
             and "hook" in guard
             and run.usage.steps > 0
             and not any(verdicts.values())

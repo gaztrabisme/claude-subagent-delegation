@@ -165,6 +165,9 @@ class GeminiProvider:
     """Runs a turn as ``gemini -p --output-format stream-json``."""
 
     name = DRIVER_GEMINI
+    known_event_types = frozenset({
+        "init", "message", "tool_use", "tool_result", "result", "error",
+    })
     needs_api_key = False  # the Gemini CLI logs in with its own credentials
     prompt_on_stdin = False
     experimental = True  # fixture-tested only

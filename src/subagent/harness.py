@@ -225,6 +225,9 @@ def _missing_expected(expected: Any, actual: Any, path: str = "") -> tuple[str, 
             found = _missing_expected(value, actual[index], child_path)
             if found is not None:
                 return found
+        if len(actual) > len(expected):
+            child_path = f"{path}[{len(expected)}]"
+            return child_path, "<no additional items>", actual[len(expected)]
         return None
     if expected != actual:
         return path or "value", expected, actual
@@ -257,13 +260,18 @@ def _verify_fixtures(cfg: Any, lane: str, fixtures_dir: Path) -> list[str]:
             from .providers import for_driver
 
             known_event_types = getattr(for_driver(cfg.driver), "known_event_types", None)
+            if not known_event_types:
+                errors.append(
+                    f"{fixture.stem}: {cfg.driver} declares no known_event_types"
+                )
+                continue
             actual: list[dict[str, Any]] = []
             unknown: list[str] = []
             for event in inputs:
                 if not isinstance(event, dict):
                     raise ValueError("fixture event must be a JSON object")
                 event_type = _event_type(event)
-                if known_event_types is not None and event_type not in known_event_types:
+                if event_type not in known_event_types:
                     unknown.append(event_type)
                     continue
                 produced = [event] if translator is None else translator.feed(event)

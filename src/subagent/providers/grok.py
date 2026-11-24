@@ -79,6 +79,12 @@ class GrokProvider:
     """Runs a turn as ``grok -p --output-format streaming-messages-json``."""
 
     name = DRIVER_GROK
+    # Grok's stream-json output is passed through in Claude's event format.
+    known_event_types = frozenset({
+        "system", "assistant", "user", "result", "stream_event",
+        "rate_limit_event", "tool_progress", "auth_status", "prompt_suggestion",
+        "task_started", "task_progress", "task_notification", "files_persisted",
+    })
     needs_api_key = False  # XAI_API_KEY is optional; the CLI also uses OAuth
     prompt_on_stdin = False
     experimental = False  # verified by fixture; live check is a coordinator task

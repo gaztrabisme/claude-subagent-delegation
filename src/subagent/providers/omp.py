@@ -343,6 +343,11 @@ class OmpProvider:
     """Runs ``omp -p --mode json`` with isolated config and the approval hook."""
 
     name = DRIVER_OMP
+    known_event_types = frozenset({
+        "session", "agent_start", "turn_start", "message_start", "message_end",
+        "message_update", "tool_execution_start", "tool_execution_update",
+        "tool_execution_end", "turn_end", "agent_end",
+    })
     # Local OpenAI-compatible endpoints may be keyless. When a key is named,
     # the generated models.yml points at that environment variable.
     needs_api_key = False

@@ -164,6 +164,15 @@ def provider_homes(settings) -> tuple[str, ...]:
     return tuple(homes)
 
 
+def provider_guard_context(settings) -> dict[str, list[str]]:
+    """Build the settings-derived guard context shared by agents and callers."""
+    return {
+        "secret_env_names": list(settings.guard_secret_env_names),
+        "secret_files": [str(path) for path in provider_secret_files(settings)],
+        "provider_homes": list(provider_homes(settings)),
+    }
+
+
 def protect_provider_homes(settings) -> None:
     """Set the legacy process-wide provider protection for direct classifiers.
 
@@ -2051,7 +2060,9 @@ def _tool_paths(name: str, payload: dict) -> list | None:
     return [path] if path is not None else None
 
 
-def classify_verification(command: str, workspace: Path) -> Verdict:
+def classify_verification(
+    command: str, workspace: Path, context: dict | None = None,
+) -> Verdict:
     """Classify a caller's acceptance command.
 
     This is deliberately the same policy the child's own calls get, rather than
@@ -2062,7 +2073,7 @@ def classify_verification(command: str, workspace: Path) -> Verdict:
     """
     if not command.strip():
         return Verdict(ESCALATE, "empty verification command", {"command": command})
-    return classify_bash(command, workspace)
+    return classify_bash(command, workspace, context=context)
 
 
 def _clip_command(text: str, limit: int = 60) -> str:

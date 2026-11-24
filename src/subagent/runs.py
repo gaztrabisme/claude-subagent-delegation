@@ -26,7 +26,7 @@ from . import adapter, health, providers, router
 from .config import APPROVAL_HOOK, Settings, log
 from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
-from .guard.classify import protect
+from .guard.classify import protect, provider_guard_context
 from .lane_state import LaneState
 from .providers.base import (
     DRIVER_CODEX,
@@ -783,13 +783,7 @@ class Agent:
         self.delegate_options = delegate_options or {}
         # Guard context carries configured child-secret names even before the
         # loop adds its protected tests and state allowlist.
-        self.guard_context: dict[str, Any] = {
-            "secret_env_names": list(settings.guard_secret_env_names),
-        }
-        from .guard.classify import provider_homes, provider_secret_files
-
-        self.guard_context["secret_files"] = [str(p) for p in provider_secret_files(settings)]
-        self.guard_context["provider_homes"] = list(provider_homes(settings))
+        self.guard_context: dict[str, Any] = provider_guard_context(settings)
         self.agent_id = agent_id
         self.name = name
         self.workspace = workspace

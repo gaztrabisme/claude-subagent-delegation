@@ -70,6 +70,12 @@ _HEADLESS_PROFILE_PNPM_WORKSPACE = (
     "nodeLinker: hoisted\n"
     "autoInstallPeers: false\n"
 )
+_HEADLESS_PROFILE_ROOT = (
+    "# dsh profile root — an empty entry list. The tree is composed as patches:\n"
+    "# each bundle in package.json's dsh.profile.bundles, then cordis.patch.yml, then any\n"
+    "# --patch overlays. Edit cordis.patch.yml, not this file.\n"
+    "[]\n"
+)
 
 
 def _bridge_bundle() -> tuple[Path, Path, Path]:
@@ -119,7 +125,12 @@ def _dsh_home(settings: Settings, agent_id: str) -> Path:
     (headless / "pnpm-workspace.yaml").write_text(
         _HEADLESS_PROFILE_PNPM_WORKSPACE, encoding="utf-8",
     )
-    (headless / "cordis.yml").touch(exist_ok=True)
+    cordis_yml = headless / "cordis.yml"
+    # DSH rewrites this generated root at boot. Reset it in the parent before
+    # every launch so a worker cannot persist entries into the next run. Remove
+    # first so a worker-created symlink is replaced rather than followed.
+    cordis_yml.unlink(missing_ok=True)
+    cordis_yml.write_text(_HEADLESS_PROFILE_ROOT, encoding="utf-8")
     return path
 
 

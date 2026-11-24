@@ -1,0 +1,69 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "gemini-sess-1"
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "I'll run the tests."
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "t1",
+          "name": "Bash",
+          "input": {
+            "command": "uv run pytest -q"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "t1",
+          "content": "2 passed",
+          "is_error": false
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "the tests pass"
+        }
+      ]
+    }
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "result": "the tests pass",
+    "usage": {
+      "input_tokens": 100,
+      "cache_read_input_tokens": 20,
+      "output_tokens": 40
+    },
+    "num_turns": 1
+  }
+]

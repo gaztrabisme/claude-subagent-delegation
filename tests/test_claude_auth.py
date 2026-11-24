@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
 
 from subagent import config
 from subagent.cli import main
-from subagent.guard.classify import DENY, ESCALATE, classify
+from subagent.commands import init as init_command
+from subagent.guard.classify import ALLOW, DENY, ESCALATE, classify, protected
 from subagent.providers.base import Session
 from subagent.providers.claude import CLAUDE_PROVIDER
+from subagent.providers.codex import codex_env
+from subagent.providers.grok import GROK_PROVIDER
 from subagent.runs import FAILED, Registry
 from subagent.telemetry import cost
 from subagent.telemetry.trace import Trace
@@ -204,7 +208,7 @@ def test_auth_login_doctor_warns_about_owner_history_and_instructions(
     config_path.parent.mkdir(parents=True)
     config_path.write_text(
         '[core]\ndefault_provider = "login"\n\n'
-        '[providers.login]\ndriver = "claude"\nauth = "login"\n',
+        '[providers.login]\ndriver = "claude"\nauth = "login"\nmax_agents = 1\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
@@ -299,3 +303,320 @@ def test_auth_login_flat_plan_keeps_unknown_cash_unknown(tmp_path: Path) -> None
     assert result["kind"] == "flat_plan"
     assert result["provider_usd"] is None
     assert result["note"] == "subscription plan; cash price unknown"
+
+
+def test_auth_login_passes_user_and_logname_only_to_login_providers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("USER", "owner-user")
+    monkeypatch.setenv("LOGNAME", "owner-logname")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-secret")
+    monkeypatch.setenv("GLM_API_KEY", "glm-secret")
+    monkeypatch.setenv("OMLX_API_KEY", "omlx-secret")
+    monkeypatch.setenv("GROK_API_KEY", "grok-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-api-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "parent-auth-token")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "parent-oauth-token")
+    monkeypatch.setenv("USER_SECRET", "user-secret-val")
+    monkeypatch.setenv("USER_TOKEN", "user-token-val")
+    monkeypatch.setenv("LOGNAME_KEY", "logname-key-val")
+    monkeypatch.setenv("MY_PASSWORD", "password-val")
+    monkeypatch.setenv("UNRELATED_PARENT_VAR", "not-passed")
+
+    providers = {
+        "login": _login_provider(),
+        "deepseek": {
+            "driver": "claude",
+            "base_url": "https://api.deepseek.com/anthropic",
+            "api_key_env": "DEEPSEEK_API_KEY",
+        },
+        "glm": {
+            "driver": "claude",
+            "base_url": "https://api.z.ai/api/anthropic",
+            "api_key_env": "GLM_API_KEY",
+        },
+        "omlx": {
+            "driver": "claude",
+            "base_url": "http://127.0.0.1:8000",
+            "api_key_env": "OMLX_API_KEY",
+        },
+        "codex": {"driver": "codex"},
+        "grok": {"driver": "grok", "api_key_env": "GROK_API_KEY"},
+    }
+    secret_like = {
+        "USER_SECRET",
+        "USER_TOKEN",
+        "LOGNAME_KEY",
+        "MY_PASSWORD",
+        "UNRELATED_PARENT_VAR",
+    }
+
+    plain_root = tmp_path / "plain"
+    plain_root.mkdir()
+    settings = make_settings(plain_root, providers=providers, child_env_passthrough=[])
+
+    login_env = settings.child_env("a-login", settings.provider("login"))
+    assert login_env["USER"] == "owner-user"
+    assert login_env["LOGNAME"] == "owner-logname"
+    assert not (
+        secret_like
+        | {
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "DEEPSEEK_API_KEY",
+            "GLM_API_KEY",
+            "OMLX_API_KEY",
+            "GROK_API_KEY",
+        }
+    ) & login_env.keys()
+
+    base_env = settings.base_child_env()
+    codex_child_env = codex_env(settings, "a-codex", plain_root / "codex-home")
+    grok_cfg = settings.provider("grok")
+    grok_child_env = GROK_PROVIDER.env(
+        settings, "a-grok", grok_cfg, Session(provider=grok_cfg.name)
+    )
+    non_login_envs = [
+        base_env,
+        settings.child_env("a-deepseek", settings.provider("deepseek")),
+        settings.child_env("a-glm", settings.provider("glm")),
+        settings.child_env("a-omlx", settings.provider("omlx")),
+        codex_child_env,
+        grok_child_env,
+    ]
+    for env in non_login_envs:
+        assert "USER" not in env
+        assert "LOGNAME" not in env
+        assert not secret_like & env.keys()
+
+    pass_root = tmp_path / "passthrough"
+    pass_root.mkdir()
+    pass_settings = make_settings(
+        pass_root,
+        providers=providers,
+        child_env_passthrough=["USER", "LOGNAME", "USER_SECRET", "LOGNAME_KEY"],
+    )
+    passed_envs = [
+        pass_settings.base_child_env(),
+        pass_settings.child_env("a-login", pass_settings.provider("login")),
+        pass_settings.child_env("a-glm", pass_settings.provider("glm")),
+        codex_env(pass_settings, "a-codex", pass_root / "codex-home"),
+        GROK_PROVIDER.env(
+            pass_settings, "a-grok", pass_settings.provider("grok"), Session(provider="grok")
+        ),
+    ]
+    for env in passed_envs:
+        assert env["USER"] == "owner-user"
+        assert env["LOGNAME"] == "owner-logname"
+        assert not secret_like & env.keys()
+
+
+def test_auth_login_omits_unset_user_and_logname(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    settings = _login_settings(tmp_path / "settings")
+    cfg = settings.provider("login")
+
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+    neither = settings.child_env("a-neither", cfg)
+    assert "USER" not in neither
+    assert "LOGNAME" not in neither
+
+    monkeypatch.setenv("USER", "only-user")
+    only_user = settings.child_env("a-user", cfg)
+    assert only_user["USER"] == "only-user"
+    assert "LOGNAME" not in only_user
+
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setenv("LOGNAME", "only-logname")
+    only_logname = settings.child_env("a-logname", cfg)
+    assert "USER" not in only_logname
+    assert only_logname["LOGNAME"] == "only-logname"
+
+
+def test_auth_login_unset_config_dir_protects_home_claude_during_events(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)
+    other_home = tmp_path / "other-home"
+    other_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    settings = _login_settings(tmp_path / "settings")
+    cfg = settings.provider("login")
+    process = CLAUDE_PROVIDER.spawn(
+        cfg, settings, "unset-cfg", "prompt", workspace, Session(provider="login"), None
+    )
+
+    expected_root = (fake_home / ".claude").resolve()
+    target = fake_home / ".claude" / "settings.json"
+    assert "CLAUDE_CONFIG_DIR" not in process.env
+    assert process.protected_root.resolve() == expected_root
+    assert protected(target) is None
+
+    def check_during_events():
+        assert protected(target) is not None
+        assert classify("Read", {"file_path": str(target)}, workspace).action == DENY
+        assert classify("Write", {"file_path": str(target)}, workspace).action == DENY
+        raise RuntimeError("fake process start")
+
+    monkeypatch.setattr(process, "_start", check_during_events)
+    with pytest.raises(RuntimeError, match="fake process start"):
+        next(process.events())
+
+    assert protected(target) is None
+    monkeypatch.setenv("HOME", str(other_home))
+    assert classify("Read", {"file_path": str(target)}, workspace).action == ALLOW
+    assert classify("Write", {"file_path": str(target)}, workspace).action == ESCALATE
+
+
+@pytest.mark.parametrize("blank", ["   ", "\t\n "])
+def test_auth_login_blank_config_dir_treated_as_unset(
+    tmp_path: Path, monkeypatch, blank: str
+) -> None:
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)
+    other_home = tmp_path / "other-home"
+    other_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", blank)
+
+    settings = _login_settings(tmp_path / "settings")
+    cfg = settings.provider("login")
+    process = CLAUDE_PROVIDER.spawn(
+        cfg, settings, "blank-cfg", "prompt", workspace, Session(provider="login"), None
+    )
+
+    expected_root = (fake_home / ".claude").resolve()
+    target = fake_home / ".claude" / "settings.json"
+    assert "CLAUDE_CONFIG_DIR" not in process.env
+    assert process.protected_root.resolve() == expected_root
+    assert protected(target) is None
+
+    def check_during_events():
+        assert protected(target) is not None
+        assert classify("Read", {"file_path": str(target)}, workspace).action == DENY
+        assert classify("Write", {"file_path": str(target)}, workspace).action == DENY
+        raise RuntimeError("fake process start")
+
+    monkeypatch.setattr(process, "_start", check_during_events)
+    with pytest.raises(RuntimeError, match="fake process start"):
+        next(process.events())
+
+    assert protected(target) is None
+    monkeypatch.setenv("HOME", str(other_home))
+    assert classify("Read", {"file_path": str(target)}, workspace).action == ALLOW
+    assert classify("Write", {"file_path": str(target)}, workspace).action == ESCALATE
+
+
+def test_auth_login_set_config_dir_preserved_and_protected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+
+    settings = _login_settings(tmp_path / "settings")
+    cfg = settings.provider("login")
+    process = CLAUDE_PROVIDER.spawn(
+        cfg, settings, "set-cfg", "prompt", workspace, Session(provider="login"), None
+    )
+
+    target = cfg_dir / "settings.json"
+    assert process.env["CLAUDE_CONFIG_DIR"] == str(cfg_dir.resolve())
+    assert process.protected_root.resolve() == cfg_dir.resolve()
+
+    def check_during_events():
+        assert classify("Read", {"file_path": str(target)}, workspace).action == DENY
+        assert classify("Write", {"file_path": str(target)}, workspace).action == DENY
+        raise RuntimeError("fake process start")
+
+    monkeypatch.setattr(process, "_start", check_during_events)
+    with pytest.raises(RuntimeError, match="fake process start"):
+        next(process.events())
+
+    assert classify("Read", {"file_path": str(target)}, workspace).action == ALLOW
+    assert classify("Write", {"file_path": str(target)}, workspace).action == ESCALATE
+
+
+def test_auth_login_example_and_init_default_to_serial_max_agents(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    example = Path(__file__).resolve().parents[1] / "examples" / "config.claude.toml"
+    raw = tomllib.loads(example.read_text(encoding="utf-8"))
+    assert raw["providers"]["claude"]["max_agents"] == 1
+    assert config.load(extra=example).provider("claude").max_agents == 1
+
+    for detected in (False, True):
+        monkeypatch.setattr(
+            init_command.shutil,
+            "which",
+            (lambda name: "/fake/bin/claude" if name == "claude" else None)
+            if detected
+            else (lambda _name: None),
+        )
+        dest = tmp_path / f"init-claude-{detected}.toml"
+        assert main(["init", "--yes", "--from", "claude", "--path", str(dest)]) == 0
+        capsys.readouterr()
+        data = tomllib.loads(dest.read_text(encoding="utf-8"))
+        assert data["providers"]["claude"]["max_agents"] == 1
+        assert config.load(extra=dest).provider("claude").max_agents == 1
+
+
+def test_auth_login_doctor_warns_when_max_agents_exceeds_one(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    xdg = tmp_path / "xdg"
+    config_path = xdg / "subagent" / "config.toml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        '[core]\ndefault_provider = "login_parallel"\n\n'
+        '[providers.login_parallel]\n'
+        'driver = "claude"\nauth = "login"\nmax_agents = 2\n\n'
+        '[providers.login_serial]\n'
+        'driver = "claude"\nauth = "login"\nmax_agents = 1\n\n'
+        '[providers.api_parallel]\n'
+        'driver = "claude"\nbase_url = "https://api.example.test"\n'
+        'api_key_env = "GLM_API_KEY"\nmax_agents = 4\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    assert main(["doctor", "--provider", "login_parallel", "--no-probe", "--json"]) == 0
+    parallel_data = json.loads(capsys.readouterr().out)
+    parallel_warnings = "\n".join(
+        filter(
+            None,
+            [parallel_data["providers"][0].get("warning", ""), *parallel_data.get("warnings", ())],
+        )
+    )
+    assert "max_agents" in parallel_warnings
+
+    assert main(["doctor", "--provider", "login_parallel", "--no-probe"]) == 0
+    assert "max_agents" in capsys.readouterr().err
+
+    for name in ("login_serial", "api_parallel"):
+        assert main(["doctor", "--provider", name, "--no-probe", "--json"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        warnings_text = "\n".join(
+            filter(None, [data["providers"][0].get("warning", ""), *data.get("warnings", ())])
+        )
+        assert "max_agents" not in warnings_text
+
+        assert main(["doctor", "--provider", name, "--no-probe"]) == 0
+        assert "max_agents" not in capsys.readouterr().err

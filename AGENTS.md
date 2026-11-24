@@ -25,6 +25,7 @@ comes from the user's config file.
 | `src/subagent/providers/` | One module per driver (`claude`, `codex`, `copilot`, `grok`, `gemini`); `base.py` holds the `Provider` protocol and `ProviderConfig` |
 | `src/subagent/runs.py` | `Registry` and `Agent`: spawning a worker, collecting its events, verification, cost at run end |
 | `src/subagent/router.py`, `health.py`, `lane_state.py` | Provider choice, endpoint health, throttle/closure memory |
+| `src/subagent/lane_status.py` | Shared lane status per provider (open/closed/unknown, usage left, free slots, spend), read by `list` and `subagent lanes`; background probe of stale lanes |
 | `src/subagent/guard/` | The PreToolUse guard: a deterministic classifier that allows or denies every worker tool call, plus an optional supervisor for the undecided ones |
 | `src/subagent/loop/` | The delegation loop: plan, test outline, worker rounds, test lock, checkpoints, review |
 | `src/subagent/telemetry/` | JSONL trace (schema 3), host/GPU sampler, pricing |
@@ -44,6 +45,7 @@ uv sync --group dev              # install with test tools (Python 3.11 or newer
 uv run pytest -q                 # the whole suite; must stay green (no network needed)
 uv run ruff check src tests      # lint
 uv run subagent doctor           # check the providers in the current config
+uv run subagent lanes --json     # stored lane status (add --probe to refresh stale lanes)
 uv run subagent report --html out.html
 ```
 

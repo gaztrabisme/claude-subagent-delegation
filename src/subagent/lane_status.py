@@ -152,7 +152,8 @@ class LaneStatusStore:
             yield
         finally:
             if handle is not None:
-                handle.close()
+                with contextlib.suppress(OSError):
+                    handle.close()
             self._thread_lock.release()
 
     @staticmethod

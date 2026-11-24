@@ -7,6 +7,7 @@ Each test is prefixed with ``test_review_<n>_`` matching the finding number in
 from __future__ import annotations
 
 import contextlib
+import copy
 import errno
 import fcntl
 import importlib
@@ -168,9 +169,13 @@ def test_review_1_epi_list_preserves_extra_and_status(tmp_path: Path, monkeypatc
         assert len(out["providers"]) == 1
         entry = out["providers"][0]
         assert "extra" in entry, "list_agents() dropped epi provider metadata ('extra')"
-        expected_list = json.loads(
+        fixture_list = json.loads(
             (HARNESS_FIXTURES / "list.json").read_text(encoding="utf-8").splitlines()[0]
         )
+        expected_list = copy.deepcopy(fixture_list)
+        resolved_root = str(tmp_path.resolve())
+        expected_list["providers"][0]["extra"]["allowed_projects"] = [resolved_root]
+        expected_list["providers"][0]["extra"]["default_project"] = resolved_root
         assert entry["extra"]["profile"] == "fake"
         assert entry["extra"]["epi"] == expected_list
         assert "status" in entry

@@ -493,9 +493,6 @@ class DshProvider:
         argv = [
             self.binary(cfg),
             "--profile", "headless",
-            "--json",
-            "--approval-policy", "never",
-            "--permission-mode", "danger-full-access" if cfg.deny_read else "workspace-write",
             "--patch", str(guard_patch),
         ]
         if login:
@@ -507,6 +504,11 @@ class DshProvider:
         elif selected_model:
             model_patch = _model_patch(settings, agent_id, selected_model, login=False)
             argv.extend(["--patch", str(model_patch)])
+        argv.extend([
+            "--json",
+            "--approval-policy", "never",
+            "--permission-mode", "danger-full-access" if cfg.deny_read else "workspace-write",
+        ])
         session_id = _session_text(session)
         if session_id:
             argv.extend(["--session-id", session_id])

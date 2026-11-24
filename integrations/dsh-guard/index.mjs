@@ -9,6 +9,21 @@ const TOOL_NAMES = Object.freeze({
   glob: 'Glob',
 });
 
+const DELEGATION_TOOLS = new Set([
+  'subagent',
+  'agent-team',
+  'tool-agent-team',
+  'subagent-spawn-in-process',
+  'subagent-fork-in-process',
+  'tool-subagent-control',
+  'tool-subagent',
+  'tool-subagent-fork',
+  'ptc-runtime',
+  'workflow-ptc',
+  'tool-workflow',
+  'tool-executor-ptc',
+]);
+
 const DEFAULT_TIMEOUT_SECONDS = 150;
 const MAX_TIMEOUT_SECONDS = 300;
 const MAX_OUTPUT_BYTES = 64 * 1024;
@@ -137,6 +152,9 @@ async function runHook(command, payload, env) {
 
 export async function decide(call, env = {}) {
   const tool = typeof call?.name === 'string' ? call.name.toLowerCase() : '';
+  if (DELEGATION_TOOLS.has(tool)) {
+    return deny(`blocked: DSH delegation tool ${tool} is disabled by subagent`);
+  }
   const toolName = TOOL_NAMES[tool];
   if (!toolName) return deny(`blocked: unsupported DSH tool ${tool || '(unnamed)'}`);
 

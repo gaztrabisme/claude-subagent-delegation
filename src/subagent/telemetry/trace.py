@@ -190,6 +190,18 @@ class Trace:
         parent = getattr(run, "parent", None)
         if parent:
             extra["parent"] = parent
+        # R7a/S65 facts belong under `extra`, the free-form bucket the schema
+        # already allows on a run record.
+        run_extra = extra.get("extra")
+        run_extra = dict(run_extra) if isinstance(run_extra, dict) else {}
+        if getattr(run, "overrun", None):
+            # The per-run cap or watchdog limit this run hit (R7a).
+            run_extra["overrun"] = dict(run.overrun)
+        if getattr(run, "released_agents", None):
+            # Idle agents the registry closed to admit this run (S65).
+            run_extra["released_agents"] = list(run.released_agents)
+        if run_extra:
+            extra["extra"] = run_extra
         distil: dict[str, Any] = {"distilled": run.distilled, "truncated": run.truncated}
         if run.distilled:
             distil["raw_chars"] = len(run.final_response)

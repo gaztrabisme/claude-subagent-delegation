@@ -265,6 +265,8 @@ async def delegate(
     fallback: str | None = None,
     goal: str | None = None,
     request_id: str | None = None,
+    timeout: float | None = None,
+    max_steps: int | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Start a new subagent on a task.
@@ -303,6 +305,11 @@ async def delegate(
         request_id: Optional caller key for providers supporting run context.
             Identical retries return the original run; conflicting work raises.
             Epi waits up to five seconds for admission even with wait_seconds=0.
+        timeout: Optional cap on this run in seconds. Clamped to the provider's
+            own run_timeout; a value of zero or less is refused. The result's
+            `caps` reports the request and the effective limit.
+        max_steps: Optional cap on this run's turns. Clamped to the provider's
+            own max_steps; a value of zero or less is refused.
     """
     wanted = provider or lane
     deprecated = provider is None and lane is not None
@@ -356,7 +363,8 @@ async def delegate(
     caller_key = request_id if capabilities(for_driver(chosen.driver)).run_context else None
     arguments = {"tool": "delegate", "task": task, "verification": verification,
                  "workspace": str(resolved), "instructions": instructions, "model": model,
-                 "name": name, "fallback": fallback or "full", "goal": goal}
+                 "name": name, "fallback": fallback or "full", "goal": goal,
+                 "timeout": timeout, "max_steps": max_steps}
     agent = None
 
     def submit():
@@ -374,7 +382,8 @@ async def delegate(
         pre_run, pre_verify = _goal_guard_hooks(agent)
         try:
             return agent.delegate(prompt, verification, parent=_parent_context(ctx),
-                                  pre_run=pre_run, pre_verify=pre_verify, request_id=caller_key)
+                                  pre_run=pre_run, pre_verify=pre_verify, request_id=caller_key,
+                                  timeout=timeout, max_steps=max_steps)
         except Exception:
             if pre_verify is not None:
                 pre_verify()

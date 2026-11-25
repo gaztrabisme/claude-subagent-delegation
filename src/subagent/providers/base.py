@@ -149,6 +149,13 @@ class ProviderConfig:
     max_steps: int = 40
     run_timeout: float = 1800.0
     idle_timeout: float = 900.0
+    # A run that only reads is stopped after this many tool calls (0 = off) or
+    # this much run time (0 = off); see runs._Watch.
+    no_progress_steps: int = 0
+    no_progress_seconds: float = 0.0
+    # How long a finished, idle agent may hold its lane slot before a new
+    # request on that lane releases it (S65).
+    slot_release_grace_seconds: float = 120.0
     adapter: str | None = None
     binary: str | None = None
     experimental: bool = False
@@ -206,6 +213,9 @@ class ProviderConfig:
             "max_steps": self.max_steps,
             "run_timeout": self.run_timeout,
             "idle_timeout": self.idle_timeout,
+            "no_progress_steps": self.no_progress_steps,
+            "no_progress_seconds": self.no_progress_seconds,
+            "slot_release_grace_seconds": self.slot_release_grace_seconds,
             "adapter": self.adapter,
             "experimental": self.experimental,
         }

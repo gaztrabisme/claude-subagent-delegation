@@ -324,8 +324,9 @@ def _pricing(table: Mapping[str, Any]) -> PricingSpec:
 _PROVIDER_KEYS = frozenset({
     "driver", "vendor", "base_url", "model", "effort", "api_key_env", "api_key", "local",
     "send_sampling", "max_agents", "compact_window", "max_steps", "run_timeout",
-    "idle_timeout", "adapter", "binary", "experimental", "health", "probe",
-    "pricing", "thinking", "deny_read", "monthly_usd_cap",
+    "idle_timeout", "no_progress_steps", "no_progress_seconds",
+    "slot_release_grace_seconds", "adapter", "binary", "experimental", "health",
+    "probe", "pricing", "thinking", "deny_read", "monthly_usd_cap",
 })
 
 
@@ -400,6 +401,15 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         max_steps=int(_int(table, "max_steps", core["max_steps"])),
         run_timeout=float(_num(table, "run_timeout", core["run_timeout"])),
         idle_timeout=float(_num(table, "idle_timeout", core["idle_timeout"])),
+        no_progress_steps=int(
+            _int(table, "no_progress_steps", 0, positive=False)
+        ),
+        no_progress_seconds=float(
+            _num(table, "no_progress_seconds", 0.0, positive=False)
+        ),
+        slot_release_grace_seconds=float(
+            _num(table, "slot_release_grace_seconds", 120.0, positive=False)
+        ),
         adapter=adapter_name,
         binary=_str(table, "binary", None),
         experimental=_bool(table, "experimental", False),

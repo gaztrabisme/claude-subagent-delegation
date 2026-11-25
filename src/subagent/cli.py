@@ -649,14 +649,19 @@ def cmd_harness(args: argparse.Namespace) -> int:
 
 
 def _run_argv(argv: list[str], root: Path) -> int:
-    """Run one command in `root`; a missing binary is the shell's 127."""
+    """Run one command in `root`; a missing binary is the shell's 127.
+
+    A child killed by a signal reports a negative status from subprocess; the
+    shell's convention (and `exec`'s exit code) is 128 + the signal number.
+    """
     try:
-        return subprocess.run(argv, cwd=root).returncode
+        code = subprocess.run(argv, cwd=root).returncode
     except FileNotFoundError:
         return 127
     except OSError as exc:
         print(f"error: cannot run {argv[0]!r}: {exc}", file=sys.stderr)
         return 126
+    return 128 - code if code < 0 else code
 
 
 class _LockListingError(RuntimeError):
@@ -672,6 +677,23 @@ def _resolve_rev(root: Path, rev: str) -> str | None:
     )
     sha = result.stdout.strip() if result.returncode == 0 else ""
     return sha or None
+
+
+def _symlink_paths(root: Path, globs: list[str]) -> set[str]:
+    """Symlinks matching `globs`: walk_files skips them, but a link is a change."""
+    from .loop.common import SKIP_DIRS, matches
+
+    found: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if not path.is_symlink():
+                continue
+            rel = path.relative_to(root).as_posix()
+            if matches(rel, globs):
+                found.add(rel)
+    return found
 
 
 def _lock_violations(root: Path, rev: str, globs: list[str]) -> list[str]:
@@ -693,8 +715,12 @@ def _lock_violations(root: Path, rev: str, globs: list[str]) -> list[str]:
         if rel and matches(rel, globs)
     }
     now = {rel for rel in walk_files(root) if matches(rel, globs)}
+    now |= _symlink_paths(root, globs)
     violations = []
     for rel in sorted(at_rev):
+        if (root / rel).is_symlink():
+            violations.append(rel)
+            continue
         try:
             current = (root / rel).read_bytes()
         except OSError:
@@ -788,12 +814,22 @@ def cmd_exec(args: argparse.Namespace) -> int:
     store = LaneStatusStore(settings.session_root, redact_keys=settings.leaked_keys)
     started = time.time()
     interrupted = False
-    with store.active_run(args.lane):
-        try:
-            rc = _run_argv(argv, root)
-        except KeyboardInterrupt:
-            interrupted = True
-            rc = 130
+    try:
+        with store.active_run(args.lane):
+            try:
+                rc = _run_argv(argv, root)
+            except KeyboardInterrupt:
+                interrupted = True
+                rc = 130
+    except TimeoutError as exc:
+        # The lane probe lock never cleared: report it as one failed run, with
+        # no command started and no traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        _trace_exec(
+            settings, cfg, args.lane, root, started, time.time(),
+            "failed", "error", 1, None,
+        )
+        return 1
     finished = time.time()
 
     lock = None

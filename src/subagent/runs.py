@@ -82,9 +82,12 @@ KILL_TIMEOUT = "timeout"
 KILL_LOOP = "loop"
 KILL_BUDGET = "budget"
 KILL_STEPS = "steps"
+KILL_NO_PROGRESS = "no_progress"
 KILL_SHUTDOWN = "shutdown"
 KILL_IDLE = "idle"
-KILL_IS_FAILURE = frozenset({KILL_TIMEOUT, KILL_LOOP, KILL_BUDGET, KILL_STEPS})
+KILL_IS_FAILURE = frozenset({
+    KILL_TIMEOUT, KILL_LOOP, KILL_BUDGET, KILL_STEPS, KILL_NO_PROGRESS,
+})
 
 DISTIL_PROMPT = """\
 Stop working on the task. Summarize what you did, for a different engineer who \
@@ -329,10 +332,25 @@ class _Watch:
     Starts from what the run has already ingested, so a trip is judged on the
     whole run, not one attempt. Nothing here is written back to the run: a
     rate-limited attempt that is discarded must not count twice.
+
+    It also carries the no-progress watchdog (R7a): a run with no write or edit
+    tool call is stopped after `no_progress_steps` tool calls or
+    `no_progress_seconds` of run time. That trip is written back to the run,
+    because the result and the trace report what the worker read.
     """
 
+    # Tool calls that count as progress: the worker changed something.
+    WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"})
+
     def __init__(
-        self, run: Run, settings: Settings, seen: Counter[str], max_steps: int | None = None
+        self,
+        run: Run,
+        settings: Settings,
+        seen: Counter[str],
+        max_steps: int | None = None,
+        *,
+        no_progress_steps: int = 0,
+        no_progress_seconds: float = 0.0,
     ):
         self.settings = settings
         self.max_steps = settings.max_steps if max_steps is None else max_steps
@@ -341,6 +359,45 @@ class _Watch:
         self.signatures: Counter[str] = Counter(seen)
         self.base_tokens = run.usage.total
         self.messages: dict[str, int] = {}
+        self.run = run
+        self.started_at = run.started_at if run.started_at is not None else _now()
+        self.no_progress_steps = no_progress_steps
+        self.no_progress_seconds = no_progress_seconds
+        self.steps_seen = 0
+        self.reads: list[str] = []
+        self.wrote = False
+
+    def _no_progress(self, reason: str, limit: int | float) -> tuple[str, str] | None:
+        self.run.no_progress = {"reads": list(self.reads), "steps": self.steps_seen}
+        self.run.overrun = {"kind": KILL_NO_PROGRESS, "limit": limit}
+        return (KILL_NO_PROGRESS, reason)
+
+    def _watch_progress(self, event: dict[str, Any]) -> tuple[str, str] | None:
+        """Count this event's tool calls and trip if the run only reads."""
+        for name, args in _tool_uses(event):
+            self.steps_seen += 1
+            if name in self.WRITE_TOOLS:
+                self.wrote = True
+            elif name == "Read" and isinstance(args, dict):
+                path = args.get("file_path")
+                if isinstance(path, str) and path not in self.reads:
+                    self.reads.append(path)
+        if self.wrote:
+            return None
+        if self.no_progress_steps > 0 and self.steps_seen >= self.no_progress_steps:
+            return self._no_progress(
+                f"no write or edit in {self.steps_seen} tool calls "
+                f"(no_progress_steps = {self.no_progress_steps})",
+                self.no_progress_steps,
+            )
+        if (self.no_progress_seconds > 0
+                and _now() - self.started_at >= self.no_progress_seconds):
+            return self._no_progress(
+                f"no write or edit in {_now() - self.started_at:g}s "
+                f"(no_progress_seconds = {self.no_progress_seconds:g})",
+                self.no_progress_seconds,
+            )
+        return None
 
     def see(self, event: dict[str, Any]) -> tuple[str, str] | None:
         if _hit_max_turns(event):
@@ -353,6 +410,9 @@ class _Watch:
             )
         if event.get("type") != "assistant":
             return None
+        no_progress = self._watch_progress(event)
+        if no_progress is not None:
+            return no_progress
         for name, args in _tool_uses(event):
             sig = _tool_signature(name, args)
             self.signatures[sig] += 1
@@ -676,6 +736,17 @@ class Run:
     verification_result: VerificationResult | None = None
     trip: tuple[str, str] | None = None
     deadline: float | None = None
+    # Per-run caps (R7a): the caller's request and the effective limit, plus
+    # the public `caps` view. Both stay None when the caller asked for none.
+    time_limit: float | None = None
+    step_limit: int | None = None
+    caps: dict[str, Any] | None = None
+    # The limit this run overran, written to the trace as extra.overrun.
+    overrun: dict[str, Any] | None = None
+    # A no-progress stop: {"reads": [...], "steps": n}, visible in detail().
+    no_progress: dict[str, Any] | None = None
+    # Agent ids the registry released to make room for this run (S65).
+    released_agents: list[str] = field(default_factory=list)
     _human_wait_started_at: float | None = field(default=None, repr=False)
     _timeout_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     session_id: str | None = None
@@ -762,6 +833,10 @@ class Run:
         }
         if self.warning:
             out["warning"] = self.warning
+        if self.caps:
+            out["caps"] = copy.deepcopy(self.caps)
+        if self.no_progress is not None:
+            out["no_progress"] = copy.deepcopy(self.no_progress)
         if self.native_outcome is not None:
             for key in ("needs_human", "human_action", "plan_id", "usage_unreported",
                         "credits", "credits_unit", "cash_usd", "extra"):
@@ -857,6 +932,7 @@ class Agent:
         delegate_options: dict[str, Any] | None = None,
         deny_read: list[str] | None = None,
         entry: str = "mcp",
+        released_agents: list[str] | None = None,
     ):
         self.trace = trace
         # The route that started this agent's runs (MCP delegate, CLI loop,
@@ -888,6 +964,9 @@ class Agent:
         self.goal = goal
         self.goal_reviewer = goal_reviewer
         self.delegate_options = delegate_options or {}
+        # Agents released to make room for this one's first run (S65); written
+        # once, on that run's trace record.
+        self._released_agents = list(released_agents or [])
         # Guard context carries configured child-secret names even before the
         # loop adds its protected tests and state allowlist.
         self.guard_context: dict[str, Any] = provider_guard_context(settings)
@@ -978,6 +1057,9 @@ class Agent:
         distill: bool = True,
         source_chars: dict[str, int] | None = None,
         request_id: str | None = None,
+        time_limit: float | None = None,
+        step_limit: int | None = None,
+        caps: dict[str, Any] | None = None,
     ) -> Run:
         if self._closed or self._closing:
             raise RegistryError(f"agent {self.agent_id} is closed")
@@ -1006,9 +1088,14 @@ class Agent:
             pre_verify=pre_verify,
             on_event=on_event,
             distill=distill,
+            time_limit=time_limit,
+            step_limit=step_limit,
+            caps=copy.deepcopy(caps),
+            released_agents=list(self._released_agents),
             **({"request_id": request_id} if request_id and capabilities(self.driver).run_context
                else {}),
         )
+        self._released_agents = []
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
             run.continues = len(self._order)
@@ -1031,11 +1118,19 @@ class Agent:
         reviewer: GoalReviewer | None = None,
         source_chars: dict[str, int] | None = None,
         request_id: str | None = None,
+        timeout: float | None = None,
+        max_steps: int | None = None,
     ) -> Run:
         """The agent's first run. Its verification is kept for continues.
 
         This run walks the lane chain; continues stay on the lane it ran on.
+
+        `timeout` (seconds) and `max_steps` cap this run below the provider's
+        own `run_timeout` and `max_steps`: the effective value is the smaller
+        of the request and the provider limit, and `detail()['caps']` reports
+        both. Zero or negative requests are refused.
         """
+        time_limit, step_limit, caps = self._run_caps(timeout, max_steps)
         self.delegate_verification = verification
         if goal is not None:
             self.goal = goal
@@ -1052,7 +1147,29 @@ class Agent:
             distill=distill,
             source_chars=source_chars,
             request_id=request_id,
+            time_limit=time_limit,
+            step_limit=step_limit,
+            caps=caps,
         )
+
+    def _run_caps(
+        self, timeout: float | None, max_steps: int | None
+    ) -> tuple[float | None, int | None, dict[str, Any] | None]:
+        """Validate per-run caps and clamp them to this agent's provider limits."""
+        caps: dict[str, Any] = {}
+        time_limit: float | None = None
+        step_limit: int | None = None
+        if timeout is not None:
+            if timeout <= 0:
+                raise RegistryError(f"timeout must be positive, got {timeout!r}")
+            time_limit = min(float(timeout), self.cfg.run_timeout)
+            caps["timeout"] = {"requested": timeout, "effective": time_limit}
+        if max_steps is not None:
+            if max_steps <= 0:
+                raise RegistryError(f"max_steps must be positive, got {max_steps!r}")
+            step_limit = min(int(max_steps), self.cfg.max_steps)
+            caps["max_steps"] = {"requested": max_steps, "effective": step_limit}
+        return time_limit, step_limit, caps or None
 
     def follow_up(
         self,
@@ -1182,6 +1299,22 @@ class Agent:
                 self._run_pre_verify(run)
                 if not run.done.is_set():
                     self._finish(run)
+
+    def end_run(self, run: Run, reason: str, kind: str) -> None:
+        """End one run on its deadline without closing the agent (R7a).
+
+        The agent stays resumable: a continue starts a new run in the same
+        provider session. Unlike `close`, this never sets `_closing`.
+        """
+        if run.done.is_set():
+            return
+        if run.trip is None:
+            run.trip = (kind, reason)
+        with self._dispatch_lock:
+            self._cancel_provider(reason, kind, run)
+            current = self._current
+            if current is not None:
+                current.kill()
 
     def _boot(self) -> None:
         try:
@@ -1355,8 +1488,12 @@ class Agent:
             )
         # Codex must coordinate its inner sandbox mode with its outer profile.
         # Give it the frozen agent policy plus the current provider's exclusions.
-        spawn_cfg = (dataclasses.replace(self.cfg, deny_read=paths)
-                     if self.cfg.driver in (DRIVER_CODEX, DRIVER_DSH) else self.cfg)
+        cfg = self.cfg
+        if run.step_limit is not None and run.step_limit != cfg.max_steps:
+            # A per-run step cap is Claude Code's --max-turns for this run only.
+            cfg = dataclasses.replace(cfg, max_steps=run.step_limit)
+        spawn_cfg = (dataclasses.replace(cfg, deny_read=paths)
+                     if cfg.driver in (DRIVER_CODEX, DRIVER_DSH) else cfg)
         process = self.driver.spawn(
             spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
             session, self.model, **kwargs,
@@ -1387,7 +1524,8 @@ class Agent:
             self._finish(run)
             return
         run.native_usage = capabilities(self.driver).native_usage
-        run.deadline = run.started_at + self.cfg.run_timeout
+        limit = run.time_limit if run.time_limit is not None else self.cfg.run_timeout
+        run.deadline = run.started_at + limit
         run.phase = PHASE_RUNNING
         self.last_activity = _now()
         if (not run.route and run.continues and capabilities(self.driver).native_verification
@@ -1447,6 +1585,11 @@ class Agent:
 
         run.phase = PHASE_VERIFYING
         remaining = (run.deadline - _now()) if run.deadline else None
+        if remaining is not None and remaining <= 0:
+            # The clock is already past the deadline. A live reaper would have
+            # ended the run; without one, verify under [core].verify_timeout
+            # rather than handing the command a zero-second budget.
+            remaining = None
         run.verification_result = run_verification(
             run.verification or "",
             self.workspace,
@@ -1653,7 +1796,11 @@ class Agent:
             run.cold_load = gate.cold_load
             hop.cold_load = gate.cold_load
             extra = self.settings.cold_load_seconds(cfg.name) if gate.cold_load else 0.0
-            run.deadline = _now() + cfg.run_timeout + extra
+            if run.time_limit is None:
+                timeout = cfg.run_timeout
+            else:
+                timeout = min(cfg.run_timeout, run.time_limit)
+            run.deadline = _now() + timeout + extra
             run.worked = False
             run.attempted_lane = cfg.name
             if explicit_primary and harness_state == "unverified":
@@ -1761,7 +1908,14 @@ class Agent:
                 proc = self._spawn(run, prompt, resume)
                 self._current = proc
             collected: list[dict[str, Any]] = []
-            watch = _Watch(run, self.settings, self.signatures, self.cfg.max_steps)
+            watch = _Watch(
+                run,
+                self.settings,
+                self.signatures,
+                run.step_limit if run.step_limit is not None else self.cfg.max_steps,
+                no_progress_steps=self.cfg.no_progress_steps,
+                no_progress_seconds=self.cfg.no_progress_seconds,
+            )
             try:
                 if self._closing:
                     self._cancel_provider("agent closing", self._kill_kind or KILL_CANCEL, run)
@@ -1997,9 +2151,11 @@ class Agent:
             if isinstance(event.get("num_turns"), int):
                 run.usage.turns += event["num_turns"]
             if _hit_max_turns(event) and run.trip is None:
+                limit = (run.step_limit if run.step_limit is not None
+                         else self.cfg.max_steps)
                 run.trip = (
                     KILL_STEPS,
-                    f"reached --max-turns of {self.cfg.max_steps} ([core].max_steps) "
+                    f"reached --max-turns of {limit} ([core].max_steps) "
                     "before finishing",
                 )
             budget = self.settings.turn_token_budget
@@ -2163,6 +2319,13 @@ class Agent:
             run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
             run.error = reason
             run.finish_reason = kind
+        if run.overrun is None:
+            # Only a cap the caller asked for is an overrun worth tracing; a
+            # provider-default deadline keeps its old record shape.
+            if run.finish_reason == KILL_TIMEOUT and run.time_limit is not None:
+                run.overrun = {"kind": KILL_TIMEOUT, "limit": run.time_limit}
+            elif run.finish_reason == KILL_STEPS and run.step_limit is not None:
+                run.overrun = {"kind": KILL_STEPS, "limit": run.step_limit}
         if run.error:
             run.error = redact_secrets(run.error, self.settings.leaked_keys)
         if run.error_detail:
@@ -2291,7 +2454,9 @@ class Registry:
                 agent.close(reason, kind=kind)
                 acted.append((agent.agent_id, kind))
             elif overdue is not None:
-                agent.close("run deadline exceeded", kind=KILL_TIMEOUT)
+                # A deadline is the run's, not the session's: an agent whose
+                # run timed out can still be resumed with `continue` (R7a).
+                agent.end_run(overdue, "run deadline exceeded", KILL_TIMEOUT)
                 acted.append((agent.agent_id, KILL_TIMEOUT))
             elif not active and not agent.busy:
                 if now - agent.last_activity > agent.cfg.idle_timeout:
@@ -2363,53 +2528,80 @@ class Registry:
         refusal = self.settings.workspace_refusal(workspace)
         if refusal is not None:
             raise RegistryError(refusal)
-        with self._lock:
-            live = [a for a in self._agents.values() if not a.closed]
-            if len(live) >= self.settings.max_agents:
-                raise RegistryError(
-                    f"agent limit reached ({self.settings.max_agents} live). "
-                    "Cancel one with cancel, or raise [core].max_agents."
+        released: list[str] = []
+        while True:
+            with self._lock:
+                live = [a for a in self._agents.values() if not a.closed]
+                if len(live) >= self.settings.max_agents:
+                    raise RegistryError(
+                        f"agent limit reached ({self.settings.max_agents} live). "
+                        "Cancel one with cancel, or raise [core].max_agents."
+                    )
+                here = [a for a in live if a.cfg.name == chosen.name]
+                if len(here) < chosen.max_agents:
+                    claimed = agent_id or self._claim_agent_id()
+                    approval_key = _load_or_create_approval_key(
+                        self.settings, claimed, fresh=True
+                    )
+                    agent = Agent(
+                        agent_id=claimed,
+                        approval_key=approval_key,
+                        name=name or f"subagent-{claimed}",
+                        workspace=workspace,
+                        model=model or chosen.model or "",
+                        settings=self.settings,
+                        trace=self.trace,
+                        cfg=chosen,
+                        fallback=fallback or "full",
+                        chain=self.settings.chain(chosen.name, fallback or "full"),
+                        lane_state=self.lane_state,
+                        lane_status=self.lane_status,
+                        provider_load=self._provider_load,
+                        telemetry=self.telemetry,
+                        on_event=on_event,
+                        goal=goal,
+                        goal_reviewer=goal_reviewer,
+                        delegate_options={
+                            "task": task, "instructions": instructions,
+                            "name": name, "model": model, "fallback": fallback,
+                            "provider_explicit": (
+                                provider is not None
+                                if provider_explicit is None else provider_explicit
+                            )},
+                        deny_read=deny_read,
+                        entry=self.entry,
+                        released_agents=released,
+                    )
+                    self._agents[claimed] = agent
+                    return agent
+                candidate = self._releasable(
+                    here, chosen.slot_release_grace_seconds
                 )
-            here = [a for a in live if a.cfg.name == chosen.name]
-            if len(here) >= chosen.max_agents:
-                raise RegistryError(
-                    f"agent limit reached on provider {chosen.name!r} "
-                    f"({chosen.max_agents} live). Cancel one with cancel, or raise "
-                    f"[providers.{chosen.name}].max_agents."
-                )
-            claimed = agent_id or self._claim_agent_id()
-            approval_key = _load_or_create_approval_key(
-                self.settings, claimed, fresh=True
-            )
-            agent = Agent(
-                agent_id=claimed,
-                approval_key=approval_key,
-                name=name or f"subagent-{claimed}",
-                workspace=workspace,
-                model=model or chosen.model or "",
-                settings=self.settings,
-                trace=self.trace,
-                cfg=chosen,
-                fallback=fallback or "full",
-                chain=self.settings.chain(chosen.name, fallback or "full"),
-                lane_state=self.lane_state,
-                lane_status=self.lane_status,
-                provider_load=self._provider_load,
-                telemetry=self.telemetry,
-                on_event=on_event,
-                goal=goal,
-                goal_reviewer=goal_reviewer,
-                delegate_options={"task": task, "instructions": instructions,
-                                  "name": name, "model": model, "fallback": fallback,
-                                  "provider_explicit": (
-                                      provider is not None
-                                      if provider_explicit is None else provider_explicit
-                                  )},
-                deny_read=deny_read,
-                entry=self.entry,
-            )
-            self._agents[claimed] = agent
-            return agent
+                if candidate is None:
+                    raise RegistryError(
+                        f"agent limit reached on provider {chosen.name!r} "
+                        f"({chosen.max_agents} live). Cancel one with cancel, or raise "
+                        f"[providers.{chosen.name}].max_agents."
+                    )
+            # Close outside the registry lock: the agent's own worker may be
+            # exiting and this join must not wait on a lock this thread holds.
+            candidate.close("released for a new run", kind=KILL_IDLE)
+            self._evict_closed()
+            released.append(candidate.agent_id)
+
+    @staticmethod
+    def _releasable(agents: list[Agent], grace: float) -> Agent | None:
+        """The oldest finished, non-busy agent idle at least `grace` seconds."""
+        now = _now()
+        finished = [
+            agent for agent in agents
+            if agent.runs() and not agent.busy
+            and all(run.state in TERMINAL_STATES for run in agent.runs())
+            and now - agent.last_activity >= grace
+        ]
+        return min(
+            finished, key=lambda agent: (agent.last_activity, agent.created_at), default=None
+        )
 
     def adopt(
         self,

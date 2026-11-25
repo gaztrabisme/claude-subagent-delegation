@@ -95,7 +95,8 @@ def _install(
         venv = install_root / "venv"
         _checked(
             runner(
-                [uv, "venv", "--python", sys.executable, str(venv)],
+                # --clear makes a retry after a partial install start clean.
+                [uv, "venv", "--clear", "--python", sys.executable, str(venv)],
                 capture_output=True,
                 text=True,
             ),
@@ -123,6 +124,16 @@ def promote(
     """Install `commit` from `repo` and record it in ``served.json``."""
     repo = Path(repo).resolve()
     sha = _resolve(repo, commit, runner)
+    install_root = Path(settings.session_root) / "installs" / sha
+    existing = served(settings)
+    if (
+        existing is not None
+        and existing.get("commit") == sha
+        and existing.get("install_path") == str(install_root)
+        and (install_root / "venv").is_dir()
+    ):
+        # Already installed as served: never touch a venv that may be in use.
+        return existing
     live = live_lanes(settings)
     if live and not force:
         raise PromoteError(
@@ -130,7 +141,6 @@ def promote(
         )
     if live:
         print(f"warning: live runs on {', '.join(live)}; promoting anyway")
-    install_root = Path(settings.session_root) / "installs" / sha
     install_root.mkdir(parents=True, exist_ok=True)
     _install(repo, sha, install_root, runner)
     payload = {

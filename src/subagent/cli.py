@@ -659,9 +659,14 @@ def _run_argv(argv: list[str], root: Path) -> int:
         return 126
 
 
+class _LockListingError(RuntimeError):
+    """The locked commit's tree could not be listed, so it cannot be verified."""
+
+
 def _resolve_rev(root: Path, rev: str) -> str | None:
     result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet",
+         "--end-of-options", f"{rev}^{{commit}}"],
         capture_output=True,
         text=True,
     )
@@ -677,6 +682,12 @@ def _lock_violations(root: Path, rev: str, globs: list[str]) -> list[str]:
         ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z", rev],
         capture_output=True,
     )
+    if listed.returncode != 0:
+        detail = listed.stderr or b""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        message = str(detail).strip() or f"git ls-tree exited {listed.returncode}"
+        raise _LockListingError(message)
     at_rev = {
         rel for rel in listed.stdout.decode("utf-8", "replace").split("\0")
         if rel and matches(rel, globs)
@@ -776,16 +787,32 @@ def cmd_exec(args: argparse.Namespace) -> int:
 
     store = LaneStatusStore(settings.session_root, redact_keys=settings.leaked_keys)
     started = time.time()
+    interrupted = False
     with store.active_run(args.lane):
-        rc = _run_argv(argv, root)
+        try:
+            rc = _run_argv(argv, root)
+        except KeyboardInterrupt:
+            interrupted = True
+            rc = 130
     finished = time.time()
 
     lock = None
     violations: list[str] = []
-    if lock_rev is not None:
-        violations = _lock_violations(root, lock_rev, globs)
-        lock = "violated" if violations else "ok"
-    if violations:
+    listing_failed = False
+    if not interrupted and lock_rev is not None:
+        try:
+            violations = _lock_violations(root, lock_rev, globs)
+        except _LockListingError as exc:
+            listing_failed = True
+            print(
+                f"error: cannot verify --lock-commit {lock_rev!r}: {exc}",
+                file=sys.stderr,
+            )
+        lock = "violated" if (listing_failed or violations) else "ok"
+
+    if interrupted:
+        state, finish_reason, code = "failed", "error", 130
+    elif listing_failed or violations:
         for path in violations:
             print(path, file=sys.stderr)
         state, finish_reason, code = "failed", "violated_tests", 3

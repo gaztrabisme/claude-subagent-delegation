@@ -39,7 +39,8 @@ class UnknownCommit(PromoteError):
 
 def _resolve(repo: Path, commit: str, runner: Any) -> str:
     result = runner(
-        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         "--end-of-options", f"{commit}^{{commit}}"],
         capture_output=True,
         text=True,
     )

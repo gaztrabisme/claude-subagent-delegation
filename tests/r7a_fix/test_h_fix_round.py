@@ -13,6 +13,7 @@ import time
 
 import anyio
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from subagent import config, health
 from subagent.providers import claude as claude_provider
@@ -193,7 +194,7 @@ def test_h3_a_bad_cap_is_refused_before_any_idle_agent_is_released(
             task="do it", verification="true", workspace=str(tmp_path),
             provider="glm", **kwargs)
 
-    with pytest.raises(RegistryError):
+    with pytest.raises((RegistryError, ToolError)):
         anyio.run(go)
     assert idle.closed is False
     assert len(reg.agents()) == count

@@ -36,6 +36,7 @@ comes from the user's config file.
 | `skills/delegate/SKILL.md` | The skill the orchestrator follows; it calls the CLI |
 | `examples/config.*.toml` | One working config per provider kind; the only place machine-specific values are allowed |
 | `bench/` | The benchmark matrix (orchestrator × config × task), the meeting-scribe task and the business-case model |
+| `scripts/` | Hand-run harnesses (smokes, lanes) and operator tools: `coord_meter.py` (coordination tokens per role), `owner_dashboard.py` (owner dashboard datasets from `wiki/status/registers.md`, git and lane status) |
 | `tests/` | pytest; `tests/loop/` are ported unittest suites; `tests/fakes/` are fake CLIs (`fake_claude`, `fake_copilot`, ...) |
 | `docs/` | Reader-facing documents (benchmark, business case) |
 | `wiki/` | Internal notes: decisions, run ledger, review findings, goal files. Not reader documentation |

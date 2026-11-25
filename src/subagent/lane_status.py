@@ -475,8 +475,15 @@ class LaneStatusStore:
         *,
         now: datetime | str | float | int | None = None,
         live_by_lane: Mapping[str, int] | None = None,
+        count_runs: bool = True,
     ) -> dict[str, dict[str, Any]]:
-        """Return one stored status view for every configured provider."""
+        """Return one stored status view for every configured provider.
+
+        ``count_runs`` is for callers that do not need the pre-dispatch
+        envelope readings: plain lane listings and harness views pass False
+        when ``[envelope] lane_plan`` is unset, so they never scan the trace
+        just to fill a field nothing reads.
+        """
         current = _datetime(now)
         try:
             records = self._load()
@@ -487,7 +494,7 @@ class LaneStatusStore:
         lane_state = LaneState(settings.session_root)
         closures, verified_versions = lane_state.status_entries(now=current)
         spend = _month_spend(settings, current)
-        runs = _run_counts(settings, current)
+        runs = _run_counts(settings, current) if count_runs else None
         result: dict[str, dict[str, Any]] = {}
         for name, cfg in settings.providers.items():
             entry = records.get(name)
@@ -679,7 +686,10 @@ def probe_stale_lanes(
     store.redact_keys = tuple(dict.fromkeys((
         *store.redact_keys, *getattr(settings, "leaked_keys", ()),
     )))
-    before = store.snapshot(settings, live_by_lane=live_by_lane)
+    # Envelope run counts are only consumed by the pre-dispatch check. Keep
+    # plain lane probing from scanning the trace when the check is off.
+    count_runs = getattr(settings, "envelope_lane_plan", None) is not None
+    before = store.snapshot(settings, live_by_lane=live_by_lane, count_runs=count_runs)
     remote = set(lanes_to_probe(before))
     local = {
         name for name, view in before.items()
@@ -698,7 +708,9 @@ def probe_stale_lanes(
         with store.probe_lease(name) as leased:
             if not leased or (stop is not None and stop.is_set()):
                 continue
-            latest = store.snapshot(settings, live_by_lane=live_by_lane).get(name, {})
+            latest = store.snapshot(
+                settings, live_by_lane=live_by_lane, count_runs=count_runs,
+            ).get(name, {})
             slots = latest.get("slots", {})
             if (latest.get("stale") is not True or latest.get("source") == "closure"
                     or latest.get("closed_until") is not None
@@ -737,7 +749,7 @@ def probe_stale_lanes(
                 usage = codex_usage(source_codex_home())
             if isinstance(usage, dict):
                 store.record_usage(name, usage)
-    return store.snapshot(settings, live_by_lane=live_by_lane)
+    return store.snapshot(settings, live_by_lane=live_by_lane, count_runs=count_runs)
 
 
 def _probe_allowed(cfg: Any) -> bool:
@@ -821,6 +833,9 @@ def _spend_record(line: bytes, providers: Mapping[str, Any], now: datetime,
 
 _RUN_CACHE_LOCK = threading.Lock()
 _RUN_CACHE: dict[str, dict[str, Any]] = {}
+_RUN_CHUNK_BYTES = 256 * 1024
+_RUN_DAY_SECONDS = 86400.0
+_RUN_WEEK_SECONDS = 7 * 86400.0
 
 
 def _run_event(line: bytes) -> tuple[float, str] | None:
@@ -842,11 +857,30 @@ def _run_event(line: bytes) -> tuple[float, str] | None:
         return None
 
 
+def _run_age(ts: float, now: datetime) -> float | None:
+    """Seconds since a run record, or None when its timestamp is unusable."""
+    try:
+        event_at = datetime.fromtimestamp(ts, now.tzinfo)
+        return (now - event_at).total_seconds()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _run_is_recent(ts: float, now: datetime) -> bool:
+    """Whether a run event belongs in the seven-day cache window."""
+    age = _run_age(ts, now)
+    return age is not None and 0 <= age <= _RUN_WEEK_SECONDS
+
+
 def _run_counts(settings: Any, now: datetime) -> dict[str, dict[str, int]] | None:
     """Run records per lane in the last day and week, from a cached trace tail.
 
-    None means the trace is off or unreadable; an empty mapping means it was
-    read and holds no run records.
+    Only the last seven days of ``run`` events are kept, so the cache and the
+    per-snapshot loop stay bounded no matter how long the trace grows. The
+    trace is tailed in bounded chunks; an incomplete last line is carried to
+    the next read instead of re-reading the whole file. None means the trace is
+    off or unreadable; an empty mapping means it was read and holds no recent
+    run records.
     """
     raw_path = settings.trace
     if raw_path is None:
@@ -871,7 +905,7 @@ def _run_counts(settings: Any, now: datetime) -> dict[str, dict[str, int]] | Non
                 cached is None
                 or cached["device"] != info.st_dev
                 or cached["inode"] != info.st_ino
-                or info.st_size < cached["offset"]
+                or info.st_size < cached["seen_size"]
                 or (info.st_size == cached["seen_size"]
                     and info.st_mtime_ns != cached["mtime_ns"])
             )
@@ -881,39 +915,45 @@ def _run_counts(settings: Any, now: datetime) -> dict[str, dict[str, int]] | Non
                     "seen_size": 0, "mtime_ns": 0, "pending": b"", "events": [],
                 }
             with path.open("rb") as handle:
+                # ``offset`` is the start of the incomplete line carried from
+                # the previous read; seek there and rebuild it from disk
+                # rather than prepending the cached copy as well.
                 handle.seek(cached["offset"])
-                chunk = handle.read()
-            lines = chunk.splitlines(keepends=True)
-            pending = b""
-            if lines and not lines[-1].endswith((b"\n", b"\r")):
-                pending = lines.pop()
-            for line in lines:
-                event = _run_event(line)
-                if event is not None:
-                    cached["events"].append(event)
-            cached["offset"] = info.st_size - len(pending)
-            cached["seen_size"] = info.st_size
-            cached["mtime_ns"] = info.st_mtime_ns
-            cached["pending"] = pending
+                pending = b""
+                while True:
+                    chunk = handle.read(_RUN_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    lines = (pending + chunk).splitlines(keepends=True)
+                    pending = b""
+                    if lines and not lines[-1].endswith((b"\n", b"\r")):
+                        pending = lines.pop()
+                    for line in lines:
+                        event = _run_event(line)
+                        if event is not None and _run_is_recent(event[0], now):
+                            cached["events"].append(event)
+                    cached["offset"] = handle.tell() - len(pending)
+                cached["seen_size"] = handle.tell()
+                cached["pending"] = pending
+                cached["mtime_ns"] = os.fstat(handle.fileno()).st_mtime_ns
+            # Prune on read as well as on append: a snapshot later than the
+            # one that filled the cache must not keep older events around.
+            cached["events"] = [
+                event for event in cached["events"] if _run_is_recent(event[0], now)
+            ]
             _RUN_CACHE[key] = cached
             events = list(cached["events"])
     except OSError:
         return None
-    day_cutoff = 86400.0
-    week_cutoff = 7 * 86400.0
     counts: dict[str, dict[str, int]] = {}
     for ts, lane in events:
-        try:
-            event_at = datetime.fromtimestamp(ts, now.tzinfo)
-        except (TypeError, ValueError, OSError, OverflowError):
-            continue
-        age = (now - event_at).total_seconds()
-        if age < 0:
+        age = _run_age(ts, now)
+        if age is None or age < 0 or age > _RUN_WEEK_SECONDS:
             continue
         entry = counts.setdefault(lane, {"day": 0, "week": 0})
-        if age <= day_cutoff:
+        if age <= _RUN_DAY_SECONDS:
             entry["day"] += 1
-        if age <= week_cutoff:
+        if age <= _RUN_WEEK_SECONDS:
             entry["week"] += 1
     return counts
 

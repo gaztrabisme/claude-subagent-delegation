@@ -592,7 +592,9 @@ def cmd_lanes(args: argparse.Namespace) -> int:
     if args.probe:
         snapshot = probe_stale_lanes(settings, store, _prompt_turn)
     else:
-        snapshot = store.snapshot(settings)
+        snapshot = store.snapshot(
+            settings, count_runs=settings.envelope_lane_plan is not None,
+        )
     if args.json:
         print(json.dumps(snapshot, indent=2))
     else:
@@ -619,6 +621,13 @@ def cmd_envelope(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if args.provider not in settings.providers:
+        known = ", ".join(settings.providers) or "(none configured)"
+        print(
+            f"error: unknown provider {args.provider!r}; configured providers: {known}",
+            file=sys.stderr,
+        )
+        return 2
     if settings.envelope_lane_plan is None:
         message = "envelope check is off: [envelope] lane_plan is not configured"
         if args.json:

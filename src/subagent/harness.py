@@ -175,7 +175,7 @@ def status(settings: Any) -> list[dict[str, Any]]:
     """Return stored harness state for CLI display without probing binaries."""
     snapshot = LaneStatusStore(
         settings.session_root, redact_keys=settings.leaked_keys
-    ).snapshot(settings)
+    ).snapshot(settings, count_runs=False)
     memory = LaneState(settings.session_root)
     return [
         {

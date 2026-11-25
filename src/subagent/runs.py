@@ -1250,7 +1250,10 @@ class Agent:
                 if not isinstance(lane, str) or not lane:
                     continue
                 outcome = hop.get("outcome")
-                if outcome == router.HOP_REFUSED and hop.get("code") != router.ADMISSION:
+                if (
+                    outcome == router.HOP_REFUSED
+                    and hop.get("code") not in (router.ADMISSION, router.ENVELOPE)
+                ):
                     observations.append({
                         "lane": lane, "kind": "run", "finish_reason": "refused",
                         "code": hop.get("code"), "detail": hop.get("message"),
@@ -1566,13 +1569,18 @@ class Agent:
         rows: list[envelope.EnvelopeRow],
         snapshot: dict[str, dict[str, Any]],
         override: str | None,
-    ) -> envelope.Decision | None:
-        """Check one candidate lane before admission; record what the decision implies."""
+    ) -> tuple[envelope.Decision | None, str | None]:
+        """Check one candidate lane before admission; record what the decision implies.
+
+        Returns the refusing decision, or None and the warning text to attach
+        only once the hop is actually used.
+        """
         row = envelope.row_for(rows, cfg.name)
         if row is None:
-            return None
+            return None, None
         reading = envelope.reading_for(row, snapshot)
         decision = envelope.evaluate(row.rules, reading, lane=cfg.name)
+        warning = None
         if decision.level == "refuse":
             if override:
                 self._envelope_record(
@@ -1580,16 +1588,16 @@ class Agent:
                     override_reason=override,
                 )
             else:
-                return decision
+                return decision, None
         elif decision.level == "warn":
-            run.warning = decision.reason
+            warning = decision.reason
             self._envelope_record("envelope_warning", run, decision)
         elif decision.level == "unknown":
             self._envelope_record(
                 "envelope_no_reading", run, decision,
                 missing=envelope.missing_keys(row.rules, reading),
             )
-        return None
+        return None, warning
 
     def _hop(self, run: Run, hop: router.Hop) -> None:
         if hop.message:
@@ -1616,7 +1624,10 @@ class Agent:
         primary_model = self.model
         last_refusal: str | None = None
         harness_status = (
-            self.lane_status.snapshot(self.settings) if self.lane_status is not None else {}
+            self.lane_status.snapshot(
+                self.settings,
+                count_runs=self.settings.envelope_lane_plan is not None,
+            ) if self.lane_status is not None else {}
         )
         envelope_rows = self._envelope_plan(run)
         override = self.delegate_options.get("override_envelope")
@@ -1688,8 +1699,9 @@ class Agent:
                     hop.message = warm.message
                     self._hop(run, hop)
                     continue
+            warning: str | None = None
             if envelope_rows is not None:
-                decision = self._check_envelope(
+                decision, warning = self._check_envelope(
                     run, cfg, envelope_rows, harness_status, override
                 )
                 if decision is not None:
@@ -1717,6 +1729,11 @@ class Agent:
                     last_refusal = hop.message
                     continue
 
+            # Attach a warn only now that this hop is known to be used. A
+            # warning from a lane that admission then skipped must not linger
+            # on the run.
+            if warning:
+                run.warning = warning
             self.cfg = cfg
             self.driver = driver
             self.model = model
@@ -1776,10 +1793,14 @@ class Agent:
         run.error = f"no provider took the run: {tried}"
         run.error_detail = last_refusal
         # "refused" only when every provider said no itself. A hop skipped by
-        # an admission threshold is this machine's decision, not a refusal by
-        # the backend, and leaves the run a plain no_lane.
-        refused = [h for h in run.hops if h["outcome"] == router.HOP_REFUSED
-                   and h.get("code") != router.ADMISSION]
+        # an admission threshold or a usage envelope is this machine's
+        # decision, not a refusal by the backend, and leaves the run a plain
+        # no_lane.
+        refused = [
+            h for h in run.hops
+            if h["outcome"] == router.HOP_REFUSED
+            and h.get("code") not in (router.ADMISSION, router.ENVELOPE)
+        ]
         run.finish_reason = "refused" if refused and len(refused) == len(run.hops) else "no_lane"
         return False
 

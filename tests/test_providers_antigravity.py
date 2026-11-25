@@ -73,9 +73,12 @@ def test_argv_uses_config_model_and_resumes_conversation(tmp_path: Path):
     assert "--sandbox" in argv and "--dangerously-skip-permissions" in argv
 
 
-def test_guard_is_none_and_stays_sandboxed(tmp_path: Path):
+def test_guard_is_sandbox_on_macos_and_agy_keeps_inner_sandbox(tmp_path: Path, monkeypatch):
     settings = make_settings(tmp_path)
     cfg = _cfg()
+    monkeypatch.setattr(agy_driver.sys, "platform", "darwin")
+    assert agy_driver.ANTIGRAVITY_PROVIDER.guard(settings, cfg) == "sandbox"
+    monkeypatch.setattr(agy_driver.sys, "platform", "linux")
     assert agy_driver.ANTIGRAVITY_PROVIDER.guard(settings, cfg) == "none"
     argv = agy_driver.ANTIGRAVITY_PROVIDER.argv(
         cfg, settings, "a1", "task", _workspace(tmp_path), Session(provider="gemini"), None

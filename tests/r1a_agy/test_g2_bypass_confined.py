@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -49,9 +50,18 @@ def test_g2_real_profile_confines_a_bypassing_child(tmp_path: Path, monkeypatch)
         "p = socket.socket(); p.settimeout(2); p.connect(('127.0.0.1', proxy_port)); p.close()\n"
         "sys.exit(0)\n"
     )
-    proc = subprocess.run(
-        [SEATBELT, "-p", profile, sys.executable, "-c", probe],
-        capture_output=True, text=True, timeout=15, cwd=ws,
-    )
+    # The agent's proxy stopped with the registry; a stand-in listener on its port
+    # shows the profile still lets the child reach it.
+    stand_in = socket.socket()
+    stand_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    stand_in.bind(("127.0.0.1", proxy_port))
+    stand_in.listen(1)
+    try:
+        proc = subprocess.run(
+            [SEATBELT, "-p", profile, sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=15, cwd=ws,
+        )
+    finally:
+        stand_in.close()
     assert proc.returncode == 0, f"rc={proc.returncode} stderr={proc.stderr!r}"
     assert (ws / "inside.txt").exists() and not outside.exists()

@@ -171,7 +171,7 @@ def test_smoke_main_accepts_config_only_provider_name(tmp_path, monkeypatch, cap
     assert ".ssh" not in seen["task"]
     output = capsys.readouterr().out
     assert "model=gemini-test effort=high" in output
-    assert "guard: none (deny check skipped)" in output
+    assert "guard: sandbox (no hook; deny check skipped)" in output
 
 
 def test_smoke_main_uses_config_default_provider(tmp_path, monkeypatch):

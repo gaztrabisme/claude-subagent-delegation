@@ -128,9 +128,28 @@ def test_r2_5_unreadable_record_fails_open_with_one_unavailable_record(
     assert run.state == COMPLETED and "all done" in f"{run.result_text}{run.final_response}"
 
 
-@pytest.mark.parametrize("audit", [None, False])
+def test_r2_6_audit_unset_is_on(tmp_path, monkeypatch) -> None:
+    """R2.6 (S56): with bypass_audit unset the audit runs: the record is read and bypasses recorded."""
+    _db(tmp_path)
+    opened: list[str] = []
+    real_connect = sqlite3.connect
+
+    def connect(target, *a, **kw):
+        opened.append(str(target))
+        return real_connect(target, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    _, run, trace_path, _ = run_with_state(tmp_path, monkeypatch, audit=None)
+    assert any(f"{CONV}.db" in p and "mode=ro" in p for p in opened), opened
+    records = trace_of(trace_path, "sandbox_bypass")
+    assert sorted(r["command"] for r in records) == sorted([CMD_A, CMD_B]), records
+    assert all(r["source"] == "conversation_record" for r in records)
+    assert run.state == COMPLETED
+
+
+@pytest.mark.parametrize("audit", [False])
 def test_r2_6_audit_off_opens_nothing(tmp_path, monkeypatch, audit) -> None:
-    """R2.6: with bypass_audit unset or false, the conversation record is never opened and nothing is recorded."""
+    """R2.6: with bypass_audit = false, the conversation record is never opened and nothing is recorded."""
     db = _db(tmp_path)
     db.chmod(0)  # a read attempt would raise and be recorded as unavailable
     state = str(state_dir_for(tmp_path))

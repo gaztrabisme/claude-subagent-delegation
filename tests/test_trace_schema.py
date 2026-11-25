@@ -75,6 +75,11 @@ OPTIONAL: dict[str, set[str]] = {
     "delegation": {"stopped_because", "test_writer", "uat"},
 }
 
+# R1a-agy G3 and addendum R2: additive record types, schema version unchanged.
+REQUIRED["sandbox_bypass"] = {"agent_id", "run_id", "provider", "tool", "command", "type"}
+REQUIRED["bypass_audit_unavailable"] = {"agent_id", "run_id", "provider", "reason", "type"}
+OPTIONAL["sandbox_bypass"] = {"source"}
+
 UAT_KEYS = {"row", "label", "kind", "command", "passed", "output_tail"}
 
 

@@ -341,6 +341,19 @@ def _provider_rows(run_rows: list[dict[str, Any]],
     return out
 
 
+def _round_tests(value: Any) -> int:
+    """A round's test count: the int itself, or a dict's ``counts.total``; else 0."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, Mapping):
+        counts = value.get("counts")
+        if isinstance(counts, Mapping):
+            total = counts.get("total")
+            if isinstance(total, int) and not isinstance(total, bool):
+                return total
+    return 0
+
+
 def _delegation_row(d: Mapping[str, Any], provider_usd: float | None,
                     aliases: Mapping[str, str] | None = None) -> dict[str, Any]:
     rounds = [r for r in (d.get("rounds") or []) if isinstance(r, dict)]
@@ -369,7 +382,7 @@ def _delegation_row(d: Mapping[str, Any], provider_usd: float | None,
         "status": d.get("status"),
         "rounds": len(rounds),
         "reviews": len(reviews),
-        "tests": sum(int(r.get("tests") or 0) for r in rounds),
+        "tests": sum(_round_tests(r.get("tests")) for r in rounds),
         "tokens": tokens,
         "provider_usd": provider_usd,
         "counterfactual_usd": _num(cost_total.get("counterfactual_usd")),

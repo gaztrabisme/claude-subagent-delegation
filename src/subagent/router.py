@@ -104,6 +104,10 @@ def skip_unverified_harness(harness_state: str | None, *, explicit: bool = False
 # closure: the next dispatch probes the lane again.
 ADMISSION = "admission"
 
+# Refusal code of a hop refused by the lane's usage envelope. Also not a lane
+# closure: the envelope is re-read on the next dispatch.
+ENVELOPE = "envelope"
+
 # An empty DeepSeek balance: its message, or HTTP 402 as a status (not any
 # "402" in the text, such as "timed out after 402 s").
 _BALANCE_RE = re.compile(

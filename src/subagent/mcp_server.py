@@ -265,6 +265,7 @@ async def delegate(
     fallback: str | None = None,
     goal: str | None = None,
     request_id: str | None = None,
+    override_envelope: str | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Start a new subagent on a task.
@@ -303,7 +304,18 @@ async def delegate(
         request_id: Optional caller key for providers supporting run context.
             Identical retries return the original run; conflicting work raises.
             Epi waits up to five seconds for admission even with wait_seconds=0.
+        override_envelope: Optional non-empty reason to let a run proceed on a
+            lane whose usage envelope would refuse it. The override and the
+            decision are recorded in the trace; the worker never sees it.
     """
+    if override_envelope is not None and not override_envelope.strip():
+        return {
+            "state": "rejected",
+            "error": "override_envelope requires a non-empty reason",
+            "lane": provider or lane or settings.default_provider,
+            "provider": provider or lane or settings.default_provider,
+            "fallback": fallback or "full",
+        }
     wanted = provider or lane
     deprecated = provider is None and lane is not None
     try:
@@ -356,7 +368,8 @@ async def delegate(
     caller_key = request_id if capabilities(for_driver(chosen.driver)).run_context else None
     arguments = {"tool": "delegate", "task": task, "verification": verification,
                  "workspace": str(resolved), "instructions": instructions, "model": model,
-                 "name": name, "fallback": fallback or "full", "goal": goal}
+                 "name": name, "fallback": fallback or "full", "goal": goal,
+                 "override_envelope": override_envelope}
     agent = None
 
     def submit():
@@ -366,6 +379,7 @@ async def delegate(
             fallback=fallback, goal=parsed_goal, goal_reviewer=goal_review,
             task=task, instructions=instructions,
             provider_explicit=wanted is not None,
+            override_envelope=override_envelope,
         )
         start_error = agent.wait_ready(60.0)
         if start_error is not None:
@@ -519,7 +533,10 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
         if not agent.closed:
             live_by_lane[agent.cfg.name] = live_by_lane.get(agent.cfg.name, 0) + 1
     statuses = await anyio.to_thread.run_sync(
-        partial(registry.lane_status.snapshot, settings, live_by_lane=live_by_lane)
+        partial(
+            registry.lane_status.snapshot, settings, live_by_lane=live_by_lane,
+            count_runs=settings.envelope_lane_plan is not None,
+        )
     )
     for cfg in settings.providers.values():
         view = cfg.as_dict()

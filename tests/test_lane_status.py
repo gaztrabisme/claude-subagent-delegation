@@ -573,6 +573,8 @@ def test_spend_sums_current_month_trace_and_keeps_unpriced_null(tmp_path: Path) 
         },
     }
     trace_path = tmp_path / "sessions" / "trace.jsonl"
+    # The fixture's session root is no longer tmp_path/sessions (R1a round 4).
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
     settings = make_settings(tmp_path, providers=providers, trace=str(trace_path))
 
     oct_ts = datetime(2026, 10, 15, 12, 0, tzinfo=UTC).timestamp()

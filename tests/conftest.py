@@ -240,12 +240,12 @@ def _approval_socket_base(tmp_path_factory):
     _SOCKET_BASE.clear()
 
 
-def _approval_socket_dir() -> Path:
-    """A fresh private directory for one Settings' approval socket."""
+def _approval_socket_dir(prefix: str = "s") -> Path:
+    """A fresh private directory for one Settings' approval socket or session root."""
     import tempfile
 
     base = _SOCKET_BASE[0] if _SOCKET_BASE else None
-    return Path(tempfile.mkdtemp(prefix="s", dir=base))
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=base))
 
 
 def make_settings(tmp_path: Path, providers: dict[str, Any] | None = None,
@@ -259,7 +259,10 @@ def make_settings(tmp_path: Path, providers: dict[str, Any] | None = None,
     tables = default_providers() if providers is None else providers
     core: dict[str, Any] = {
         "workspace": str(tmp_path),
-        "session_root": str(tmp_path / "sessions"),
+        # Outside every test's tmp_path too: a workspace that contains the
+        # session root is refused (R1a round 4), and tests delegate into
+        # tmp_path or one of its subdirectories.
+        "session_root": str(_approval_socket_dir("r") / "sessions"),
         "default_provider": "glm" if "glm" in tables else next(iter(tables), ""),
         "loop_strikes": 3,
         "trace": "off",

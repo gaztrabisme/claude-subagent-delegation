@@ -115,9 +115,10 @@ def test_a10_1_sandbox_network_loopback_ports_and_external_deny() -> None:
             capture_output=True,
             timeout=5,
         ).returncode == 0
-        if can_nest:
-            proc = subprocess.run(wrapped, capture_output=True, text=True, timeout=10)
-            assert proc.returncode == 0, f"rc={proc.returncode} stderr={proc.stderr!r}"
+        if not can_nest:
+            pytest.skip("Seatbelt cannot nest in this runner; the live A10.1 probe did not run")
+        proc = subprocess.run(wrapped, capture_output=True, text=True, timeout=10)
+        assert proc.returncode == 0, f"rc={proc.returncode} stderr={proc.stderr!r}"
     finally:
         srv_allowed.shutdown()
         srv_allowed.server_close()
@@ -275,6 +276,7 @@ def test_a10_3_e2e_fake_claude_refused_connect_writes_egress_refused_trace(
         timeout=5,
     ).returncode == 0
     if not can_nest:
+        # The egress_refused chain below still runs: only the profile is removed.
         real_agent_spawn = Agent._spawn
 
         def strip_nested_sandbox(self, run, prompt, resume):
@@ -346,6 +348,11 @@ def test_a10_3_e2e_fake_claude_refused_connect_writes_egress_refused_trace(
     assert rec["host"] == "unlisted.example"
     assert rec["port"] == 8443
     assert isinstance(rec["ts"], (int, float))
+    if not can_nest:
+        pytest.skip(
+            "Seatbelt cannot nest in this runner: the run-to-trace chain above was asserted "
+            "without the A9/A10 profile; enforcement of the profile itself was not exercised"
+        )
 
 
 def test_a10_4_proxy_starts_on_first_spawn_and_stops_on_close(tmp_path: Path, monkeypatch) -> None:

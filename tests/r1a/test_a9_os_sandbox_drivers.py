@@ -175,7 +175,7 @@ def test_a9_3_real_seatbelt_blocks_cross_agent_read_and_outside_write(
         timeout=5,
     ).returncode == 0
     if not can_nest:
-        return
+        pytest.skip("Seatbelt cannot nest in this runner; the live A9.3 probe did not run")
 
     probe = (
         "import pathlib, sys\n"

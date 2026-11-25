@@ -185,7 +185,8 @@ def test_a12_dsh_cordis_tamper_denies_remaining_requests_and_traces_guard_tamper
         assert str(trec["path"]).endswith("cordis.yml")
         assert isinstance(trec["ts"], (int, float))
 
-        # Next launch rewrites cordis.yml cleanly and allows normal requests again.
+        # Next launch rewrites cordis.yml cleanly, but the agent that was
+        # tampered with stays denied for its whole life (R1a round 4, fix 6).
         sync2 = ws / ".a12-sync2"
         sync2.mkdir()
         monkeypatch.setenv("A12_SYNC_DIR", str(sync2))
@@ -197,7 +198,13 @@ def test_a12_dsh_cordis_tamper_denies_remaining_requests_and_traces_guard_tamper
         (sync2 / "step1_done").write_text("1", encoding="utf-8")
         assert run2.done.wait(timeout=15)
         assert run2.state == COMPLETED, run2.error
-        assert r_next["action"] == ALLOW, f"fresh launch should reset cordis.yml and allow: {r_next}"
+        assert r_next["action"] == DENY, f"a tampered agent must stay denied after relaunch: {r_next}"
+        records = [
+            json.loads(ln)
+            for ln in trace_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        assert len([r for r in records if r.get("type") == "guard_tamper"]) == 1
     finally:
         for s in (sync1,):
             for name in ("step1_done", "step2_done", "step3_done"):

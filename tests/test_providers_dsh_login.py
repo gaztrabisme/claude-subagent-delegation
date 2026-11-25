@@ -720,7 +720,7 @@ def test_login_run_keeps_owner_dsh_home_isolated_and_untouched(
     calls = fake_dsh.calls()
     assert len(calls) == 1
     child_dsh_home = Path(calls[0]["env"]["DSH_HOME"]).resolve()
-    assert child_dsh_home.is_relative_to((tmp_path / "sessions").resolve())
+    assert child_dsh_home.is_relative_to(reg.settings.session_root.resolve())
     assert child_dsh_home != owner_home.resolve()
     assert cred_file.read_text(encoding="utf-8") == orig_cred
     assert storage_file.read_text(encoding="utf-8") == orig_storage

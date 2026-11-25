@@ -927,6 +927,8 @@ def test_review_8_list_does_not_block_event_loop_on_snapshot(
 
 def test_review_8_spend_cached_and_invalidated_on_growth(tmp_path: Path) -> None:
     trace_path = tmp_path / "sessions" / "trace.jsonl"
+    # The fixture's session root is no longer tmp_path/sessions (R1a round 4).
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
     providers = {
         "deepseek": {
             "driver": "claude",
@@ -1210,6 +1212,8 @@ def test_review_10_cli_lanes_respects_root_and_project_config(
 
 def test_review_11_month_spend_flat_plan_not_zero(tmp_path: Path) -> None:
     trace_path = tmp_path / "sessions" / "trace.jsonl"
+    # The fixture's session root is no longer tmp_path/sessions (R1a round 4).
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
     providers = {
         "flat_lane": {
             "driver": "claude",
@@ -1236,6 +1240,8 @@ def test_review_11_month_spend_flat_plan_not_zero(tmp_path: Path) -> None:
 
 def test_review_11_month_spend_reads_native_usage_cash_usd(tmp_path: Path) -> None:
     trace_path = tmp_path / "sessions" / "trace.jsonl"
+    # The fixture's session root is no longer tmp_path/sessions (R1a round 4).
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
     providers = {
         "native_lane": {
             "driver": "claude",

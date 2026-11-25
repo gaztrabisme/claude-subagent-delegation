@@ -255,13 +255,18 @@ def test_codex_merged_deny_read_uses_outer_write_allow_without_nested_sandbox(
         # A9.1: the agent's own temp directory, never /private/tmp or the
         # server's TMPDIR.
         assert Path(process.env["TMPDIR"]).resolve() == (agent_dir / "tmp").resolve()
+        # R1a round 4: a per-agent cache (the child's XDG_CACHE_HOME) instead
+        # of the user's shared cache, and only the standard devices, not /dev.
+        assert Path(process.env["XDG_CACHE_HOME"]).resolve() == (agent_dir / "cache").resolve()
         allowed = [workspace.resolve(), (agent_dir / "tmp").resolve(), home,
-                   Path("/dev"), cache]
+                   (agent_dir / "cache").resolve()]
         assert rules[3] == '(allow file-write* ' + " ".join(
             f'(subpath "{path}")' for path in allowed
         ) + ')'
         assert '(subpath "/private/tmp")' not in rules[3]
         assert f'(subpath "{temp.resolve()}")' not in rules[3]
+        assert '(subpath "/dev")' not in argv[2]
+        assert f'(subpath "{cache}")' not in argv[2]
         assert (f'(deny file-read* (subpath "{provider_path}"))' in rules) == configured
         assert (f'(deny file-read* (subpath "{call_path}"))' in rules) == per_call
 
@@ -347,13 +352,16 @@ def test_codex_deny_read_allows_only_real_user_temp_and_cache_roots(codex_sandbo
     process = spawn()
     rules = process.argv[2].splitlines()
     # R1a A9.1: the write roots are the agent's own temp directory (its child
-    # TMPDIR) and the real user cache, not the server's TMPDIR or /private/tmp.
+    # TMPDIR) and, since round 4, its own cache (XDG_CACHE_HOME), not the
+    # server's TMPDIR, /private/tmp, the user's shared cache or all of /dev.
     agent_tmp = Path(process.env["TMPDIR"]).resolve()
+    agent_cache = Path(process.env["XDG_CACHE_HOME"]).resolve()
     assert agent_tmp.name == "tmp" and agent_tmp.parent.name == "a1"
-    for path in (agent_tmp, cache, Path("/dev")):
+    assert agent_cache.name == "cache" and agent_cache.parent.name == "a1"
+    for path in (agent_tmp, agent_cache):
         assert f'(subpath "{path}")' in rules[3]
-    for path in (temp, temp_alias, cache_alias, Path("/private/tmp"),
-                 Path("/private/var/folders")):
+    for path in (temp, temp_alias, cache, cache_alias, Path("/private/tmp"),
+                 Path("/private/var/folders"), Path("/dev")):
         assert f'(subpath "{path}")' not in rules[3]
 
 

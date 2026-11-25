@@ -201,7 +201,7 @@ def evaluate(
                    ", ".join(f"{h.get('lane')} {h.get('outcome')}" for h in run.get("hops") or [])
                    or "no hops"))
 
-    if guard == "none":
+    if _hookless(guard):
         completed = run.get("state") == "completed"
         checks.append(("run completed", completed, str(run.get("state"))))
     else:
@@ -295,8 +295,13 @@ def _sampling_upstream(provider: str, cfg: Any) -> str | None:
     return OMLX_UPSTREAM
 
 
+def _hookless(guard: str) -> bool:
+    """No pre-tool hook ("none", or a sandbox-only label such as antigravity's)."""
+    return "hook" not in guard
+
+
 def _task_for_guard(guard: str) -> str:
-    return UNGUARDED_TASK if guard == "none" else TASK
+    return UNGUARDED_TASK if _hookless(guard) else TASK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -355,8 +360,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"provider: {cfg.name} driver={cfg.driver} model={cfg.model} "
               f"effort={cfg.effort} base_url={cfg.base_url}")
         guard = for_driver(cfg.driver).guard(server.settings, cfg)
-        if guard == "none":
-            print("guard: none (deny check skipped)")
+        if _hookless(guard):
+            print(f"guard: {guard} (no hook; deny check skipped)")
         run = server.delegate(provider=provider, task=_task_for_guard(guard),
                               verification=VERIFICATION,
                               workspace=workspace, fallback="none", name=f"smoke-{provider}")

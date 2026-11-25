@@ -51,7 +51,8 @@ SCHEMA = 3
 
 KINDS = (
     "run", "hop", "turn", "sample", "run_summary", "verdict", "calibration",
-    "delegation", "egress_refused", "guard_tamper",
+    "delegation", "egress_refused", "guard_tamper", "sandbox_bypass",
+    "bypass_audit_unavailable",
 )
 
 
@@ -119,6 +120,23 @@ class Trace:
         """Append the additive DSH bootstrap tamper record."""
         self.write("guard_tamper", type="guard_tamper", agent_id=agent_id,
                    run_id=run_id, path=path)
+
+    def sandbox_bypass(
+        self, *, agent_id: str, run_id: str, provider: str, tool: str, command: str,
+        source: str | None = None,
+    ) -> None:
+        """Append the additive record for a tool step that asked to leave agy's sandbox."""
+        extra = {"source": source} if source is not None else {}
+        self.write("sandbox_bypass", type="sandbox_bypass", agent_id=agent_id,
+                   run_id=run_id, provider=provider, tool=tool, command=command[:500],
+                   **extra)
+
+    def bypass_audit_unavailable(
+        self, *, agent_id: str, run_id: str, provider: str, reason: str,
+    ) -> None:
+        """Append the additive record for a bypass audit that could not read its record."""
+        self.write("bypass_audit_unavailable", type="bypass_audit_unavailable",
+                   agent_id=agent_id, run_id=run_id, provider=provider, reason=reason[:500])
 
     def verdict(
         self,

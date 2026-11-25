@@ -359,6 +359,12 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         host = parsed_base.hostname
         network_allow.append(f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
     row["network_allow"] = list(dict.fromkeys(network_allow))
+    if cfg.driver == "antigravity":
+        # agy has no hook; say what actually confines it (R1a-agy G4).
+        from .providers.antigravity import ANTIGRAVITY_PROVIDER
+
+        row["guard"] = ANTIGRAVITY_PROVIDER.guard(settings, cfg)
+        row["boundary"] = ANTIGRAVITY_PROVIDER.boundary()
     warning = _thinking_warning(cfg)
     if not cfg.local and not network_allow:
         # Its own field, so it never displaces or reorders the existing

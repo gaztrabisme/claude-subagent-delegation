@@ -6,8 +6,12 @@ across a resumed conversation, so the translator stores the last totals on the
 session and reports only each turn's token delta.
 
 The CLI's pre-tool hook configuration could not be established from its
-settings, plugin help, or installed binary. Turns therefore stay sandboxed and
-the driver remains behind the `experimental = true` opt-in.
+settings, plugin help, or installed binary. On macOS the server therefore wraps
+every agy turn in its own Seatbelt profile (the same path as the hook drivers,
+in `Agent._spawn`); agy's `--sandbox` stays on as an inner layer only, because a
+tool call with `BypassSandbox: true` leaves it. Off macOS the driver refuses to
+start. A tool step that asks for `BypassSandbox` ends the run (see
+`Translator._bypass`). The driver remains behind the `experimental = true` opt-in.
 """
 
 from __future__ import annotations
@@ -15,18 +19,107 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 from ..config import Settings
 from ..router import Refusal, clip
 from .base import DRIVER_ANTIGRAVITY, Process, ProviderConfig, Session
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from pathlib import Path
-
-GUARD = "none"
+# The server's outer Seatbelt profile is the boundary; agy's own --sandbox is
+# not one on its own (a tool step may ask for BypassSandbox).
+GUARD = "sandbox"
+GUARD_UNSANDBOXED = "none"
+BOUNDARY = "server profile (sandbox-exec)"
 DEFAULT_BINARY = "agy"
+FINISH_SANDBOX_BYPASS = "sandbox_bypass"
+BYPASS_KEY = "bypasssandbox"
+COMMAND_CLIP = 500
+OFF_MACOS = (
+    "antigravity driver runs only under the server's macOS sandbox-exec profile; "
+    "agy's own --sandbox is not a boundary on its own, so it refuses to start here"
+)
+# Owner homes agy has a reason to read: its own login and state.
+_AGY_HOMES = (".gemini",)
+# Not denied although the classifier protects it: the login Keychain is read
+# through the Security framework, and agy may keep its sign-in there. Items stay
+# guarded by their own Keychain access control lists.
+_READ_DENY_EXEMPT = ("Library/Keychains",)
+
+
+def runtime_state_dir() -> Path:
+    """agy's own runtime state (conversations, CLI settings, logs)."""
+    return Path.home() / ".gemini" / "antigravity-cli"
+
+
+def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                        cwd: Path) -> list[str]:
+    """Workspace, this agent's server state and temp directory, and agy's runtime state."""
+    agent_root = settings.session_root / "agents" / agent_id
+    roots = [
+        str(cwd),  # Project files are the worker's deliverable.
+        str(agent_root),  # Own server-side state for this agent.
+        str(agent_root / "tmp"),  # The child's TMPDIR (set in Agent._spawn).
+        str(runtime_state_dir()),  # agy writes its conversation store and CLI state here.
+    ]
+    return list(dict.fromkeys(roots))
+
+
+def sandbox_read_deny(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                      cwd: Path) -> list[str]:
+    """Owner credential homes the classifier protects, except the ones agy needs.
+
+    The list is the guard classifier's (`SENSITIVE_HOME` plus every provider home
+    in `PROVIDER_HOMES`), so a home added there is denied here too. A home that
+    contains the workspace, the session root or a write root is left out: denying
+    it would deny the run's own files.
+    """
+    from ..guard.classify import PROVIDER_HOMES, SENSITIVE_HOME
+
+    home = Path.home()
+    entries = dict.fromkeys(
+        [*SENSITIVE_HOME, *(rel for homes in PROVIDER_HOMES.values() for rel in homes)]
+    )
+    keep = [
+        Path(p).expanduser().resolve()
+        for p in (cwd, settings.session_root,
+                  *sandbox_write_roots(settings, agent_id, cfg, cwd))
+    ]
+    denied: list[str] = []
+    for rel in entries:
+        if rel in _AGY_HOMES or rel in _READ_DENY_EXEMPT:
+            continue
+        path = (home / rel).resolve()
+        if any(own == path or own.is_relative_to(path) for own in keep):
+            continue
+        denied.append(str(home / rel))
+    return denied
+
+
+def _bypass_requested(params: Any) -> bool:
+    """BypassSandbox true: boolean True, or the string "true" in any case."""
+    if not isinstance(params, dict):
+        return False
+    for key, value in params.items():
+        if isinstance(key, str) and key.lower() == BYPASS_KEY:
+            if value is True:
+                return True
+            if isinstance(value, str) and value.strip().lower() == "true":
+                return True
+    return False
+
+
+def _bypass_command(params: dict[str, Any]) -> str:
+    for key in ("CommandLine", "Command", "command"):
+        value = params.get(key)
+        if isinstance(value, str):
+            return value[:COMMAND_CLIP]
+    try:
+        return json.dumps(params, ensure_ascii=False, default=str)[:COMMAND_CLIP]
+    except (TypeError, ValueError):
+        return ""
 
 
 def _int(value: Any) -> int:
@@ -66,8 +159,13 @@ class Translator:
         self.turn_count = 1
         self.pending_usage_cumulative: dict[str, int] | None = None
         self.pending_num_turns = 0
+        # Set by the first step that asks to leave agy's sandbox; from then on
+        # nothing more is translated as work.
+        self.bypass: dict[str, str] | None = None
 
     def feed(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.bypass is not None:
+            return []
         kind = event.get("event")
         if kind == "init":
             conversation_id = event.get("conversation_id")
@@ -99,7 +197,40 @@ class Translator:
                 self.errors.append(str(message))
         return []
 
+    def _bypass(self, step: dict[str, Any]) -> bool:
+        """Flag a step (any type or state) whose tool parameters ask for BypassSandbox."""
+        info = step.get("tool_info") if isinstance(step.get("tool_info"), dict) else {}
+        params = info.get("parameters")
+        if not _bypass_requested(params):
+            return False
+        name = step.get("tool_name") or info.get("name") or "unknown"
+        self.bypass = {"tool": str(name), "command": _bypass_command(params)}
+        self.terminal = True
+        return True
+
+    def bypass_result(self) -> dict[str, Any]:
+        """The terminal event for a run ended because a step asked to bypass the sandbox."""
+        assert self.bypass is not None
+        message = (
+            f"sandbox bypass: agy tool step {self.bypass['tool']!r} asked for "
+            "BypassSandbox; the server ended the run and killed the agy process tree"
+        )
+        return {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "result": message,
+            "error": message,
+            "error_kind": FINISH_SANDBOX_BYPASS,
+            "sandbox_bypass": dict(self.bypass),
+            "usage": {"input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0},
+            "num_turns": 1,
+            "session_id": self.conversation_id,
+        }
+
     def _step(self, step: dict[str, Any]) -> list[dict[str, Any]]:
+        if self._bypass(step):
+            return []
         step_type = step.get("step_type")
         if step_type == "agent_response":
             text = step.get("text_delta")
@@ -261,6 +392,13 @@ class AntigravityProcess(Process):
                         terminal = translated
                     else:
                         yield translated
+                if self.translator.bypass is not None:
+                    break
+            if self.translator.bypass is not None:
+                # Detection is after the fact: end the turn and the whole tree now.
+                self.kill()
+                yield self.translator.bypass_result()
+                return
             code = proc.wait()
             stderr_thread.join(timeout=5)
             if terminal is not None:
@@ -289,8 +427,16 @@ class AntigravityProvider:
     experimental = True
 
     def guard(self, settings: Settings, cfg: ProviderConfig | None = None) -> str:
-        """The hook protocol is not known; this driver relies on agy's sandbox."""
-        return GUARD
+        """The hook protocol is not known; the server's Seatbelt profile is the boundary."""
+        return GUARD if sys.platform == "darwin" else GUARD_UNSANDBOXED
+
+    def boundary(self) -> str:
+        """What confines the child, for `doctor`."""
+        return BOUNDARY if sys.platform == "darwin" else "none (refuses to start off macOS)"
+
+    def sandbox_write_roots(self, settings: Settings, agent_id: str, cfg: ProviderConfig,
+                            cwd: Path) -> list[str]:
+        return sandbox_write_roots(settings, agent_id, cfg, cwd)
 
     def binary(self, cfg: ProviderConfig) -> str:
         return cfg.binary or DEFAULT_BINARY
@@ -299,6 +445,8 @@ class AntigravityProvider:
         self, settings: Settings, agent_id: str, cfg: ProviderConfig
     ) -> tuple[str | None, Session]:
         session = Session(provider=cfg.name)
+        if sys.platform != "darwin":
+            return OFF_MACOS, session
         if not cfg.experimental:
             return (
                 "antigravity driver has no installed approval hook; set "
@@ -361,9 +509,16 @@ class AntigravityProvider:
         session: Session,
         model: str | None,
     ) -> AntigravityProcess:
+        if sys.platform != "darwin":
+            raise RuntimeError(OFF_MACOS)
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session, model)
-        return _spawn_antigravity(argv, env, str(cwd), session)
+        process = _spawn_antigravity(argv, env, str(cwd), session)
+        # Read by Agent._spawn when it builds the outer profile (G1.3). Its own
+        # agent directory and the standard devices (/dev/null) are writable
+        # through sandbox.agent_profile_kwargs.
+        process.sandbox_read_deny = sandbox_read_deny(settings, agent_id, cfg, cwd)
+        return process
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:
         """Recognize only CLI-reported quota, authentication and model failures."""
@@ -371,6 +526,8 @@ class AntigravityProvider:
         for event in events:
             if not isinstance(event, dict) or event.get("type") != "result":
                 continue
+            if event.get("error_kind") == FINISH_SANDBOX_BYPASS:
+                return None  # The server ended it; not a lane failure to route around.
             if isinstance(event.get("error"), str):
                 errors.append(event["error"])
             if event.get("is_error") and isinstance(event.get("result"), str):
@@ -413,6 +570,9 @@ __all__ = [
     "ANTIGRAVITY_PROVIDER",
     "AntigravityProcess",
     "AntigravityProvider",
+    "FINISH_SANDBOX_BYPASS",
     "GUARD",
     "Translator",
+    "sandbox_read_deny",
+    "sandbox_write_roots",
 ]

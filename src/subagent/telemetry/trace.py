@@ -51,7 +51,7 @@ SCHEMA = 3
 
 KINDS = (
     "run", "hop", "turn", "sample", "run_summary", "verdict", "calibration",
-    "delegation", "egress_refused", "guard_tamper",
+    "delegation", "egress_refused", "guard_tamper", "sandbox_bypass",
 )
 
 
@@ -119,6 +119,13 @@ class Trace:
         """Append the additive DSH bootstrap tamper record."""
         self.write("guard_tamper", type="guard_tamper", agent_id=agent_id,
                    run_id=run_id, path=path)
+
+    def sandbox_bypass(
+        self, *, agent_id: str, run_id: str, provider: str, tool: str, command: str,
+    ) -> None:
+        """Append the additive record for a tool step that asked to leave agy's sandbox."""
+        self.write("sandbox_bypass", type="sandbox_bypass", agent_id=agent_id,
+                   run_id=run_id, provider=provider, tool=tool, command=command[:500])
 
     def verdict(
         self,

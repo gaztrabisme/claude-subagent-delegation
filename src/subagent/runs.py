@@ -44,6 +44,7 @@ from .guard.classify import _git_metadata_roots, protect, provider_guard_context
 from .lane_state import LaneState
 from .lane_status import LaneStatusStore, codex_usage
 from .providers.base import (
+    DRIVER_ANTIGRAVITY,
     DRIVER_CODEX,
     DRIVER_DSH,
     Process,
@@ -88,9 +89,11 @@ TERMINAL_STATES = frozenset({COMPLETED, COMPLETED_UNVERIFIED, FAILED, CANCELLED}
 
 # Drivers whose child runs the guard hook: each gets an egress proxy (A10) and,
 # on macOS, one Seatbelt profile (A9). codex and dsh build that profile in their
-# own spawn; the server wraps claude and omp here.
+# own spawn; the server wraps claude and omp here. antigravity has no hook: the
+# same server-built profile and proxy are its only boundary (R1a-agy G1).
 _HOOK_DRIVERS = frozenset({"claude", "codex", "omp", "dsh"})
-_SERVER_WRAPPED_DRIVERS = frozenset({"claude", "omp"})
+_PROFILE_DRIVERS = _HOOK_DRIVERS | {"antigravity"}
+_SERVER_WRAPPED_DRIVERS = frozenset({"claude", "omp", "antigravity"})
 
 PHASE_QUEUED = "queued"
 PHASE_RUNNING = "running"
@@ -131,6 +134,7 @@ Do not paraphrase an identifier or a path.
 - Preserve any question you could not answer, verbatim.
 - Do not continue the task, propose new work, or take any tool call. Summarize only.
 - Stay under {limit} characters."""
+
 
 
 class RegistryError(RuntimeError):
@@ -1375,8 +1379,14 @@ class Agent:
         """One turn's child process, on the current provider's driver."""
         paths = normalize_paths([*self.deny_read, *self.cfg.deny_read])
         check_platform(paths)
+        if self.cfg.driver == DRIVER_ANTIGRAVITY and sys.platform != "darwin":
+            # agy's own --sandbox is not a boundary; without the outer profile
+            # there is nothing to run it under (R1a-agy G1).
+            raise RuntimeError(
+                "antigravity driver runs only under the server's macOS sandbox-exec profile"
+            )
         self._egress_run_id = run.run_id
-        if self.cfg.driver in _HOOK_DRIVERS:
+        if self.cfg.driver in _PROFILE_DRIVERS:
             self._start_egress_proxy()
         session = self.session()
         session.session_id = resume
@@ -1416,7 +1426,8 @@ class Agent:
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
         # codex and dsh build their one profile themselves (they coordinate
-        # their inner sandbox mode with it); claude and omp are wrapped here.
+        # their inner sandbox mode with it); claude, omp and antigravity are
+        # wrapped here.
         if (sys.platform == "darwin" and self.cfg.driver in _SERVER_WRAPPED_DRIVERS
                 and isinstance(getattr(process, "argv", None), list)):
             driver_module = importlib.import_module(f".providers.{self.cfg.driver}", __package__)
@@ -1440,6 +1451,13 @@ class Agent:
                     ),
                     write_deny=write_deny,
                 )
+            if self.cfg.driver == DRIVER_ANTIGRAVITY:
+                # Owner credential homes agy has no use for (G1.3), read-denied.
+                profile["read_deny_subpaths"].extend(
+                    getattr(process, "sandbox_read_deny", ())
+                )
+                # agy has no approval hook, so it has no reason to reach the socket.
+                profile["network_unix_sockets"] = []
             process.argv = wrap_argv(process.argv, paths, **profile)
         elif paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
             process.argv = wrap_argv(
@@ -2135,6 +2153,13 @@ class Agent:
                 )
             text = str(event.get("result") or "")
             run.final_response = text
+            bypass = event.get("sandbox_bypass")
+            if (event.get("error_kind") == "sandbox_bypass" and isinstance(bypass, dict)
+                    and self.trace is not None):
+                self.trace.sandbox_bypass(
+                    agent_id=self.agent_id, run_id=run.run_id, provider=self.cfg.name,
+                    tool=str(bypass.get("tool") or ""), command=str(bypass.get("command") or ""),
+                )
             if event.get("is_error"):
                 run.state = FAILED
                 reported = str(event.get("error") or text or "claude reported an error")

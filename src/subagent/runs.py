@@ -13,6 +13,7 @@ import dataclasses
 import hashlib
 import itertools
 import json
+import math
 import os
 import secrets
 import stat
@@ -743,6 +744,9 @@ class Run:
     caps: dict[str, Any] | None = None
     # The limit this run overran, written to the trace as extra.overrun.
     overrun: dict[str, Any] | None = None
+    # The reaper ended this run on its deadline. Its trip must not make a
+    # later pass close the agent, and its deadline must not be re-end_run.
+    ended_by_end_run: bool = False
     # A no-progress stop: {"reads": [...], "steps": n}, visible in detail().
     no_progress: dict[str, Any] | None = None
     # Agent ids the registry released to make room for this run (S65).
@@ -1098,6 +1102,10 @@ class Agent:
         self._released_agents = []
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
+            # A release claim may land between the check above and this queue
+            # append. Re-check under the same lock the claim takes.
+            if self._closed or self._closing:
+                raise RegistryError(f"agent {self.agent_id} is closed")
             run.continues = len(self._order)
             self._runs[run.run_id] = run
             self._order.append(run.run_id)
@@ -1152,22 +1160,47 @@ class Agent:
             caps=caps,
         )
 
+    @staticmethod
+    def _step_limit_for(run: Run, cfg: ProviderConfig) -> int:
+        """This hop's --max-turns: the run's cap clamped to the hop's lane."""
+        if run.step_limit is None:
+            return cfg.max_steps
+        return min(run.step_limit, cfg.max_steps)
+
+    @staticmethod
+    def validate_caps(timeout: float | None, max_steps: int | None) -> None:
+        """Refuse non-positive and NaN caps before an agent is created.
+
+        A NaN cap compares false with every bound, so it would slip through
+        `min()` and reach the provider as a limit that never triggers. `inf`
+        is allowed: it clamps to the provider's own limit.
+        """
+        for name, value in (("timeout", timeout), ("max_steps", max_steps)):
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                raise RegistryError(f"{name} must be a number, got {value!r}") from None
+            if math.isnan(number):
+                raise RegistryError(f"{name} must be a finite number, got {value!r}")
+            too_small = number < 1 if name == "max_steps" else number <= 0
+            if too_small:
+                raise RegistryError(f"{name} must be positive, got {value!r}")
+
     def _run_caps(
         self, timeout: float | None, max_steps: int | None
     ) -> tuple[float | None, int | None, dict[str, Any] | None]:
         """Validate per-run caps and clamp them to this agent's provider limits."""
+        self.validate_caps(timeout, max_steps)
         caps: dict[str, Any] = {}
         time_limit: float | None = None
         step_limit: int | None = None
         if timeout is not None:
-            if timeout <= 0:
-                raise RegistryError(f"timeout must be positive, got {timeout!r}")
             time_limit = min(float(timeout), self.cfg.run_timeout)
             caps["timeout"] = {"requested": timeout, "effective": time_limit}
         if max_steps is not None:
-            if max_steps <= 0:
-                raise RegistryError(f"max_steps must be positive, got {max_steps!r}")
-            step_limit = min(int(max_steps), self.cfg.max_steps)
+            step_limit = int(min(float(max_steps), float(self.cfg.max_steps)))
             caps["max_steps"] = {"requested": max_steps, "effective": step_limit}
         return time_limit, step_limit, caps or None
 
@@ -1263,6 +1296,25 @@ class Agent:
             "runs": [r.summary() for r in self.runs()],
         }
 
+    def try_release(self) -> bool:
+        """Claim this agent for slot release, atomically against a new `submit`.
+
+        The caller must hold the registry lock while it decides; this re-check
+        under `_wake` is what makes that decision final: once `_closing` is set,
+        a `submit` that raced into the gap is refused instead of enqueued on an
+        agent that is about to be closed.
+        """
+        with self._wake:
+            if self._closed or self._closing:
+                return False
+            if self._queue or any(
+                run.state not in TERMINAL_STATES for run in self._runs.values()
+            ):
+                return False
+            self._closing = True
+            self._wake.notify_all()
+            return True
+
     def close(self, reason: str = "cancelled by caller", kind: str = KILL_CANCEL) -> None:
         with self._wake:
             if self._closed:
@@ -1300,6 +1352,10 @@ class Agent:
                 if not run.done.is_set():
                     self._finish(run)
 
+    # How long end_run waits for a service-job worker to finish after the kill
+    # before it finishes the run itself.
+    END_RUN_WAIT = 2.0
+
     def end_run(self, run: Run, reason: str, kind: str) -> None:
         """End one run on its deadline without closing the agent (R7a).
 
@@ -1308,6 +1364,9 @@ class Agent:
         """
         if run.done.is_set():
             return
+        # A later reaper pass must not read this run's trip as a reason to
+        # close the agent (the run is still WORKING while its worker drains).
+        run.ended_by_end_run = True
         if run.trip is None:
             run.trip = (kind, reason)
         with self._dispatch_lock:
@@ -1315,6 +1374,18 @@ class Agent:
             current = self._current
             if current is not None:
                 current.kill()
+        with self._wake:
+            self._wake.notify_all()
+        if not (capabilities(self.driver).cancel
+                or capabilities(self.driver).native_outcome):
+            # A plain child dies with the kill; its worker finishes the run
+            # once it has drained the stream.
+            return
+        # A service job can outlive the local kill (the cancel hook is remote).
+        # Give its worker a short bounded window; if it cannot finish, finish
+        # the run here as `close` does.
+        if not run.done.wait(self.END_RUN_WAIT):
+            self._finish(run)
 
     def _boot(self) -> None:
         try:
@@ -1489,9 +1560,10 @@ class Agent:
         # Codex must coordinate its inner sandbox mode with its outer profile.
         # Give it the frozen agent policy plus the current provider's exclusions.
         cfg = self.cfg
-        if run.step_limit is not None and run.step_limit != cfg.max_steps:
+        step_limit = self._step_limit_for(run, cfg)
+        if step_limit != cfg.max_steps:
             # A per-run step cap is Claude Code's --max-turns for this run only.
-            cfg = dataclasses.replace(cfg, max_steps=run.step_limit)
+            cfg = dataclasses.replace(cfg, max_steps=step_limit)
         spawn_cfg = (dataclasses.replace(cfg, deny_read=paths)
                      if cfg.driver in (DRIVER_CODEX, DRIVER_DSH) else cfg)
         process = self.driver.spawn(
@@ -1912,7 +1984,7 @@ class Agent:
                 run,
                 self.settings,
                 self.signatures,
-                run.step_limit if run.step_limit is not None else self.cfg.max_steps,
+                self._step_limit_for(run, self.cfg),
                 no_progress_steps=self.cfg.no_progress_steps,
                 no_progress_seconds=self.cfg.no_progress_seconds,
             )
@@ -2151,8 +2223,7 @@ class Agent:
             if isinstance(event.get("num_turns"), int):
                 run.usage.turns += event["num_turns"]
             if _hit_max_turns(event) and run.trip is None:
-                limit = (run.step_limit if run.step_limit is not None
-                         else self.cfg.max_steps)
+                limit = self._step_limit_for(run, self.cfg)
                 run.trip = (
                     KILL_STEPS,
                     f"reached --max-turns of {limit} ([core].max_steps) "
@@ -2301,6 +2372,11 @@ class Agent:
 
     def _finish_locked(self, run: Run) -> None:
         run.admission_ready.set()
+        if run.done.is_set() and self._kill_kind is None:
+            # end_run already gave this run its terminal state; the worker
+            # must not write a second trace record for it. A close sets
+            # `_kill_kind`, and its finish still repairs finish_reason/error.
+            return
         if run.cancel_pending:
             run.state = WORKING
             run.phase = "cancellation_pending"
@@ -2388,6 +2464,11 @@ class Registry:
         self._agents: dict[str, Agent] = {}
         self._archive: OrderedDict[str, Run] = OrderedDict()
         self._lock = threading.Lock()
+        # A close or end_run that has not returned after this many seconds is
+        # abandoned for the pass and remembered in `reap_stuck`; a later pass
+        # must not start another thread for that agent.
+        self.reap_close_timeout = 20
+        self.reap_stuck: set[str] = set()
         self._requests_lock = threading.RLock()
         self._requests: dict[tuple[str, ...], tuple[dict[str, Any], Run]] = {}
         self._counter = itertools.count(1)
@@ -2443,27 +2524,80 @@ class Registry:
     def reap_once(self) -> list[tuple[str, str]]:
         now = _now()
         acted: list[tuple[str, str]] = []
-        for agent in self.agents():
-            if agent.closed:
-                continue
-            active = [r for r in agent.runs() if r.state == WORKING and r.started_at]
-            tripped = next((r for r in active if r.trip), None)
-            overdue = next((r for r in active if r.timeout_expired(now)), None)
-            if tripped is not None and tripped.trip is not None:
-                kind, reason = tripped.trip
-                agent.close(reason, kind=kind)
-                acted.append((agent.agent_id, kind))
-            elif overdue is not None:
-                # A deadline is the run's, not the session's: an agent whose
-                # run timed out can still be resumed with `continue` (R7a).
-                agent.end_run(overdue, "run deadline exceeded", KILL_TIMEOUT)
-                acted.append((agent.agent_id, KILL_TIMEOUT))
-            elif not active and not agent.busy:
-                if now - agent.last_activity > agent.cfg.idle_timeout:
-                    agent.close("idle", kind=KILL_IDLE)
-                    acted.append((agent.agent_id, KILL_IDLE))
-        self._evict_closed()
+        try:
+            for agent in self.agents():
+                if agent.closed:
+                    self.reap_stuck.discard(agent.agent_id)
+                    continue
+                if agent.agent_id in self.reap_stuck:
+                    # An earlier close attempt has not returned; starting
+                    # another thread for it would only pile up more work.
+                    continue
+                try:
+                    action = self._reap_action(agent, now)
+                except Exception:  # noqa: BLE001 - one agent must not stop the pass
+                    log.warning("reap: inspecting agent %s failed", agent.agent_id,
+                                exc_info=True)
+                    continue
+                if action is None:
+                    continue
+                kind, work = action
+                if self._reap_bounded(agent, work):
+                    acted.append((agent.agent_id, kind))
+        finally:
+            self._evict_closed()
         return acted
+
+    @staticmethod
+    def _reap_action(
+        agent: Agent, now: float
+    ) -> tuple[str, Callable[[], None]] | None:
+        """The one action this pass takes for `agent`, if any."""
+        active = [run for run in agent.runs() if run.state == WORKING and run.started_at]
+        # A run `end_run` already ended on its deadline may still be WORKING
+        # while its worker drains. Its trip is not a reason to close the agent.
+        pending = [run for run in active if not run.ended_by_end_run]
+        tripped = next((run for run in pending if run.trip), None)
+        if tripped is not None and tripped.trip is not None:
+            kind, reason = tripped.trip
+            return kind, lambda: agent.close(reason, kind=kind)
+        overdue = next((run for run in pending if run.timeout_expired(now)), None)
+        if overdue is not None:
+            # A deadline is the run's, not the session's: an agent whose run
+            # timed out can still be resumed with `continue` (R7a).
+            return KILL_TIMEOUT, lambda: agent.end_run(
+                overdue, "run deadline exceeded", KILL_TIMEOUT
+            )
+        if (not active and not agent.busy
+                and now - agent.last_activity > agent.cfg.idle_timeout):
+            return KILL_IDLE, lambda: agent.close("idle", kind=KILL_IDLE)
+        return None
+
+    def _reap_bounded(self, agent: Agent, work: Callable[[], None]) -> bool:
+        """Run one close/end_run in its own thread, bounded by the close timeout."""
+        errors: list[BaseException] = []
+
+        def target() -> None:
+            try:
+                work()
+            except BaseException as exc:  # noqa: BLE001 - never stop the pass
+                errors.append(exc)
+
+        worker = threading.Thread(
+            target=target, name=f"sam-reap-{agent.agent_id}", daemon=True
+        )
+        worker.start()
+        worker.join(self.reap_close_timeout)
+        if worker.is_alive():
+            self.reap_stuck.add(agent.agent_id)
+            log.warning("reap: agent %s did not close within %ss; moving on",
+                        agent.agent_id, self.reap_close_timeout)
+            return False
+        if errors:
+            log.warning("reap: agent %s failed: %s", agent.agent_id, errors[0],
+                        exc_info=errors[0])
+            return False
+        return True
 
     def _evict_closed(self) -> None:
         with self._lock:
@@ -2472,6 +2606,7 @@ class Registry:
                 if a.closed and all(r.state in TERMINAL_STATES for r in a.runs())
             ]
             for agent in closed:
+                self.reap_stuck.discard(agent.agent_id)
                 for run in agent.runs():
                     self._archive[run.run_id] = run
                 self._agents.pop(agent.agent_id, None)
@@ -2577,7 +2712,9 @@ class Registry:
                 candidate = self._releasable(
                     here, chosen.slot_release_grace_seconds
                 )
-                if candidate is None:
+                if candidate is None or not candidate.try_release():
+                    # Somebody queued work on the candidate after it looked
+                    # idle; never cancel that work to free this slot.
                     raise RegistryError(
                         f"agent limit reached on provider {chosen.name!r} "
                         f"({chosen.max_agents} live). Cancel one with cancel, or raise "

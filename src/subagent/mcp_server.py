@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +26,7 @@ from .promote import served
 from .providers import for_driver
 from .providers.base import capabilities
 from .router import FALLBACK_MODES
-from .runs import TERMINAL_STATES, Registry, RegistryError, Run
+from .runs import TERMINAL_STATES, Agent, Registry, RegistryError, Run
 from .secrets import redact_secrets
 
 SERVER_INSTRUCTIONS = """\
@@ -331,6 +331,9 @@ async def delegate(
         return result
     if ctx is not None:
         supervisor.bind(ctx.session)
+    # Refuse a bad cap before an agent is created: releasing an idle agent for
+    # a request that can never run would cancel the slot for nothing.
+    Agent.validate_caps(timeout, max_steps)
     try:
         resolved = settings.resolve_workspace(workspace)
     except OSError as exc:
@@ -375,18 +378,23 @@ async def delegate(
             task=task, instructions=instructions,
             provider_explicit=wanted is not None,
         )
-        start_error = agent.wait_ready(60.0)
-        if start_error is not None:
-            raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
-        prompt = f"{instructions.strip()}\n\n---\n\n{task}" if instructions else task
-        pre_run, pre_verify = _goal_guard_hooks(agent)
+        pre_run = pre_verify = None
         try:
+            pre_run, pre_verify = _goal_guard_hooks(agent)
+            start_error = agent.wait_ready(60.0)
+            if start_error is not None:
+                raise RegistryError(f"Claude Code runtime failed to start: {start_error}")
+            prompt = f"{instructions.strip()}\n\n---\n\n{task}" if instructions else task
             return agent.delegate(prompt, verification, parent=_parent_context(ctx),
                                   pre_run=pre_run, pre_verify=pre_verify, request_id=caller_key,
                                   timeout=timeout, max_steps=max_steps)
         except Exception:
             if pre_verify is not None:
                 pre_verify()
+            # The new agent owns a slot; a failed submit must not leak it.
+            # Keep the submit error even if the close itself fails.
+            with suppress(Exception):
+                agent.close("delegate failed before the run was accepted")
             raise
 
     try:

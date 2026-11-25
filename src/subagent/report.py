@@ -75,6 +75,7 @@ class Report:
     runs: int
     counterfactual: str | None
     plan_price_notes: list[str] = field(default_factory=list)
+    run_roles: dict[str, Any] = field(default_factory=dict)
 
 
 def _num(v: Any) -> float | None:
@@ -381,6 +382,92 @@ def _delegation_row(d: Mapping[str, Any], provider_usd: float | None,
     return row
 
 
+def _run_entries(value: Any) -> list[dict[str, Any]]:
+    """A delegation field as run entries: one dict, or a list of dicts."""
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    return []
+
+
+def _role_run_ids(delegations: list[Mapping[str, Any]]) -> tuple[set[str], set[str], set[str]]:
+    """The run ids each delegation names: builder rounds, reviews, and setup/test_writer."""
+    builders: set[str] = set()
+    reviews: set[str] = set()
+    setups: set[str] = set()
+    for d in delegations:
+        for entry in _run_entries(d.get("rounds")):
+            run_id = entry.get("run_id")
+            if isinstance(run_id, str):
+                builders.add(run_id)
+        for entry in _run_entries(d.get("reviews")):
+            run_id = entry.get("run_id")
+            if isinstance(run_id, str):
+                reviews.add(run_id)
+        for key in ("setup", "test_writer"):
+            for entry in _run_entries(d.get(key)):
+                run_id = entry.get("run_id")
+                if isinstance(run_id, str):
+                    setups.add(run_id)
+    return builders, reviews, setups
+
+
+def _run_roles(run_rows: list[dict[str, Any]],
+               delegations: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Classify runs by role from the delegation trace, never from names.
+
+    Precedence is rounds (builder), reviews (review), setup plus test_writer
+    (setup), then unclassified. Only runs with a run record are counted.
+    """
+    builders, reviews, setups = _role_run_ids(delegations)
+    builder: dict[str, Any] = {
+        "runs": 0, "verified_passed": 0, "pass_rate": None, "by_provider": {},
+    }
+    review = {"runs": 0, "verified_passed": 0}
+    setup = {"runs": 0}
+    unclassified = {"runs": 0}
+    for row in run_rows:
+        run_id = row.get("run_id")
+        passed = row.get("verification_passed") is True
+        provider = row.get("provider") or "?"
+        if run_id in builders:
+            builder["runs"] += 1
+            by_provider = builder["by_provider"].setdefault(
+                provider, {"runs": 0, "verified_passed": 0}
+            )
+            by_provider["runs"] += 1
+            if passed:
+                builder["verified_passed"] += 1
+                by_provider["verified_passed"] += 1
+        elif run_id in reviews:
+            review["runs"] += 1
+            if passed:
+                review["verified_passed"] += 1
+        elif run_id in setups:
+            setup["runs"] += 1
+        else:
+            unclassified["runs"] += 1
+    if builder["runs"]:
+        builder["pass_rate"] = round(builder["verified_passed"] / builder["runs"], 3)
+    return {
+        "builder": builder,
+        "review": review,
+        "setup": setup,
+        "unclassified": unclassified,
+    }
+
+
+def _builder_line(run_roles: Mapping[str, Any]) -> str:
+    """The text summary line: builder runs, verified passes and the pass rate."""
+    builder = run_roles.get("builder") or {}
+    runs = builder.get("runs") or 0
+    passed = builder.get("verified_passed") or 0
+    rate = builder.get("pass_rate")
+    pct = "n/a" if rate is None else f"{rate * 100:.1f}%"
+    return f"builder runs: {passed} of {runs} verified ({pct})"
+
+
 def _recorded_run_usd(delegations: list[Mapping[str, Any]],
                       aliases: Mapping[str, str]) -> dict[tuple[str, str], float]:
     """(delegation_id, provider) -> one run's share of the recorded cost total.
@@ -511,6 +598,7 @@ def build(traces: list[Path], since: dt.datetime | None, bench_run: str | None) 
         runs=len(run_rows),
         counterfactual=cf_model,
         plan_price_notes=plan_price_notes,
+        run_roles=_run_roles(run_rows, delegation_records),
     )
 
 
@@ -524,6 +612,7 @@ def _report_data(report: Report) -> dict[str, Any]:
         },
         "providers": report.providers,
         "delegations": report.delegations,
+        "run_roles": report.run_roles,
     }
 
 
@@ -656,7 +745,9 @@ def main(argv: list[str] | None = None) -> int:
     for note in report.plan_price_notes:
         print(note)
     print()
-    _print_delegations(report.delegations)
+    print(_builder_line(report.run_roles))
+    print()
+    _print_delegations(report.delegations, sys.stdout)
 
     if args.html:
         args.html.parent.mkdir(parents=True, exist_ok=True)

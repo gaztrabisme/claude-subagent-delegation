@@ -39,18 +39,18 @@ _GUARD_INACTIVE = re.compile(
 
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
                         cwd: Path) -> list[str]:
-    """The DSH child's write roots (unchanged from the R1-0 profile)."""
-    dsh_home = _dsh_home(settings, agent_id)
-    roots = [
+    """The DSH child's write roots (H1): the workspace and its agent directory.
+
+    The agent directory holds DSH_HOME (sessions, storages, spills, install
+    id) and TMPDIR (Q6). Devices are the standard ones every A9 profile
+    allows, not all of /dev (R5). The profiles, the guard bridge patch and the
+    server's patches stay write-denied (see `DshProvider.argv`).
+    """
+    _dsh_home(settings, agent_id)
+    return [
         str(cwd),  # Project files are the worker's deliverable.
-        str(settings.session_root / "agents" / agent_id / "tmp"),  # Per-agent TMPDIR (Q6).
-        str(dsh_home / "sessions"),  # DSH session transcripts.
-        str(dsh_home / "storages"),  # DSH runtime key-value storage.
-        str(dsh_home / "spills"),  # DSH large-output spill files.
-        str(dsh_home / ".anonymous-user-id"),  # DSH writes its install id once.
-        "/dev",  # DSH's terminal and descriptor devices, as on the base profile.
+        str(_agent_dir(settings, agent_id)),  # Own DSH home, temp and patches.
     ]
-    return list(dict.fromkeys(roots))
 
 
 USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
@@ -771,6 +771,8 @@ class DshProvider:
             read_metadata_allow=read_metadata_allow,
             write_allow_exact=[str(headless_cordis)],
             write_allow_subpaths=[str(agent_tmp)],
+            workspace=cwd,
+            driver=DRIVER_DSH,
         ))
         if argv[:2] != [SANDBOX_EXEC, "-p"]:
             raise RuntimeError("DSH requires the outer macOS sandbox-exec profile")

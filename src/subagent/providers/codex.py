@@ -47,17 +47,15 @@ DEFAULT_BINARY = "codex"
 
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
                         cwd: Path) -> list[str]:
-    """The Codex child's write roots under its macOS profile."""
-    agent_dir = settings.session_root / "agents" / agent_id
-    roots = [
+    """The Codex child's write roots (H1): the workspace and its agent directory.
+
+    The agent directory holds CODEX_HOME, TMPDIR and XDG_CACHE_HOME. Devices
+    are only the standard ones every A9 profile allows (no /dev subpath).
+    """
+    return [
         str(cwd),  # Project files are the worker's deliverable.
-        str(agent_dir / "tmp"),  # Per-agent TMPDIR; never the server's own temp.
-        str(agent_dir / "codex-home"),  # Isolated CODEX_HOME: sessions, logs, state.
-        str(agent_dir / "cache"),  # Per-agent cache (XDG_CACHE_HOME), not the user's.
+        str(settings.session_root / "agents" / agent_id),  # Own homes, temp and cache.
     ]
-    # Devices: only the standard ones every A9 profile allows (no /dev subpath,
-    # which would reach the owner's other terminals).
-    return list(dict.fromkeys(roots))
 
 
 REFUSAL_USAGE_LIMIT = "codex_usage_limit"
@@ -540,6 +538,8 @@ class CodexProvider:
                 base_url=cfg.base_url,
                 write_roots=sandbox_write_roots(settings, agent_id, cfg, cwd),
                 write_deny=write_deny,
+                workspace=cwd,
+                driver=DRIVER_CODEX,
             ))
             if argv[:2] != [SANDBOX_EXEC, "-p"]:
                 raise RuntimeError("codex requires the outer macOS sandbox-exec profile")

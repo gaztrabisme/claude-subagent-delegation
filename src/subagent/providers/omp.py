@@ -58,14 +58,15 @@ DEFAULT_BINARY = "omp"
 
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
                         cwd: Path) -> list[str]:
-    """Workspace, this agent's omp state, and temporary/runtime scratch roots."""
-    roots = [
+    """The omp child's write roots (H1): the workspace and its agent directory.
+
+    The agent directory holds the omp agent dir (PI_CODING_AGENT_DIR), TMPDIR
+    and the hook state.
+    """
+    return [
         str(cwd),  # Project files are the worker's deliverable.
-        str(settings.session_root / "agents" / agent_id),  # Own hook and session state.
-        str(settings.session_root / "agents" / agent_id / "omp-agent"),  # Omp config and cache.
-        str(settings.session_root / "agents" / agent_id / "tmp"),  # Private CLI scratch.
+        str(settings.session_root / "agents" / agent_id),  # Own homes, temp and state.
     ]
-    return list(dict.fromkeys(roots))
 
 
 # What omp loads from its agent directory (PI_CODING_AGENT_DIR) as settings,

@@ -380,14 +380,14 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         else:
             login_warning = (
                 f"warning: provider {cfg.name!r} uses the owner's Claude login and plan quota; "
-                "worker sessions are written into the owner's Claude history, and the owner's "
-                "global instructions, commands and skills may load"
+                "only the credential is copied into the worker's own config directory, and a "
+                "token refresh by the worker may rotate the owner's refresh token"
             )
         warning = f"{warning}\n{login_warning}" if warning else login_warning
         if cfg.max_agents > 1:
             concurrency_warning = (
                 f"warning: provider {cfg.name!r} max_agents = {cfg.max_agents}; concurrent "
-                "login children share ~/.claude.json and one OAuth refresh token"
+                "login children each hold a copy of one OAuth refresh token"
             )
             warning = f"{warning}\n{concurrency_warning}"
     if warning:

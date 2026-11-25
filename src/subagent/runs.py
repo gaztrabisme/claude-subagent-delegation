@@ -1453,6 +1453,8 @@ class Agent:
                         self.settings, self.agent_id, self.cfg, self.workspace
                     ),
                     write_deny=write_deny,
+                    workspace=self.workspace,
+                    driver=self.cfg.driver,
                 )
             process.argv = wrap_argv(process.argv, paths, **profile)
         elif paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):

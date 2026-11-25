@@ -38,6 +38,21 @@ IPC_ESCAPE_EXECUTABLES = (
     "/usr/bin/osascript",  # Sends Apple Events to other apps.
 )
 
+# R1a round 6 (H1, H4): every A9 profile writes only the workspace, the
+# agent's own directory `<session_root>/agents/<agent_id>/` (its CLI homes,
+# temp and cache) and the standard devices. A write root anywhere else under
+# the owner's home is refused unless it is listed here, per driver, with the
+# reason the CLI cannot run without it (proved by a live run, not assumed).
+# Each entry is a residual in the round's report. None is needed today: the
+# login credentials are copied (claude) or linked/read in place read-only
+# (codex auth.json, dsh .credentials.yaml).
+OWNER_HOME_EXCEPTIONS: dict[str, list[tuple[str, str]]] = {
+    "claude": [],
+    "codex": [],
+    "omp": [],
+    "dsh": [],
+}
+
 # The loopback port of the agent's egress proxy while its driver builds argv.
 _EGRESS_PORT: ContextVar[int | None] = ContextVar("subagent_egress_port", default=None)
 
@@ -245,15 +260,49 @@ def wrap_argv(
     ]
 
 
+def _inside(path: str | Path, root: str | Path) -> bool:
+    path, root = os.path.abspath(path), os.path.abspath(root)
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def check_write_roots(
+    driver: str, roots: Sequence[str | Path], *, workspace: str | Path, agent_dir: str | Path,
+) -> None:
+    """Refuse a write root outside the H1 allowlist (workspace, agent dir, devices, H4)."""
+    devices = (*STANDARD_DEVICE_LITERALS, *STANDARD_DEVICE_SUBPATHS)
+    listed = [path for path, _reason in OWNER_HOME_EXCEPTIONS.get(driver, [])]
+    for root in roots:
+        spellings = {os.path.abspath(Path(root).expanduser()),
+                     str(Path(root).expanduser().resolve())}
+        for spelling in spellings:
+            if spelling in devices:
+                continue
+            if any(_inside(spelling, base) for base in (
+                workspace, Path(workspace).resolve(), agent_dir, Path(agent_dir).resolve(),
+            )):
+                continue
+            if any(_inside(spelling, os.path.expanduser(p)) for p in listed):
+                continue
+            raise ValueError(
+                f"{driver} write root {spelling} is outside the workspace and the agent "
+                "directory and is not listed in OWNER_HOME_EXCEPTIONS"
+            )
+
+
 def agent_profile_kwargs(
     *, session_root: Path, agent_id: str, approval_socket: str, base_url: str | None,
     write_roots: Sequence[str], write_deny: Sequence[str] = (),
     read_allow: Sequence[str] = (), read_metadata_allow: Sequence[str] = (),
     write_allow_exact: Sequence[str] = (), write_allow_subpaths: Sequence[str] = (),
+    workspace: str | Path | None = None, driver: str | None = None,
 ) -> dict:
     """`wrap_argv` keywords for a hook driver's one A9 profile.
 
-    Writes are confined to `write_roots` (plus the standard devices); the
+    Writes are confined to `write_roots` (plus the standard devices); with
+    `workspace` given, each root must be the workspace, the agent directory
+    or an OWNER_HOME_EXCEPTIONS entry for `driver` (H1, H4), and
+    `<workspace>/.codex` is write-denied (N6). The agent's approval key is
+    write-denied. The
     approval socket's directory is write-denied (R1-0 Q2); other agents'
     directories under `<session_root>/agents/` are read-denied while this
     agent's own stays readable (A9.3); outbound network is limited to the
@@ -263,13 +312,23 @@ def agent_profile_kwargs(
     request outside the profile.
     """
     agents = Path(session_root) / "agents"
+    agent_dir = agents / agent_id
+    common_deny = [str(agent_dir / "approval.key")]  # The hook's reply key.
+    if workspace is not None:
+        check_write_roots(
+            driver or "unknown", [*write_roots, *write_allow_exact, *write_allow_subpaths],
+            workspace=workspace, agent_dir=agent_dir,
+        )
+        # Codex reads hook trust and project config from <workspace>/.codex
+        # (N6, with --dangerously-bypass-hook-trust): no child may write it.
+        common_deny.append(str(Path(workspace) / ".codex"))
     socket_deny = approval_socket_write_deny(
         approval_socket, [*write_roots, *write_allow_subpaths, *write_allow_exact],
     )
     return {
         "write_allow": list(write_roots),
         "write_allow_devices": True,
-        "write_deny": [*write_deny, socket_deny],
+        "write_deny": [*write_deny, *common_deny, socket_deny],
         "read_allow": list(read_allow),
         # Path resolution through agents/ to this agent's own directory needs
         # the directory's metadata, not a listing of its siblings.

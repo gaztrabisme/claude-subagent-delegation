@@ -135,7 +135,17 @@ class Trace:
             seen = self._verdicts.pop(agent_id, Counter())
         return {action: seen.get(action, 0) for action in ("allow", "deny", "escalate")}
 
-    def run(self, run: Any, workspace: str, model: str, guard: str | None = None) -> None:
+    def run(
+        self,
+        run: Any,
+        workspace: str,
+        model: str,
+        guard: str | None = None,
+        *,
+        entry: str = "mcp",
+        exit_code: int | None = None,
+        lock: str | None = None,
+    ) -> None:
         verification = run.verification_result
         verification_dict = verification.as_dict() if verification else None
         started = run.started_at or 0
@@ -194,6 +204,11 @@ class Trace:
             driver=getattr(run, "driver", None),
             workspace=workspace,
             guard=guard,
+            # Which route started this run: the MCP delegate tool, `subagent
+            # run`, or the `subagent exec` wrapper. Additive to schema 3.
+            entry=entry,
+            exit_code=exit_code,
+            lock=lock,
             state=run.state,
             finish_reason=run.finish_reason,
             elapsed_seconds=round(finished - started, 2),

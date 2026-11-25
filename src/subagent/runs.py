@@ -856,8 +856,12 @@ class Agent:
         goal_reviewer: GoalReviewer | None = None,
         delegate_options: dict[str, Any] | None = None,
         deny_read: list[str] | None = None,
+        entry: str = "mcp",
     ):
         self.trace = trace
+        # The route that started this agent's runs (MCP delegate, CLI loop,
+        # exec wrapper); written on every run record.
+        self.entry = entry
         self.telemetry = telemetry
         # The provider this agent runs on. The delegate's run may move it
         # along `chain` (Settings.chain) when a provider refuses before work;
@@ -2174,7 +2178,7 @@ class Agent:
         if self.trace is not None:
             try:
                 self._summarize(run)
-                self.trace.run(run, str(self.workspace), self.model)
+                self.trace.run(run, str(self.workspace), self.model, entry=self.entry)
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
         run.done.set()
@@ -2200,8 +2204,10 @@ class Registry:
         start_reaper: bool = True,
         trace: Trace | None = None,
         telemetry: Telemetry | None = None,
+        entry: str = "mcp",
     ):
         self.settings = settings
+        self.entry = entry
         self.trace = trace if trace is not None else open_trace(
             settings.trace, settings.session_root
         )
@@ -2400,6 +2406,7 @@ class Registry:
                                       if provider_explicit is None else provider_explicit
                                   )},
                 deny_read=deny_read,
+                entry=self.entry,
             )
             self._agents[claimed] = agent
             return agent
@@ -2493,6 +2500,7 @@ class Registry:
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,
+                entry=self.entry,
             )
             session_id = record.get("session_id")
             if session_id:

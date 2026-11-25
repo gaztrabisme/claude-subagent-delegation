@@ -22,6 +22,7 @@ from .goal import GoalError, parse_goal
 from .goal_runtime import goal_error_messages
 from .guard.supervisor import Supervisor
 from .lane_status import probe_stale_lanes
+from .promote import served
 from .providers import for_driver
 from .providers.base import capabilities
 from .router import FALLBACK_MODES
@@ -540,6 +541,7 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
         "default_provider": settings.default_provider,
         "providers": provider_views,
         "default_workspace": str(settings.workspace),
+        "served_commit": (served(settings) or {}).get("commit"),
         "tokens_spent": spent,
         "archived_runs": len(registry.archived_runs()),
         "trace": str(registry.trace.path) if registry.trace.enabled else None,

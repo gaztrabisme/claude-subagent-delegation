@@ -13,7 +13,9 @@ import dataclasses
 import hashlib
 import itertools
 import json
+import os
 import secrets
+import stat
 import threading
 import time
 import uuid
@@ -51,7 +53,7 @@ from .providers.claude import (  # noqa: F401
 )
 from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
-from .sandbox import check_platform, normalize_paths, wrap_argv
+from .sandbox import approval_socket_write_deny, check_platform, normalize_paths, wrap_argv
 from .secrets import redact_secrets
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
@@ -110,6 +112,71 @@ Do not paraphrase an identifier or a path.
 
 class RegistryError(RuntimeError):
     """A caller-visible problem: unknown id, capacity, or a closed agent."""
+
+
+def _approval_key_file(settings: Settings, agent_id: str) -> Path:
+    """The private file carrying one agent's approval socket key."""
+    return settings.session_root / "agents" / agent_id / "approval.key"
+
+
+def _load_or_create_approval_key(
+    settings: Settings, agent_id: str, *, fresh: bool
+) -> bytes:
+    """Load an adopted key or create a new key atomically with mode 0600."""
+    path = _approval_key_file(settings, agent_id)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def read_existing() -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != getattr(os, "getuid", lambda: info.st_uid)()
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                raise RegistryError(f"approval key file for agent {agent_id!r} is not private")
+            raw = os.read(fd, 256).decode("ascii").strip()
+        finally:
+            os.close(fd)
+        try:
+            key = bytes.fromhex(raw)
+        except ValueError as exc:
+            raise RegistryError(f"approval key file for agent {agent_id!r} is malformed") from exc
+        if len(key) != 32:
+            raise RegistryError(f"approval key file for agent {agent_id!r} is malformed")
+        return key
+
+    if not fresh:
+        try:
+            return read_existing()
+        except FileNotFoundError:
+            pass
+
+    key = secrets.token_bytes(32)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        if fresh:
+            raise RegistryError(
+                f"approval key already exists for agent {agent_id!r}"
+            ) from None
+        return read_existing()
+    try:
+        view = memoryview((key.hex() + "\n").encode("ascii"))
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fchmod(fd, 0o600)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+    else:
+        os.close(fd)
+    return key
 
 
 def _now() -> float:
@@ -771,6 +838,7 @@ class Agent:
     def __init__(
         self,
         agent_id: str,
+        approval_key: bytes,
         name: str,
         workspace: Path,
         model: str,
@@ -820,6 +888,7 @@ class Agent:
         # loop adds its protected tests and state allowlist.
         self.guard_context: dict[str, Any] = provider_guard_context(settings)
         self.agent_id = agent_id
+        self.approval_key = approval_key
         self.name = name
         self.workspace = workspace
         self.model = model
@@ -1291,7 +1360,14 @@ class Agent:
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
         if paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
-            process.argv = wrap_argv(process.argv, paths)
+            process.argv = wrap_argv(
+                process.argv,
+                paths,
+                write_deny=[approval_socket_write_deny(
+                    self.settings.approval_socket,
+                    [self.workspace, self.settings.session_root],
+                )],
+            )
         if capabilities(self.driver).cancel and isinstance(process, Process):
             process.enable_cancel_fence()
         return process
@@ -1734,6 +1810,8 @@ class Agent:
                     proc.kill()
                 raise
             finally:
+                if isinstance(proc, Process):
+                    proc.kill()
                 self._current = None
                 self._sample_end(run)
                 # Every attempt's spend counts, including one that is retried,
@@ -2294,8 +2372,12 @@ class Registry:
                     f"[providers.{chosen.name}].max_agents."
                 )
             claimed = agent_id or self._claim_agent_id()
+            approval_key = _load_or_create_approval_key(
+                self.settings, claimed, fresh=True
+            )
             agent = Agent(
                 agent_id=claimed,
+                approval_key=approval_key,
                 name=name or f"subagent-{claimed}",
                 workspace=workspace,
                 model=model or chosen.model or "",
@@ -2395,6 +2477,9 @@ class Registry:
                 del self._agents[agent_id]
             agent = Agent(
                 agent_id=agent_id,
+                approval_key=_load_or_create_approval_key(
+                    self.settings, agent_id, fresh=False
+                ),
                 name=f"subagent-{agent_id}",
                 workspace=workspace or self.settings.workspace,
                 model=record.get("model") or chosen.model or "",

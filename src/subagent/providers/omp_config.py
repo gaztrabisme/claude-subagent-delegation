@@ -100,6 +100,9 @@ def child_env(settings: Settings, agent_id: str, cfg: ProviderConfig) -> dict[st
         "SUBAGENT_HOOK_TIMEOUT": str(settings.supervisor_timeout + 20),
         "SUBAGENT_GUARD_PYTHON": sys.executable,
         "SUBAGENT_GUARD_HOOK": str(APPROVAL_HOOK),
+        "SUBAGENT_GUARD_KEY_FILE": str(
+            settings.session_root / "agents" / agent_id / "approval.key"
+        ),
         "SUBAGENT_GUARD_AGENT_ID": agent_id,
     })
     return env

@@ -12,10 +12,11 @@ policy's own deny verdicts are unaffected.
 from __future__ import annotations
 
 import dataclasses
+import os
 import threading
 from pathlib import Path
 
-from .config import Settings, _approval_socket_path
+from .config import Settings, _approval_socket_path, _configured_approval_socket_path
 from .guard.supervisor import Supervisor
 from .runs import Registry, Run
 
@@ -27,12 +28,15 @@ class InProcessServer:
                  approval_socket: str | None = None):
         self.session_root = Path(session_root)
         self.session_root.mkdir(parents=True, exist_ok=True)
-        preferred_socket = self.session_root / "approval.sock"
+        preferred_socket = self.session_root / "s" / f"a{os.getpid():x}.sock"
+        socket_path = (
+            _configured_approval_socket_path(approval_socket)
+            if approval_socket else _approval_socket_path(preferred_socket)
+        )
         self.settings = dataclasses.replace(
             settings,
             session_root=self.session_root,
-            approval_socket=approval_socket
-            or _approval_socket_path(preferred_socket),
+            approval_socket=socket_path,
         )
         self.registry = Registry(self.settings, start_reaper=False)
         self.supervisor = Supervisor(self.settings, self.registry, trace=self.registry.trace)

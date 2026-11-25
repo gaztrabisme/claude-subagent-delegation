@@ -35,7 +35,7 @@ from uuid import uuid4
 from ..config import APPROVAL_HOOK, Settings, log
 from ..guard.classify import _git_metadata_roots
 from ..router import Refusal, codex_reset
-from ..sandbox import wrap_argv
+from ..sandbox import approval_socket_write_deny, wrap_argv
 from .base import DRIVER_CODEX, Process, ProviderConfig, Session
 
 GUARD = "sandbox+hook"
@@ -327,7 +327,14 @@ def prepare_home(
     auth = home / "auth.json"
     if auth.is_symlink() or auth.exists():
         auth.unlink()
-    auth.symlink_to(source / "auth.json")
+    target = source / "auth.json"
+    try:
+        auth.symlink_to(target)
+    except FileExistsError:
+        # Agent boot and an explicit provider setup can arrive concurrently.
+        # Accept only the symlink another caller just installed for this user.
+        if not auth.is_symlink() or auth.resolve() != target.resolve():
+            raise
 
     lines = ["# Written by subagent for one agent. Hooks live in hooks.json."]
     if cfg.model is None:
@@ -501,6 +508,7 @@ class CodexProvider:
                 str(cwd / ".git"), *(str(root) for root in sorted(_git_metadata_roots(cwd))),
                 *(str(home / name) for name in ("hooks.json", "config.toml", "auth.json")),
                 str(APPROVAL_HOOK),
+                approval_socket_write_deny(settings.approval_socket, write_allow),
             ]
             argv = wrap_argv(argv, cfg.deny_read, write_allow=write_allow, write_deny=write_deny)
         return _spawn_codex(argv, env, str(cwd), prompt)

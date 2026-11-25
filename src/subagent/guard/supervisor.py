@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import stat
 import subprocess
 import time
 from functools import partial
@@ -44,7 +45,8 @@ from typing import Any
 import anyio
 from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapability
 
-from ..config import Settings, log
+from ..config import Settings, _configured_approval_socket_path, log
+from .approval_auth import sign, valid_nonce, verify
 from .classify import ALLOW, DENY, ESCALATE, Verdict, classify, provider_guard_context
 
 
@@ -100,6 +102,7 @@ class Supervisor:
         self.decisions: list[dict[str, Any]] = []
         # Denials keyed by agent id, drained by the loop after each run.
         self.denials: dict[str, list[dict[str, Any]]] = {}
+        self._used_nonces: dict[str, set[str]] = {}
 
     # -- session binding ------------------------------------------------
 
@@ -149,18 +152,15 @@ class Supervisor:
         """The workspace a verdict is judged against, resolved server-side,
         plus the agent's guard context (protected paths, .subagent allowlist).
         """
-        if agent_id and self.registry is not None:
-            agent = self.registry.find_agent(agent_id)
-            if agent is not None:
-                return (
-                    agent.workspace,
-                    getattr(agent, "guard_context", None) or self.default_guard_context,
-                )
-            log.warning("verdict for unknown agent %r; using the server workspace", agent_id)
-            return self.settings.workspace, self.default_guard_context
+        del fallback  # Caller supplied workspaces are never an authority.
+        if not agent_id or self.registry is None:
+            raise ValueError("approval request does not name a live agent")
+        agent = self.registry.find_agent(agent_id)
+        if agent is None or getattr(agent, "closed", False):
+            raise ValueError("approval request does not name a live agent")
         return (
-            Path(fallback) if fallback else self.settings.workspace,
-            self.default_guard_context,
+            agent.workspace,
+            getattr(agent, "guard_context", None) or self.default_guard_context,
         )
 
     async def decide(
@@ -343,10 +343,22 @@ class Supervisor:
     # -- socket ---------------------------------------------------------
 
     async def serve(self, *, task_status=anyio.TASK_STATUS_IGNORED) -> None:
-        if self.socket_path.exists():
+        _configured_approval_socket_path(self.socket_path)
+        try:
+            existing = self.socket_path.lstat()
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.getuid():
+                raise RuntimeError(
+                    f"refusing to replace non-owned approval socket path {self.socket_path}"
+                )
             self.socket_path.unlink()
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        listener = await anyio.create_unix_listener(self.socket_path)
+        previous_umask = os.umask(0o177)
+        try:
+            listener = await anyio.create_unix_listener(self.socket_path)
+        finally:
+            os.umask(previous_umask)
         os.chmod(self.socket_path, 0o600)
         task_status.started()
         async with listener:
@@ -355,17 +367,49 @@ class Supervisor:
     def cleanup(self) -> None:
         """Remove the socket file. The listener is closed by its task group."""
         try:
-            self.socket_path.unlink(missing_ok=True)
+            info = self.socket_path.lstat()
+            if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+                self.socket_path.unlink()
         except OSError:
             log.warning("could not remove %s", self.socket_path, exc_info=True)
 
     async def _handle(self, stream) -> None:
         async with stream:
+            agent = None
+            request: dict[str, Any] | None = None
             try:
                 raw = await _read_line(stream)
                 request = json.loads(raw)
-                agent_id = request.get("agent_id") or None
-                workspace, guard_context = self.workspace_for(agent_id, request.get("workspace"))
+                if not isinstance(request, dict):
+                    raise ValueError("request must be an object")
+                agent_id = request.get("agent_id")
+                if isinstance(agent_id, str) and agent_id and self.registry is not None:
+                    agent = self.registry.find_agent(agent_id)
+                nonce = request.get("nonce")
+                known_key = getattr(agent, "approval_key", None) if agent is not None else None
+                if (agent is None or getattr(agent, "closed", False) or not valid_nonce(nonce)
+                        or not verify(known_key, request)):
+                    reply = {"action": DENY, "reason": "denied: invalid approval request"}
+                    if agent is not None:
+                        reply["nonce"] = nonce
+                        reply = sign(agent.approval_key, reply)
+                    await stream.send((json.dumps(reply) + "\n").encode())
+                    return
+                used = self._used_nonces.setdefault(agent_id, set())
+                normalized_nonce = nonce.lower()
+                if normalized_nonce in used:
+                    reply = sign(agent.approval_key, {
+                        "action": DENY,
+                        "reason": "denied: replayed approval nonce",
+                        "nonce": nonce,
+                    })
+                    await stream.send((json.dumps(reply) + "\n").encode())
+                    return
+                used.add(normalized_nonce)
+
+                # Authentication and replay checks complete before any caller
+                # data is interpreted for classification or escalation.
+                workspace, guard_context = self.workspace_for(agent_id, None)
                 verdict = await self.decide(
                     request.get("tool_name") or "",
                     request.get("tool_input") or {},
@@ -374,10 +418,17 @@ class Supervisor:
                     request.get("cwd") or None,
                     guard_context,
                 )
-                reply = {"action": verdict.action, "reason": verdict.reason}
+                reply = sign(agent.approval_key, {
+                    "action": verdict.action,
+                    "reason": verdict.reason,
+                    "nonce": nonce,
+                })
             except Exception as exc:  # noqa: BLE001 - a broken request denies
                 log.warning("supervisor request failed", exc_info=True)
                 reply = {"action": DENY, "reason": f"supervisor error: {type(exc).__name__}"}
+                if agent is not None:
+                    reply["nonce"] = request.get("nonce") if request is not None else None
+                    reply = sign(agent.approval_key, reply)
             await stream.send((json.dumps(reply) + "\n").encode())
 
 

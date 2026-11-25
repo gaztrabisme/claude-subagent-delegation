@@ -112,12 +112,13 @@ export default function (pi: HookAPI) {
 
 		const python = process.env.SUBAGENT_GUARD_PYTHON;
 		const hook = process.env.SUBAGENT_GUARD_HOOK;
+		const keyFile = process.env.SUBAGENT_GUARD_KEY_FILE;
 		const agent = process.env.SUBAGENT_GUARD_AGENT_ID;
-		if (!python || !hook || !agent) return blocked("guard configuration is missing");
+		if (!python || !hook || !keyFile || !agent) return blocked("guard configuration is missing");
 
 		const input = JSON.stringify({ ...call, cwd: process.cwd() });
 		const timeout = Number(process.env.SUBAGENT_HOOK_TIMEOUT ?? 150_000);
-		const result = spawnSync(python, [hook, "--agent", agent], {
+		const result = spawnSync(python, [hook, "--agent", agent, "--key-file", keyFile], {
 			input,
 			encoding: "utf8",
 			timeout: Number.isFinite(timeout) && timeout > 0 ? timeout * 1000 : 150_000,

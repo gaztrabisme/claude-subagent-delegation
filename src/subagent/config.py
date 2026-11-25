@@ -18,7 +18,9 @@ import itertools
 import json
 import logging
 import os
+import pwd
 import shlex
+import stat
 import sys
 import tempfile
 import tomllib
@@ -49,7 +51,7 @@ CONFIG_ENV = "SUBAGENT_CONFIG"
 CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
 UNIX_SOCKET_PATH_MAX = 104
-SHORT_SOCKET_ROOT = Path("/tmp")
+SHORT_SOCKET_ROOT = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".subagent" / "run"
 _APPROVAL_SOCKET_IDS = itertools.count()
 
 # Names the child must never inherit from this server, whatever the providers
@@ -67,26 +69,75 @@ class ConfigError(RuntimeError):
     """A config file this server cannot run with. The message says why."""
 
 
-def _approval_socket_path(preferred: str | Path) -> str:
-    """Use a preferred socket path or a unique short path when it is too long."""
-    path = Path(preferred)
-    if len(os.fsencode(path)) < UNIX_SOCKET_PATH_MAX:
-        return str(path)
+def prepare_private_directory(path: str | Path) -> Path:
+    """Create or validate a directory owned by this user with mode 0700."""
+    directory = Path(path)
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = directory.lstat()
+    except OSError as exc:
+        raise ConfigError(f"cannot prepare private directory {directory}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ConfigError(f"private directory {directory} must be a real directory")
+    if info.st_uid != getattr(os, "getuid", lambda: info.st_uid)():
+        raise ConfigError(f"private directory {directory} is not owned by this user")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise ConfigError(f"private directory {directory} is group- or world-writable")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        try:
+            directory.chmod(0o700)
+            info = directory.lstat()
+        except OSError as exc:
+            raise ConfigError(f"cannot secure private directory {directory}: {exc}") from exc
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != getattr(os, "getuid", lambda: info.st_uid)()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ConfigError(f"private directory {directory} could not be secured")
+    return directory
 
-    uid = getattr(os, "getuid", lambda: "user")()
-    private_dir = SHORT_SOCKET_ROOT / f"subagent-{uid}"
-    private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    private_dir.chmod(0o700)
-    path = private_dir / f"a-{os.getpid()}-{next(_APPROVAL_SOCKET_IDS)}.sock"
+
+def _unsafe_short_socket_path(path: Path) -> bool:
+    """Whether a short-path fallback is in any system temporary directory."""
+    forbidden_roots = (
+        Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp"),
+        Path("/var/folders"), Path("/private/var/folders"),
+    )
+    for root in forbidden_roots:
+        for candidate in (path, path.resolve()):
+            if candidate.is_relative_to(root) or candidate.is_relative_to(root.resolve()):
+                return True
+    return False
+
+
+def _approval_socket_path(preferred: str | Path) -> str:
+    """Use a preferred socket path or a private, short home-based fallback."""
+    path = Path(preferred)
     if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
-        raise ConfigError("short approval socket path still exceeds the Unix socket limit")
+        uid = os.getuid()
+        private_dir = SHORT_SOCKET_ROOT / f"subagent-{uid}"
+        path = private_dir / f"a-{os.getpid()}-{next(_APPROVAL_SOCKET_IDS)}.sock"
+        if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
+            raise ConfigError("short approval socket path still exceeds the Unix socket limit")
+        if _unsafe_short_socket_path(path):
+            raise ConfigError(
+                "short approval socket fallback must not be under a temporary directory"
+            )
+        prepare_private_directory(private_dir)
+        return str(path)
+    prepare_private_directory(path.parent)
     return str(path)
 
 
-def _default_approval_socket() -> str:
-    """Choose a default socket path that fits macOS's sockaddr_un limit."""
-    pid = os.getpid()
-    preferred = Path(tempfile.gettempdir()) / f"subagent-approval-{pid}.sock"
+def _configured_approval_socket_path(preferred: str | Path) -> str:
+    """Keep a configured socket pathname verbatim while securing its parent."""
+    path = Path(preferred)
+    prepare_private_directory(path.parent)
+    return str(path)
+
+
+def _default_approval_socket(session_root: Path) -> str:
+    """Place the socket in a private directory inside the configured session root."""
+    preferred = Path(session_root) / "s" / f"a{os.getpid():x}.sock"
     return _approval_socket_path(preferred)
 
 
@@ -537,7 +588,11 @@ class Settings:
 
     def guard_hook_command(self, agent_id: str, *extra: str) -> str:
         """The PreToolUse guard hook command line for one agent, any driver."""
-        parts = [sys.executable, str(APPROVAL_HOOK), "--agent", agent_id, *extra]
+        key_file = self.session_root / "agents" / agent_id / "approval.key"
+        parts = [
+            sys.executable, str(APPROVAL_HOOK), "--agent", agent_id,
+            "--key-file", str(key_file), *extra,
+        ]
         return " ".join(shlex.quote(p) for p in parts)
 
     @property
@@ -792,11 +847,18 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
     # Outside every workspace by default: the session root holds the per-agent
     # settings file that installs the guard hook, and a child that could write
     # it could remove its own guard.
+    session_root = _path(
+        _str(core, "session_root", None), Path.home() / ".subagent" / "sessions"
+    )
+    configured_socket = _str(guard, "approval_socket", None)
+    approval_socket = (
+        _configured_approval_socket_path(configured_socket)
+        if configured_socket else _default_approval_socket(session_root)
+    )
+
     settings = Settings(
         workspace=_path(_str(core, "workspace", None), Path.cwd()),
-        session_root=_path(
-            _str(core, "session_root", None), Path.home() / ".subagent" / "sessions"
-        ),
+        session_root=session_root,
         max_agents=int(defaults["max_agents"]),
         transcript_limit=int(_int(core, "transcript_limit", 400)),
         summary_tokens=int(_int(core, "summary_tokens", 2000)),
@@ -808,8 +870,7 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
         supervisor_cmd=_str(guard, "supervisor_cmd", None),
         supervisor_timeout=float(_num(guard, "supervisor_timeout", 120.0)),
         allow_unguarded=_bool(guard, "allow_unguarded", False),
-        approval_socket=_str(guard, "approval_socket", None)
-        or _default_approval_socket(),
+        approval_socket=approval_socket,
         log_level=_str(core, "log_level", "info") or "info",
         max_steps=int(defaults["max_steps"]),
         verify_timeout=float(_num(core, "verify_timeout", 300.0)),

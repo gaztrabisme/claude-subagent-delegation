@@ -31,11 +31,24 @@ def _filter(path: str, kind: str) -> str:
     return f'({kind} "{escaped}")'
 
 
+def approval_socket_write_deny(
+    socket_path: str | Path, write_allowed_roots: Sequence[str | Path] = (),
+) -> str:
+    """Deny the socket directory unless that directory contains another writable root."""
+    socket = Path(socket_path).expanduser()
+    socket_parent = socket.parent.resolve()
+    for raw in write_allowed_roots:
+        allowed = Path(raw).expanduser().resolve()
+        if allowed == socket_parent or allowed.is_relative_to(socket_parent):
+            return str(socket)
+    return str(socket.parent)
+
+
 def build_profile(
     deny_paths: Sequence[str], write_allow: Sequence[str] | None = None,
     write_deny: Sequence[str] = (), *,
     read_allow: Sequence[str] = (), read_metadata_allow: Sequence[str] = (),
-    write_allow_exact: Sequence[str] = (),
+    write_allow_exact: Sequence[str] = (), write_allow_subpaths: Sequence[str] = (),
 ) -> str:
     """Restrict writes, deny excluded realpaths, and prevent ancestor renames."""
     rules = ["(version 1)", "(allow default)"]
@@ -74,6 +87,10 @@ def build_profile(
         # Literal only: siblings within an allowed ancestor remain writable.
         # Pin write-denied files too, so renaming CODEX_HOME cannot replace hooks.
         rules.append(f'(deny file-write* {_filter(ancestor, "literal")})')
+    # A narrow worker scratch area may be nested below a configured socket
+    # parent; it cannot cover the socket file or its direct siblings.
+    for path in normalize_paths(write_allow_subpaths):
+        rules.append(f'(allow file-write* {_filter(path, "subpath")})')
     return "\n".join(rules)
 
 
@@ -86,7 +103,7 @@ def wrap_argv(
     argv: list[str], paths: Sequence[str], write_allow: Sequence[str] | None = None,
     write_deny: Sequence[str] = (), *,
     read_allow: Sequence[str] = (), read_metadata_allow: Sequence[str] = (),
-    write_allow_exact: Sequence[str] = (),
+    write_allow_exact: Sequence[str] = (), write_allow_subpaths: Sequence[str] = (),
 ) -> list[str]:
     """Pass arguments directly to sandbox-exec; never fall back on sandbox failure."""
     if not paths:
@@ -96,6 +113,7 @@ def wrap_argv(
         "/usr/bin/sandbox-exec", "-p",
         build_profile(paths, write_allow, write_deny, read_allow=read_allow,
                       read_metadata_allow=read_metadata_allow,
-                      write_allow_exact=write_allow_exact),
+                      write_allow_exact=write_allow_exact,
+                      write_allow_subpaths=write_allow_subpaths),
         *argv,
     ]

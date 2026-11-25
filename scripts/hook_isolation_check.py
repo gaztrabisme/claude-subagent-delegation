@@ -222,8 +222,10 @@ def main(argv: list[str] | None = None) -> int:
     (planted / ".claude").mkdir(parents=True)
     for name in ("settings.json", "settings.local.json"):
         (planted / ".claude" / name).write_text(json.dumps(PLANT))
-    # A unix socket path must stay under ~104 bytes on macOS.
-    sock = f"/tmp/subagent-hc-{os.getpid()}.sock"
+    # A unix socket path must stay under ~104 bytes on macOS, and Q1 requires
+    # the configured parent to be private rather than /tmp itself.
+    socket_dir = Path(tempfile.mkdtemp(prefix="subagent-hc-sock-")).resolve()
+    sock = str(socket_dir / "approval.sock")
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), MockAnthropic)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -275,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         stop.set()
         httpd.shutdown()
         Path(sock).unlink(missing_ok=True)
+        socket_dir.rmdir()
     checks = {"(a) deny-all hook blocks the call": a_ok,
               "(b) without the hook the call runs": b_ok,
               "(c) workspace .claude settings ignored": c_ok}

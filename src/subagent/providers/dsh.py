@@ -18,10 +18,10 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from ..config import APPROVAL_HOOK, Settings
+from ..config import APPROVAL_HOOK, Settings, prepare_private_directory
 from ..guard.classify import _git_metadata_roots, _redact_private_paths, protect, release
 from ..router import Refusal, clip
-from ..sandbox import wrap_argv
+from ..sandbox import approval_socket_write_deny, wrap_argv
 from .base import DRIVER_DSH, Process, ProviderConfig, Session
 
 DEFAULT_BINARY = "dsh"
@@ -614,7 +614,7 @@ class DshProcess(Process):
                     yield final_text
             yield self.dsh_translator.finish(code, "".join(stderr_buf))
         finally:
-            if proc is not None and proc.poll() is None:
+            if proc is not None:
                 self.kill()
             if selector is not None:
                 selector.close()
@@ -702,12 +702,14 @@ class DshProvider:
         bridge_root, bridge_entry, bridge_patch = _bridge_bundle()
         headless_profile = dsh_home / "profiles" / "headless"
         headless_cordis = headless_profile / "cordis.yml"
+        agent_tmp = prepare_private_directory(
+            settings.session_root / "agents" / agent_id / "tmp"
+        )
         # DSH rewrites only this generated bootstrap file on every launch.
         # The profile directory and every patch remain write-denied.
         write_allow = [
             str(cwd),
-            "/private/tmp",
-            os.environ.get("TMPDIR") or "/private/tmp",
+            str(agent_tmp),
             str(dsh_home / "sessions"),
             str(dsh_home / "storages"),
             str(dsh_home / "spills"),
@@ -729,6 +731,7 @@ class DshProvider:
             str(bridge_root),
             str(bridge_entry),
             str(bridge_patch),
+            approval_socket_write_deny(settings.approval_socket, write_allow),
         ]
         owner_home = _owner_dsh_home().resolve()
         deny_paths = [*cfg.deny_read, str(owner_home), str(owner_home / "storages")]
@@ -742,6 +745,7 @@ class DshProvider:
             read_allow=read_allow,
             read_metadata_allow=read_metadata_allow,
             write_allow_exact=[str(headless_cordis)],
+            write_allow_subpaths=[str(agent_tmp)],
         )
         if argv[:2] != ["/usr/bin/sandbox-exec", "-p"]:
             raise RuntimeError("DSH requires the outer macOS sandbox-exec profile")
@@ -752,7 +756,11 @@ class DshProvider:
     ) -> dict[str, str]:
         env = settings.base_child_env()
         dsh_home = _dsh_home(settings, agent_id)
+        agent_tmp = prepare_private_directory(
+            settings.session_root / "agents" / agent_id / "tmp"
+        )
         env["DSH_HOME"] = str(dsh_home)
+        env["TMPDIR"] = str(agent_tmp)
         env["SUBAGENT_GUARD_HOOK"] = settings.guard_hook_command(agent_id)
         env["SUBAGENT_APPROVAL_SOCKET"] = settings.approval_socket
         env["SUBAGENT_HOOK_TIMEOUT"] = str(settings.supervisor_timeout + 20)

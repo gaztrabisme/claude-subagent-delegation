@@ -771,7 +771,9 @@ def _run_loop_command(command: str, args: argparse.Namespace, raw: list[str],
     # configured shared pathname can be rebound by a respawned child and then
     # removed when the parent exits.
     if command == "run" and getattr(args, "run_id", None):
-        approval_socket = settings.session_root / f"a{os.getpid():x}"
+        approval_socket = config._approval_socket_path(
+            settings.session_root / f"a{os.getpid():x}.sock"
+        )
     else:
         approval_socket = Path(settings.approval_socket)
     server = InProcessServer(settings.session_root, settings,

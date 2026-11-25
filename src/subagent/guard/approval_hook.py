@@ -17,11 +17,15 @@ Standard library only: this runs once per tool call and must stay cheap.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shlex
 import socket
+import stat
 import sys
 
 TIMEOUT_S = float(os.environ.get("SUBAGENT_HOOK_TIMEOUT", "150"))
@@ -33,6 +37,57 @@ CODEX_SHELL_TOOLS = frozenset({
     "exec_command", "shell", "shell_command", "local_shell", "container.exec", "unified_exec",
 })
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.M)
+_NONCE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _canonical_bytes(obj: dict) -> bytes:
+    """Match the approval_auth module's canonical wire encoding."""
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _sign(key: bytes, obj: dict) -> dict:
+    unsigned = dict(obj)
+    unsigned.pop("mac", None)
+    mac = hmac.new(key, _canonical_bytes(unsigned), hashlib.sha256).hexdigest()
+    return {**unsigned, "mac": mac}
+
+
+def _verify(key: bytes, obj: dict) -> bool:
+    if not isinstance(obj, dict) or not isinstance(obj.get("mac"), str):
+        return False
+    unsigned = dict(obj)
+    supplied = unsigned.pop("mac")
+    try:
+        expected = hmac.new(key, _canonical_bytes(unsigned), hashlib.sha256).hexdigest()
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(expected, supplied)
+
+
+def _read_key_file(path: str) -> bytes:
+    if not path:
+        raise ValueError("--key-file is required")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        mode = stat.S_IMODE(info.st_mode)
+        if (not stat.S_ISREG(info.st_mode)
+                or info.st_uid != getattr(os, "getuid", lambda: info.st_uid)()
+                or mode & 0o077 or not mode & 0o400):
+            raise ValueError("approval key file is not a private readable file")
+        raw = os.read(fd, 256).decode("ascii").strip()
+    finally:
+        os.close(fd)
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError as exc:
+        raise ValueError("approval key file is malformed") from exc
+    if len(key) != 32:
+        raise ValueError("approval key file is malformed")
+    return key
 
 
 def agent_id() -> str:
@@ -139,6 +194,11 @@ def main() -> None:
         )
 
     try:
+        key = _read_key_file(option("--key-file"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        block(f"blocked: approval key is unavailable ({type(exc).__name__})")
+
+    try:
         payload = json.loads(sys.stdin.read() or "{}")
     except (ValueError, OSError) as exc:
         block(f"blocked: hook could not read its input ({exc})")
@@ -152,17 +212,21 @@ def main() -> None:
 
     reason = "allowed"
     for name, args in requests(tool_name, tool_input, codex):
-        request = {
+        nonce = secrets.token_hex(32)
+        request = _sign(key, {
             "tool_name": name,
             "tool_input": args,
             "workspace": workspace,
             "cwd": payload.get("cwd"),
             "agent_id": agent_id(),
-        }
+            "nonce": nonce,
+        })
         try:
             reply = ask(socket_path, request)
         except (OSError, ValueError) as exc:
             block(f"blocked: supervisor unreachable ({type(exc).__name__}: {exc})")
+        if reply.get("nonce") != nonce or not _verify(key, reply):
+            block("blocked: supervisor reply authentication failed")
         reason = reply.get("reason") or "blocked by the supervisor"
         if reply.get("action") != "allow":
             block(reason)

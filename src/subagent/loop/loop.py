@@ -195,7 +195,8 @@ def _prompt_source_chars(prompt, plan, test_output=""):
 class Worker:
     """One worker turn through the provider Registry: candidates, guard, verification."""
 
-    def __init__(self, server, root, test_cmd, guard=None, live=None):
+    def __init__(self, server, root, test_cmd, guard=None, live=None,
+                 override_envelope=None):
         self.server = server
         self.registry = server.registry
         self.settings = server.settings
@@ -203,6 +204,7 @@ class Worker:
         self.test_cmd = test_cmd or ""
         self.guard = guard
         self.live = live
+        self.override_envelope = override_envelope
         self.agent = None
         self.run = None
         self.model = None
@@ -232,6 +234,7 @@ class Worker:
         agent = self.registry.create_agent(
             None, self.root, provider=provider, model=model, fallback=fallback,
             on_event=self._on_event(), agent_id=_new_loop_agent_id(),
+            override_envelope=self.override_envelope,
         )
         agent.guard_context.update(self._guard_context())
         return agent
@@ -704,7 +707,8 @@ def run_round(root, server, args, live_view=True, goal=None):
     )
     source_chars = _prompt_source_chars(prompt, plan, test_output)
     started = time.time()
-    worker = Worker(server, root, info["test_cmd"], guard, live)
+    worker = Worker(server, root, info["test_cmd"], guard, live,
+                    getattr(args, "override_envelope", None))
     try:
         if args.continue_session and record.get("agent_id"):
             worker.follow_up(record, prompt, source_chars)
@@ -893,7 +897,8 @@ def _parallel_work(
             live_path = log.with_name(f"{log.stem}-{task['name']}.jsonl")
             live = LiveLog(sink, live_path, proj, task["name"])
             w["live"] = live
-            w["worker"] = Worker(server, proj, "true", guard, live)
+            w["worker"] = Worker(server, proj, "true", guard, live,
+                                 getattr(args, "override_envelope", None))
 
         def work(w):
             try:

@@ -269,6 +269,7 @@ class Trace:
             model=hop.model,
             outcome=hop.outcome,
             code=hop.code,
+            message=hop.message,
             reset_at=hop.reset_at.isoformat() if hop.reset_at else None,
             closed_until=hop.closed_until.isoformat() if hop.closed_until else None,
             admission=getattr(hop, "admission", None),

@@ -532,6 +532,9 @@ class Settings:
     chars_per_token: float = 3.5
     run_archive: int = 200
     trace: str | None = None
+    # The lane plan whose usage envelopes gate dispatch. None means the
+    # pre-dispatch envelope check is off.
+    envelope_lane_plan: Path | None = None
     compact_window: int = 1_000_000
     # Explicit non-secret variables for provider subprocesses, primarily test
     # harness controls. Secret-looking names are still rejected below.
@@ -832,6 +835,7 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
     fallback = _table(data, "fallback")
     pricing = _table(data, "pricing")
     loop = _table(data, "loop")
+    envelope = _table(data, "envelope")
     provider_tables = _table(data, "providers")
 
     defaults = {
@@ -870,6 +874,10 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
     session_root = _path(
         _str(core, "session_root", None), Path.home() / ".subagent" / "sessions"
     )
+    envelope_plan = _str(envelope, "lane_plan", None)
+    envelope_lane_plan = (
+        Path(envelope_plan).expanduser().resolve() if envelope_plan else None
+    )
     configured_socket = _str(guard, "approval_socket", None)
     approval_socket = (
         _configured_approval_socket_path(configured_socket)
@@ -897,6 +905,7 @@ def load(project_root: Path | None = None, extra: Path | None = None) -> Setting
         chars_per_token=float(_num(core, "chars_per_token", 3.5)),
         run_archive=int(_int(core, "run_archive", 200)),
         trace=_str(core, "trace", None),
+        envelope_lane_plan=envelope_lane_plan,
         compact_window=int(defaults["compact_window"]),
         child_env_passthrough=_strings(core, "child_env_passthrough"),
         rate_limit_retries=int(_int(core, "rate_limit_retries", 3, positive=False)),

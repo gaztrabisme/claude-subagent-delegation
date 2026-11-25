@@ -171,3 +171,8 @@ provider = "codex"
 
 [loop.test_writer]
 provider = "glm"
+
+# Pre-dispatch usage-envelope check. Off unless lane_plan names a lane-plan
+# markdown file with a "## Usage envelopes" table; `~` expands.
+# [envelope]
+# lane_plan = "~/.config/subagent/lane-plan.md"

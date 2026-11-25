@@ -303,6 +303,7 @@ async def delegate(
     request_id: str | None = None,
     timeout: float | None = None,
     max_steps: int | None = None,
+    override_envelope: str | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Start a new subagent on a task.
@@ -346,7 +347,18 @@ async def delegate(
             `caps` reports the request and the effective limit.
         max_steps: Optional cap on this run's turns. Clamped to the provider's
             own max_steps; a value of zero or less is refused.
+        override_envelope: Optional non-empty reason to let a run proceed on a
+            lane whose usage envelope would refuse it. The override and the
+            decision are recorded in the trace; the worker never sees it.
     """
+    if override_envelope is not None and not override_envelope.strip():
+        return {
+            "state": "rejected",
+            "error": "override_envelope requires a non-empty reason",
+            "lane": provider or lane or settings.default_provider,
+            "provider": provider or lane or settings.default_provider,
+            "fallback": fallback or "full",
+        }
     wanted = provider or lane
     deprecated = provider is None and lane is not None
     try:
@@ -402,7 +414,8 @@ async def delegate(
     arguments = {"tool": "delegate", "task": task, "verification": verification,
                  "workspace": str(resolved), "instructions": instructions, "model": model,
                  "name": name, "fallback": fallback or "full", "goal": goal,
-                 "timeout": timeout, "max_steps": max_steps}
+                 "timeout": timeout, "max_steps": max_steps,
+                 "override_envelope": override_envelope}
     agent = None
 
     def submit():
@@ -412,6 +425,7 @@ async def delegate(
             fallback=fallback, goal=parsed_goal, goal_reviewer=goal_review,
             task=task, instructions=instructions,
             provider_explicit=wanted is not None,
+            override_envelope=override_envelope,
         )
         pre_run = pre_verify = None
         try:
@@ -572,7 +586,10 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
         if not agent.closed:
             live_by_lane[agent.cfg.name] = live_by_lane.get(agent.cfg.name, 0) + 1
     statuses = await anyio.to_thread.run_sync(
-        partial(registry.lane_status.snapshot, settings, live_by_lane=live_by_lane)
+        partial(
+            registry.lane_status.snapshot, settings, live_by_lane=live_by_lane,
+            count_runs=settings.envelope_lane_plan is not None,
+        )
     )
     for cfg in settings.providers.values():
         view = cfg.as_dict()

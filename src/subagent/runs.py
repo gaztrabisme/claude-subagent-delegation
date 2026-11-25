@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import adapter, health, providers, router
+from . import adapter, envelope, health, providers, router
 from .config import APPROVAL_HOOK, Settings, log
 from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
@@ -1471,7 +1471,10 @@ class Agent:
                 if not isinstance(lane, str) or not lane:
                     continue
                 outcome = hop.get("outcome")
-                if outcome == router.HOP_REFUSED and hop.get("code") != router.ADMISSION:
+                if (
+                    outcome == router.HOP_REFUSED
+                    and hop.get("code") not in (router.ADMISSION, router.ENVELOPE)
+                ):
                     observations.append({
                         "lane": lane, "kind": "run", "finish_reason": "refused",
                         "code": hop.get("code"), "detail": hop.get("message"),
@@ -1760,6 +1763,74 @@ class Agent:
         names = ", ".join(cfg.api_key_envs) or "(none configured)"
         return f"missing API key for provider {cfg.name!r}: set one of {names}"
 
+    def _envelope_plan(self, run: Run) -> list[envelope.EnvelopeRow] | None:
+        """Rows from the configured lane plan; None when the check is off or unusable."""
+        plan = self.settings.envelope_lane_plan
+        if plan is None:
+            return None
+        rows = envelope.load_plan(plan)
+        if rows:
+            return rows
+        message = f"envelope check skipped: no usage envelopes table in {plan}"
+        if self.trace is not None:
+            self.trace.write("envelope_config_warning", run_id=run.run_id, message=message)
+        return None
+
+    def _envelope_record(
+        self, kind: str, run: Run, decision: envelope.Decision, **extra: Any
+    ) -> None:
+        if self.trace is None:
+            return
+        self.trace.write(
+            kind,
+            run_id=run.run_id,
+            lane=decision.lane,
+            rule=decision.kind,
+            level=decision.level,
+            used=decision.used,
+            limit=decision.limit,
+            unit=decision.unit,
+            reason=decision.reason,
+            **extra,
+        )
+
+    def _check_envelope(
+        self,
+        run: Run,
+        cfg: ProviderConfig,
+        rows: list[envelope.EnvelopeRow],
+        snapshot: dict[str, dict[str, Any]],
+        override: str | None,
+    ) -> tuple[envelope.Decision | None, str | None]:
+        """Check one candidate lane before admission; record what the decision implies.
+
+        Returns the refusing decision, or None and the warning text to attach
+        only once the hop is actually used.
+        """
+        row = envelope.row_for(rows, cfg.name)
+        if row is None:
+            return None, None
+        reading = envelope.reading_for(row, snapshot)
+        decision = envelope.evaluate(row.rules, reading, lane=cfg.name)
+        warning = None
+        if decision.level == "refuse":
+            if override:
+                self._envelope_record(
+                    "envelope_override", run, decision, entry=self.entry,
+                    override_reason=override,
+                )
+            else:
+                return decision, None
+        elif decision.level == "warn":
+            warning = decision.reason
+            self._envelope_record("envelope_warning", run, decision)
+        elif decision.level == "unknown":
+            self._envelope_record(
+                "envelope_no_reading", run, decision,
+                missing=envelope.missing_keys(row.rules, reading),
+            )
+        return None, warning
+
     def _hop(self, run: Run, hop: router.Hop) -> None:
         if hop.message:
             hop.message = redact_secrets(hop.message, self.settings.leaked_keys)
@@ -1785,8 +1856,14 @@ class Agent:
         primary_model = self.model
         last_refusal: str | None = None
         harness_status = (
-            self.lane_status.snapshot(self.settings) if self.lane_status is not None else {}
+            self.lane_status.snapshot(
+                self.settings,
+                count_runs=self.settings.envelope_lane_plan is not None,
+            ) if self.lane_status is not None else {}
         )
+        envelope_rows = self._envelope_plan(run)
+        override = self.delegate_options.get("override_envelope")
+        override = override.strip() if isinstance(override, str) and override.strip() else None
         explicitly_named = bool(self.delegate_options.get("provider_explicit"))
         for index, cfg in enumerate(self.chain):
             if self._closing:
@@ -1854,6 +1931,18 @@ class Agent:
                     hop.message = warm.message
                     self._hop(run, hop)
                     continue
+            warning: str | None = None
+            if envelope_rows is not None:
+                decision, warning = self._check_envelope(
+                    run, cfg, envelope_rows, harness_status, override
+                )
+                if decision is not None:
+                    hop.outcome = router.HOP_REFUSED
+                    hop.code = router.ENVELOPE
+                    hop.message = decision.reason
+                    self._hop(run, hop)
+                    last_refusal = hop.message
+                    continue
             if self.telemetry is not None and self.telemetry.covers(cfg):
                 admission = self.telemetry.admission(cfg)
                 hop.admission = admission.snapshot
@@ -1872,6 +1961,11 @@ class Agent:
                     last_refusal = hop.message
                     continue
 
+            # Attach a warn only now that this hop is known to be used. A
+            # warning from a lane that admission then skipped must not linger
+            # on the run.
+            if warning:
+                run.warning = warning
             self.cfg = cfg
             self.driver = driver
             self.model = model
@@ -1893,8 +1987,11 @@ class Agent:
             run.worked = False
             run.attempted_lane = cfg.name
             if explicit_primary and harness_state == "unverified":
-                run.warning = (
+                unverified = (
                     f"provider {cfg.name!r} is running with an unverified harness version"
+                )
+                run.warning = (
+                    f"{run.warning}; {unverified}" if run.warning else unverified
                 )
             events = self._collect(run, run.prompt, resume=None)
             refusal = None
@@ -1932,10 +2029,14 @@ class Agent:
         run.error = f"no provider took the run: {tried}"
         run.error_detail = last_refusal
         # "refused" only when every provider said no itself. A hop skipped by
-        # an admission threshold is this machine's decision, not a refusal by
-        # the backend, and leaves the run a plain no_lane.
-        refused = [h for h in run.hops if h["outcome"] == router.HOP_REFUSED
-                   and h.get("code") != router.ADMISSION]
+        # an admission threshold or a usage envelope is this machine's
+        # decision, not a refusal by the backend, and leaves the run a plain
+        # no_lane.
+        refused = [
+            h for h in run.hops
+            if h["outcome"] == router.HOP_REFUSED
+            and h.get("code") not in (router.ADMISSION, router.ENVELOPE)
+        ]
         run.finish_reason = "refused" if refused and len(refused) == len(run.hops) else "no_lane"
         return False
 
@@ -2738,6 +2839,7 @@ class Registry:
         instructions: str | None = None,
         deny_read: list[str] | None = None,
         provider_explicit: bool | None = None,
+        override_envelope: str | None = None,
     ) -> Agent:
         chosen = self.select_provider(provider, fallback)
         refusal = self.settings.workspace_refusal(workspace)
@@ -2782,7 +2884,8 @@ class Registry:
                             "provider_explicit": (
                                 provider is not None
                                 if provider_explicit is None else provider_explicit
-                            )},
+                            ),
+                            "override_envelope": override_envelope},
                         deny_read=deny_read,
                         entry=self.entry,
                         released_agents=released,

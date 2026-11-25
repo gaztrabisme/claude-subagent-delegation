@@ -73,7 +73,8 @@ _BYPASS_OBJECT = re.compile(r"\{[^{}]*\"BypassSandbox\"[^{}]*\}")
 
 
 def bypass_audit_enabled(cfg: ProviderConfig) -> bool:
-    return cfg.extra.get("bypass_audit") is True
+    """On unless the provider sets `bypass_audit = false` (S56)."""
+    return cfg.extra.get("bypass_audit", True) is not False
 
 
 def conversation_record(cfg: ProviderConfig, conversation_id: str) -> Path:
@@ -91,6 +92,17 @@ def audit_conversation(cfg: ProviderConfig, conversation_id: str | None
             or conversation_id in (".", ".."):
         return [], "no usable conversation id for this run"
     path = conversation_record(cfg, conversation_id)
+    # The state directory is a worker write root: never follow a link planted
+    # there, so nothing but this run's own record is ever opened.
+    try:
+        if path.parent.is_symlink() or path.is_symlink():
+            return [], "conversation record path is a symbolic link; not read"
+        if not path.exists():
+            return [], "conversation record not found"
+        if not path.is_file():
+            return [], "conversation record is not a regular file"
+    except OSError as exc:
+        return [], f"conversation record not accessible: {type(exc).__name__}"
     uri = "file:" + quote(str(path.resolve())) + "?mode=ro"
     try:
         con = sqlite3.connect(uri, uri=True)

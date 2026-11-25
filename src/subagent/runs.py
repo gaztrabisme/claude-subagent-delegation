@@ -1863,20 +1863,23 @@ class Agent:
     def _bypass_audit(self, run: Run) -> None:
         """R1a-agy addendum R2: record bypassing calls from agy's own conversation record.
 
-        Off unless `bypass_audit = true`. Observation only: it never changes the
-        run, and any failure becomes one bypass_audit_unavailable record.
+        On unless `bypass_audit = false` (S56). Observation only: it never changes
+        the run, and any failure becomes one bypass_audit_unavailable record (a
+        missing record, as with a fake agy, is expected and not logged).
         """
         from .providers import antigravity
 
         if not antigravity.bypass_audit_enabled(self.cfg):
             return
+        if self.trace is None or self.trace.path is None:
+            return  # nowhere to record a finding: read nothing
         try:
             findings, reason = antigravity.audit_conversation(self.cfg, run.session_id)
         except Exception as exc:  # noqa: BLE001 - the audit fails open
             findings, reason = [], f"audit failed: {type(exc).__name__}"
-        if self.trace is None:
-            return
         if reason is not None:
+            if reason != "conversation record not found":
+                log.warning("bypass audit for run %s unavailable: %s", run.run_id, reason)
             self.trace.bypass_audit_unavailable(
                 agent_id=self.agent_id, run_id=run.run_id, provider=self.cfg.name,
                 reason=reason,

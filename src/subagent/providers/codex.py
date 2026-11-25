@@ -53,11 +53,10 @@ def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
         str(cwd),  # Project files are the worker's deliverable.
         str(agent_dir / "tmp"),  # Per-agent TMPDIR; never the server's own temp.
         str(agent_dir / "codex-home"),  # Isolated CODEX_HOME: sessions, logs, state.
-        "/dev",  # Codex's pty and descriptor devices, as on the R1-0 profile.
+        str(agent_dir / "cache"),  # Per-agent cache (XDG_CACHE_HOME), not the user's.
     ]
-    cache = _darwin_user_cache_dir()
-    if cache:
-        roots.append(cache)  # Codex's discovered per-user cache root.
+    # Devices: only the standard ones every A9 profile allows (no /dev subpath,
+    # which would reach the owner's other terminals).
     return list(dict.fromkeys(roots))
 
 
@@ -359,7 +358,7 @@ def prepare_home(
         for key, value in _user_defaults(source).items():
             lines.append(f"{key} = {_toml_string(value)}")
     lines.append('approval_policy = "never"')
-    (home / "config.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_atomic(home / "config.toml", "\n".join(lines) + "\n")
 
     if settings.supervisor == "off":
         hooks: dict[str, Any] = {}
@@ -379,8 +378,18 @@ def prepare_home(
                 }
             ]
         }
-    (home / "hooks.json").write_text(json.dumps({"hooks": hooks}, indent=2), encoding="utf-8")
+    _write_atomic(home / "hooks.json", json.dumps({"hooks": hooks}, indent=2))
     return home
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace `path` whole: a concurrent boot never reads a half-written file."""
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def codex_argv(
@@ -514,10 +523,9 @@ class CodexProvider:
             # The outer profile is the filesystem and network boundary (A9,
             # A10); a second Seatbelt sandbox inside it prevents Codex from
             # initializing, so the inner mode opens only under that profile.
-            agent_tmp = prepare_private_directory(
-                settings.session_root / "agents" / agent_id / "tmp"
-            )
-            env["TMPDIR"] = str(agent_tmp)
+            agent_dir = settings.session_root / "agents" / agent_id
+            env["TMPDIR"] = str(prepare_private_directory(agent_dir / "tmp"))
+            env["XDG_CACHE_HOME"] = str(prepare_private_directory(agent_dir / "cache"))
             home = Path(env["CODEX_HOME"])
             write_deny = [
                 str(cwd / ".git"), *(str(root) for root in sorted(_git_metadata_roots(cwd))),

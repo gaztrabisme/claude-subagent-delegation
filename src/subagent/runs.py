@@ -1410,8 +1410,12 @@ class Agent:
                 "dsh_cordis_path": str(cordis_path),
                 "dsh_cordis_sha256": None,
                 "dsh_cordis_run_id": run.run_id,
-                "dsh_guard_tampered": False,
-                "dsh_guard_tamper_traced": False,
+                # A12: once a bootstrap change was seen, every later request
+                # of this agent stays denied, across later launches too.
+                "dsh_guard_tampered": bool(self.guard_context.get("dsh_guard_tampered")),
+                "dsh_guard_tamper_traced": bool(
+                    self.guard_context.get("dsh_guard_tamper_traced")
+                ),
             })
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
@@ -1428,6 +1432,11 @@ class Agent:
             write_deny = [
                 str(APPROVAL_HOOK), str(self.workspace / ".git"),
                 *(str(root) for root in sorted(_git_metadata_roots(self.workspace))),
+                # The driver's own guard configuration and auto-loaded files,
+                # as codex denies its hooks.json, config.toml and auth.json.
+                *driver_module.sandbox_write_deny(
+                    self.settings, self.agent_id, self.cfg, self.workspace
+                ),
             ]
             with egress_port(self._egress_port):
                 profile = agent_profile_kwargs(

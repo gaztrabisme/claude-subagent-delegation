@@ -67,6 +67,23 @@ def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
     ]
     return list(dict.fromkeys(roots))
 
+
+# What omp loads from its agent directory (PI_CODING_AGENT_DIR) as settings,
+# instructions or code: the server-written config.yml and models.yml, and the
+# extension, hook, agent, command, skill, prompt, tool and theme folders.
+OMP_AUTOLOAD_NAMES = (
+    "config.yml", "models.yml", "settings.json", "settings.yml", "models.json", "auth.json",
+    "AGENTS.md", "SYSTEM.md", "extensions", "hooks", "agents", "commands", "skills",
+    "prompts", "tools", "themes", "plugins",
+)
+
+
+def sandbox_write_deny(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                       cwd: Path) -> list[str]:
+    """Paths the omp child may not write, even below one of its write roots."""
+    home = settings.session_root / "agents" / agent_id / "omp-agent"
+    return [str(home / name) for name in OMP_AUTOLOAD_NAMES]
+
 _NO_SAMPLING_ARGS = frozenset({
     "--thinking", "--external-thinking", "--temperature", "--top-p", "--top-k",
     "--min-p", "--typical-p", "--presence-penalty", "--frequency-penalty",

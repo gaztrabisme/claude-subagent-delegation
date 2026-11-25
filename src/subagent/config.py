@@ -813,6 +813,15 @@ class Settings:
                 f"workspace {root} contains the approval socket directory ({socket_dirs[-1]}); "
                 "a child there could access its supervisor transport"
             )
+        # The session root holds every agent's state (hook settings, homes,
+        # keys); a workspace containing it would make other agents' writable.
+        session_spelling = Path(self.session_root).expanduser().absolute()
+        session_dirs = (session_spelling, session_spelling.resolve())
+        if any(candidate == root or candidate.is_relative_to(root) for candidate in session_dirs):
+            return (
+                f"workspace {root} contains the session root ({session_dirs[-1]}); "
+                "a child there could rewrite other agents' state"
+            )
         return None
 
     def resolve_workspace(self, requested: str | None) -> Path:

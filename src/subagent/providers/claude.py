@@ -40,9 +40,41 @@ CHILD_TOOLS = "Bash,Read,Edit,Write,Grep,Glob"
 DEFAULT_BINARY = "claude"
 
 
+# Files and directories Claude Code loads from a config directory as settings,
+# instructions, hooks or code. A child must never write them: in the owner's
+# directory they would run in the owner's own (unsandboxed) sessions, and in
+# the per-agent home in this agent's later turns.
+CLAUDE_AUTOLOAD_NAMES = (
+    "settings.json", "settings.local.json", "CLAUDE.md", "CLAUDE.local.md",
+    "keybindings.json", "hooks", "agents", "commands", "skills", "plugins",
+    "output-styles", "statusline",
+)
+# More of the owner's config directory that changes what the owner's sessions
+# run: shell snapshots are sourced before every Bash call, session-env is
+# applied to it, ide/ lock files point sessions at an MCP endpoint, local/ holds
+# a local install of the CLI, and .claude.json carries MCP servers.
+CLAUDE_OWNER_CONTROL_NAMES = (
+    "shell-snapshots", "session-env", "ide", "local", "downloads", ".claude.json",
+)
+
+
+def _owner_claude_config() -> tuple[Path, bool]:
+    """The owner's Claude config directory and whether CLAUDE_CONFIG_DIR names it."""
+    config = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if config:
+        return Path(config).expanduser(), True
+    return Path.home() / ".claude", False
+
+
+def _project_dir_names(cwd: Path) -> list[str]:
+    """Claude Code's projects/ entry for a working directory (both spellings)."""
+    spellings = dict.fromkeys((str(cwd), str(Path(cwd).resolve())))
+    return [re.sub(r"[^A-Za-z0-9]", "-", spelling) for spelling in spellings]
+
+
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
                         cwd: Path) -> list[str]:
-    """Workspace, this agent's Claude state, and temporary/runtime scratch roots."""
+    """The claude child's write roots under its macOS profile."""
     roots = [
         str(cwd),  # Project files are the worker's deliverable.
         str(settings.session_root / "agents" / agent_id),  # Own hook and session state.
@@ -50,10 +82,37 @@ def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
         str(settings.session_root / "agents" / agent_id / "tmp"),  # Private CLI scratch.
     ]
     if cfg.extra.get("auth") == "login":
-        config = os.environ.get("CLAUDE_CONFIG_DIR")
-        roots.append(str(Path(config).expanduser() if config else Path.home() / ".claude"))
-        # The login CLI must update the owner's own authentication store.
+        # The login child runs on the owner's config directory. It may write
+        # only its own state there, never what the owner's sessions load.
+        config, _ = _owner_claude_config()
+        roots.extend(
+            str(config / "projects" / name)  # This workspace's session transcripts.
+            for name in _project_dir_names(cwd)
+        )
+        roots.extend([
+            str(config / "todos"),  # Per-session todo lists.
+            str(config / "statsig"),  # Feature-flag cache.
+            str(config / "debug"),  # Debug logs.
+            str(config / ".credentials.json"),  # OAuth refresh where no Keychain is used.
+        ])
     return list(dict.fromkeys(roots))
+
+
+def sandbox_write_deny(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                       cwd: Path) -> list[str]:
+    """Paths the claude child may not write, even below one of its write roots."""
+    home = settings.agent_home(agent_id)
+    denied = [str(home / name) for name in CLAUDE_AUTOLOAD_NAMES]
+    if cfg.extra.get("auth") == "login":
+        config, named = _owner_claude_config()
+        denied.extend(str(config / name)
+                      for name in (*CLAUDE_AUTOLOAD_NAMES, *CLAUDE_OWNER_CONTROL_NAMES))
+        if not named:
+            # Without CLAUDE_CONFIG_DIR the global state file sits in the home.
+            denied.extend(str(Path.home() / name)
+                          for name in (".claude.json", ".claude.json.backup"))
+    return list(dict.fromkeys(denied))
+
 
 # Claude Code 2.1.261 prints this harmless warning to stderr on every request
 # (the wrapper passes the raw model name; the env maps only the aliases).

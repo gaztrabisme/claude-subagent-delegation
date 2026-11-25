@@ -19,6 +19,25 @@ SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 STANDARD_DEVICE_LITERALS = ("/dev/null", "/dev/zero", "/dev/tty", "/dev/dtracehelper")
 STANDARD_DEVICE_SUBPATHS = ("/dev/fd",)
 
+# Ways out of a Seatbelt profile that `(allow default)` leaves open: another
+# process started on the child's behalf runs outside the profile (and outside
+# the run's process tree). An A9 profile denies sending Apple Events, the
+# LaunchServices, ServiceManagement and background-download services, and
+# running the three system tools that drive them.
+IPC_ESCAPE_MACH_SERVICES = (
+    "com.apple.coreservices.launchservicesd",  # LaunchServices: open apps, URLs, files.
+    "com.apple.lsd.open",  # LaunchServices open requests.
+    "com.apple.lsd.modifydb",  # LaunchServices handler registration (persistence).
+    "com.apple.xpc.smd",  # ServiceManagement: launchd job and login-item submission.
+    "com.apple.nsurlsessiond",  # Background URL sessions run by the daemon, not the child.
+    "com.apple.nsurlsessiond.NSURLSessionProxyService",  # The same daemon's proxy service.
+)
+IPC_ESCAPE_EXECUTABLES = (
+    "/bin/launchctl",  # Submits or bootstraps launchd jobs.
+    "/usr/bin/open",  # Launches apps and URLs through LaunchServices.
+    "/usr/bin/osascript",  # Sends Apple Events to other apps.
+)
+
 # The loopback port of the agent's egress proxy while its driver builds argv.
 _EGRESS_PORT: ContextVar[int | None] = ContextVar("subagent_egress_port", default=None)
 
@@ -104,6 +123,7 @@ def build_profile(
     network_unix_sockets: Sequence[str] = (),
     read_deny_subpaths: Sequence[str] = (),
     write_allow_devices: bool = False,
+    deny_ipc_escapes: bool = False,
 ) -> str:
     """Restrict writes, deny excluded realpaths, and prevent ancestor renames.
 
@@ -178,6 +198,12 @@ def build_profile(
             rules.append(
                 f'(allow network-outbound (remote unix-socket {_filter(path, "literal")}))'
             )
+    if deny_ipc_escapes:
+        rules.append("(deny appleevent-send)")
+        services = " ".join(f'(global-name "{name}")' for name in IPC_ESCAPE_MACH_SERVICES)
+        rules.append(f"(deny mach-lookup {services})")
+        programs = " ".join(_filter(path, "literal") for path in IPC_ESCAPE_EXECUTABLES)
+        rules.append(f"(deny process-exec {programs})")
     return "\n".join(rules)
 
 
@@ -196,6 +222,7 @@ def wrap_argv(
     network_unix_sockets: Sequence[str] = (),
     read_deny_subpaths: Sequence[str] = (),
     write_allow_devices: bool = False,
+    deny_ipc_escapes: bool = False,
 ) -> list[str]:
     """Pass arguments directly to sandbox-exec; never fall back on sandbox failure."""
     network_policy = network_loopback_ports is not None or bool(network_unix_sockets)
@@ -212,7 +239,8 @@ def wrap_argv(
                       network_loopback_ports=network_loopback_ports,
                       network_unix_sockets=network_unix_sockets,
                       read_deny_subpaths=read_deny_subpaths,
-                      write_allow_devices=write_allow_devices),
+                      write_allow_devices=write_allow_devices,
+                      deny_ipc_escapes=deny_ipc_escapes),
         *argv,
     ]
 
@@ -229,7 +257,10 @@ def agent_profile_kwargs(
     approval socket's directory is write-denied (R1-0 Q2); other agents'
     directories under `<session_root>/agents/` are read-denied while this
     agent's own stays readable (A9.3); outbound network is limited to the
-    agent's egress proxy, a loopback `base_url` and the approval socket (A10).
+    agent's egress proxy, a loopback `base_url` and the approval socket (A10);
+    Apple Events, LaunchServices, ServiceManagement, nsurlsessiond and the
+    tools that drive them are denied, so no helper process runs the child's
+    request outside the profile.
     """
     agents = Path(session_root) / "agents"
     socket_deny = approval_socket_write_deny(
@@ -249,4 +280,5 @@ def agent_profile_kwargs(
         "read_allow_subpaths": [str(agents / agent_id)],
         "network_loopback_ports": network_ports(base_url),
         "network_unix_sockets": [approval_socket],
+        "deny_ipc_escapes": True,
     }

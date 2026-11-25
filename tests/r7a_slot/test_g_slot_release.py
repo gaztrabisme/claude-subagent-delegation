@@ -40,7 +40,7 @@ def _clock(monkeypatch):
 
 
 def _finished(reg, tmp_path, provider="glm", name="t"):
-    agent = reg.create_agent(name, tmp_path, provider)
+    agent = reg.create_agent(name, tmp_path, provider=provider)
     run = h.wait(agent.delegate("work", "true"))
     assert run.state == "completed", run.error
     return agent, run

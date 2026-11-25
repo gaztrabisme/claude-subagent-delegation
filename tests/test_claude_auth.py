@@ -23,8 +23,9 @@ from tests.conftest import make_settings
 
 FAKE_CLAUDE = Path(__file__).parent / "fakes" / "fake_claude.py"
 OWNER_WARNING = (
-    "uses the owner's Claude login and plan quota; worker sessions are written into the "
-    "owner's Claude history, and the owner's global instructions, commands and skills may load"
+    "uses the owner's Claude login and plan quota; only the credential is copied into the "
+    "worker's own config directory, and a token refresh by the worker may rotate the owner's "
+    "refresh token"
 )
 
 
@@ -81,11 +82,11 @@ def test_auth_login_is_opt_in(tmp_path: Path, monkeypatch) -> None:
     assert login.as_dict()["has_api_key"] is False
     assert login.base_url is None
     assert login.unavailable() is None
-    env = _login_settings(tmp_path / "child").child_env("agent", login)
-    # No config dir is forced when the parent set none: the child must read the
-    # CLI's own credential store (the login Keychain on macOS). An explicit dir
-    # makes Claude Code skip that store and report "Not logged in".
-    assert "CLAUDE_CONFIG_DIR" not in env
+    child = _login_settings(tmp_path / "child")
+    env = child.child_env("agent", login)
+    # R1a round 6 (H2): the login child runs on its own per-agent config
+    # directory; the driver copies only the owner's credential into it.
+    assert env["CLAUDE_CONFIG_DIR"] == str(child.agent_home("agent"))
     assert not {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -163,7 +164,7 @@ def test_auth_login_is_scoped_to_selected_provider(tmp_path: Path, monkeypatch) 
     login_env = settings.child_env("login-agent", settings.provider("login"))
     other_env = settings.child_env("other-agent", settings.provider("other"))
 
-    assert login_env["CLAUDE_CONFIG_DIR"] == str(owner_home.resolve())
+    assert login_env["CLAUDE_CONFIG_DIR"] == str(settings.agent_home("login-agent"))
     assert not {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -233,7 +234,7 @@ def test_auth_login_context_reaches_claude_child(tmp_path: Path, monkeypatch) ->
         cfg, settings, "child-context", "prompt", tmp_path, Session(provider="login"), None
     )
 
-    assert process.env["CLAUDE_CONFIG_DIR"] == str(owner_config.resolve())
+    assert process.env["CLAUDE_CONFIG_DIR"] == str(settings.agent_home("child-context"))
     assert not {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -458,7 +459,7 @@ def test_auth_login_unset_config_dir_protects_home_claude_during_events(
 
     expected_root = (fake_home / ".claude").resolve()
     target = fake_home / ".claude" / "settings.json"
-    assert "CLAUDE_CONFIG_DIR" not in process.env
+    assert process.env["CLAUDE_CONFIG_DIR"] == str(settings.agent_home("unset-cfg"))
     assert process.protected_root.resolve() == expected_root
     assert protected(target) is None
 
@@ -499,7 +500,7 @@ def test_auth_login_blank_config_dir_treated_as_unset(
 
     expected_root = (fake_home / ".claude").resolve()
     target = fake_home / ".claude" / "settings.json"
-    assert "CLAUDE_CONFIG_DIR" not in process.env
+    assert process.env["CLAUDE_CONFIG_DIR"] == str(settings.agent_home("blank-cfg"))
     assert process.protected_root.resolve() == expected_root
     assert protected(target) is None
 
@@ -538,7 +539,7 @@ def test_auth_login_set_config_dir_preserved_and_protected(
     )
 
     target = cfg_dir / "settings.json"
-    assert process.env["CLAUDE_CONFIG_DIR"] == str(cfg_dir.resolve())
+    assert process.env["CLAUDE_CONFIG_DIR"] == str(settings.agent_home("set-cfg"))
     assert process.protected_root.resolve() == cfg_dir.resolve()
 
     def check_during_events():

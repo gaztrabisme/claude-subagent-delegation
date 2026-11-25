@@ -130,27 +130,33 @@ _WRITE_PROBE = (
 
 @pytest.mark.parametrize("named", [True, False], ids=["CLAUDE_CONFIG_DIR", "default"])
 def test_login_profile_writes_only_cli_state_in_owner_config(tmp_path, monkeypatch, named):
+    # R1a round 6 (H1-H3): the login child runs on its own CLAUDE_CONFIG_DIR;
+    # nothing in the owner's config directory is writable, its own state is.
     config = tmp_path / "owner-claude" if named else None
     ws, settings = _setup(tmp_path, monkeypatch, claude_config=config)
     config = config or (tmp_path / "home" / ".claude")
-    argv, _ = _capture(monkeypatch, settings, ws, "claude_login", "login1")
+    argv, env = _capture(monkeypatch, settings, ws, "claude_login", "login1")
     profile = argv[2]
+    home = Path(env["CLAUDE_CONFIG_DIR"])
+    assert home == settings.agent_home("login1")
 
-    project = claude_driver._project_dir_names(ws)[0]
-    for allowed in (config / "projects" / project / "s.jsonl", config / "todos" / "t.json"):
+    for allowed in (home / "projects" / "p" / "s.jsonl", home / "todos" / "t.json",
+                    home / ".credentials.json", home / ".claude.json"):
         assert sbpl_allows(profile, "file-write*", allowed), allowed
     denied = [config / name for name in (
         "settings.json", "settings.local.json", "CLAUDE.md", "hooks/h.sh", "agents/a.md",
         "commands/c.md", "skills/s/SKILL.md", "plugins/p.json", "output-styles/o.md",
         "shell-snapshots/snapshot.sh", "session-env/e", "ide/1.lock", "local/claude",
-        ".claude.json", "projects/-other-project/s.jsonl",
+        ".claude.json", "projects/-other-project/s.jsonl", "projects/p/s.jsonl",
+        "todos/t.json", "statsig/s", "debug/d.log", ".credentials.json",
     )]
     denied.append(config)  # renaming the directory itself
+    denied.append(home / "settings.json")
     if not named:
         denied.append(tmp_path / "home" / ".claude.json")
     for path in denied:
         assert not sbpl_allows(profile, "file-write*", path), path
-    assert f'(subpath "{config.resolve()}")' not in profile.split("\n")[3]
+    assert f'(subpath "{config.resolve()}")' not in profile
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt runtime check")
@@ -159,18 +165,20 @@ def test_login_profile_live_blocks_owner_settings_even_through_a_symlink(tmp_pat
         pytest.skip("Seatbelt cannot nest inside this runner")
     config = tmp_path / "owner-claude"
     ws, settings = _setup(tmp_path, monkeypatch, claude_config=config)
-    argv, _ = _capture(monkeypatch, settings, ws, "claude_login", "login2")
+    argv, env = _capture(monkeypatch, settings, ws, "claude_login", "login2")
     profile = argv[2]
     (config / "settings.json").write_text("{}\n", encoding="utf-8")
     link = ws / "innocent.json"
     link.symlink_to(config / "settings.json")
-    project = config / "projects" / claude_driver._project_dir_names(ws)[0]
+    project = config / "projects" / "p"
     project.mkdir(parents=True)
+    home = Path(env["CLAUDE_CONFIG_DIR"])
 
     assert _run_under(profile, _WRITE_PROBE, str(config / "settings.json")).returncode == 3
     assert _run_under(profile, _WRITE_PROBE, str(link)).returncode == 3
     assert _run_under(profile, _WRITE_PROBE, str(config / "CLAUDE.md")).returncode == 3
-    assert _run_under(profile, _WRITE_PROBE, str(project / "s.jsonl")).returncode == 0
+    assert _run_under(profile, _WRITE_PROBE, str(project / "s.jsonl")).returncode == 3
+    assert _run_under(profile, _WRITE_PROBE, str(home / "s.jsonl")).returncode == 0
     assert (config / "settings.json").read_text(encoding="utf-8") == "{}\n"
 
 

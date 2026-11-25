@@ -1017,17 +1017,21 @@ class Agent:
         if not run.admission_ready.wait(timeout):
             # A serial continuation may still be queued behind a human wait.
             # Cancel only that unsubmitted run, never the active service job.
+            queued = False
+            finished = False
             with self._dispatch_lock, self._wake:
                 queued = run.started_at is None
                 if queued:
                     if run in self._queue:
                         self._queue.remove(run)
                     run.trip = (KILL_TIMEOUT, "provider admission timed out before submission")
-                    self._finish_locked(run)
+                    finished = self._finish_locked(run)
             if queued:
                 # This run never owned the agent's active lane lease; an
-                # earlier human-waiting run may still be using it.
-                self._record_lane_status(run, release_active_lane=False)
+                # earlier human-waiting run may still be using it. A run that
+                # already had its terminal state was recorded then.
+                if finished:
+                    self._record_lane_status(run, release_active_lane=False)
                 raise RegistryError("provider admission timed out before submission")
             self.close("provider admission timed out", kind=KILL_TIMEOUT)
             raise RegistryError("provider admission timed out; cancellation requested")
@@ -1099,13 +1103,15 @@ class Agent:
             **({"request_id": request_id} if request_id and capabilities(self.driver).run_context
                else {}),
         )
-        self._released_agents = []
         run.transcript = deque(maxlen=self.settings.transcript_limit)
         with self._wake:
             # A release claim may land between the check above and this queue
             # append. Re-check under the same lock the claim takes.
             if self._closed or self._closing:
                 raise RegistryError(f"agent {self.agent_id} is closed")
+            # Only a successful submit consumes the ids released for it: a
+            # refused submit must keep them for the caller's retry.
+            self._released_agents = []
             run.continues = len(self._order)
             self._runs[run.run_id] = run
             self._order.append(run.run_id)
@@ -1356,11 +1362,17 @@ class Agent:
     # before it finishes the run itself.
     END_RUN_WAIT = 2.0
 
-    def end_run(self, run: Run, reason: str, kind: str) -> None:
+    def end_run(
+        self, run: Run, reason: str, kind: str, *, finish_stuck: bool = True
+    ) -> None:
         """End one run on its deadline without closing the agent (R7a).
 
         The agent stays resumable: a continue starts a new run in the same
         provider session. Unlike `close`, this never sets `_closing`.
+
+        `finish_stuck=False` is for the reaper, whose caller is itself bounded:
+        it leaves a run that its worker may still finish WORKING for that pass,
+        and a later pass finishes it if the worker remains stuck.
         """
         if run.done.is_set():
             return
@@ -1376,15 +1388,15 @@ class Agent:
                 current.kill()
         with self._wake:
             self._wake.notify_all()
-        if not (capabilities(self.driver).cancel
-                or capabilities(self.driver).native_outcome):
-            # A plain child dies with the kill; its worker finishes the run
-            # once it has drained the stream.
-            return
-        # A service job can outlive the local kill (the cancel hook is remote).
-        # Give its worker a short bounded window; if it cannot finish, finish
-        # the run here as `close` does.
-        if not run.done.wait(self.END_RUN_WAIT):
+        service = (
+            capabilities(self.driver).cancel
+            or capabilities(self.driver).native_outcome
+        )
+        # A service job can outlive the local kill (the cancel hook is remote);
+        # a plain child should die with it, but a stuck stream may ignore the
+        # kill too. Both get the same bounded window, then this side finishes
+        # the run as `close` does. The reaper defers the plain case by one pass.
+        if not run.done.wait(self.END_RUN_WAIT) and (service or finish_stuck):
             self._finish(run)
 
     def _boot(self) -> None:
@@ -2364,24 +2376,30 @@ class Agent:
             with self._dispatch_lock:
                 if self._closing and not self._cancel_complete.is_set():
                     continue
-                self._finish_locked(run)
-                finished = run.done.is_set() and not run.cancel_pending
+                wrote = self._finish_locked(run)
+                finished = wrote and run.done.is_set() and not run.cancel_pending
                 break
         if finished:
             self._record_lane_status(run)
 
-    def _finish_locked(self, run: Run) -> None:
+    def _finish_locked(self, run: Run) -> bool:
+        """Give the run its terminal state; False when it already had one.
+
+        Exactly one finish writes the run's trace record and reports its lane
+        observation. A run `end_run` already finished keeps that outcome, even
+        if a later cancel sets `_kill_kind`.
+        """
         run.admission_ready.set()
+        if run.ended_by_end_run and run.done.is_set():
+            return False
         if run.done.is_set() and self._kill_kind is None:
-            # end_run already gave this run its terminal state; the worker
-            # must not write a second trace record for it. A close sets
-            # `_kill_kind`, and its finish still repairs finish_reason/error.
-            return
+            # Something else already gave this run its terminal state.
+            return False
         if run.cancel_pending:
             run.state = WORKING
             run.phase = "cancellation_pending"
             run.await_ready.set()
-            return
+            return False
         if self._kill_kind:
             kind = self._kill_kind
             run.state = FAILED if kind in KILL_IS_FAILURE else CANCELLED
@@ -2422,6 +2440,7 @@ class Agent:
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
         run.done.set()
         run.await_ready.set()
+        return True
 
     def _price(self, run: Run) -> dict[str, Any] | None:
         """The run's cost at run end (telemetry.cost.price_run), priced once per agent."""
@@ -2432,6 +2451,26 @@ class Agent:
         return price_run(
             run.usage, run.usage.credits, self.cfg, pricing, run.finished_at or _now()
         )
+
+
+class _ReapStuck(dict[str, threading.Thread]):
+    """Agent id -> the still-running close/end_run thread that is stuck on it.
+
+    It is a mapping so a later pass can see whether that thread returned (and
+    what it raised), while keeping the old set interface: `in`, `len()`, and
+    equality with an empty set or a set of the keys all still work.
+    """
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (set, frozenset)):
+            return set(self) == set(other)
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    __hash__ = None  # type: ignore[assignment]
 
 
 class Registry:
@@ -2468,7 +2507,10 @@ class Registry:
         # abandoned for the pass and remembered in `reap_stuck`; a later pass
         # must not start another thread for that agent.
         self.reap_close_timeout = 20
-        self.reap_stuck: set[str] = set()
+        self.reap_stuck: _ReapStuck = _ReapStuck()
+        # Agent id -> the exceptions its abandoned close thread raised after
+        # the pass moved on; the next pass logs them.
+        self._reap_errors: dict[str, list[BaseException]] = {}
         self._requests_lock = threading.RLock()
         self._requests: dict[tuple[str, ...], tuple[dict[str, Any], Run]] = {}
         self._counter = itertools.count(1)
@@ -2524,10 +2566,20 @@ class Registry:
     def reap_once(self) -> list[tuple[str, str]]:
         now = _now()
         acted: list[tuple[str, str]] = []
+        # An abandoned close thread may have returned since the last pass.
+        # Forget it so this pass can reap its agent normally, and surface any
+        # exception it raised after the earlier pass had already moved on.
+        for agent_id, thread in list(self.reap_stuck.items()):
+            if thread.is_alive():
+                continue
+            del self.reap_stuck[agent_id]
+            for exc in self._reap_errors.pop(agent_id, ()):
+                log.warning("reap: agent %s failed: %s", agent_id, exc, exc_info=exc)
         try:
             for agent in self.agents():
                 if agent.closed:
-                    self.reap_stuck.discard(agent.agent_id)
+                    self.reap_stuck.pop(agent.agent_id, None)
+                    self._reap_errors.pop(agent.agent_id, None)
                     continue
                 if agent.agent_id in self.reap_stuck:
                     # An earlier close attempt has not returned; starting
@@ -2564,10 +2616,19 @@ class Registry:
         overdue = next((run for run in pending if run.timeout_expired(now)), None)
         if overdue is not None:
             # A deadline is the run's, not the session's: an agent whose run
-            # timed out can still be resumed with `continue` (R7a).
+            # timed out can still be resumed with `continue` (R7a). The reaper
+            # does not finish a plain child in this call: its own bounded
+            # thread does not block a caller, and the next pass below finishes
+            # the run if that child is still stuck.
             return KILL_TIMEOUT, lambda: agent.end_run(
-                overdue, "run deadline exceeded", KILL_TIMEOUT
+                overdue, "run deadline exceeded", KILL_TIMEOUT, finish_stuck=False
             )
+        # A plain child that ignored `end_run`'s kill in an earlier pass still
+        # has a WORKING run: its stream never drained. Finish it here so the
+        # agent cannot hold its slot forever.
+        abandoned = next((run for run in active if run.ended_by_end_run), None)
+        if abandoned is not None:
+            return KILL_TIMEOUT, lambda: agent._finish(abandoned)
         if (not active and not agent.busy
                 and now - agent.last_activity > agent.cfg.idle_timeout):
             return KILL_IDLE, lambda: agent.close("idle", kind=KILL_IDLE)
@@ -2589,10 +2650,15 @@ class Registry:
         worker.start()
         worker.join(self.reap_close_timeout)
         if worker.is_alive():
-            self.reap_stuck.add(agent.agent_id)
+            self.reap_stuck[agent.agent_id] = worker
+            # The thread still owns this list; it appends to it if it raises
+            # after the pass has moved on, and the next pass logs that.
+            self._reap_errors[agent.agent_id] = errors
             log.warning("reap: agent %s did not close within %ss; moving on",
                         agent.agent_id, self.reap_close_timeout)
             return False
+        self.reap_stuck.pop(agent.agent_id, None)
+        self._reap_errors.pop(agent.agent_id, None)
         if errors:
             log.warning("reap: agent %s failed: %s", agent.agent_id, errors[0],
                         exc_info=errors[0])
@@ -2606,7 +2672,8 @@ class Registry:
                 if a.closed and all(r.state in TERMINAL_STATES for r in a.runs())
             ]
             for agent in closed:
-                self.reap_stuck.discard(agent.agent_id)
+                self.reap_stuck.pop(agent.agent_id, None)
+                self._reap_errors.pop(agent.agent_id, None)
                 for run in agent.runs():
                     self._archive[run.run_id] = run
                 self._agents.pop(agent.agent_id, None)

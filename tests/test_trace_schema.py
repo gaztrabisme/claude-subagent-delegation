@@ -62,6 +62,9 @@ REQUIRED: dict[str, set[str]] = {
         "orchestrator", "mode", "status", "rounds", "reviews", "usage_total",
         "credits_total", "cost_total", "wall_seconds", "changed_files", "verified_pass",
     },
+    # R1a A10.3 and A12: additive record types, schema version unchanged.
+    "egress_refused": {"agent_id", "run_id", "provider", "host", "port", "type"},
+    "guard_tamper": {"agent_id", "run_id", "path", "type"},
 }
 
 # Fields a kind may also carry, never required.

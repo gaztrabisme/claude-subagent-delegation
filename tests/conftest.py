@@ -56,6 +56,38 @@ def _provider_keys(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _fake_cli_outside_seatbelt(request, monkeypatch):
+    """Run fake claude/codex/omp CLIs without the live macOS profile.
+
+    On macOS every hook driver's argv now starts with `sandbox-exec -p
+    <profile>` (R1a A9), whose write roots exclude the test's tmp_path, where
+    the fake CLIs write their call records and pid files. Before R1a these
+    fakes ran unsandboxed, so they still do: the argv a test inspects keeps the
+    profile; only the process start drops it. DSH children ran under their
+    profile before R1a and still do, and tests/r1a, which exercises the live
+    profile itself, is left alone.
+    """
+    if Path(str(request.node.fspath)).is_relative_to(Path(__file__).parent / "r1a"):
+        return
+    from subagent.providers import base
+    from subagent.providers.dsh import DshProcess
+
+    real_start = base.Process._start
+
+    def start(self, *args, **kwargs):
+        wrapped = self.argv
+        if isinstance(self, DshProcess) or wrapped[:2] != ["/usr/bin/sandbox-exec", "-p"]:
+            return real_start(self, *args, **kwargs)
+        self.argv = wrapped[3:]
+        try:
+            return real_start(self, *args, **kwargs)
+        finally:
+            self.argv = wrapped
+
+    monkeypatch.setattr(base.Process, "_start", start)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_provider_secret_paths(monkeypatch):
     # Provider declarations are process-global in the in-process classifier.
     # Each test supplies its own Settings, just as hook subprocesses do.
@@ -196,6 +228,26 @@ def write_config(path: Path, tables: dict[str, Any]) -> Path:
     return path
 
 
+# A per-session directory beside (not inside) the tests' tmp_paths; set by the
+# autouse fixture below, which pytest's tmp_path_factory cleans up.
+_SOCKET_BASE: list[Path] = []
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _approval_socket_base(tmp_path_factory):
+    _SOCKET_BASE.append(tmp_path_factory.mktemp("approval-sockets"))
+    yield
+    _SOCKET_BASE.clear()
+
+
+def _approval_socket_dir() -> Path:
+    """A fresh private directory for one Settings' approval socket."""
+    import tempfile
+
+    base = _SOCKET_BASE[0] if _SOCKET_BASE else None
+    return Path(tempfile.mkdtemp(prefix="s", dir=base))
+
+
 def make_settings(tmp_path: Path, providers: dict[str, Any] | None = None,
                   **overrides) -> Settings:
     """Settings for a test, written as a config file and loaded back.
@@ -216,7 +268,10 @@ def make_settings(tmp_path: Path, providers: dict[str, Any] | None = None,
     guard: dict[str, Any] = {
         "supervisor": "off",
         "supervisor_cmd": "claude -p --model sonnet",
-        "approval_socket": str(tmp_path / "approval.sock"),
+        # Outside every test's tmp_path: a workspace that contains the approval
+        # socket's directory is refused (R1a A4), and tests delegate into
+        # tmp_path or one of its subdirectories.
+        "approval_socket": str(_approval_socket_dir() / "approval.sock"),
     }
     telemetry: dict[str, Any] = {}
     for key, value in overrides.items():

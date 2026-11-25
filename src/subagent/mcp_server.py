@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager, suppress
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -147,6 +147,39 @@ PROGRESS_INTERVAL = 3.0
 LANE_DEPRECATED = "`lane` is deprecated; use `provider`"
 
 
+def _registry_errors_as_tool_errors(fn):
+    """Re-raise `RegistryError` from a tool body as `ToolError`.
+
+    The MCP framework turns any other exception into the bare
+    "Error executing tool <name>", which hides the reason from the caller.
+    Applied under `@app.tool` on every tool that can raise `RegistryError`.
+    """
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except RegistryError as exc:
+            raise ToolError(str(exc)) from None
+
+    return wrapper
+
+
+def _bind_supervisor(ctx: Context | None) -> None:
+    """Bind the caller's MCP session for escalations when there is one.
+
+    `app.call_tool` invoked in-process has no request context, and `ctx.session`
+    raises there. Binding is decoration, not a requirement, so skip it rather
+    than failing the tool call before it reaches the real work.
+    """
+    if ctx is None:
+        return
+    try:
+        session = ctx.session
+    except Exception:  # noqa: BLE001 - no request context outside a live call
+        return
+    supervisor.bind(session)
+
+
 def _parent_context(ctx: Context | None) -> dict[str, Any] | None:
     """The caller's request `_meta` (Claude Code sends its tool-use id there),
     scalars only, for the trace's run record. None when the caller sent none."""
@@ -252,6 +285,7 @@ def _result(run: Run) -> dict[str, Any]:
 
 
 @app.tool(name="delegate")
+@_registry_errors_as_tool_errors
 async def delegate(
     task: str,
     verification: str,
@@ -329,8 +363,7 @@ async def delegate(
         if deprecated:
             result["warning"] = LANE_DEPRECATED
         return result
-    if ctx is not None:
-        supervisor.bind(ctx.session)
+    _bind_supervisor(ctx)
     # Refuse a bad cap before an agent is created: releasing an idle agent for
     # a request that can never run would cancel the slot for nothing.
     Agent.validate_caps(timeout, max_steps)
@@ -429,6 +462,7 @@ async def delegate(
 
 
 @app.tool(name="await")
+@_registry_errors_as_tool_errors
 async def await_run(
     run_id: str,
     wait_seconds: float = 120,
@@ -450,6 +484,7 @@ async def await_run(
 
 
 @app.tool(name="continue")
+@_registry_errors_as_tool_errors
 async def continue_agent(
     agent_id: str,
     message: str,
@@ -478,8 +513,7 @@ async def continue_agent(
         request_id: Optional caller key. Repeating it with identical work arguments
             returns the original run; conflicting arguments raise a tool error.
     """
-    if ctx is not None:
-        supervisor.bind(ctx.session)
+    _bind_supervisor(ctx)
     arguments = {"tool": "continue", "agent_id": agent_id, "message": message,
                  "verification": verification}
     admission_barrier = False
@@ -518,12 +552,12 @@ async def continue_agent(
 
 
 @app.tool(name="list")
+@_registry_errors_as_tool_errors
 async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
     """List every subagent this server owns, with its state, cost, and run history."""
     # Bind here too, so the reported supervisor tier is the real one on the
     # first call rather than a placeholder that reads like a resolved answer.
-    if ctx is not None:
-        supervisor.bind(ctx.session)
+    _bind_supervisor(ctx)
     live_agents = await anyio.to_thread.run_sync(registry.agents)
     agents = await anyio.to_thread.run_sync(lambda: [a.info() for a in live_agents])
     spent = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0, "steps": 0}
@@ -595,6 +629,7 @@ def _sanitize_mcp_output(value: Any) -> Any:
 
 
 @app.tool(name="cancel")
+@_registry_errors_as_tool_errors
 async def cancel(agent_id: str) -> dict[str, Any]:
     """Stop a subagent and release its runtime process.
 
@@ -619,6 +654,7 @@ async def cancel(agent_id: str) -> dict[str, Any]:
 
 
 @app.tool(name="transcript")
+@_registry_errors_as_tool_errors
 async def transcript(run_id: str, limit: int = 60, raw: bool = False) -> dict[str, Any]:
     """Show what a subagent actually did during a run.
 

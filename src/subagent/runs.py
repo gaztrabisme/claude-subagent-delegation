@@ -747,6 +747,9 @@ class Run:
     # The reaper ended this run on its deadline. Its trip must not make a
     # later pass close the agent, and its deadline must not be re-end_run.
     ended_by_end_run: bool = False
+    # The run record has been written (or could not be: no trace, or a failed
+    # write). A later finish pass must not write a second one.
+    trace_written: bool = False
     # A no-progress stop: {"reads": [...], "steps": n}, visible in detail().
     no_progress: dict[str, Any] | None = None
     # Agent ids the registry released to make room for this run (S65).
@@ -1396,6 +1399,8 @@ class Agent:
         # a plain child should die with it, but a stuck stream may ignore the
         # kill too. Both get the same bounded window, then this side finishes
         # the run as `close` does. The reaper defers the plain case by one pass.
+        # A plain-driver worker thread blocked in the child's stream iterator
+        # is left to exit when the child's pipe closes; it is not replaced.
         if not run.done.wait(self.END_RUN_WAIT) and (service or finish_stuck):
             self._finish(run)
 
@@ -2390,7 +2395,10 @@ class Agent:
         if a later cancel sets `_kill_kind`.
         """
         run.admission_ready.set()
-        if run.ended_by_end_run and run.done.is_set():
+        if run.trace_written:
+            # One `run` record per run. `close()` gives a run its terminal
+            # state without writing a trace, so `trace_written`, not
+            # `ended_by_end_run and done`, decides whether this pass may write.
             return False
         if run.done.is_set() and self._kill_kind is None:
             # Something else already gave this run its terminal state.
@@ -2438,6 +2446,9 @@ class Agent:
                 self.trace.run(run, str(self.workspace), self.model, entry=self.entry)
             except Exception:  # noqa: BLE001
                 log.warning("trace.write failed for %s", run.run_id, exc_info=True)
+        # Set even when there is no trace or the write failed: this run had its
+        # one chance at a record, and a later finish must not retry or duplicate.
+        run.trace_written = True
         run.done.set()
         run.await_ready.set()
         return True
@@ -2625,7 +2636,9 @@ class Registry:
             )
         # A plain child that ignored `end_run`'s kill in an earlier pass still
         # has a WORKING run: its stream never drained. Finish it here so the
-        # agent cannot hold its slot forever.
+        # agent cannot hold its slot forever. Its worker thread stays blocked
+        # in the child's stream iterator and is left to exit when the pipe
+        # closes; the reaper does not replace it.
         abandoned = next((run for run in active if run.ended_by_end_run), None)
         if abandoned is not None:
             return KILL_TIMEOUT, lambda: agent._finish(abandoned)

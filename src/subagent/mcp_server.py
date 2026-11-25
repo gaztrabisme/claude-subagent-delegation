@@ -175,7 +175,9 @@ def _bind_supervisor(ctx: Context | None) -> None:
         return
     try:
         session = ctx.session
-    except Exception:  # noqa: BLE001 - no request context outside a live call
+    except ValueError:
+        # mcp 2.x `Context.request_context` raises ValueError ("Context is not
+        # available outside of a request") when the tool runs without one.
         return
     supervisor.bind(session)
 

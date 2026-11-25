@@ -533,7 +533,10 @@ async def list_agents(ctx: Context = None) -> dict[str, Any]:  # type: ignore[as
         if not agent.closed:
             live_by_lane[agent.cfg.name] = live_by_lane.get(agent.cfg.name, 0) + 1
     statuses = await anyio.to_thread.run_sync(
-        partial(registry.lane_status.snapshot, settings, live_by_lane=live_by_lane)
+        partial(
+            registry.lane_status.snapshot, settings, live_by_lane=live_by_lane,
+            count_runs=settings.envelope_lane_plan is not None,
+        )
     )
     for cfg in settings.providers.values():
         view = cfg.as_dict()

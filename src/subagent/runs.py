@@ -1443,7 +1443,12 @@ class Agent:
                     session_root=self.settings.session_root,
                     agent_id=self.agent_id,
                     approval_socket=self.settings.approval_socket,
-                    base_url=self.cfg.base_url,
+                    # The loopback endpoint the child actually dials: for a
+                    # claude lane with an adapter that is the adapter proxy
+                    # (child_env points ANTHROPIC_BASE_URL at it), not the
+                    # upstream, which only the server-side adapter reaches.
+                    base_url=(adapter.child_base_url(self.cfg)
+                              if self.cfg.driver == "claude" else self.cfg.base_url),
                     write_roots=driver_module.sandbox_write_roots(
                         self.settings, self.agent_id, self.cfg, self.workspace
                     ),

@@ -376,3 +376,32 @@ def test_hook_exits_2_when_stdout_cannot_be_written(tmp_path):
     with open(target, "rb") as read_only:
         result = _hook({}, stdout=read_only)
     assert result.returncode == 2, result.stderr
+
+
+# --- round 5: the claude child's adapter proxy is reachable --------------------------
+
+
+def test_claude_profile_allows_the_adapter_proxy_the_child_dials(tmp_path, monkeypatch):
+    """A lane with an adapter (omlx: strip_sampling) points ANTHROPIC_BASE_URL at a
+    loopback adapter proxy on a random port; the profile must allow that port, and the
+    upstream port only the server-side adapter dials need not be open to the child."""
+    from urllib.parse import urlsplit
+
+    from subagent import adapter
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    providers = {"lane": {"driver": "claude", "base_url": "http://127.0.0.1:8000",
+                          "model": "m", "api_key": "local", "local": True,
+                          "send_sampling": False, "adapter": "strip_sampling"}}
+    settings = make_settings(tmp_path, workspace=str(ws), providers=providers,
+                             default_provider="lane", supervisor="off", trace="off")
+    try:
+        argv, env = _capture(monkeypatch, settings, ws, "lane", "ad1")
+        child_url = urlsplit(env["ANTHROPIC_BASE_URL"])
+        assert child_url.hostname == "127.0.0.1" and child_url.port not in (None, 8000)
+        lines = argv[2].splitlines()
+        assert f'(allow network-outbound (remote ip "localhost:{child_url.port}"))' in lines
+        assert '(allow network-outbound (remote ip "localhost:8000"))' not in lines
+    finally:
+        adapter.shutdown()

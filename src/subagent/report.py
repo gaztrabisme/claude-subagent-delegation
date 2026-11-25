@@ -62,6 +62,7 @@ DELEGATION_FIELDS = [
     "reviews", "tests", "tokens", "provider_usd", "counterfactual_usd", "wall_seconds",
     "verified_pass",
 ]
+_ABSENT = object()
 
 
 @dataclass
@@ -426,6 +427,50 @@ def _role_run_ids(delegations: list[Mapping[str, Any]]) -> tuple[set[str], set[s
     return builders, reviews, setups
 
 
+def _builder_round_tests(delegations: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """run_id -> the ``tests`` value of its first round entry in trace order.
+
+    A builder run can appear in several delegations or rounds; only the first
+    entry decides, and an absent ``tests`` is kept as ``None`` (no result).
+    """
+    out: dict[str, Any] = {}
+    for d in delegations:
+        for entry in _run_entries(d.get("rounds")):
+            run_id = entry.get("run_id")
+            if isinstance(run_id, str) and run_id not in out:
+                out[run_id] = entry.get("tests")
+    return out
+
+
+def _round_passed(tests: Any, run_passed: bool) -> bool:
+    """Whether a builder run passed: its round's own tests first, else the run flag.
+
+    A bool ``tests.passed`` decides. Otherwise, when ``passed`` is absent/null,
+    a usable ``counts`` dict decides: an int total above zero with int
+    ``failed == 0`` passes and ``failed > 0`` fails. Anything else (including
+    an int ``tests``) falls back to the run record's ``verification_passed``
+    being exactly ``True``.
+    """
+    if isinstance(tests, Mapping):
+        passed = tests.get("passed", _ABSENT)
+        if isinstance(passed, bool):
+            return passed
+        if passed is None or passed is _ABSENT:
+            counts = tests.get("counts")
+            if isinstance(counts, Mapping):
+                total = counts.get("total")
+                failed = counts.get("failed")
+                if (
+                    isinstance(total, int) and not isinstance(total, bool) and total > 0
+                    and isinstance(failed, int) and not isinstance(failed, bool)
+                ):
+                    if failed == 0:
+                        return True
+                    if failed > 0:
+                        return False
+    return run_passed
+
+
 def _run_roles(run_rows: list[dict[str, Any]],
                delegations: list[Mapping[str, Any]]) -> dict[str, Any]:
     """Classify runs by role from the delegation trace, never from names.
@@ -434,6 +479,7 @@ def _run_roles(run_rows: list[dict[str, Any]],
     (setup), then unclassified. Only runs with a run record are counted.
     """
     builders, reviews, setups = _role_run_ids(delegations)
+    round_tests = _builder_round_tests(delegations)
     builder: dict[str, Any] = {
         "runs": 0, "verified_passed": 0, "pass_rate": None, "by_provider": {},
     }
@@ -450,7 +496,7 @@ def _run_roles(run_rows: list[dict[str, Any]],
                 provider, {"runs": 0, "verified_passed": 0}
             )
             by_provider["runs"] += 1
-            if passed:
+            if _round_passed(round_tests.get(run_id), passed):
                 builder["verified_passed"] += 1
                 by_provider["verified_passed"] += 1
         elif run_id in reviews:

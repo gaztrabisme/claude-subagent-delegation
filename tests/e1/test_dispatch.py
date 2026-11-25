@@ -59,8 +59,14 @@ def test_just_under_the_line_runs_and_writes_no_envelope_record(make_env):
     assert env.envelope_records() == []
 
 
-def test_refused_lane_falls_back_to_the_next_lane(make_env):
-    env = make_env(seed=over_codex)
+def test_refused_lane_falls_back_to_the_next_lane(make_env, tmp_path):
+    from ._helpers import plan_text, write_plan
+
+    plan = write_plan(tmp_path, plan_text().replace(
+        "| glm, gpubox | closed | 0 | - |",
+        "| glm, gpubox | closed | at most 2 runs a week | - |",
+    ))
+    env = make_env(plan=plan, seed=over_codex)
     run = env.run("codex", fallback="full")
     assert run.state == COMPLETED
     assert run.lane == "glm"

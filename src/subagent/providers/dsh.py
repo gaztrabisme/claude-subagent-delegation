@@ -14,7 +14,6 @@ import re
 import secrets
 import selectors
 import shutil
-import sys
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from pathlib import Path
@@ -23,7 +22,7 @@ from typing import Any
 from ..config import APPROVAL_HOOK, Settings, prepare_private_directory
 from ..guard.classify import _git_metadata_roots, _redact_private_paths, protect, release
 from ..router import Refusal, clip
-from ..sandbox import approval_socket_write_deny
+from ..sandbox import SANDBOX_EXEC, agent_profile_kwargs, wrap_argv
 from .base import DRIVER_DSH, Process, ProviderConfig, Session
 
 DEFAULT_BINARY = "dsh"
@@ -40,15 +39,20 @@ _GUARD_INACTIVE = re.compile(
 
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
                         cwd: Path) -> list[str]:
-    """Workspace, this agent's DSH runtime and the agent-specific temp directory."""
-    agent_root = settings.session_root / "agents" / agent_id
+    """The DSH child's write roots (unchanged from the R1-0 profile)."""
+    dsh_home = _dsh_home(settings, agent_id)
     roots = [
         str(cwd),  # Project files are the worker's deliverable.
-        str(agent_root),  # Own hook, bootstrap, and session state.
-        str(_dsh_home(settings, agent_id)),  # Isolated DSH runtime data.
-        str(agent_root / "tmp"),  # DSH's private temporary directory.
+        str(settings.session_root / "agents" / agent_id / "tmp"),  # Per-agent TMPDIR (Q6).
+        str(dsh_home / "sessions"),  # DSH session transcripts.
+        str(dsh_home / "storages"),  # DSH runtime key-value storage.
+        str(dsh_home / "spills"),  # DSH large-output spill files.
+        str(dsh_home / ".anonymous-user-id"),  # DSH writes its install id once.
+        "/dev",  # DSH's terminal and descriptor devices, as on the base profile.
     ]
     return list(dict.fromkeys(roots))
+
+
 USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
 AUTH_CODES = (
     "MISSING_CREDENTIAL",
@@ -716,10 +720,9 @@ class DshProvider:
         argv.extend([
             "--json",
             "--approval-policy", "never",
-            # On macOS Seatbelt supplies the boundary. Elsewhere keep DSH's
-            # ordinary workspace sandbox until R1b defines a platform refusal.
-            "--permission-mode", "danger-full-access" if sys.platform == "darwin"
-            else "workspace-write",
+            # Seatbelt is the authority for this driver; DSH's own sandbox
+            # would otherwise block its isolated runtime state.
+            "--permission-mode", "danger-full-access",
         ])
         session_id = _session_text(session)
         if session_id:
@@ -734,15 +737,7 @@ class DshProvider:
         )
         # DSH rewrites only this generated bootstrap file on every launch.
         # The profile directory and every patch remain write-denied.
-        write_allow = [
-            str(cwd),
-            str(agent_tmp),
-            str(dsh_home / "sessions"),
-            str(dsh_home / "storages"),
-            str(dsh_home / "spills"),
-            str(dsh_home / ".anonymous-user-id"),
-            "/dev",
-        ]
+        write_allow = sandbox_write_roots(settings, agent_id, cfg, cwd)
         write_deny = [
             str(cwd / ".env"),
             str(cwd / ".git"),
@@ -758,29 +753,28 @@ class DshProvider:
             str(bridge_root),
             str(bridge_entry),
             str(bridge_patch),
-            approval_socket_write_deny(
-                settings.approval_socket,
-                [
-                    cwd,
-                    settings.session_root,
-                    *sandbox_write_roots(settings, agent_id, cfg, cwd),
-                    *write_allow,
-                ],
-            ),
         ]
         owner_home = _owner_dsh_home().resolve()
         deny_paths = [*cfg.deny_read, str(owner_home), str(owner_home / "storages")]
         read_allow = [str(owner_home / ".credentials.yaml")] if login else []
         read_metadata_allow = [str(owner_home)] if login else []
-        session.data.update({
-            "sandbox_deny_paths": deny_paths,
-            "sandbox_write_deny": write_deny,
-            "sandbox_read_allow": read_allow,
-            "sandbox_read_metadata_allow": read_metadata_allow,
-            "sandbox_write_allow_exact": [str(headless_cordis)],
-            "sandbox_write_allow_subpaths": [str(agent_tmp)],
-            "cordis_path": str(headless_cordis),
-        })
+        # One profile carries R1-0's rules and R1a's (A9 read isolation, A10
+        # network policy); the server never wraps a DSH argv a second time.
+        argv = wrap_argv(argv, deny_paths, **agent_profile_kwargs(
+            session_root=settings.session_root,
+            agent_id=agent_id,
+            approval_socket=settings.approval_socket,
+            base_url=cfg.base_url,
+            write_roots=write_allow,
+            write_deny=write_deny,
+            read_allow=read_allow,
+            read_metadata_allow=read_metadata_allow,
+            write_allow_exact=[str(headless_cordis)],
+            write_allow_subpaths=[str(agent_tmp)],
+        ))
+        if argv[:2] != [SANDBOX_EXEC, "-p"]:
+            raise RuntimeError("DSH requires the outer macOS sandbox-exec profile")
+        session.data["cordis_path"] = str(headless_cordis)
         return argv
 
     def env(
@@ -835,16 +829,6 @@ class DshProvider:
         process = DshProcess(
             argv, env, str(cwd), prompt, self.translator(session), protected_root,
             login_patch, Path(session.data["cordis_path"]),
-        )
-        process.sandbox_deny_paths = session.data.get("sandbox_deny_paths", [])
-        process.sandbox_write_deny = session.data.get("sandbox_write_deny", [])
-        process.sandbox_read_allow = session.data.get("sandbox_read_allow", [])
-        process.sandbox_read_metadata_allow = session.data.get(
-            "sandbox_read_metadata_allow", []
-        )
-        process.sandbox_write_allow_exact = session.data.get("sandbox_write_allow_exact", [])
-        process.sandbox_write_allow_subpaths = session.data.get(
-            "sandbox_write_allow_subpaths", []
         )
         return process
 

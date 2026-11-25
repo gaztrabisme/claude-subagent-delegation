@@ -12,12 +12,12 @@ import copy
 import dataclasses
 import hashlib
 import importlib
-import ipaddress
 import itertools
 import json
 import os
 import secrets
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -40,7 +40,7 @@ from .config import (
 from .egress import EgressProxy
 from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
-from .guard.classify import protect, provider_guard_context
+from .guard.classify import _git_metadata_roots, protect, provider_guard_context
 from .lane_state import LaneState
 from .lane_status import LaneStatusStore, codex_usage
 from .providers.base import (
@@ -63,7 +63,14 @@ from .providers.claude import (  # noqa: F401
 )
 from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
-from .sandbox import approval_socket_write_deny, check_platform, normalize_paths, wrap_argv
+from .sandbox import (
+    agent_profile_kwargs,
+    approval_socket_write_deny,
+    check_platform,
+    egress_port,
+    normalize_paths,
+    wrap_argv,
+)
 from .secrets import redact_secrets
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
@@ -78,6 +85,12 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 
 TERMINAL_STATES = frozenset({COMPLETED, COMPLETED_UNVERIFIED, FAILED, CANCELLED})
+
+# Drivers whose child runs the guard hook: each gets an egress proxy (A10) and,
+# on macOS, one Seatbelt profile (A9). codex and dsh build that profile in their
+# own spawn; the server wraps claude and omp here.
+_HOOK_DRIVERS = frozenset({"claude", "codex", "omp", "dsh"})
+_SERVER_WRAPPED_DRIVERS = frozenset({"claude", "omp"})
 
 PHASE_QUEUED = "queued"
 PHASE_RUNNING = "running"
@@ -1363,7 +1376,7 @@ class Agent:
         paths = normalize_paths([*self.deny_read, *self.cfg.deny_read])
         check_platform(paths)
         self._egress_run_id = run.run_id
-        if self.cfg.driver in {"claude", "codex", "omp", "dsh"}:
+        if self.cfg.driver in _HOOK_DRIVERS:
             self._start_egress_proxy()
         session = self.session()
         session.session_id = resume
@@ -1381,16 +1394,15 @@ class Agent:
         # Give it the frozen agent policy plus the current provider's exclusions.
         spawn_cfg = (dataclasses.replace(self.cfg, deny_read=paths)
                      if self.cfg.driver in (DRIVER_CODEX, DRIVER_DSH) else self.cfg)
-        with child_egress_environment(self._egress_environment()):
+        with child_egress_environment(self._egress_environment()), \
+                egress_port(self._egress_port):
             process = self.driver.spawn(
                 spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
                 session, self.model, **kwargs,
             )
-        agent_tmp = prepare_private_directory(
-            self.settings.session_root / "agents" / self.agent_id / "tmp"
-        )
-        process.env["TMPDIR"] = str(agent_tmp)
-        process.env.update(self._egress_environment())
+        child_env = getattr(process, "env", None)
+        if isinstance(child_env, dict):
+            child_env.update(self._egress_environment())
         cordis_path = getattr(process, "cordis_path", None)
         if cordis_path is not None:
             process.guard_ready_callback = self._dsh_guard_ready
@@ -1403,79 +1415,39 @@ class Agent:
             })
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
-        hook_drivers = {"claude", "codex", "omp", "dsh"}
-        darwin_profile = __import__("sys").platform == "darwin" and self.cfg.driver in hook_drivers
-        if darwin_profile:
+        # codex and dsh build their one profile themselves (they coordinate
+        # their inner sandbox mode with it); claude and omp are wrapped here.
+        if (sys.platform == "darwin" and self.cfg.driver in _SERVER_WRAPPED_DRIVERS
+                and isinstance(getattr(process, "argv", None), list)):
             driver_module = importlib.import_module(f".providers.{self.cfg.driver}", __package__)
-            roots_fn = driver_module.sandbox_write_roots
-            write_allow = roots_fn(self.settings, self.agent_id, self.cfg, self.workspace)
-            socket_write_roots = [
-                self.workspace, self.settings.session_root, *write_allow
-            ]
-            own_agent_dir = self.settings.session_root / "agents" / self.agent_id
-            read_deny = [str(self.settings.session_root / "agents")]
-            read_allow = [str(own_agent_dir)]
+            agent_tmp = prepare_private_directory(
+                self.settings.session_root / "agents" / self.agent_id / "tmp"
+            )
+            if isinstance(child_env, dict):
+                child_env["TMPDIR"] = str(agent_tmp)
             write_deny = [
-                approval_socket_write_deny(
-                    self.settings.approval_socket, socket_write_roots
-                ),
                 str(APPROVAL_HOOK), str(self.workspace / ".git"),
+                *(str(root) for root in sorted(_git_metadata_roots(self.workspace))),
             ]
-            from .guard.classify import _git_metadata_roots
-
-            write_deny.extend(str(root) for root in _git_metadata_roots(self.workspace))
-            write_deny.extend(getattr(process, "sandbox_write_deny", ()))
-            deny_read = [
-                *paths, *read_deny, *getattr(process, "sandbox_deny_paths", ())
-            ]
-            read_allow.extend(getattr(process, "sandbox_read_allow", ()))
-            read_metadata_allow = list(getattr(process, "sandbox_read_metadata_allow", ()))
-            write_allow_exact = list(getattr(process, "sandbox_write_allow_exact", ()))
-            write_allow_subpaths = list(getattr(process, "sandbox_write_allow_subpaths", ()))
-            ports = [self._egress_port] if self._egress_port is not None else []
-            base_url = self.cfg.base_url or ""
-            parsed = urlsplit(base_url)
-            host = parsed.hostname or ""
-            if host.lower() == "localhost":
-                ports.append(parsed.port or (443 if parsed.scheme == "https" else 80))
-            else:
-                try:
-                    if ipaddress.ip_address(host).is_loopback:
-                        ports.append(parsed.port or (443 if parsed.scheme == "https" else 80))
-                except ValueError:
-                    pass
-            if self.cfg.driver == DRIVER_CODEX:
-                # The surrounding profile is the network and filesystem boundary.
-                with contextlib.suppress(ValueError, IndexError):
-                    process.argv[process.argv.index("-s") + 1] = "danger-full-access"
+            with egress_port(self._egress_port):
+                profile = agent_profile_kwargs(
+                    session_root=self.settings.session_root,
+                    agent_id=self.agent_id,
+                    approval_socket=self.settings.approval_socket,
+                    base_url=self.cfg.base_url,
+                    write_roots=driver_module.sandbox_write_roots(
+                        self.settings, self.agent_id, self.cfg, self.workspace
+                    ),
+                    write_deny=write_deny,
+                )
+            process.argv = wrap_argv(process.argv, paths, **profile)
+        elif paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
             process.argv = wrap_argv(
                 process.argv,
-                deny_read,
-                write_allow=write_allow,
-                write_deny=write_deny,
-                read_allow=read_allow,
-                read_allow_subpaths=[str(own_agent_dir)],
-                read_metadata_allow=read_metadata_allow,
-                write_allow_exact=write_allow_exact,
-                write_allow_subpaths=write_allow_subpaths,
-                network_loopback_ports=ports,
-                network_unix_sockets=[self.settings.approval_socket],
-            )
-        elif paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
-            driver_module = importlib.import_module(
-                f".providers.{self.cfg.driver}", __package__
-            )
-            roots_fn = getattr(driver_module, "sandbox_write_roots", None)
-            socket_write_roots = [self.workspace, self.settings.session_root]
-            if roots_fn is not None:
-                socket_write_roots.extend(
-                    roots_fn(self.settings, self.agent_id, self.cfg, self.workspace)
-                )
-            process.argv = wrap_argv(
-                process.argv, paths,
+                paths,
                 write_deny=[approval_socket_write_deny(
                     self.settings.approval_socket,
-                    socket_write_roots,
+                    [self.workspace, self.settings.session_root],
                 )],
             )
         if capabilities(self.driver).cancel and isinstance(process, Process):

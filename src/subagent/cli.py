@@ -361,11 +361,12 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
     row["network_allow"] = list(dict.fromkeys(network_allow))
     warning = _thinking_warning(cfg)
     if not cfg.local and not network_allow:
-        route_warning = (
+        # Its own field, so it never displaces or reorders the existing
+        # warnings; `warning` carries it only when there is no other.
+        row["network_warning"] = (
             f"warning: provider {cfg.name!r} has no network route; configure network_allow "
             "or base_url"
         )
-        warning = f"{warning}\n{route_warning}" if warning else route_warning
     if cfg.extra.get("auth") == "login":
         if cfg.driver == "dsh":
             login_warning = (
@@ -391,6 +392,8 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
             warning = f"{warning}\n{concurrency_warning}"
     if warning:
         row["warning"] = warning
+    elif row.get("network_warning"):
+        row["warning"] = row["network_warning"]
     if cfg.driver == "epi" and not args.no_probe:
         from .providers.epi import EPI_PROVIDER
 
@@ -564,6 +567,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for row in rows:
             if row.get("warning"):
                 print(row["warning"], file=sys.stderr)
+            if row.get("network_warning") and row["network_warning"] != row.get("warning"):
+                print(row["network_warning"], file=sys.stderr)
         if goal_warning:
             print(goal_warning, file=sys.stderr)
         elif goal is not None:

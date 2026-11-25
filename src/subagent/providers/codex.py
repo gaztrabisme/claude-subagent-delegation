@@ -26,14 +26,17 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..config import Settings, log
+from ..config import APPROVAL_HOOK, Settings, log, prepare_private_directory
+from ..guard.classify import _git_metadata_roots
 from ..router import Refusal, codex_reset
+from ..sandbox import SANDBOX_EXEC, agent_profile_kwargs, check_platform, wrap_argv
 from .base import DRIVER_CODEX, Process, ProviderConfig, Session
 
 GUARD = "sandbox+hook"
@@ -44,19 +47,19 @@ DEFAULT_BINARY = "codex"
 
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
                         cwd: Path) -> list[str]:
-    """Workspace, this agent's Codex state, temporary files, and Codex runtime cache."""
-    home = settings.session_root / "agents" / agent_id / "codex-home"
+    """The Codex child's write roots under its macOS profile."""
+    agent_dir = settings.session_root / "agents" / agent_id
     roots = [
         str(cwd),  # Project files are the worker's deliverable.
-        str(settings.session_root / "agents" / agent_id),  # Own hook and session state.
-        str(home),  # Isolated Codex config and runtime files.
-        str(settings.session_root / "agents" / agent_id / "tmp"),  # Private CLI scratch.
-        "/dev",  # Codex's local process and device descriptors.
+        str(agent_dir / "tmp"),  # Per-agent TMPDIR; never the server's own temp.
+        str(agent_dir / "codex-home"),  # Isolated CODEX_HOME: sessions, logs, state.
+        "/dev",  # Codex's pty and descriptor devices, as on the R1-0 profile.
     ]
     cache = _darwin_user_cache_dir()
     if cache:
         roots.append(cache)  # Codex's discovered per-user cache root.
     return list(dict.fromkeys(roots))
+
 
 REFUSAL_USAGE_LIMIT = "codex_usage_limit"
 KIND_CONTEXT_FULL = "context_full"
@@ -506,6 +509,32 @@ class CodexProvider:
     ) -> CodexProcess:
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session, model)
+        check_platform(cfg.deny_read)
+        if sys.platform == "darwin":
+            # The outer profile is the filesystem and network boundary (A9,
+            # A10); a second Seatbelt sandbox inside it prevents Codex from
+            # initializing, so the inner mode opens only under that profile.
+            agent_tmp = prepare_private_directory(
+                settings.session_root / "agents" / agent_id / "tmp"
+            )
+            env["TMPDIR"] = str(agent_tmp)
+            home = Path(env["CODEX_HOME"])
+            write_deny = [
+                str(cwd / ".git"), *(str(root) for root in sorted(_git_metadata_roots(cwd))),
+                *(str(home / name) for name in ("hooks.json", "config.toml", "auth.json")),
+                str(APPROVAL_HOOK),
+            ]
+            argv[argv.index("-s") + 1] = "danger-full-access"
+            argv = wrap_argv(argv, cfg.deny_read, **agent_profile_kwargs(
+                session_root=settings.session_root,
+                agent_id=agent_id,
+                approval_socket=settings.approval_socket,
+                base_url=cfg.base_url,
+                write_roots=sandbox_write_roots(settings, agent_id, cfg, cwd),
+                write_deny=write_deny,
+            ))
+            if argv[:2] != [SANDBOX_EXEC, "-p"]:
+                raise RuntimeError("codex requires the outer macOS sandbox-exec profile")
         return _spawn_codex(argv, env, str(cwd), prompt)
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:

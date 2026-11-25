@@ -1799,7 +1799,9 @@ def _sensitive_shell_operand(
                 found, _ = shell_paths.bounded_glob(concrete)
                 candidates.extend(found)
         for candidate in candidates:
-            why = is_sensitive(candidate, context)
+            # Declared provider secret files are judged by
+            # _shell_provider_secret, which follows `cd` and shell quoting.
+            why = is_sensitive(candidate, context, provider=False)
             if why:
                 return candidate, why
     for word in recursive_roots:

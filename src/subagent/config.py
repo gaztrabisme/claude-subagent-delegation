@@ -14,6 +14,7 @@ providers: a config with no `[providers]` table can run nothing.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -71,6 +72,7 @@ CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
 UNIX_SOCKET_PATH_MAX = 104
 SHORT_SOCKET_ROOT = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".subagent" / "run"
+_APPROVAL_SOCKET_IDS = itertools.count()
 
 # Names the child must never inherit from this server, whatever the providers
 # declare: the parent's own Claude credentials and endpoint.
@@ -148,12 +150,14 @@ def _approval_socket_path(preferred: str | Path) -> str:
     if (len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX
             or _under_temporary_root(path.parent)):
         uid = os.getuid()
-        private_dir = SHORT_SOCKET_ROOT / f"u{uid:x}"
-        # The fallback root can itself be in a long checkout path (for example,
-        # when tests or operators override it). Keep the socket basename fixed
-        # and short while retaining enough randomness to avoid stale/live
-        # collisions across server processes.
-        path = private_dir / os.urandom(7).hex()
+        private_dir = SHORT_SOCKET_ROOT / f"subagent-{uid}"
+        path = private_dir / f"a-{os.getpid()}-{next(_APPROVAL_SOCKET_IDS)}.sock"
+        if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
+            # The fallback root can itself sit in a long path (an operator
+            # override, a checkout). Then use a compact directory and a short
+            # random basename that still avoids stale/live collisions.
+            private_dir = SHORT_SOCKET_ROOT / f"u{uid:x}"
+            path = private_dir / os.urandom(7).hex()
         if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
             raise ConfigError("short approval socket path still exceeds the Unix socket limit")
         if _unsafe_short_socket_path(path):
@@ -790,14 +794,6 @@ class Settings:
         child it guards.
         """
         root = Path(workspace).resolve()
-        socket_spelling = Path(self.approval_socket).expanduser().absolute().parent
-        socket_dirs = (socket_spelling, socket_spelling.resolve())
-        socket_dir = socket_dirs[-1]
-        if any(candidate == root or candidate.is_relative_to(root) for candidate in socket_dirs):
-            return (
-                f"workspace {root} contains the approval socket directory ({socket_dir}); "
-                "a child there could access its supervisor transport"
-            )
         owned = (("the guard hook", APPROVAL_HOOK), ("this server's Python", Path(sys.prefix)))
         for label, path in owned:
             try:
@@ -807,6 +803,15 @@ class Settings:
             return (
                 f"workspace {root} contains {label} ({path}); a child there could "
                 "rewrite its own guard. Delegate into a subdirectory or a worktree."
+            )
+        # R1a A4: the approval socket's directory, by its configured spelling
+        # or its real path, must not be the workspace or lie inside it.
+        socket_spelling = Path(self.approval_socket).expanduser().absolute().parent
+        socket_dirs = (socket_spelling, socket_spelling.resolve())
+        if any(candidate == root or candidate.is_relative_to(root) for candidate in socket_dirs):
+            return (
+                f"workspace {root} contains the approval socket directory ({socket_dirs[-1]}); "
+                "a child there could access its supervisor transport"
             )
         return None
 

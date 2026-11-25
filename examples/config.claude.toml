@@ -8,6 +8,7 @@ default_provider = "claude"
 driver = "claude"
 auth = "login"
 max_agents = 1
+network_allow = ["api.anthropic.com", "claude.ai"]
 
 [providers.claude.pricing]
 kind = "flat_plan"

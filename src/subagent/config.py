@@ -14,7 +14,6 @@ providers: a config with no `[providers]` table can run nothing.
 
 from __future__ import annotations
 
-import itertools
 import json
 import logging
 import os
@@ -24,7 +23,9 @@ import stat
 import sys
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,24 @@ from .providers.base import (
 
 log = logging.getLogger("sam")
 
+_CHILD_EGRESS_ENV: ContextVar[dict[str, str] | None] = ContextVar(
+    "subagent_child_egress_env", default=None
+)
+_EGRESS_ENV_NAMES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
+
+
+@contextmanager
+def child_egress_environment(values: Mapping[str, str]) -> Iterator[None]:
+    """Apply this agent's proxy variables while a provider builds its child env."""
+    if any(name not in _EGRESS_ENV_NAMES or not isinstance(value, str)
+           for name, value in values.items()):
+        raise ValueError("child egress environment contains an unsupported value")
+    token = _CHILD_EGRESS_ENV.set(dict(values))
+    try:
+        yield
+    finally:
+        _CHILD_EGRESS_ENV.reset(token)
+
 APPROVAL_HOOK = Path(__file__).parent / "guard" / "approval_hook.py"
 
 CONFIG_ENV = "SUBAGENT_CONFIG"
@@ -52,7 +71,6 @@ CONFIG_NAME = "config.toml"
 PROJECT_DIR = ".subagent"
 UNIX_SOCKET_PATH_MAX = 104
 SHORT_SOCKET_ROOT = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".subagent" / "run"
-_APPROVAL_SOCKET_IDS = itertools.count()
 
 # Names the child must never inherit from this server, whatever the providers
 # declare: the parent's own Claude credentials and endpoint.
@@ -109,13 +127,33 @@ def _unsafe_short_socket_path(path: Path) -> bool:
     return False
 
 
+def _under_temporary_root(path: Path) -> bool:
+    """Resolve aliases before deciding whether the preferred socket is temporary."""
+    candidate = Path(path).expanduser()
+    resolved = candidate.resolve()
+    roots = (
+        Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp"),
+        Path("/var/folders"), Path("/private/var/folders"),
+    )
+    for root in roots:
+        for canonical in (root, root.resolve()):
+            if candidate.is_relative_to(canonical) or resolved.is_relative_to(canonical):
+                return True
+    return False
+
+
 def _approval_socket_path(preferred: str | Path) -> str:
     """Use a preferred socket path or a private, short home-based fallback."""
     path = Path(preferred)
-    if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
+    if (len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX
+            or _under_temporary_root(path.parent)):
         uid = os.getuid()
-        private_dir = SHORT_SOCKET_ROOT / f"subagent-{uid}"
-        path = private_dir / f"a-{os.getpid()}-{next(_APPROVAL_SOCKET_IDS)}.sock"
+        private_dir = SHORT_SOCKET_ROOT / f"u{uid:x}"
+        # The fallback root can itself be in a long checkout path (for example,
+        # when tests or operators override it). Keep the socket basename fixed
+        # and short while retaining enough randomness to avoid stale/live
+        # collisions across server processes.
+        path = private_dir / os.urandom(7).hex()
         if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
             raise ConfigError("short approval socket path still exceeds the Unix socket limit")
         if _unsafe_short_socket_path(path):
@@ -325,7 +363,7 @@ _PROVIDER_KEYS = frozenset({
     "driver", "vendor", "base_url", "model", "effort", "api_key_env", "api_key", "local",
     "send_sampling", "max_agents", "compact_window", "max_steps", "run_timeout",
     "idle_timeout", "adapter", "binary", "experimental", "health", "probe",
-    "pricing", "thinking", "deny_read", "monthly_usd_cap",
+    "pricing", "thinking", "deny_read", "network_allow", "monthly_usd_cap",
 })
 
 
@@ -375,6 +413,11 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         isinstance(path, str) and path.strip() for path in deny_read
     ):
         raise ConfigError(f"provider {name!r} deny_read must be a list of nonempty paths")
+    network_allow = table.get("network_allow", [])
+    if not isinstance(network_allow, list) or not all(
+        isinstance(host, str) and host.strip() for host in network_allow
+    ):
+        raise ConfigError(f"provider {name!r} network_allow must be a list of nonempty hosts")
     monthly_usd_cap = _num(table, "monthly_usd_cap", None, positive=False)
     extra = {k: v for k, v in table.items() if k not in _PROVIDER_KEYS}
     if monthly_usd_cap is not None:
@@ -408,6 +451,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         pricing=_pricing(table),
         thinking=thinking,
         deny_read=tuple(str(Path(path).expanduser()) for path in deny_read),
+        network_allow=tuple(network_allow),
         extra=extra,
     )
 
@@ -622,13 +666,15 @@ class Settings:
         PASSWORD are excluded even when explicitly listed.
         """
         allowed = {"PATH", "HOME", "LANG", "TERM", "TMPDIR", *self.child_env_passthrough}
-        return {
+        env = {
             name: value
             for name, value in os.environ.items()
             if value is not None
             and (name in allowed or name.startswith("LC_"))
             and not any(marker in name.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
         }
+        env.update(_CHILD_EGRESS_ENV.get() or {})
+        return env
 
     def hooks_config(
         self, agent_id: str, cfg: ProviderConfig | None = None, model: str | None = None
@@ -744,6 +790,14 @@ class Settings:
         child it guards.
         """
         root = Path(workspace).resolve()
+        socket_spelling = Path(self.approval_socket).expanduser().absolute().parent
+        socket_dirs = (socket_spelling, socket_spelling.resolve())
+        socket_dir = socket_dirs[-1]
+        if any(candidate == root or candidate.is_relative_to(root) for candidate in socket_dirs):
+            return (
+                f"workspace {root} contains the approval socket directory ({socket_dir}); "
+                "a child there could access its supervisor transport"
+            )
         owned = (("the guard hook", APPROVAL_HOOK), ("this server's Python", Path(sys.prefix)))
         for label, path in owned:
             try:

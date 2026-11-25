@@ -32,16 +32,31 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..config import APPROVAL_HOOK, Settings, log
-from ..guard.classify import _git_metadata_roots
+from ..config import Settings, log
 from ..router import Refusal, codex_reset
-from ..sandbox import approval_socket_write_deny, wrap_argv
 from .base import DRIVER_CODEX, Process, ProviderConfig, Session
 
 GUARD = "sandbox+hook"
 GUARD_NO_HOOK = "sandbox"
 
 DEFAULT_BINARY = "codex"
+
+
+def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                        cwd: Path) -> list[str]:
+    """Workspace, this agent's Codex state, temporary files, and Codex runtime cache."""
+    home = settings.session_root / "agents" / agent_id / "codex-home"
+    roots = [
+        str(cwd),  # Project files are the worker's deliverable.
+        str(settings.session_root / "agents" / agent_id),  # Own hook and session state.
+        str(home),  # Isolated Codex config and runtime files.
+        str(settings.session_root / "agents" / agent_id / "tmp"),  # Private CLI scratch.
+        "/dev",  # Codex's local process and device descriptors.
+    ]
+    cache = _darwin_user_cache_dir()
+    if cache:
+        roots.append(cache)  # Codex's discovered per-user cache root.
+    return list(dict.fromkeys(roots))
 
 REFUSAL_USAGE_LIMIT = "codex_usage_limit"
 KIND_CONTEXT_FULL = "context_full"
@@ -465,8 +480,6 @@ class CodexProvider:
     ) -> list[str]:
         effort = "low" if cfg.thinking == "low" else cfg.effort
         argv = codex_argv(cwd, model or None, session.session_id, self.binary(cfg), effort)
-        if cfg.deny_read:
-            argv[argv.index("-s") + 1] = "danger-full-access"
         return argv
 
     def env(
@@ -493,24 +506,6 @@ class CodexProvider:
     ) -> CodexProcess:
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session, model)
-        if cfg.deny_read:
-            # The outer profile supplies write confinement; a second Seatbelt
-            # sandbox inside it prevents Codex from initializing or editing.
-            write_allow = [
-                str(cwd), "/private/tmp", env.get("TMPDIR") or "/private/tmp",
-                env["CODEX_HOME"], "/dev",
-            ]
-            cache = _darwin_user_cache_dir()
-            if cache:
-                write_allow.append(cache)
-            home = Path(env["CODEX_HOME"])
-            write_deny = [
-                str(cwd / ".git"), *(str(root) for root in sorted(_git_metadata_roots(cwd))),
-                *(str(home / name) for name in ("hooks.json", "config.toml", "auth.json")),
-                str(APPROVAL_HOOK),
-                approval_socket_write_deny(settings.approval_socket, write_allow),
-            ]
-            argv = wrap_argv(argv, cfg.deny_read, write_allow=write_allow, write_deny=write_deny)
         return _spawn_codex(argv, env, str(cwd), prompt)
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:

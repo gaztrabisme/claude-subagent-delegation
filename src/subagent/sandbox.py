@@ -49,9 +49,26 @@ def build_profile(
     write_deny: Sequence[str] = (), *,
     read_allow: Sequence[str] = (), read_metadata_allow: Sequence[str] = (),
     write_allow_exact: Sequence[str] = (), write_allow_subpaths: Sequence[str] = (),
+    read_allow_subpaths: Sequence[str] = (),
+    network_loopback_ports: Sequence[int] | None = None,
+    network_unix_sockets: Sequence[str] = (),
 ) -> str:
     """Restrict writes, deny excluded realpaths, and prevent ancestor renames."""
     rules = ["(version 1)", "(allow default)"]
+    if network_loopback_ports is not None or network_unix_sockets:
+        rules.append("(deny network-outbound)")
+        for port in dict.fromkeys(int(port) for port in (network_loopback_ports or ())):
+            if not 1 <= port <= 65535:
+                raise ValueError("network loopback ports must be between 1 and 65535")
+            rules.append(
+                f'(allow network-outbound (remote ip "localhost:{port}"))'
+            )
+        for path in normalize_paths(network_unix_sockets):
+            # Seatbelt's unix-socket filter is path scoped; it does not grant
+            # access to other local sockets.
+            rules.append(
+                f'(allow network-outbound (remote unix-socket {_filter(path, "literal")}))'
+            )
     if write_allow is not None:
         rules.append('(deny file-write* (subpath "/"))')
         allowed = [_filter(path, "subpath") for path in normalize_paths(write_allow)]
@@ -77,6 +94,8 @@ def build_profile(
         rules.append(f'(allow file-read* {_filter(path, "literal")})')
     for path in normalize_paths(read_metadata_allow):
         rules.append(f'(allow file-read-metadata {_filter(path, "literal")})')
+    for path in normalize_paths(read_allow_subpaths):
+        rules.append(f'(allow file-read* {_filter(path, "subpath")})')
     for path in normalize_paths(write_allow_exact):
         rules.append(f'(allow file-write* {_filter(path, "literal")})')
     ancestors = dict.fromkeys(
@@ -104,16 +123,23 @@ def wrap_argv(
     write_deny: Sequence[str] = (), *,
     read_allow: Sequence[str] = (), read_metadata_allow: Sequence[str] = (),
     write_allow_exact: Sequence[str] = (), write_allow_subpaths: Sequence[str] = (),
+    read_allow_subpaths: Sequence[str] = (),
+    network_loopback_ports: Sequence[int] | None = None,
+    network_unix_sockets: Sequence[str] = (),
 ) -> list[str]:
     """Pass arguments directly to sandbox-exec; never fall back on sandbox failure."""
-    if not paths:
+    network_policy = network_loopback_ports is not None or bool(network_unix_sockets)
+    if not paths and not network_policy:
         return argv
-    check_platform(paths)
+    check_platform(paths if paths else ("network-policy",))
     return [
         "/usr/bin/sandbox-exec", "-p",
         build_profile(paths, write_allow, write_deny, read_allow=read_allow,
                       read_metadata_allow=read_metadata_allow,
                       write_allow_exact=write_allow_exact,
-                      write_allow_subpaths=write_allow_subpaths),
+                      write_allow_subpaths=write_allow_subpaths,
+                      read_allow_subpaths=read_allow_subpaths,
+                      network_loopback_ports=network_loopback_ports,
+                      network_unix_sockets=network_unix_sockets),
         *argv,
     ]

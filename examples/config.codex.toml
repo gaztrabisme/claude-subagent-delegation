@@ -6,6 +6,7 @@ default_provider = "codex"
 
 [providers.codex]
 driver = "codex"
+network_allow = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
 
 [providers.codex.pricing]
 # A subscription. The monthly price is not known, so it is left out; the cost

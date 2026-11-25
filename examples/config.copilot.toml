@@ -8,6 +8,7 @@ default_provider = "copilot"
 [providers.copilot]
 driver = "copilot"
 model = "claude-sonnet-5"
+network_allow = ["api.github.com", "github.com", "copilot-proxy.githubusercontent.com"]
 
 [providers.copilot.pricing]
 # Copilot is paid in credits.

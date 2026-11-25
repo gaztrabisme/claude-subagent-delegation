@@ -11,6 +11,8 @@ import contextlib
 import copy
 import dataclasses
 import hashlib
+import importlib
+import ipaddress
 import itertools
 import json
 import os
@@ -25,9 +27,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import adapter, health, providers, router
-from .config import APPROVAL_HOOK, Settings, log
+from .config import (
+    APPROVAL_HOOK,
+    Settings,
+    child_egress_environment,
+    log,
+    prepare_private_directory,
+)
+from .egress import EgressProxy
 from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import protect, provider_guard_context
@@ -856,6 +866,7 @@ class Agent:
         goal_reviewer: GoalReviewer | None = None,
         delegate_options: dict[str, Any] | None = None,
         deny_read: list[str] | None = None,
+        on_close: Callable[[str], None] | None = None,
     ):
         self.trace = trace
         self.telemetry = telemetry
@@ -893,6 +904,10 @@ class Agent:
         self.workspace = workspace
         self.model = model
         self.settings = settings
+        self._on_close = on_close
+        self._egress_proxy: EgressProxy | None = None
+        self._egress_port: int | None = None
+        self._egress_run_id: str | None = None
         self.session_id: str | None = None
         # The acceptance command the delegate was given; a continue that
         # names none is judged against it.
@@ -1171,6 +1186,16 @@ class Agent:
                 self._record_lane_status(run)
         self._thread.join(timeout=8)
         self._closed = not any(r.cancel_pending for r in self.runs())
+        if self._closed:
+            self._stop_egress_proxy()
+            key_file = self.settings.session_root / "agents" / self.agent_id / "approval.key"
+            try:
+                key_file.unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove approval key for %s", self.agent_id, exc_info=True)
+            if self._on_close is not None:
+                callback, self._on_close = self._on_close, None
+                callback(self.agent_id)
         # A second close may resolve a previously uncertain native cancel after
         # the serial worker has stopped. Its retained guard still belongs here.
         for run in self.runs():
@@ -1337,6 +1362,9 @@ class Agent:
         """One turn's child process, on the current provider's driver."""
         paths = normalize_paths([*self.deny_read, *self.cfg.deny_read])
         check_platform(paths)
+        self._egress_run_id = run.run_id
+        if self.cfg.driver in {"claude", "codex", "omp", "dsh"}:
+            self._start_egress_proxy()
         session = self.session()
         session.session_id = resume
         kwargs = {}
@@ -1353,24 +1381,152 @@ class Agent:
         # Give it the frozen agent policy plus the current provider's exclusions.
         spawn_cfg = (dataclasses.replace(self.cfg, deny_read=paths)
                      if self.cfg.driver in (DRIVER_CODEX, DRIVER_DSH) else self.cfg)
-        process = self.driver.spawn(
-            spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
-            session, self.model, **kwargs,
+        with child_egress_environment(self._egress_environment()):
+            process = self.driver.spawn(
+                spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
+                session, self.model, **kwargs,
+            )
+        agent_tmp = prepare_private_directory(
+            self.settings.session_root / "agents" / self.agent_id / "tmp"
         )
+        process.env["TMPDIR"] = str(agent_tmp)
+        process.env.update(self._egress_environment())
+        cordis_path = getattr(process, "cordis_path", None)
+        if cordis_path is not None:
+            process.guard_ready_callback = self._dsh_guard_ready
+            self.guard_context.update({
+                "dsh_cordis_path": str(cordis_path),
+                "dsh_cordis_sha256": None,
+                "dsh_cordis_run_id": run.run_id,
+                "dsh_guard_tampered": False,
+                "dsh_guard_tamper_traced": False,
+            })
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
-        if paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
+        hook_drivers = {"claude", "codex", "omp", "dsh"}
+        darwin_profile = __import__("sys").platform == "darwin" and self.cfg.driver in hook_drivers
+        if darwin_profile:
+            driver_module = importlib.import_module(f".providers.{self.cfg.driver}", __package__)
+            roots_fn = driver_module.sandbox_write_roots
+            write_allow = roots_fn(self.settings, self.agent_id, self.cfg, self.workspace)
+            socket_write_roots = [
+                self.workspace, self.settings.session_root, *write_allow
+            ]
+            own_agent_dir = self.settings.session_root / "agents" / self.agent_id
+            read_deny = [str(self.settings.session_root / "agents")]
+            read_allow = [str(own_agent_dir)]
+            write_deny = [
+                approval_socket_write_deny(
+                    self.settings.approval_socket, socket_write_roots
+                ),
+                str(APPROVAL_HOOK), str(self.workspace / ".git"),
+            ]
+            from .guard.classify import _git_metadata_roots
+
+            write_deny.extend(str(root) for root in _git_metadata_roots(self.workspace))
+            write_deny.extend(getattr(process, "sandbox_write_deny", ()))
+            deny_read = [
+                *paths, *read_deny, *getattr(process, "sandbox_deny_paths", ())
+            ]
+            read_allow.extend(getattr(process, "sandbox_read_allow", ()))
+            read_metadata_allow = list(getattr(process, "sandbox_read_metadata_allow", ()))
+            write_allow_exact = list(getattr(process, "sandbox_write_allow_exact", ()))
+            write_allow_subpaths = list(getattr(process, "sandbox_write_allow_subpaths", ()))
+            ports = [self._egress_port] if self._egress_port is not None else []
+            base_url = self.cfg.base_url or ""
+            parsed = urlsplit(base_url)
+            host = parsed.hostname or ""
+            if host.lower() == "localhost":
+                ports.append(parsed.port or (443 if parsed.scheme == "https" else 80))
+            else:
+                try:
+                    if ipaddress.ip_address(host).is_loopback:
+                        ports.append(parsed.port or (443 if parsed.scheme == "https" else 80))
+                except ValueError:
+                    pass
+            if self.cfg.driver == DRIVER_CODEX:
+                # The surrounding profile is the network and filesystem boundary.
+                with contextlib.suppress(ValueError, IndexError):
+                    process.argv[process.argv.index("-s") + 1] = "danger-full-access"
             process.argv = wrap_argv(
                 process.argv,
-                paths,
+                deny_read,
+                write_allow=write_allow,
+                write_deny=write_deny,
+                read_allow=read_allow,
+                read_allow_subpaths=[str(own_agent_dir)],
+                read_metadata_allow=read_metadata_allow,
+                write_allow_exact=write_allow_exact,
+                write_allow_subpaths=write_allow_subpaths,
+                network_loopback_ports=ports,
+                network_unix_sockets=[self.settings.approval_socket],
+            )
+        elif paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
+            driver_module = importlib.import_module(
+                f".providers.{self.cfg.driver}", __package__
+            )
+            roots_fn = getattr(driver_module, "sandbox_write_roots", None)
+            socket_write_roots = [self.workspace, self.settings.session_root]
+            if roots_fn is not None:
+                socket_write_roots.extend(
+                    roots_fn(self.settings, self.agent_id, self.cfg, self.workspace)
+                )
+            process.argv = wrap_argv(
+                process.argv, paths,
                 write_deny=[approval_socket_write_deny(
                     self.settings.approval_socket,
-                    [self.workspace, self.settings.session_root],
+                    socket_write_roots,
                 )],
             )
         if capabilities(self.driver).cancel and isinstance(process, Process):
             process.enable_cancel_fence()
         return process
+
+    def _start_egress_proxy(self) -> None:
+        if self._egress_proxy is not None:
+            return
+        allow = list(self.cfg.network_allow)
+        parsed = urlsplit(self.cfg.base_url or "")
+        if parsed.hostname:
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+            allow.append(f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
+
+        def refused(host: str, port: int) -> None:
+            trace = self.trace
+            if trace is not None and self._egress_run_id:
+                trace.egress_refused(
+                    agent_id=self.agent_id, run_id=self._egress_run_id,
+                    provider=self.cfg.name, host=host, port=port,
+                )
+
+        proxy = EgressProxy(allow, on_refusal=refused)
+        self._egress_port = proxy.start()
+        self._egress_proxy = proxy
+
+    def _egress_environment(self) -> dict[str, str]:
+        if self._egress_port is None:
+            return {}
+        proxy = f"http://127.0.0.1:{self._egress_port}"
+        return {
+            "HTTPS_PROXY": proxy,
+            "HTTP_PROXY": proxy,
+            "ALL_PROXY": proxy,
+            "NO_PROXY": "127.0.0.1,localhost",
+        }
+
+    def _stop_egress_proxy(self) -> None:
+        proxy, self._egress_proxy = self._egress_proxy, None
+        self._egress_port = None
+        if proxy is not None:
+            proxy.stop()
+
+    def _dsh_guard_ready(self, path: str, digest: str) -> None:
+        self.guard_context.update({
+            "dsh_cordis_path": path,
+            "dsh_cordis_sha256": digest,
+            "dsh_cordis_run_id": self._egress_run_id,
+        })
 
     def _execute(self, run: Run) -> None:
         with self._dispatch_lock:
@@ -2221,6 +2377,7 @@ class Registry:
         self._lock = threading.Lock()
         self._requests_lock = threading.RLock()
         self._requests: dict[tuple[str, ...], tuple[dict[str, Any], Run]] = {}
+        self._agent_cleanup_callbacks: list[Callable[[str], None]] = []
         self._counter = itertools.count(1)
         # Agent ids name directories under the shared session root
         # (agents/<id>/claude-home, codex-home), so they must not repeat
@@ -2258,6 +2415,22 @@ class Registry:
             run = submit()
             self._requests[key] = (copy.deepcopy(arguments), run)
             return run
+
+    def register_agent_cleanup(self, callback: Callable[[str], None]) -> None:
+        """Register per-agent security state to discard at close/eviction."""
+        self._agent_cleanup_callbacks.append(callback)
+
+    def _agent_closed(self, agent_id: str) -> None:
+        for callback in tuple(self._agent_cleanup_callbacks):
+            try:
+                callback(agent_id)
+            except Exception:  # noqa: BLE001 - cleanup cannot strand other cleanup
+                log.warning("agent cleanup callback failed for %s", agent_id, exc_info=True)
+        key_file = self.settings.session_root / "agents" / agent_id / "approval.key"
+        try:
+            key_file.unlink(missing_ok=True)
+        except OSError:
+            log.warning("could not remove approval key for %s", agent_id, exc_info=True)
 
     def replay_continue(self, agent_id: str, request_id: str | None,
                         arguments: dict[str, Any]) -> Run | None:
@@ -2301,6 +2474,7 @@ class Registry:
                 if a.closed and all(r.state in TERMINAL_STATES for r in a.runs())
             ]
             for agent in closed:
+                self._agent_closed(agent.agent_id)
                 for run in agent.runs():
                     self._archive[run.run_id] = run
                 self._agents.pop(agent.agent_id, None)
@@ -2400,6 +2574,7 @@ class Registry:
                                       if provider_explicit is None else provider_explicit
                                   )},
                 deny_read=deny_read,
+                on_close=self._agent_closed,
             )
             self._agents[claimed] = agent
             return agent
@@ -2493,6 +2668,7 @@ class Registry:
                 provider_load=self._provider_load,
                 telemetry=self.telemetry,
                 on_event=on_event,
+                on_close=self._agent_closed,
             )
             session_id = record.get("session_id")
             if session_id:
@@ -2528,6 +2704,10 @@ class Registry:
         if agent is None:
             raise RegistryError(f"unknown agent_id {agent_id!r}")
         return agent
+
+    def cancel(self, agent_id: str, reason: str = "cancelled by caller") -> None:
+        """Close an agent and cancel any current or queued run."""
+        self.agent(agent_id).close(reason)
 
     def find_agent(self, agent_id: str) -> Agent | None:
         with self._lock:

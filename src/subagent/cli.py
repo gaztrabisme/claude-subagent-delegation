@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import config
 from .commands import init as init_command
@@ -351,7 +352,20 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         "binary_ok": path is not None,
         "api_key_envs": _key_envs(cfg),
     }
+    network_allow = list(cfg.network_allow)
+    parsed_base = urlsplit(cfg.base_url or "")
+    if parsed_base.hostname:
+        port = parsed_base.port or (443 if parsed_base.scheme.lower() == "https" else 80)
+        host = parsed_base.hostname
+        network_allow.append(f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
+    row["network_allow"] = list(dict.fromkeys(network_allow))
     warning = _thinking_warning(cfg)
+    if not cfg.local and not network_allow:
+        route_warning = (
+            f"warning: provider {cfg.name!r} has no network route; configure network_allow "
+            "or base_url"
+        )
+        warning = f"{warning}\n{route_warning}" if warning else route_warning
     if cfg.extra.get("auth") == "login":
         if cfg.driver == "dsh":
             login_warning = (

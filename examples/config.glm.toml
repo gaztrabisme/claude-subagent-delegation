@@ -14,6 +14,7 @@ base_url = "https://api.z.ai/api/anthropic"
 model = "glm-5.3-flash[1m]"
 api_key_env = ["GLM_API_KEY", "ZAI_API_KEY"]
 vendor = "zai"
+network_allow = ["api.z.ai"]
 
 [providers.glm.pricing]
 # z.ai GLM Coding Plan, USD per month, spread evenly over that month's runs.

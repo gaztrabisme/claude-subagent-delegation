@@ -55,6 +55,18 @@ GUARD = "hook"
 
 DEFAULT_BINARY = "omp"
 
+
+def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                        cwd: Path) -> list[str]:
+    """Workspace, this agent's omp state, and temporary/runtime scratch roots."""
+    roots = [
+        str(cwd),  # Project files are the worker's deliverable.
+        str(settings.session_root / "agents" / agent_id),  # Own hook and session state.
+        str(settings.session_root / "agents" / agent_id / "omp-agent"),  # Omp config and cache.
+        str(settings.session_root / "agents" / agent_id / "tmp"),  # Private CLI scratch.
+    ]
+    return list(dict.fromkeys(roots))
+
 _NO_SAMPLING_ARGS = frozenset({
     "--thinking", "--external-thinking", "--temperature", "--top-p", "--top-k",
     "--min-p", "--typical-p", "--presence-penalty", "--frequency-penalty",

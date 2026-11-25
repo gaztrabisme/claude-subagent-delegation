@@ -10,6 +10,7 @@ lives under the agent's session directory and is carried by a `Session`.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from collections.abc import Iterator
@@ -37,6 +38,22 @@ GUARD = "hook"
 CHILD_TOOLS = "Bash,Read,Edit,Write,Grep,Glob"
 
 DEFAULT_BINARY = "claude"
+
+
+def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                        cwd: Path) -> list[str]:
+    """Workspace, this agent's Claude state, and temporary/runtime scratch roots."""
+    roots = [
+        str(cwd),  # Project files are the worker's deliverable.
+        str(settings.session_root / "agents" / agent_id),  # Own hook and session state.
+        str(settings.agent_home(agent_id)),  # Claude's isolated config directory.
+        str(settings.session_root / "agents" / agent_id / "tmp"),  # Private CLI scratch.
+    ]
+    if cfg.extra.get("auth") == "login":
+        config = os.environ.get("CLAUDE_CONFIG_DIR")
+        roots.append(str(Path(config).expanduser() if config else Path.home() / ".claude"))
+        # The login CLI must update the owner's own authentication store.
+    return list(dict.fromkeys(roots))
 
 # Claude Code 2.1.261 prints this harmless warning to stderr on every request
 # (the wrapper passes the raw model name; the env maps only the aliases).

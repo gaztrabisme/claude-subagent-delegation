@@ -38,6 +38,8 @@ CODEX_SHELL_TOOLS = frozenset({
 })
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.M)
 _NONCE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DECISION_EMITTED = False
+_VERIFIED_ALLOW = False
 
 
 def _canonical_bytes(obj: dict) -> bytes:
@@ -147,6 +149,9 @@ def requests(tool_name: str, tool_input, codex: bool) -> list[tuple[str, object]
 
 
 def emit(decision: str, reason: str, *, code: int) -> None:
+    global _DECISION_EMITTED, _VERIFIED_ALLOW
+    _DECISION_EMITTED = True
+    _VERIFIED_ALLOW = decision == "allow"
     json.dump(
         {
             "hookSpecificOutput": {
@@ -185,7 +190,7 @@ def ask(socket_path: str, request: dict) -> dict:
     return reply
 
 
-def main() -> None:
+def _main() -> None:
     socket_path = os.environ.get("SUBAGENT_APPROVAL_SOCKET")
     if not socket_path:
         block(
@@ -232,8 +237,28 @@ def main() -> None:
             block(reason)
     if codex:
         # Exit 0 with no output is Codex's allow; it rejects an explicit one.
+        global _DECISION_EMITTED, _VERIFIED_ALLOW
+        _DECISION_EMITTED = True
+        _VERIFIED_ALLOW = True
         sys.exit(0)
     emit("allow", reason, code=0)
+
+
+def main() -> None:
+    """Run the hook and turn every unexpected failure or exit into a deny."""
+    global _DECISION_EMITTED, _VERIFIED_ALLOW
+    _DECISION_EMITTED = False
+    _VERIFIED_ALLOW = False
+    try:
+        _main()
+    except SystemExit as exc:
+        expected_allow = exc.code == 0 and _VERIFIED_ALLOW
+        expected_deny = exc.code == 2 and _DECISION_EMITTED and not _VERIFIED_ALLOW
+        if expected_allow or expected_deny:
+            raise
+        block("blocked: hook exited without a verified decision")
+    except BaseException as exc:  # noqa: BLE001 - a hook exception must never allow
+        block(f"blocked: unexpected hook failure ({type(exc).__name__})")
 
 
 if __name__ == "__main__":

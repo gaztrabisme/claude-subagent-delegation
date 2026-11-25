@@ -49,7 +49,10 @@ from ..config import log
 #    needs_human, human_action and plan_id. Native values are never repriced.
 SCHEMA = 3
 
-KINDS = ("run", "hop", "turn", "sample", "run_summary", "verdict", "calibration", "delegation")
+KINDS = (
+    "run", "hop", "turn", "sample", "run_summary", "verdict", "calibration",
+    "delegation", "egress_refused", "guard_tamper",
+)
 
 
 class Trace:
@@ -102,6 +105,20 @@ class Trace:
             # failed looks fine, and every later run on that agent hangs. A
             # trace is the least important thing happening in this process.
             log.warning("could not append to %s", self.path, exc_info=True)
+
+    def egress_refused(
+        self, *, agent_id: str, run_id: str, provider: str, host: str, port: int,
+    ) -> None:
+        """Append the additive, destination-specific egress refusal record."""
+        self.write(
+            "egress_refused", type="egress_refused", agent_id=agent_id,
+            run_id=run_id, provider=provider, host=host, port=port,
+        )
+
+    def guard_tamper(self, *, agent_id: str, run_id: str, path: str) -> None:
+        """Append the additive DSH bootstrap tamper record."""
+        self.write("guard_tamper", type="guard_tamper", agent_id=agent_id,
+                   run_id=run_id, path=path)
 
     def verdict(
         self,

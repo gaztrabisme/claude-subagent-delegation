@@ -259,8 +259,14 @@ def meter(
     end: dt.datetime,
     roles: dict[str, str],
     pricing: dict[str, Any] | None,
+    io_share: bool = False,
 ) -> dict[str, Any]:
-    """Build the report dict for the listed sessions inside the inclusive window."""
+    """Build the report dict for the listed sessions inside the inclusive window.
+
+    `io_share` adds each role's input-plus-output tokens and their share, plus a
+    top-level `coordination` block (coordinator plus the `m-*` roles). Without it
+    the report is byte-for-byte the M0 shape.
+    """
     projects = Path(projects_dir)
     role_map = dict(roles)
     if pricing is None:
@@ -384,21 +390,48 @@ def meter(
         share = blocks[name]["tokens"]["total"]
         blocks[name]["share_of_claude_tokens"] = share / grand_tokens if grand_tokens else 0.0
 
+    coordination: dict[str, Any] | None = None
+    if io_share:
+        grand_io = sum(
+            blocks[name]["tokens"]["input"] + blocks[name]["tokens"]["output"]
+            for name in role_names
+        )
+        for name in role_names:
+            io_tokens = blocks[name]["tokens"]["input"] + blocks[name]["tokens"]["output"]
+            blocks[name]["io_tokens"] = io_tokens
+            blocks[name]["share_of_claude_io_tokens"] = (
+                io_tokens / grand_io if grand_io else 0.0
+            )
+        coordination_roles = [
+            name for name in role_names if name == "coordinator" or name.startswith("m-")
+        ]
+        coordination_io = sum(blocks[name]["io_tokens"] for name in coordination_roles)
+        coordination = {
+            "roles": coordination_roles,
+            "io_tokens": coordination_io,
+            "share_of_claude_io_tokens": (
+                coordination_io / grand_io if grand_io else 0.0
+            ),
+        }
+
     total_tokens = dict.fromkeys(TOKEN_KEYS, 0)
     for block in blocks.values():
         for key in TOKEN_KEYS:
             total_tokens[key] += block["tokens"][key]
     role_usds = [block["usd"] for block in blocks.values()]
-    return {
+    out: dict[str, Any] = {
         "window": {"start": _iso_z(start), "end": _iso_z(end)},
         "sessions": list(sessions),
         "roles": blocks,
-        "total": {
-            "tokens": total_tokens,
-            "usd": None if any(u is None for u in role_usds) else sum(role_usds),
-            "messages": sum(block["messages"] for block in blocks.values()),
-        },
     }
+    if coordination is not None:
+        out["coordination"] = coordination
+    out["total"] = {
+        "tokens": total_tokens,
+        "usd": None if any(u is None for u in role_usds) else sum(role_usds),
+        "messages": sum(block["messages"] for block in blocks.values()),
+    }
+    return out
 
 
 def _usage_rec_model(rec: dict[str, Any]) -> str:
@@ -419,6 +452,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start", required=True, type=_aware_cli)
     parser.add_argument("--end", required=True, type=_aware_cli)
     parser.add_argument("--role", action="append", default=[])
+    parser.add_argument(
+        "--io-share",
+        action="store_true",
+        help="add input-plus-output tokens and shares, plus a coordination block",
+    )
     parser.add_argument("--pricing", type=Path)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
@@ -444,7 +482,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"coord_meter: cannot read pricing file {args.pricing}: {exc}", file=sys.stderr)
             return 2
 
-    report = meter(args.projects_dir, args.session, args.start, args.end, roles, pricing)
+    report = meter(
+        args.projects_dir,
+        args.session,
+        args.start,
+        args.end,
+        roles,
+        pricing,
+        io_share=args.io_share,
+    )
     text = json.dumps(report, indent=2)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)

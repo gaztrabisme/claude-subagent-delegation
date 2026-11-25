@@ -487,6 +487,7 @@ class LaneStatusStore:
         lane_state = LaneState(settings.session_root)
         closures, verified_versions = lane_state.status_entries(now=current)
         spend = _month_spend(settings, current)
+        runs = _run_counts(settings, current)
         result: dict[str, dict[str, Any]] = {}
         for name, cfg in settings.providers.items():
             entry = records.get(name)
@@ -544,6 +545,10 @@ class LaneStatusStore:
                 "slots": {"limit": int(limit), "live": count,
                           "free": max(int(limit) - count, 0)},
                 "spend": {"month_usd": spend.get(name), "cap_usd": cap},
+                "runs": (
+                    runs.get(name, {"day": 0, "week": 0}) if runs is not None
+                    else {"day": None, "week": None}
+                ),
                 "local": bool(getattr(cfg, "local", False)),
                 "driver": getattr(cfg, "driver", None),
                 "harness_version": harness_version,
@@ -812,6 +817,105 @@ def _spend_record(line: bytes, providers: Mapping[str, Any], now: datetime,
         amount = record.get("cash_usd")
     if isinstance(amount, (int, float)) and not isinstance(amount, bool):
         totals[lane] = totals.get(lane, 0.0) + float(amount)
+
+
+_RUN_CACHE_LOCK = threading.Lock()
+_RUN_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _run_event(line: bytes) -> tuple[float, str] | None:
+    """(timestamp, lane) for one run record, or None for anything else."""
+    if b'"kind"' not in line or b'"run"' not in line:
+        return None
+    try:
+        record = json.loads(line)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("kind") != "run":
+        return None
+    lane = record.get("lane")
+    if not isinstance(lane, str):
+        return None
+    try:
+        return float(record.get("ts")), lane
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_counts(settings: Any, now: datetime) -> dict[str, dict[str, int]] | None:
+    """Run records per lane in the last day and week, from a cached trace tail.
+
+    None means the trace is off or unreadable; an empty mapping means it was
+    read and holds no run records.
+    """
+    raw_path = settings.trace
+    if raw_path is None:
+        path: Path | None = Path(settings.session_root) / "trace.jsonl"
+    elif str(raw_path).strip().lower() in ("off", "0", "false", ""):
+        path = None
+    else:
+        path = Path(raw_path).expanduser()
+    if path is None:
+        return None
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    key = str(path.resolve())
+    try:
+        with _RUN_CACHE_LOCK:
+            cached = _RUN_CACHE.get(key)
+            reset = (
+                cached is None
+                or cached["device"] != info.st_dev
+                or cached["inode"] != info.st_ino
+                or info.st_size < cached["offset"]
+                or (info.st_size == cached["seen_size"]
+                    and info.st_mtime_ns != cached["mtime_ns"])
+            )
+            if reset:
+                cached = {
+                    "device": info.st_dev, "inode": info.st_ino, "offset": 0,
+                    "seen_size": 0, "mtime_ns": 0, "pending": b"", "events": [],
+                }
+            with path.open("rb") as handle:
+                handle.seek(cached["offset"])
+                chunk = handle.read()
+            lines = chunk.splitlines(keepends=True)
+            pending = b""
+            if lines and not lines[-1].endswith((b"\n", b"\r")):
+                pending = lines.pop()
+            for line in lines:
+                event = _run_event(line)
+                if event is not None:
+                    cached["events"].append(event)
+            cached["offset"] = info.st_size - len(pending)
+            cached["seen_size"] = info.st_size
+            cached["mtime_ns"] = info.st_mtime_ns
+            cached["pending"] = pending
+            _RUN_CACHE[key] = cached
+            events = list(cached["events"])
+    except OSError:
+        return None
+    day_cutoff = 86400.0
+    week_cutoff = 7 * 86400.0
+    counts: dict[str, dict[str, int]] = {}
+    for ts, lane in events:
+        try:
+            event_at = datetime.fromtimestamp(ts, now.tzinfo)
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+        age = (now - event_at).total_seconds()
+        if age < 0:
+            continue
+        entry = counts.setdefault(lane, {"day": 0, "week": 0})
+        if age <= day_cutoff:
+            entry["day"] += 1
+        if age <= week_cutoff:
+            entry["week"] += 1
+    return counts
 
 
 def _month_spend(settings: Any, now: datetime) -> dict[str, float | None]:

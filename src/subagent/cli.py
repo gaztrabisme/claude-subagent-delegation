@@ -36,7 +36,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from . import config
+from . import config, envelope
 from .commands import init as init_command
 from .commands import install as install_command
 from .commands import providers as providers_command
@@ -609,6 +609,46 @@ def cmd_lanes(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_envelope(args: argparse.Namespace) -> int:
+    """Print the pre-dispatch decision for one lane; starts and records nothing."""
+    root = Path(getattr(args, "root", None) or ".").expanduser().resolve()
+    project_root = root if getattr(args, "root", None) else _project_config_root(root)
+    try:
+        settings = config.load(project_root=project_root)
+        settings.require_providers()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if settings.envelope_lane_plan is None:
+        message = "envelope check is off: [envelope] lane_plan is not configured"
+        if args.json:
+            print(json.dumps({"enabled": False, "message": message}))
+        else:
+            print(message)
+        return 0
+    rows = envelope.load_plan(settings.envelope_lane_plan)
+    row = envelope.row_for(rows, args.provider)
+    store = LaneStatusStore(settings.session_root, redact_keys=settings.leaked_keys)
+    snapshot = store.snapshot(settings)
+    if row is None:
+        decision = envelope.Decision(
+            "unknown", args.provider, None, None, None, None,
+            f"envelope: lane {args.provider} has no envelope row",
+        )
+        reading = {}
+    else:
+        reading = envelope.reading_for(row, snapshot)
+        decision = envelope.evaluate(row.rules, reading, lane=args.provider)
+    if args.json:
+        data = dataclasses.asdict(decision)
+        data["rules"] = [dataclasses.asdict(rule) for rule in (row.rules if row else ())]
+        data["reading"] = reading
+        print(json.dumps(data, indent=2))
+    else:
+        print(decision.reason)
+    return 3 if decision.level == "refuse" else 0
+
+
 def cmd_harness(args: argparse.Namespace) -> int:
     """Inspect or explicitly maintain configured provider CLIs."""
     from . import harness
@@ -868,6 +908,10 @@ def _loop_parsers(subparsers: argparse._SubParsersAction) -> None:
     run.add_argument("--model", metavar="MODEL", help="override the tier's model")
     run.add_argument("--provider", metavar="NAME", help="override the tier's provider")
     run.add_argument(
+        "--override-envelope", metavar="REASON", default=None,
+        help="let this run proceed past a refusing usage envelope, recording REASON",
+    )
+    run.add_argument(
         "--test-outline", metavar="FILE", help="write tests from this outline (--auto)"
     )
     run.add_argument(
@@ -933,6 +977,13 @@ def _parser() -> argparse.ArgumentParser:
     lanes = sub.add_parser("lanes", help="show stored provider lane status")
     lanes.add_argument("--json", action="store_true", help="print JSON instead of a table")
     lanes.add_argument("--probe", action="store_true", help="refresh stale idle lanes first")
+
+    envelope_command = sub.add_parser("envelope", help="inspect lane usage envelopes")
+    envelope_sub = envelope_command.add_subparsers(dest="envelope_command", required=True)
+    envelope_check = envelope_sub.add_parser("check", help="check one lane before dispatch")
+    envelope_check.add_argument("--provider", metavar="NAME", required=True,
+                                help="the configured provider (lane) to check")
+    envelope_check.add_argument("--json", action="store_true", help="print JSON")
 
     harness_command = sub.add_parser("harness", help="check and verify provider CLI versions")
     harness_sub = harness_command.add_subparsers(dest="harness_command", required=True)
@@ -1064,6 +1115,10 @@ def main(argv: list[str] | None = None) -> int:
         return report_main(raw[1:])
     raw, exec_argv = _split_exec_argv(raw)
     args = _parser().parse_args(raw)
+    if (args.command == "run" and getattr(args, "override_envelope", None) is not None
+            and not args.override_envelope.strip()):
+        print("error: --override-envelope requires a non-empty reason", file=sys.stderr)
+        return 2
     if args.command == "exec" and exec_argv is not None:
         args.argv = exec_argv
     if args.command == "doctor":
@@ -1072,6 +1127,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_lanes(args)
     if args.command == "harness":
         return cmd_harness(args)
+    if args.command == "envelope":
+        return cmd_envelope(args)
     if args.command == "exec":
         return cmd_exec(args)
     if args.command == "promote":

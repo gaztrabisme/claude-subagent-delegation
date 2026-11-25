@@ -19,10 +19,12 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sqlite3
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from ..config import Settings
 from ..router import Refusal, clip
@@ -49,9 +51,79 @@ _AGY_HOMES = (".gemini",)
 _READ_DENY_EXEMPT = ("Library/Keychains",)
 
 
-def runtime_state_dir() -> Path:
-    """agy's own runtime state (conversations, CLI settings, logs)."""
+def runtime_state_dir(cfg: ProviderConfig | None = None) -> Path:
+    """agy's own runtime state (conversations, CLI settings, logs).
+
+    `agy_state_dir` on the provider overrides the default location.
+    """
+    configured = cfg.extra.get("agy_state_dir") if cfg is not None else None
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured).expanduser()
     return Path.home() / ".gemini" / "antigravity-cli"
+
+
+# --- bypass audit (R1a-agy addendum R2) ----------------------------------------
+# agy's stream-json drops BypassSandbox from tool parameters, so the stream
+# detector cannot see a real bypass. The audit reads agy's own record of the
+# run's conversation after the turn, read-only, and only records what it finds.
+
+_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+# A flat JSON object (no nested braces) that mentions BypassSandbox.
+_BYPASS_OBJECT = re.compile(r"\{[^{}]*\"BypassSandbox\"[^{}]*\}")
+
+
+def bypass_audit_enabled(cfg: ProviderConfig) -> bool:
+    return cfg.extra.get("bypass_audit") is True
+
+
+def conversation_record(cfg: ProviderConfig, conversation_id: str) -> Path:
+    return runtime_state_dir(cfg) / "conversations" / f"{conversation_id}.db"
+
+
+def audit_conversation(cfg: ProviderConfig, conversation_id: str | None
+                       ) -> tuple[list[dict[str, str]], str | None]:
+    """Distinct BypassSandbox-true calls in the run's own conversation record.
+
+    Returns (findings, None), or ([], reason) when the record cannot be read.
+    Opens exactly one file, read-only; never raises.
+    """
+    if not isinstance(conversation_id, str) or not _CONVERSATION_ID.match(conversation_id) \
+            or conversation_id in (".", ".."):
+        return [], "no usable conversation id for this run"
+    path = conversation_record(cfg, conversation_id)
+    uri = "file:" + quote(str(path.resolve())) + "?mode=ro"
+    try:
+        con = sqlite3.connect(uri, uri=True)
+        try:
+            rows = con.execute("select step_payload from steps").fetchall()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return [], f"conversation record unreadable: {type(exc).__name__}: {exc}"
+    seen: dict[str, dict[str, str]] = {}
+    for (payload,) in rows:
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            text = bytes(payload).decode("utf-8", errors="replace")
+        elif isinstance(payload, str):
+            text = payload
+        else:
+            continue
+        for match in _BYPASS_OBJECT.finditer(text):
+            try:
+                obj = json.loads(match.group(0))
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("BypassSandbox") is not True:
+                continue
+            key = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)
+            if key in seen:
+                continue
+            command = obj.get("CommandLine")
+            seen[key] = {
+                "tool": "run_command",
+                "command": (command if isinstance(command, str) else "")[:COMMAND_CLIP],
+            }
+    return list(seen.values()), None
 
 
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
@@ -62,7 +134,7 @@ def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
         str(cwd),  # Project files are the worker's deliverable.
         str(agent_root),  # Own server-side state for this agent.
         str(agent_root / "tmp"),  # The child's TMPDIR (set in Agent._spawn).
-        str(runtime_state_dir()),  # agy writes its conversation store and CLI state here.
+        str(runtime_state_dir(cfg)),  # agy writes its conversation store and CLI state here.
     ]
     return list(dict.fromkeys(roots))
 
@@ -573,6 +645,8 @@ __all__ = [
     "FINISH_SANDBOX_BYPASS",
     "GUARD",
     "Translator",
+    "audit_conversation",
+    "bypass_audit_enabled",
     "sandbox_read_deny",
     "sandbox_write_roots",
 ]

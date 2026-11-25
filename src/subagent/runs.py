@@ -1857,6 +1857,37 @@ class Agent:
     def _turn(self, run: Run, prompt: str, resume: str | None) -> None:
         for event in self._collect(run, prompt, resume=resume):
             self._ingest(run, event)
+        if self.cfg.driver == DRIVER_ANTIGRAVITY:
+            self._bypass_audit(run)
+
+    def _bypass_audit(self, run: Run) -> None:
+        """R1a-agy addendum R2: record bypassing calls from agy's own conversation record.
+
+        Off unless `bypass_audit = true`. Observation only: it never changes the
+        run, and any failure becomes one bypass_audit_unavailable record.
+        """
+        from .providers import antigravity
+
+        if not antigravity.bypass_audit_enabled(self.cfg):
+            return
+        try:
+            findings, reason = antigravity.audit_conversation(self.cfg, run.session_id)
+        except Exception as exc:  # noqa: BLE001 - the audit fails open
+            findings, reason = [], f"audit failed: {type(exc).__name__}"
+        if self.trace is None:
+            return
+        if reason is not None:
+            self.trace.bypass_audit_unavailable(
+                agent_id=self.agent_id, run_id=run.run_id, provider=self.cfg.name,
+                reason=reason,
+            )
+            return
+        for finding in findings:
+            self.trace.sandbox_bypass(
+                agent_id=self.agent_id, run_id=run.run_id, provider=self.cfg.name,
+                tool=finding["tool"], command=finding["command"],
+                source="conversation_record",
+            )
 
     def _backoff_sleep(self, run: Run, seconds: float) -> bool:
         """Sleep before a rate-limit retry, in short slices so cancel/close

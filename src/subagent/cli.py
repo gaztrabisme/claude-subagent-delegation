@@ -25,9 +25,11 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from collections.abc import Mapping, MutableMapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -491,6 +493,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # health probe that sends one, from this process's environment.
     load_provider_env()
 
+    workspace = Path(args.root or ".").expanduser().resolve()
+
     goal: Goal | None = None
     if args.goal is not None:
         workspace = Path(args.root or ".").expanduser().resolve()
@@ -518,6 +522,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return 2
 
     names = [args.provider] if args.provider else list(settings.providers)
+    refusal = settings.workspace_refusal(workspace)
+    workspace_row: dict[str, Any] = {
+        "path": str(workspace),
+        "accepted": refusal is None,
+        "reason": refusal,
+    }
     rows: list[dict[str, Any]] = []
     hard = False
     for name in names:
@@ -535,6 +545,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         response: dict[str, Any] = {
             "ok": not hard,
             "providers": rows,
+            "workspace": workspace_row,
             "loop_auto": settings.loop.auto,
         }
         if goal is not None:
@@ -547,6 +558,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(json.dumps(response, indent=2))
     else:
         _print_table(rows, args)
+        if refusal is None:
+            print("workspace: accepted")
+        else:
+            print(f"workspace: refused: {refusal}")
         for row in rows:
             if row.get("warning"):
                 print(row["warning"], file=sys.stderr)
@@ -631,6 +646,180 @@ def cmd_harness(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 0 if result.get("ok") else 1
     return 2
+
+
+def _run_argv(argv: list[str], root: Path) -> int:
+    """Run one command in `root`; a missing binary is the shell's 127."""
+    try:
+        return subprocess.run(argv, cwd=root).returncode
+    except FileNotFoundError:
+        return 127
+    except OSError as exc:
+        print(f"error: cannot run {argv[0]!r}: {exc}", file=sys.stderr)
+        return 126
+
+
+def _resolve_rev(root: Path, rev: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    sha = result.stdout.strip() if result.returncode == 0 else ""
+    return sha or None
+
+
+def _lock_violations(root: Path, rev: str, globs: list[str]) -> list[str]:
+    """Files matching `globs` whose working-tree content differs from `rev`."""
+    from .loop.common import matches, walk_files
+
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z", rev],
+        capture_output=True,
+    )
+    at_rev = {
+        rel for rel in listed.stdout.decode("utf-8", "replace").split("\0")
+        if rel and matches(rel, globs)
+    }
+    now = {rel for rel in walk_files(root) if matches(rel, globs)}
+    violations = []
+    for rel in sorted(at_rev):
+        try:
+            current = (root / rel).read_bytes()
+        except OSError:
+            violations.append(rel)
+            continue
+        original = subprocess.run(
+            ["git", "-C", str(root), "show", f"{rev}:{rel}"], capture_output=True
+        )
+        if original.returncode != 0 or original.stdout != current:
+            violations.append(rel)
+    violations.extend(sorted(now - at_rev))
+    return violations
+
+
+def _trace_exec(
+    settings: Settings,
+    cfg: ProviderConfig,
+    lane: str,
+    root: Path,
+    started: float,
+    finished: float,
+    state: str,
+    finish_reason: str,
+    exit_code: int,
+    lock: str | None,
+) -> None:
+    from .runs import Run
+    from .telemetry.trace import open_trace
+
+    run = Run(
+        run_id=f"exec-{uuid.uuid4().hex}",
+        agent_id="exec",
+        prompt="",
+        state=state,
+        finish_reason=finish_reason,
+    )
+    run.created_at = started
+    run.started_at = started
+    run.finished_at = finished
+    run.lane = lane
+    run.provider = cfg.vendor
+    run.driver = cfg.driver
+    run.guard = "none"
+    open_trace(settings.trace, settings.session_root).run(
+        run,
+        str(root),
+        cfg.model or "",
+        entry="exec-wrapper",
+        exit_code=exit_code,
+        lock=lock,
+    )
+
+
+def cmd_exec(args: argparse.Namespace) -> int:
+    """Run an arbitrary command as one traced, lane-leased exec-wrapper run."""
+    root = Path(args.root or ".").expanduser().resolve()
+    project_root = root if args.root else _project_config_root(root)
+    try:
+        settings = config.load(project_root=project_root)
+        settings.require_providers()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    cfg = settings.providers.get(args.lane)
+    if cfg is None:
+        print(
+            f"error: unknown lane {args.lane!r}; configured: "
+            f"{', '.join(settings.providers) or '(none)'}",
+            file=sys.stderr,
+        )
+        return 2
+    argv = [str(part) for part in (args.argv or [])]
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        print("error: exec needs a command after --", file=sys.stderr)
+        return 2
+    lock_rev = None
+    if args.lock_commit:
+        lock_rev = _resolve_rev(root, args.lock_commit)
+        if lock_rev is None:
+            print(f"error: unknown --lock-commit {args.lock_commit!r}", file=sys.stderr)
+            return 2
+    if args.locked:
+        globs = list(args.locked)
+    else:
+        from .loop.detect import detect
+
+        globs = list(detect(root, settings.loop)["test_globs"])
+
+    store = LaneStatusStore(settings.session_root, redact_keys=settings.leaked_keys)
+    started = time.time()
+    with store.active_run(args.lane):
+        rc = _run_argv(argv, root)
+    finished = time.time()
+
+    lock = None
+    violations: list[str] = []
+    if lock_rev is not None:
+        violations = _lock_violations(root, lock_rev, globs)
+        lock = "violated" if violations else "ok"
+    if violations:
+        for path in violations:
+            print(path, file=sys.stderr)
+        state, finish_reason, code = "failed", "violated_tests", 3
+    else:
+        state = "completed" if rc == 0 else "failed"
+        finish_reason = "complete" if rc == 0 else "error"
+        code = rc
+    store.record_run(args.lane, "completed" if state == "completed" else "error")
+    _trace_exec(
+        settings, cfg, args.lane, root, started, finished,
+        state, finish_reason, rc, lock,
+    )
+    return code
+
+
+def cmd_promote(args: argparse.Namespace) -> int:
+    """Install one exact commit as the served build."""
+    root = Path(args.root or ".").expanduser().resolve()
+    project_root = root if args.root else _project_config_root(root)
+    try:
+        settings = config.load(project_root=project_root)
+        settings.require_providers()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    from .promote import PromoteError, promote
+
+    try:
+        result = promote(root, args.commit, settings, force=args.force)
+    except PromoteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return exc.code
+    print(result["commit"][:7])
+    return 0
 
 
 # --- the delegate loop ----------------------------------------------------------
@@ -726,6 +915,27 @@ def _parser() -> argparse.ArgumentParser:
     harness_verify = harness_sub.add_parser("verify", help="verify one provider harness")
     harness_verify.add_argument("lane", metavar="LANE")
 
+    exec_command = sub.add_parser(
+        "exec", help="run a command as a traced lane run, optionally locking test files"
+    )
+    exec_command.add_argument("lane", metavar="LANE")
+    exec_command.add_argument(
+        "--lock-commit", metavar="REV", help="fail with exit 3 if locked files changed since REV"
+    )
+    exec_command.add_argument(
+        "--locked", metavar="GLOB", action="append",
+        help="a protected glob (repeatable; default: the detected test files)",
+    )
+    exec_command.add_argument("argv", nargs="*", metavar="ARGV")
+
+    promote_command = sub.add_parser(
+        "promote", help="install one exact commit as the served build"
+    )
+    promote_command.add_argument("commit", metavar="COMMIT")
+    promote_command.add_argument(
+        "--force", action="store_true", help="promote even while lanes have live runs"
+    )
+
     sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",
                    add_help=False)
 
@@ -799,6 +1009,20 @@ def _project_config_root(root: Path) -> Path:
     return root
 
 
+def _split_exec_argv(raw: list[str]) -> tuple[list[str], list[str] | None]:
+    """Separate `exec`'s own options from the command after `--`.
+
+    argparse cannot tell an option that belongs to `exec` from one that belongs
+    to the wrapped command, so the `--` boundary is split before parsing.
+    """
+    if "--" not in raw:
+        return raw, None
+    boundary = raw.index("--")
+    if "exec" not in raw[:boundary]:
+        return raw, None
+    return raw[:boundary], raw[boundary + 1:]
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "report":
@@ -811,13 +1035,20 @@ def main(argv: list[str] | None = None) -> int:
         from .report import main as report_main
 
         return report_main(raw[1:])
+    raw, exec_argv = _split_exec_argv(raw)
     args = _parser().parse_args(raw)
+    if args.command == "exec" and exec_argv is not None:
+        args.argv = exec_argv
     if args.command == "doctor":
         return cmd_doctor(args)
     if args.command == "lanes":
         return cmd_lanes(args)
     if args.command == "harness":
         return cmd_harness(args)
+    if args.command == "exec":
+        return cmd_exec(args)
+    if args.command == "promote":
+        return cmd_promote(args)
     handler = getattr(args, "command_handler", None)
     if handler is not None:
         return handler(args)

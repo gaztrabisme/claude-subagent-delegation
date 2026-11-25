@@ -38,7 +38,7 @@ class InProcessServer:
             session_root=self.session_root,
             approval_socket=socket_path,
         )
-        self.registry = Registry(self.settings, start_reaper=False)
+        self.registry = Registry(self.settings, start_reaper=False, entry="cli")
         self.supervisor = Supervisor(self.settings, self.registry, trace=self.registry.trace)
         self._stop = threading.Event()
         self._ready = threading.Event()

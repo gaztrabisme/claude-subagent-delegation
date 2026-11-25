@@ -744,7 +744,17 @@ class Settings:
         child it guards.
         """
         root = Path(workspace).resolve()
-        owned = (("the guard hook", APPROVAL_HOOK), ("this server's Python", Path(sys.prefix)))
+        owned = [
+            ("the guard hook", Path(APPROVAL_HOOK)),
+            ("this server's Python", Path(sys.prefix)),
+        ]
+        try:
+            served = json.loads((self.session_root / "served.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            served = None
+        install = served.get("install_path") if isinstance(served, dict) else None
+        if isinstance(install, str) and install:
+            owned.append(("the pinned install", Path(install)))
         for label, path in owned:
             try:
                 Path(path).resolve().relative_to(root)

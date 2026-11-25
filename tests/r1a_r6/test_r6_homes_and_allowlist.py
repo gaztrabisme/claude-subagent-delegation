@@ -42,12 +42,17 @@ def test_h1_live_seatbelt_write_allowlist(tmp_path: Path, monkeypatch, lane_id: 
     lane = capture_lane(tmp_path, monkeypatch, lane_id)
     skip_unless_seatbelt()
     profile = lane.profile
-    must_write = [lane.ws / "h1-probe.txt", lane.agent_dir / "h1-probe.txt", Path("/dev/null")]
+    # TCR-R7: codex keeps four narrow roots (ws, CODEX_HOME, tmp, cache); its agent-folder
+    # root is not a write root, so its must-write probe sits inside CODEX_HOME instead.
+    agent_probe = (lane.child_home if lane_id == "codex" else lane.agent_dir) / "h1-probe.txt"
+    must_write = [lane.ws / "h1-probe.txt", agent_probe, Path("/dev/null")]
     if lane.child_home is not None:
         must_write.append(lane.child_home / "h1-scratch.txt")
     must_fail = [*_owner_files(lane.owner), lane.ws / ".codex" / "config.toml",
                  lane.ws / ".codex" / "hooks.json", lane.ws / ".codex" / "new.toml",
                  Path("/dev/random")]
+    if lane_id == "codex":
+        must_fail.append(lane.agent_dir / "h1-probe-root.txt")
     result = run_probe(profile, [*must_write, *must_fail])
     wrongly_denied = [str(p) for p in must_write if result[str(p)] != "ok"]
     wrongly_allowed = [str(p) for p in must_fail if result[str(p)] == "ok"]
@@ -78,6 +83,17 @@ def test_h1_profile_write_roots_are_exactly_ws_agent_dir_and_devices(
             if _under(root, lane.owner) or (_under(lane.owner, root) and root != "/"):
                 problems.append(f"{lane_id}: write root {root} touches the owner home")
     assert not problems, problems
+
+
+def test_h1_codex_profile_write_roots_are_the_four_narrow_roots(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """H1 (TCR-R7): codex write roots are exactly ws, CODEX_HOME, agent tmp, agent cache, plus devices."""
+    lane = capture_lane(tmp_path, monkeypatch, "codex")
+    roots = {os.path.realpath(r) for r in write_allow_roots(lane.profile) if r not in STD_DEVICES}
+    expected = {os.path.realpath(p) for p in (
+        lane.ws, lane.child_home, lane.agent_dir / "tmp", lane.agent_dir / "cache")}
+    assert roots == expected, f"codex write roots {sorted(roots)} != {sorted(expected)}"
 
 
 def test_h2_child_homes_live_under_the_agent_directory(tmp_path: Path, monkeypatch) -> None:

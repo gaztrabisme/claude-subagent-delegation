@@ -45,16 +45,25 @@ GUARD_NO_HOOK = "sandbox"
 DEFAULT_BINARY = "codex"
 
 
+def codex_home_dir(settings: Settings, agent_id: str) -> Path:
+    """The agent's CODEX_HOME under its agent directory."""
+    return settings.session_root / "agents" / agent_id / "codex-home"
+
+
 def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
                         cwd: Path) -> list[str]:
-    """The Codex child's write roots (H1): the workspace and its agent directory.
+    """The Codex child's write roots (H1): four narrow roots and nothing broader.
 
-    The agent directory holds CODEX_HOME, TMPDIR and XDG_CACHE_HOME. Devices
-    are only the standard ones every A9 profile allows (no /dev subpath).
+    The workspace, the agent's TMPDIR, its CODEX_HOME and its XDG_CACHE_HOME.
+    The agent directory itself is not a root. Devices are only the standard
+    ones every A9 profile allows (no /dev subpath).
     """
+    agent_dir = settings.session_root / "agents" / agent_id
     return [
         str(cwd),  # Project files are the worker's deliverable.
-        str(settings.session_root / "agents" / agent_id),  # Own homes, temp and cache.
+        str(agent_dir / "tmp"),  # TMPDIR.
+        str(codex_home_dir(settings, agent_id)),  # CODEX_HOME (config files are write-denied).
+        str(agent_dir / "cache"),  # XDG_CACHE_HOME.
     ]
 
 
@@ -336,7 +345,7 @@ def prepare_home(
     provider names no model; hooks.json holds the guard hook and nothing else.
     """
     source = source or source_codex_home()
-    home = settings.session_root / "agents" / agent_id / "codex-home"
+    home = codex_home_dir(settings, agent_id)
     home.mkdir(parents=True, exist_ok=True)
 
     auth = home / "auth.json"

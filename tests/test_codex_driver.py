@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
-import threading
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +28,7 @@ from subagent.runs import COMPLETED, FAILED, Registry
 from subagent.telemetry.trace import Trace
 
 from .conftest import default_providers, make_settings
+from .signed_supervisor import private_socket_path, signed_supervisor_socket, write_key_file
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
 HOOK = Path(__file__).resolve().parents[1] / "src" / "subagent" / "guard" / "approval_hook.py"
@@ -552,49 +551,31 @@ def test_missing_binary_is_a_start_error(tmp_path: Path, registry):
 
 @pytest.fixture
 def supervisor_socket(tmp_path: Path):
-    """A one-thread fake supervisor: records requests, answers from a list."""
-    path = Path("/tmp") / f"sam-codex-hook-{os.getpid()}-{tmp_path.name[-8:]}.sock"
-    path.unlink(missing_ok=True)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(path))
-    server.listen(8)
-    seen: list[dict] = []
+    """A one-thread signed fake supervisor: verifies requests, answers from a list."""
+    key, _key_path, key_args = write_key_file(tmp_path / "approval.key")
     answers: list[dict] = []
 
-    def serve() -> None:
-        while True:
-            try:
-                conn, _ = server.accept()
-            except OSError:
-                return
-            with conn:
-                data = b""
-                while b"\n" not in data:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    data += chunk
-                seen.append(json.loads(data.split(b"\n", 1)[0]))
-                reply = answers.pop(0) if answers else {"action": "allow", "reason": "ok"}
-                conn.sendall((json.dumps(reply) + "\n").encode())
-
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
+    def respond(_req: dict) -> dict:
+        return answers.pop(0) if answers else {"action": "allow", "reason": "ok"}
 
     class Sock:
         pass
 
-    sock = Sock()
-    sock.path, sock.seen, sock.answers = path, seen, answers
-    yield sock
-    server.close()
-    path.unlink(missing_ok=True)
+    with private_socket_path("codex.sock") as path, signed_supervisor_socket(
+        path, key, respond, backlog=8
+    ) as seen:
+        sock = Sock()
+        sock.path, sock.seen, sock.answers = path, seen, answers
+        sock.key, sock.key_args = key, key_args
+        yield sock
 
 
 def _hook(sock, payload: dict, *extra: str) -> subprocess.CompletedProcess:
+    from subagent.config import APPROVAL_HOOK
+
     env = {**os.environ, "SUBAGENT_APPROVAL_SOCKET": str(sock.path)}
     return subprocess.run(
-        [sys.executable, str(HOOK), "--agent", "a1", *extra],
+        [sys.executable, str(APPROVAL_HOOK), "--agent", "a1", *sock.key_args, *extra],
         input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=10,
     )
 

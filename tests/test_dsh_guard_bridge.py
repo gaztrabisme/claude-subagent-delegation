@@ -42,11 +42,8 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
-import threading
-import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -54,6 +51,8 @@ import pytest
 
 from subagent.config import APPROVAL_HOOK
 from subagent.guard.classify import classify
+
+from .signed_supervisor import private_socket_path, signed_supervisor_socket, write_key_file
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_DIR = REPO_ROOT / "integrations" / "dsh-guard"
@@ -614,55 +613,20 @@ def test_decide_returns_allow_and_deny_shape_directly(tmp_path: Path):
 
 
 @contextmanager
-def _classification_socket(path: Path, workspace: Path, context: dict):
-    """Local Unix approval socket answering each request via the real classifier."""
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(path))
-    listener.listen(4)
-    listener.settimeout(0.2)
-    received: list[dict] = []
-    stop = threading.Event()
+def _classification_socket(path: Path, workspace: Path, context: dict, *, key: bytes):
+    """Local signed Unix approval socket answering each request via the real classifier."""
+    def responder(req: dict) -> dict:
+        verdict = classify(
+            req["tool_name"],
+            req["tool_input"],
+            workspace,
+            cwd=req.get("cwd"),
+            context=context,
+        )
+        return {"action": verdict.action, "reason": verdict.reason}
 
-    def serve() -> None:
-        while not stop.is_set():
-            try:
-                conn, _ = listener.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            with conn:
-                chunks = []
-                while b"\n" not in b"".join(chunks):
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                if not chunks:
-                    continue
-                req = json.loads(b"".join(chunks).split(b"\n", 1)[0])
-                received.append(req)
-                verdict = classify(
-                    req["tool_name"],
-                    req["tool_input"],
-                    workspace,
-                    cwd=req.get("cwd"),
-                    context=context,
-                )
-                conn.sendall(
-                    json.dumps({"action": verdict.action, "reason": verdict.reason}).encode()
-                    + b"\n"
-                )
-
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
-    try:
+    with signed_supervisor_socket(path, key, responder, backlog=4) as received:
         yield received
-    finally:
-        stop.set()
-        listener.close()
-        thread.join(timeout=5)
-        path.unlink(missing_ok=True)
 
 
 def test_bridge_blocks_protected_test_write_and_allows_workspace_read_through_real_approval_hook(
@@ -677,13 +641,17 @@ def test_bridge_blocks_protected_test_write_and_allows_workspace_read_through_re
     readme = ws / "README.md"
     readme.write_text("# hello\n", encoding="utf-8")
 
-    sock_path = Path(f"/tmp/dsh-guard-{uuid.uuid4().hex[:8]}.sock")
+    key, _key_path, key_args = write_key_file(tmp_path / "approval.key")
     hook_cmd = " ".join(
-        shlex.quote(p) for p in (sys.executable, str(APPROVAL_HOOK), "--agent", "dsh-agent-1")
+        shlex.quote(p)
+        for p in (sys.executable, str(APPROVAL_HOOK), "--agent", "dsh-agent-1", *key_args)
     )
     context = {"protected": [str(protected)], "state_allow": []}
 
-    with _classification_socket(sock_path, ws, context) as requests:
+    with (
+        private_socket_path("dsh-guard.sock") as sock_path,
+        _classification_socket(sock_path, ws, context, key=key) as requests,
+    ):
         denied = _run_node(
             APPLY_HARNESS_JS,
             cwd=ws,

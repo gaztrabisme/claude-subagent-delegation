@@ -228,7 +228,9 @@ def test_q5_hook_allows_verified_allow_and_denies_with_reason_on_signed_deny(
     assert deny_out["permissionDecisionReason"] == "signed-deny-reason"
 
 
-def _make_driver_settings(tmp_path: Path, monkeypatch) -> tuple[Any, Path]:
+def _make_driver_settings(
+    tmp_path: Path, monkeypatch, *, max_agents: int = 4
+) -> tuple[Any, Path]:
     fake_bin = tmp_path / "bin" / "fake-cli"
     fake_bin.parent.mkdir(exist_ok=True)
     fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -274,6 +276,7 @@ def _make_driver_settings(tmp_path: Path, monkeypatch) -> tuple[Any, Path]:
         tmp_path,
         workspace=str(ws),
         providers=providers,
+        max_agents=max_agents,
         supervisor="agent",
         supervisor_cmd="claude -p --model sonnet",
         trace="off",
@@ -294,7 +297,7 @@ def test_q5_guard_hook_command_and_all_hook_drivers_carry_key_file(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Q5: guard_hook_command and claude/codex/dsh/omp hook setups pass --key-file."""
-    settings, ws = _make_driver_settings(tmp_path, monkeypatch)
+    settings, ws = _make_driver_settings(tmp_path, monkeypatch, max_agents=8)
     reg = Registry(settings, start_reaper=False)
     try:
         # Direct Settings.guard_hook_command check

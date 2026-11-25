@@ -77,15 +77,62 @@ def test_q1_default_socket_under_session_root_with_secure_perms(tmp_path: Path) 
 
 
 def test_q1_too_long_session_root_raises_config_error_without_temp_fallback(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
-    """Q1: a too-long session_root raises ConfigError instead of falling back to /tmp."""
+    """Q1: too-long session_root either raises ConfigError or uses a non-temp 0700 home fallback."""
     long_session_root = tmp_path / ("s" * 100)
     cfg_path = tmp_path / "q1-long.toml"
     cfg_path.write_text(
         f'[core]\nsession_root = "{long_session_root}"\n',
         encoding="utf-8",
     )
+    short_root_attr = getattr(config, "SHORT_SOCKET_ROOT", None)
+    short_root_path = Path(short_root_attr) if short_root_attr is not None else None
+    short_root_existed = short_root_path.exists() if short_root_path is not None else True
+    existing_children = (
+        {p.name for p in short_root_path.iterdir()}
+        if short_root_path is not None and short_root_existed and short_root_path.is_dir()
+        else set()
+    )
+
+    sock: Path | None = None
+    try:
+        try:
+            settings = config.load(extra=cfg_path)
+        except ConfigError:
+            pass
+        else:
+            sock = Path(settings.approval_socket)
+            forbidden_roots = (
+                Path(tempfile.gettempdir()),
+                Path("/tmp"),
+                Path("/private/tmp"),
+                Path("/var/folders"),
+                Path("/private/var/folders"),
+            )
+            for root in forbidden_roots:
+                for candidate in (sock, sock.resolve()):
+                    assert not candidate.is_relative_to(root), (
+                        f"fallback approval_socket {candidate} must not be under {root}"
+                    )
+            assert len(os.fsencode(sock)) < config.UNIX_SOCKET_PATH_MAX
+            parent_info = sock.parent.lstat()
+            assert not stat.S_ISLNK(parent_info.st_mode) and stat.S_ISDIR(parent_info.st_mode)
+            assert stat.S_IMODE(parent_info.st_mode) == 0o700
+            assert parent_info.st_uid == os.getuid()
+    finally:
+        if short_root_path is not None:
+            if not short_root_existed:
+                shutil.rmtree(short_root_path, ignore_errors=True)
+            elif (
+                sock is not None
+                and sock.parent.is_relative_to(short_root_path)
+                and sock.parent != short_root_path
+                and sock.parent.name not in existing_children
+            ):
+                shutil.rmtree(sock.parent, ignore_errors=True)
+
+    monkeypatch.setattr(config, "SHORT_SOCKET_ROOT", Path("/tmp"))
     with pytest.raises(ConfigError):
         config.load(extra=cfg_path)
 

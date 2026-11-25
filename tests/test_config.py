@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 from pathlib import Path
 
 import anyio
@@ -66,9 +67,12 @@ def test_default_approval_socket_falls_back_when_tmpdir_path_is_too_long(
     fallback_root = Path(__file__).resolve().parents[1] / ".t"
     shutil.rmtree(fallback_root, ignore_errors=True)
     monkeypatch.setattr(config, "SHORT_SOCKET_ROOT", fallback_root)
-    monkeypatch.setattr(config.tempfile, "gettempdir", lambda: "/" + "x" * 110)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    cfg_file = write_config(tmp_path / "socket.toml", {})
+    long_session_root = tmp_path / ("s" * 110)
+    cfg_file = write_config(
+        tmp_path / "socket.toml",
+        {"core": {"session_root": str(long_session_root)}},
+    )
 
     try:
         settings = config.load(extra=cfg_file)
@@ -79,6 +83,9 @@ def test_default_approval_socket_falls_back_when_tmpdir_path_is_too_long(
         assert socket_path.name.startswith("a-") and socket_path.suffix == ".sock"
         assert len(os.fsencode(socket_path)) < 104
         assert stat.S_IMODE(per_user_dir.stat().st_mode) == 0o700
+        assert not socket_path.resolve().is_relative_to(
+            Path(tempfile.gettempdir()).resolve()
+        )
     finally:
         shutil.rmtree(fallback_root, ignore_errors=True)
 

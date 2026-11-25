@@ -26,6 +26,10 @@ import sys
 import time
 from pathlib import Path
 
+if "--version" in sys.argv[1:]:
+    print("1.0.0-fake", flush=True)
+    sys.exit(0)
+
 mode = {mode!r}
 pid_a_file = Path({pid_a_file!r})
 pid_b_file = Path({pid_b_file!r})

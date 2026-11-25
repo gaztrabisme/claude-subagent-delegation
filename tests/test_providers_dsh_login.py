@@ -68,7 +68,6 @@ import json
 import re
 import shlex
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +83,7 @@ from subagent.providers.dsh import DshProcess
 from subagent.runs import COMPLETED, FAILED, Registry
 
 from .conftest import TEST_CHILD_ENV_PASSTHROUGH, make_settings
+from .signed_supervisor import private_socket_path, write_key_file
 from .test_dsh_guard_bridge import (
     APPLY_HARNESS_JS,
     _classification_socket,
@@ -849,56 +849,58 @@ def test_login_protects_owner_dsh_home_through_bridge_during_run_and_releases_af
     readme = ws / "README.md"
     readme.write_text("# workspace readme\n", encoding="utf-8")
 
-    sock_path = Path(f"/tmp/dsh-login-guard-{uuid.uuid4().hex[:8]}.sock")
+    key, _key_path, key_args = write_key_file(tmp_path / "approval.key")
     hook_cmd = " ".join(
-        shlex.quote(p) for p in (sys.executable, str(APPROVAL_HOOK), "--agent", "dsh-login-bridge")
+        shlex.quote(p)
+        for p in (sys.executable, str(APPROVAL_HOOK), "--agent", "dsh-login-bridge", *key_args)
     )
 
-    def bridge_eval(dsh_tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return _run_node(
-            APPLY_HARNESS_JS,
-            cwd=ws,
-            env={
-                "TEST_BRIDGE_ENTRY": str(entry),
-                "TEST_CWD": str(ws),
-                "TEST_CALL_JSON": json.dumps({
-                    "name": dsh_tool,
-                    "arguments": arguments,
-                    "sessionId": "session-dsh-login-bridge",
-                }),
-                "SUBAGENT_GUARD_HOOK": hook_cmd,
-                "SUBAGENT_APPROVAL_SOCKET": str(sock_path),
-            },
+    with private_socket_path("dsh-login.sock") as sock_path:
+        def bridge_eval(dsh_tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return _run_node(
+                APPLY_HARNESS_JS,
+                cwd=ws,
+                env={
+                    "TEST_BRIDGE_ENTRY": str(entry),
+                    "TEST_CWD": str(ws),
+                    "TEST_CALL_JSON": json.dumps({
+                        "name": dsh_tool,
+                        "arguments": arguments,
+                        "sessionId": "session-dsh-login-bridge",
+                    }),
+                    "SUBAGENT_GUARD_HOOK": hook_cmd,
+                    "SUBAGENT_APPROVAL_SOCKET": str(sock_path),
+                },
+            )
+
+        driver = _driver()
+        settings = _dsh_settings(tmp_path)
+        cfg = _dsh_login_cfg(binary=fake_dsh.path)
+        process = driver.spawn(
+            cfg, settings, "dsh-login-bridge", "task", ws, Session(provider="deepseek-login"), None
         )
+        process.argv = _assert_and_strip_outer_sandbox(process.argv, fake_dsh.path)
 
-    driver = _driver()
-    settings = _dsh_settings(tmp_path)
-    cfg = _dsh_login_cfg(binary=fake_dsh.path)
-    process = driver.spawn(
-        cfg, settings, "dsh-login-bridge", "task", ws, Session(provider="deepseek-login"), None
-    )
-    process.argv = _assert_and_strip_outer_sandbox(process.argv, fake_dsh.path)
+        real_start = process._start
+        during_run: dict[str, dict[str, Any]] = {}
 
-    real_start = process._start
-    during_run: dict[str, dict[str, Any]] = {}
+        with _classification_socket(sock_path, ws, context={}, key=key):
+            def check_bridge_while_active(*args, **kwargs):
+                during_run["read_cred"] = bridge_eval("read", {"file_path": str(cred_file)})
+                during_run["write_cred"] = bridge_eval(
+                    "write", {"file_path": str(cred_file), "content": "tampered"}
+                )
+                during_run["read_storage"] = bridge_eval("read", {"file_path": str(storage_file)})
+                during_run["write_storage"] = bridge_eval(
+                    "write", {"file_path": str(storage_file), "content": "{}"}
+                )
+                during_run["bash_storage"] = bridge_eval("bash", {"command": f"cat {storage_file}"})
+                during_run["read_workspace"] = bridge_eval("read", {"file_path": "README.md"})
+                return real_start(*args, **kwargs)
 
-    with _classification_socket(sock_path, ws, context={}):
-        def check_bridge_while_active(*args, **kwargs):
-            during_run["read_cred"] = bridge_eval("read", {"file_path": str(cred_file)})
-            during_run["write_cred"] = bridge_eval(
-                "write", {"file_path": str(cred_file), "content": "tampered"}
-            )
-            during_run["read_storage"] = bridge_eval("read", {"file_path": str(storage_file)})
-            during_run["write_storage"] = bridge_eval(
-                "write", {"file_path": str(storage_file), "content": "{}"}
-            )
-            during_run["bash_storage"] = bridge_eval("bash", {"command": f"cat {storage_file}"})
-            during_run["read_workspace"] = bridge_eval("read", {"file_path": "README.md"})
-            return real_start(*args, **kwargs)
-
-        monkeypatch.setattr(process, "_start", check_bridge_while_active)
-        events = list(process.events())
-        after_run_storage = bridge_eval("read", {"file_path": str(storage_file)})
+            monkeypatch.setattr(process, "_start", check_bridge_while_active)
+            events = list(process.events())
+            after_run_storage = bridge_eval("read", {"file_path": str(storage_file)})
 
     assert any(e.get("type") == "result" and not e.get("is_error") for e in events)
     for label in ("read_cred", "write_cred", "read_storage", "write_storage", "bash_storage"):

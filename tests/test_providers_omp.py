@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import socket
 import sys
 import threading
 import time
@@ -32,6 +31,7 @@ from subagent.providers.omp_config import OMP_HOOK, write_agent_config
 from subagent.runs import COMPLETED, Registry
 
 from .conftest import default_providers, make_settings
+from .signed_supervisor import private_socket_path, signed_supervisor_socket, write_key_file
 
 FIXTURES = Path(__file__).parent / "fixtures" / "omp"
 FAKE_OMP = Path(__file__).parent / "fakes" / "fake_omp.py"
@@ -178,40 +178,17 @@ def test_spawn_writes_agent_scoped_config_and_passes_the_key_only_in_env(
 
 
 @contextmanager
-def _classification_socket(path: Path, workspace: Path, context: dict):
-    """One-shot approval socket that answers with the real deterministic classifier."""
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(path))
-    listener.listen(1)
-    listener.settimeout(25)
-    received: list[dict] = []
+def _classification_socket(path: Path, workspace: Path, context: dict, *, key: bytes):
+    """Signed approval socket that answers with the real deterministic classifier."""
+    def responder(request: dict) -> dict:
+        verdict = classify(
+            request["tool_name"], request["tool_input"], workspace,
+            cwd=request.get("cwd"), context=context,
+        )
+        return {"action": verdict.action, "reason": verdict.reason}
 
-    def serve_once():
-        connection, _ = listener.accept()
-        with connection:
-            chunks = []
-            while b"\n" not in b"".join(chunks):
-                chunk = connection.recv(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            request = json.loads(b"".join(chunks).split(b"\n", 1)[0])
-            received.append(request)
-            verdict = classify(
-                request["tool_name"], request["tool_input"], workspace,
-                cwd=request.get("cwd"), context=context,
-            )
-            response = {"action": verdict.action, "reason": verdict.reason}
-            connection.sendall(json.dumps(response).encode() + b"\n")
-
-    thread = threading.Thread(target=serve_once, daemon=True)
-    thread.start()
-    try:
+    with signed_supervisor_socket(path, key, responder, backlog=1) as received:
         yield received
-    finally:
-        listener.close()
-        thread.join(timeout=5)
-        path.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -283,32 +260,34 @@ def test_hook_blocks_omp_write_to_a_protected_test_path(
     protected = workspace / "tests" / "test_guard_classifier.py"
     protected.parent.mkdir()
     protected.write_text("# protected test\n")
-    settings = make_settings(
-        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
-    )
     cfg = _configured_omp_cfg(binary=fake_omp.path)
     agent_id = "hook-agent"
     context = {"protected": [str(protected)], "state_allow": []}
-    socket_path = Path(settings.approval_socket)
     hook_record = tmp_path / "hook-result.json"
-    process = omp_driver.OMP_PROVIDER.spawn(
-        cfg, settings, agent_id, "write a test", workspace,
-        Session(provider="omlx"), cfg.model,
-    )
-    # The fake CLI invokes the real extension, which starts the actual Python
-    # PreToolUse hook. That hook reaches this socket and gets a classifier verdict.
-    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
-        "toolName": "write",
-        "input": {"path": "tests/test_guard_classifier.py", "content": "tampered"},
-    })
-    process.env["FAKE_OMP_BUN"] = bun
-    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
-    assert process.env["SUBAGENT_GUARD_PYTHON"] == sys.executable
-    assert Path(process.env["SUBAGENT_GUARD_HOOK"]).name == "approval_hook.py"
-    assert process.env["SUBAGENT_GUARD_AGENT_ID"] == agent_id
-    assert Path(process.env["SUBAGENT_APPROVAL_SOCKET"]) == socket_path
-    with _classification_socket(socket_path, workspace, context) as requests:
-        events = list(process.events())
+    with private_socket_path("omp.sock") as socket_path:
+        settings = make_settings(tmp_path, approval_socket=str(socket_path))
+        key, key_path, _ = write_key_file(
+            settings.session_root / "agents" / agent_id / "approval.key"
+        )
+        process = omp_driver.OMP_PROVIDER.spawn(
+            cfg, settings, agent_id, "write a test", workspace,
+            Session(provider="omlx"), cfg.model,
+        )
+        # The fake CLI invokes the real extension, which starts the actual Python
+        # PreToolUse hook. That hook reaches this socket and gets a classifier verdict.
+        process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
+            "toolName": "write",
+            "input": {"path": "tests/test_guard_classifier.py", "content": "tampered"},
+        })
+        process.env["FAKE_OMP_BUN"] = bun
+        process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+        assert process.env["SUBAGENT_GUARD_PYTHON"] == sys.executable
+        assert Path(process.env["SUBAGENT_GUARD_HOOK"]).name == "approval_hook.py"
+        assert Path(process.env["SUBAGENT_GUARD_KEY_FILE"]) == key_path
+        assert process.env["SUBAGENT_GUARD_AGENT_ID"] == agent_id
+        assert Path(process.env["SUBAGENT_APPROVAL_SOCKET"]) == socket_path
+        with _classification_socket(socket_path, workspace, context, key=key) as requests:
+            events = list(process.events())
 
     assert "--hook" in process.argv
     assert Path(process.argv[process.argv.index("--hook") + 1]).name == "omp_hook.ts"
@@ -334,24 +313,26 @@ def test_hook_maps_ast_edit_paths_to_multi_edit_before_classification(
     protected = workspace / "tests" / "test_ast_edit.py"
     protected.parent.mkdir()
     protected.write_text("# protected\n")
-    settings = make_settings(
-        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
-    )
     context = {"protected": [str(protected)], "state_allow": []}
     hook_record = tmp_path / "hook-result.json"
-    process = omp_driver.OMP_PROVIDER.spawn(
-        _configured_omp_cfg(binary=fake_omp.path), settings, "ast-agent", "edit",
-        workspace, Session(provider="omlx"), None,
-    )
-    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
-        "toolName": "ast_edit",
-        "input": {"paths": ["tests/test_ast_edit.py"], "ops": []},
-    })
-    process.env["FAKE_OMP_BUN"] = bun
-    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+    with private_socket_path("omp.sock") as socket_path:
+        settings = make_settings(tmp_path, approval_socket=str(socket_path))
+        key, _, _ = write_key_file(
+            settings.session_root / "agents" / "ast-agent" / "approval.key"
+        )
+        process = omp_driver.OMP_PROVIDER.spawn(
+            _configured_omp_cfg(binary=fake_omp.path), settings, "ast-agent", "edit",
+            workspace, Session(provider="omlx"), None,
+        )
+        process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
+            "toolName": "ast_edit",
+            "input": {"paths": ["tests/test_ast_edit.py"], "ops": []},
+        })
+        process.env["FAKE_OMP_BUN"] = bun
+        process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
 
-    with _classification_socket(Path(settings.approval_socket), workspace, context) as requests:
-        events = list(process.events())
+        with _classification_socket(socket_path, workspace, context, key=key) as requests:
+            events = list(process.events())
 
     assert json.loads(hook_record.read_text())["block"] is True
     assert len(requests) == 1
@@ -370,22 +351,21 @@ def test_hook_denies_unmapped_omp_tool_without_asking_supervisor(
         pytest.skip("Bun is needed to execute the packaged omp TypeScript hook")
 
     workspace = _workspace(tmp_path)
-    settings = make_settings(
-        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
-    )
     hook_record = tmp_path / "hook-result.json"
-    process = omp_driver.OMP_PROVIDER.spawn(
-        _configured_omp_cfg(binary=fake_omp.path), settings, "unknown-agent", "edit",
-        workspace, Session(provider="omlx"), None,
-    )
-    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
-        "toolName": "future_write_tool",
-        "input": {"path": "tests/test_guard_classifier.py"},
-    })
-    process.env["FAKE_OMP_BUN"] = bun
-    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+    with private_socket_path("omp.sock") as socket_path:
+        settings = make_settings(tmp_path, approval_socket=str(socket_path))
+        process = omp_driver.OMP_PROVIDER.spawn(
+            _configured_omp_cfg(binary=fake_omp.path), settings, "unknown-agent", "edit",
+            workspace, Session(provider="omlx"), None,
+        )
+        process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps({
+            "toolName": "future_write_tool",
+            "input": {"path": "tests/test_guard_classifier.py"},
+        })
+        process.env["FAKE_OMP_BUN"] = bun
+        process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
 
-    events = list(process.events())
+        events = list(process.events())
 
     decision = json.loads(hook_record.read_text())
     assert decision["block"] is True
@@ -420,21 +400,23 @@ def test_hook_maps_other_omp_write_tools_into_classifier_shapes(
     protected = workspace / "tests" / protected_name
     protected.parent.mkdir()
     protected.write_text("# protected\n")
-    settings = make_settings(
-        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
-    )
     context = {"protected": [str(protected)], "state_allow": []}
     hook_record = tmp_path / "hook-result.json"
-    process = omp_driver.OMP_PROVIDER.spawn(
-        _configured_omp_cfg(binary=fake_omp.path), settings, "mapped-agent", "edit",
-        workspace, Session(provider="omlx"), None,
-    )
-    process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps(event)
-    process.env["FAKE_OMP_BUN"] = bun
-    process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
+    with private_socket_path("omp.sock") as socket_path:
+        settings = make_settings(tmp_path, approval_socket=str(socket_path))
+        key, _, _ = write_key_file(
+            settings.session_root / "agents" / "mapped-agent" / "approval.key"
+        )
+        process = omp_driver.OMP_PROVIDER.spawn(
+            _configured_omp_cfg(binary=fake_omp.path), settings, "mapped-agent", "edit",
+            workspace, Session(provider="omlx"), None,
+        )
+        process.env["FAKE_OMP_TOOL_EVENT"] = json.dumps(event)
+        process.env["FAKE_OMP_BUN"] = bun
+        process.env["FAKE_OMP_HOOK_RECORD"] = str(hook_record)
 
-    with _classification_socket(Path(settings.approval_socket), workspace, context) as requests:
-        events = list(process.events())
+        with _classification_socket(socket_path, workspace, context, key=key) as requests:
+            events = list(process.events())
 
     assert json.loads(hook_record.read_text())["block"] is True
     assert len(requests) == 1
@@ -459,21 +441,22 @@ def test_real_omp_hook_blocks_protected_write_against_local_stub(
     protected = workspace / "tests" / "test_protected.py"
     protected.parent.mkdir()
     protected.write_text("# protected\n")
-    settings = make_settings(
-        tmp_path, approval_socket=f"/tmp/omp-{uuid.uuid4().hex[:8]}.sock"
-    )
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     context = {"protected": [str(protected)], "state_allow": []}
-    socket_path = Path(settings.approval_socket)
 
-    with _openai_tool_stub() as (base_url, requests):
-        cfg = _configured_omp_cfg(binary=omp, base_url=base_url, model="qwen-stub")
-        process = omp_driver.OMP_PROVIDER.spawn(
-            cfg, settings, "real-hook-agent", "write the protected test file", workspace,
-            Session(provider="omlx"), cfg.model,
+    with private_socket_path("omp.sock") as socket_path:
+        settings = make_settings(tmp_path, approval_socket=str(socket_path))
+        key, _, _ = write_key_file(
+            settings.session_root / "agents" / "real-hook-agent" / "approval.key"
         )
-        with _classification_socket(socket_path, workspace, context) as decisions:
-            events = list(process.events())
+        with _openai_tool_stub() as (base_url, requests):
+            cfg = _configured_omp_cfg(binary=omp, base_url=base_url, model="qwen-stub")
+            process = omp_driver.OMP_PROVIDER.spawn(
+                cfg, settings, "real-hook-agent", "write the protected test file", workspace,
+                Session(provider="omlx"), cfg.model,
+            )
+            with _classification_socket(socket_path, workspace, context, key=key) as decisions:
+                events = list(process.events())
 
     assert protected.read_text() == "# protected\n"
     assert len(decisions) == 1

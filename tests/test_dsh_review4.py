@@ -24,6 +24,7 @@ from subagent.providers.base import Session
 from subagent.runs import Registry
 from subagent.verify import run_verification
 
+from .signed_supervisor import sign_request, verify
 from .test_dsh_review3 import (
     _driver,
     _dsh_cfg,
@@ -388,8 +389,8 @@ def test_r4_4_registry_agent_guard_context_carries_provider_homes_and_denies_rea
         assert classify("Read", {"file_path": str(ws / "README.md")}, ws, context=agent.guard_context).action == ALLOW
 
         supervisor = Supervisor(settings, registry=registry)
-        reply_home = _send_guard_request(
-            supervisor,
+        req_home = sign_request(
+            agent.approval_key,
             {
                 "agent_id": agent.agent_id,
                 "tool_name": "Read",
@@ -397,10 +398,14 @@ def test_r4_4_registry_agent_guard_context_carries_provider_homes_and_denies_rea
                 "workspace": str(ws),
             },
         )
+        reply_home = _send_guard_request(supervisor, req_home)
         assert reply_home["action"] == DENY
+        assert reply_home.get("nonce") == req_home["nonce"]
+        assert verify(agent.approval_key, reply_home)
+        assert "invalid approval request" not in reply_home["reason"]
 
-        reply_owner = _send_guard_request(
-            supervisor,
+        req_owner = sign_request(
+            agent.approval_key,
             {
                 "agent_id": agent.agent_id,
                 "tool_name": "Read",
@@ -408,7 +413,11 @@ def test_r4_4_registry_agent_guard_context_carries_provider_homes_and_denies_rea
                 "workspace": str(ws),
             },
         )
+        reply_owner = _send_guard_request(supervisor, req_owner)
         assert reply_owner["action"] == DENY
+        assert reply_owner.get("nonce") == req_owner["nonce"]
+        assert verify(agent.approval_key, reply_owner)
+        assert "invalid approval request" not in reply_owner["reason"]
     finally:
         registry.shutdown()
 

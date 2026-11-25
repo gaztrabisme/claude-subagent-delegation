@@ -186,7 +186,8 @@ def test_g3a_real_bypass_stream_is_confined_by_the_outer_profile(tmp_path, monke
     assert not [r for r in trace_of(trace_path, "sandbox_bypass")
                 if r.get("source") != "conversation_record"]  # the real stream carries no flag
     if not can_nest_sandbox():
-        return  # already sandboxed: the profile text checks live in the G1 tests
+        pytest.skip("this process is already inside Seatbelt and cannot start a nested "
+                    "sandbox-exec probe; the real-confinement check needs an unsandboxed runner")
     # Run the bypassed command exactly as agy's child would: under the profile the run got.
     proc = subprocess.run([SEATBELT, "-p", spawned[0][2], "/bin/sh", "-c", commands[0]],
                           capture_output=True, text=True, timeout=15, cwd=tmp_path / "ws")

@@ -6,6 +6,7 @@ import builtins
 import os
 import sqlite3
 import sys
+from urllib.parse import unquote
 
 import pytest
 
@@ -70,7 +71,8 @@ def test_r2_4_run_state_and_result_are_unchanged(tmp_path, monkeypatch) -> None:
     _, on, on_trace, _ = run_with_state(on_dir, monkeypatch, audit=True)
     assert len(trace_of(on_trace, "sandbox_bypass")) == 2, "the audit must have run"
     _db(off_dir)
-    _, off, _, _ = run_with_state(off_dir, monkeypatch, audit=None)
+    _, off, off_trace, _ = run_with_state(off_dir, monkeypatch, audit=False)
+    assert not trace_of(off_trace, "sandbox_bypass"), "the off control must not audit"
     assert on.state == COMPLETED
     for field in ("state", "finish_reason", "result_text", "final_response", "error"):
         assert getattr(on, field) == getattr(off, field), field
@@ -128,19 +130,47 @@ def test_r2_5_unreadable_record_fails_open_with_one_unavailable_record(
     assert run.state == COMPLETED and "all done" in f"{run.result_text}{run.final_response}"
 
 
+def _uri_path(target: str) -> str:
+    """The filesystem path of a sqlite3 target (a plain path or a file: URI)."""
+    if target.startswith("file:"):
+        return unquote(target[len("file:"):].split("?", 1)[0])
+    return target
+
+
 def test_r2_6_audit_unset_is_on(tmp_path, monkeypatch) -> None:
-    """R2.6 (S56): with bypass_audit unset the audit runs: the record is read and bypasses recorded."""
-    _db(tmp_path)
-    opened: list[str] = []
-    real_connect = sqlite3.connect
+    """R2.6 (S56): bypass_audit unset audits: exactly the run's own record is opened, read-only."""
+    own = _db(tmp_path)
+    state = state_dir_for(tmp_path)
+    make_db(state / "conversations" / "other-id.db")
+    # A decoy at the default state dir (HOME is the test's home): the configured dir must win.
+    decoy_dir = tmp_path / "home" / ".gemini" / "antigravity-cli"
+    make_db(decoy_dir / "conversations" / f"{CONV}.db")
+    watched = {str(p) for p in (state, state.resolve(), decoy_dir, decoy_dir.resolve())}
+    opened: list[tuple[str, str]] = []
+    real_connect, real_open, real_os_open = sqlite3.connect, builtins.open, os.open
 
     def connect(target, *a, **kw):
-        opened.append(str(target))
+        opened.append(("sqlite3.connect", str(target)))
         return real_connect(target, *a, **kw)
 
+    def spy_open(file, *a, **kw):
+        opened.append(("open", str(file)))
+        return real_open(file, *a, **kw)
+
+    def spy_os_open(path, *a, **kw):
+        opened.append(("os.open", str(path)))
+        return real_os_open(path, *a, **kw)
+
     monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(builtins, "open", spy_open)
+    monkeypatch.setattr(os, "open", spy_os_open)
     _, run, trace_path, _ = run_with_state(tmp_path, monkeypatch, audit=None)
-    assert any(f"{CONV}.db" in p and "mode=ro" in p for p in opened), opened
+    touched = [(how, target) for how, target in opened
+               if any(_uri_path(target).startswith(w) for w in watched)]
+    assert len(touched) == 1, touched
+    how, target = touched[0]
+    assert how == "sqlite3.connect" and "mode=ro" in target, touched
+    assert _uri_path(target) == str(own.resolve()), touched
     records = trace_of(trace_path, "sandbox_bypass")
     assert sorted(r["command"] for r in records) == sorted([CMD_A, CMD_B]), records
     assert all(r["source"] == "conversation_record" for r in records)

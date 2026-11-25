@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -70,7 +71,7 @@ def _write_served(path: Path, payload: dict[str, Any]) -> None:
 def _install(
     repo: Path, sha: str, install_root: Path, runner: Any
 ) -> None:
-    """Export `sha` and install it non-editably into `install_root`."""
+    """Export `sha` and install it non-editably into a venv under `install_root`."""
     with tempfile.TemporaryDirectory(prefix="subagent-promote-") as temporary:
         source = Path(temporary) / "src"
         source.mkdir()
@@ -89,10 +90,20 @@ def _install(
                    capture_output=True, text=True),
             "extract",
         )
+        uv = shutil.which("uv") or "uv"
+        venv = install_root / "venv"
         _checked(
             runner(
-                [sys.executable, "-m", "pip", "install", "--no-deps",
-                 "--no-build-isolation", "--target", str(install_root), str(source)],
+                [uv, "venv", "--python", sys.executable, str(venv)],
+                capture_output=True,
+                text=True,
+            ),
+            "venv",
+        )
+        _checked(
+            runner(
+                [uv, "pip", "install", "--python", str(venv / "bin" / "python"),
+                 str(source)],
                 capture_output=True,
                 text=True,
             ),
@@ -124,6 +135,7 @@ def promote(
     payload = {
         "commit": sha,
         "install_path": str(install_root),
+        "python": str(install_root / "venv" / "bin" / "python"),
         "promoted_at": datetime.now(UTC).isoformat(),
     }
     _write_served(Path(settings.session_root) / SERVED_FILE, payload)

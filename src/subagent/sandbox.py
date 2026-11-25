@@ -43,14 +43,20 @@ IPC_ESCAPE_EXECUTABLES = (
 # temp and cache) and the standard devices. A write root anywhere else under
 # the owner's home is refused unless it is listed here, per driver, with the
 # reason the CLI cannot run without it (proved by a live run, not assumed).
-# Each entry is a residual in the round's report. None is needed today: the
-# login credentials are copied (claude) or linked/read in place read-only
-# (codex auth.json, dsh .credentials.yaml).
+# Each entry is a residual in the round's report. The hook drivers need none:
+# their login credentials are copied (claude) or linked/read in place
+# read-only (codex auth.json, dsh .credentials.yaml). antigravity keeps one.
 OWNER_HOME_EXCEPTIONS: dict[str, list[tuple[str, str]]] = {
     "claude": [],
     "codex": [],
     "omp": [],
     "dsh": [],
+    "antigravity": [(
+        "~/.gemini/antigravity-cli",
+        "agy keeps its sign-in, token refresh and conversation store here and has no "
+        "documented home override; a per-agent copy of the login is unproven live "
+        "(R1a-agy G1.1). The bypass audit reads the run's own record from it.",
+    )],
 }
 
 # The loopback port of the agent's egress proxy while its driver builds argv.

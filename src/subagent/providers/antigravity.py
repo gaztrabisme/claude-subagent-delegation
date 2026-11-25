@@ -146,9 +146,24 @@ def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
         str(cwd),  # Project files are the worker's deliverable.
         str(agent_root),  # Own server-side state for this agent.
         str(agent_root / "tmp"),  # The child's TMPDIR (set in Agent._spawn).
-        str(runtime_state_dir(cfg)),  # agy writes its conversation store and CLI state here.
+        # agy writes its login refresh, CLI state and conversation store in its own
+        # fixed directory (it does not read agy_state_dir, which only moves where the
+        # audit reads); listed in sandbox.OWNER_HOME_EXCEPTIONS["antigravity"].
+        str(runtime_state_dir()),
     ]
     return list(dict.fromkeys(roots))
+
+
+def sandbox_write_deny(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                       cwd: Path) -> list[str]:
+    """Hook files in agy's state directory the child may not write (R1a round 6 H5).
+
+    agy reads hooks from `~/.gemini/config/hooks.json`, which is outside every write
+    root; older agy builds wrote them to `antigravity-cli/hooks.json`, which is inside
+    the one owner-home root agy keeps, so that file is denied too. The rest of the
+    directory stays writable: the stated residual of OWNER_HOME_EXCEPTIONS["antigravity"].
+    """
+    return [str(runtime_state_dir() / "hooks.json")]
 
 
 def sandbox_read_deny(settings: Settings, agent_id: str, cfg: ProviderConfig,

@@ -126,7 +126,6 @@ def test_validate_output_equals_the_tool_dict(tmp_path, graph_cfg):
     path = tmp_path / "g.json"
     path.write_text(json.dumps(SIMPLE_DOC), encoding="utf-8")
     from subagent.graph.mcp_tools import register
-
     from subagent.graph.server import GraphSettings
     from subagent.graph.service import GraphService
 

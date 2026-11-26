@@ -40,9 +40,8 @@ ASK_DOC = {
 
 def test_cli_verbs_print_the_tool_json_and_exit_with_the_documented_codes(tmp_path, graph_cfg):
     async def scenario():
-        from subagent.graph.mcp_tools import register
-
         from subagent.graph.dispatch import FakeDispatcher
+        from subagent.graph.mcp_tools import register
         from subagent.graph.server import GraphSettings
         from subagent.graph.service import GraphService
 

@@ -45,9 +45,8 @@ def _only_ask(graph_id: str) -> dict:
 
 
 async def _boot(env, tmp_path):
-    from subagent.graph.mcp_tools import register
-
     from subagent.graph.dispatch import FakeDispatcher, FakeStep
+    from subagent.graph.mcp_tools import register
     from subagent.graph.server import GraphSettings
     from subagent.graph.service import GraphService
 

@@ -224,6 +224,7 @@ def test_every_subagent_graph_command_parses_with_the_real_parser():
 
 def test_every_tool_name_the_section_mentions_is_a_registered_tool():
     from mcp.server import MCPServer
+
     from subagent.graph.mcp_tools import register
 
     registered = set(register(MCPServer("readme-check")))

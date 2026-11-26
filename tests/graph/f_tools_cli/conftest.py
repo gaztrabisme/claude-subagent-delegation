@@ -81,14 +81,14 @@ def no_temporalio(monkeypatch):
     """Fresh `subagent.graph*` imports that see no `temporalio`."""
     import subagent
 
-    saved = {name: sys.modules.pop(name) for name in _graph_modules() + _temporal_modules()}
     saved_attr = getattr(subagent, "graph", None)
+    for name in _graph_modules() + _temporal_modules():
+        # monkeypatch records each entry and puts the exact previous object back on undo
+        monkeypatch.delitem(sys.modules, name)
     monkeypatch.setitem(sys.modules, "temporalio", None)
     yield
     for name in _graph_modules():
         del sys.modules[name]
-    sys.modules.pop("temporalio", None)
-    sys.modules.update(saved)
     if saved_attr is not None:
         subagent.graph = saved_attr
 

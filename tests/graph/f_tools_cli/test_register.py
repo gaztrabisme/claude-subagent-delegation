@@ -67,6 +67,7 @@ def test_register_without_a_factory_still_returns_the_names():
 
 def test_tools_are_registered_on_a_real_mcp_server():
     from mcp.server import MCPServer
+
     from subagent.graph.mcp_tools import register
 
     app = MCPServer("graph-test")
@@ -75,9 +76,9 @@ def test_tools_are_registered_on_a_real_mcp_server():
     names = {t.name for t in listed}
     assert set(TOOL_NAMES) <= names
     start = next(t for t in listed if t.name == "graph_start")
-    props = start.inputSchema["properties"]
+    props = start.input_schema["properties"]
     assert {"graph", "inputs", "pool", "budget_usd", "priority", "request_id", "workspace"} <= set(props)
-    assert start.inputSchema["required"] == ["graph"]
+    assert start.input_schema["required"] == ["graph"]
 
 
 def test_the_subagent_server_registers_the_graph_tools():

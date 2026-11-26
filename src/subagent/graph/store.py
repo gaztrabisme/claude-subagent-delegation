@@ -88,6 +88,9 @@ class Store:
                 os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         self._local = threading.local()
         self._migrate()
+        for suffix in ("-wal", "-shm"):  # SQLite copies the database file's mode; make sure
+            with contextlib.suppress(OSError):
+                os.chmod(f"{self.path}{suffix}", 0o600)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=BUSY_TIMEOUT_S, isolation_level=None)

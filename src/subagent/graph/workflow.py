@@ -86,6 +86,14 @@ class TemporalRuntime:
         with contextlib.suppress(ActivityError):  # a trace record never fails the run
             await self._graph_act("record", kind, fields, timeout_s=10.0, retry=_RECORD)
 
+    async def record_node(self, inp: GraphInput, result: Any, scope: str) -> None:
+        """One `graph_node` trace record per finished node (spec 10)."""
+        await self._record(
+            "graph_node", root_run_id=inp.root_run_id, run_path=inp.run_path,
+            node_id=result.id, node_kind=result.kind, scope=scope, status=result.status,
+            attempts=result.attempts, request_id=result.request_id, cost_usd=result.cost_usd,
+            error=result.error)
+
     def now(self) -> float:
         return workflow.now().timestamp()
 
@@ -231,6 +239,7 @@ class TemporalRuntime:
                         "answered_by": found.get("answered_by"), "timed_out": False}
             remaining = None if timeout_s is None else timeout_s - (self.now() - started)
             if remaining is not None and remaining <= 0:
+                await self._graph_act("close_exception", xid, "timeout")
                 return {"answer": default, "note": None, "answered_by": "timeout",
                         "timed_out": True}
             with contextlib.suppress(TimeoutError):
@@ -335,13 +344,22 @@ class GraphWorkflow:
                 result = GraphResult(gi.run_path, "failed", dict(interp._all), {},
                                      f"internal: {type(exc).__name__}: {exc}")
         finally:
-            closed = await runtime._graph_act("close_account", gi.run_path, "closed")
-            if is_root:
-                await runtime._graph_act("root_state", gi.root_run_id, final_state)
-            await runtime._record(
-                "graph_run", root_run_id=gi.root_run_id, run_path=gi.run_path,
-                graph_id=graph.id, graph_hash=digest, event="finished", state=final_state,
-                depth=gi.depth, cap_usd=float(closed.get("cap_usd", 0.0)),
-                spent_usd=float(closed.get("spent_usd", 0.0)))
+            async def cleanup() -> None:
+                closed = await runtime._graph_act("close_account", gi.run_path, "closed")
+                if is_root:
+                    await runtime._graph_act("root_state", gi.root_run_id, final_state)
+                await runtime._record(
+                    "graph_run", root_run_id=gi.root_run_id, run_path=gi.run_path,
+                    graph_id=graph.id, graph_hash=digest, event="finished", state=final_state,
+                    depth=gi.depth, cap_usd=float(closed.get("cap_usd", 0.0)),
+                    spent_usd=float(closed.get("spent_usd", 0.0)))
+
+            # A cancelled workflow still closes its account: the cleanup runs as its own
+            # task and a further cancellation only waits for it.
+            cleanup_task = asyncio.ensure_future(cleanup())
+            while not cleanup_task.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(cleanup_task)
+            cleanup_task.result()
         assert result is not None
         return result.as_dict()

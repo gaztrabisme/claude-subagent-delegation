@@ -35,7 +35,14 @@ def _private_dir(path: Path) -> Path:
     path = Path(path)
     if not path.exists():
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path, 0o700)
+    os.chmod(path, 0o700)
+    return path
+
+
+def private_file(path: Path) -> Path:
+    """Create `path` if missing and make it owner-only (0600)."""
+    os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+    os.chmod(path, 0o600)
     return path
 
 
@@ -198,7 +205,7 @@ class DevServer:
     def start(self) -> ServerInfo:
         host, port = _split_address(self.address)
         _private_dir(self.state_dir)
-        lock = open(self.state_dir / "server.lock", "a+")  # noqa: SIM115 - held across the body
+        lock = open(private_file(self.state_dir / "server.lock"), "a+")  # noqa: SIM115 - held across the body
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
             existing = self._read()
@@ -212,7 +219,7 @@ class DevServer:
             self.address = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
             env = {k: v for k, v in os.environ.items()
                    if k in ("PATH", "HOME", "LANG", "TERM", "TMPDIR")}
-            with open(self._log, "ab") as log:
+            with open(private_file(self._log), "ab") as log:
                 proc = subprocess.Popen(
                     [str(binary), "server", "start-dev", "--ip", host, "--port", str(port),
                      "--headless", "--db-filename", str(self._db), "--log-level", "warn"],
@@ -233,6 +240,7 @@ class DevServer:
                       "binary": str(binary), "started_at": time.time()}
             tmp = self._json.with_suffix(".tmp")
             tmp.write_text(json.dumps(record), encoding="utf-8")
+            os.chmod(tmp, 0o600)
             os.replace(tmp, self._json)
             return self._info(record, by_us=True)
         finally:

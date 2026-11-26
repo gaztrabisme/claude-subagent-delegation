@@ -45,6 +45,13 @@ def set_state(store: Store, root_run_id: str, state: str) -> None:
                      (state, now, root_run_id))
 
 
+def mark_in(conn: Any, root_run_id: str, state: str) -> None:
+    """Set the state of an existing row inside the caller's transaction (no row, no change)."""
+    conn.execute(_DDL)
+    conn.execute("UPDATE graph_roots SET state=?, updated_at=? WHERE root_run_id=?",
+                 (state, time.time(), root_run_id))
+
+
 def get(store: Store, root_run_id: str) -> dict[str, Any] | None:
     ensure(store)
     row = store.read().execute("SELECT * FROM graph_roots WHERE root_run_id=?",

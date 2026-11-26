@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import log
+from . import roots as graph_roots
 from .journal import Journal
 from .ledger import BudgetRefused, Ledger
 from .store import Store, micro, usd
@@ -55,6 +56,9 @@ class ReconcileReport:
 def _lease(row: sqlite3.Row) -> Lease:
     return Lease(row["lease_id"], row["lane"], row["request_id"], row["attempt"], row["holder"],
                  row["acquired_at"], row["expires_at"])
+
+
+START_GRACE_S = 60.0  # a root opened this recently may not have reached start_workflow yet
 
 
 class Workers:
@@ -307,8 +311,10 @@ class Admission:
                     "state='active'", (rid, att)).rowcount
                 report.interrupted.append(f"{rid}#a{att}")
         # Temporal is asked outside any write transaction.
+        now = self.clock()
         roots = [r[0] for r in self.store.read().execute(
-            "SELECT run_path FROM accounts WHERE depth=0 AND state='open' ORDER BY rowid")]
+            "SELECT run_path, created_at FROM accounts WHERE depth=0 AND state='open' "
+            "ORDER BY rowid") if not 0 <= now - r[1] < START_GRACE_S]  # fresh: maybe unstarted
         dead: list[str] = []
         for root in roots:
             verdict = root_live(root)
@@ -338,6 +344,7 @@ class Admission:
             (root,))]
         for path in paths:
             self.ledger.close_in(conn, path, state="dead")
+        graph_roots.mark_in(conn, root, "failed")
         return released
 
     def _raise_run_dead(self, roots: Sequence[str]) -> None:

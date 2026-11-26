@@ -23,7 +23,7 @@ from .interpreter import GraphInput
 from .journal import Journal
 from .ledger import BudgetRefused, Ledger
 from .schema import GraphError, graph_hash, load_graph, parse
-from .server import DevServer, GraphSettings, settings_from
+from .server import DevServer, GraphSettings, _private_dir, private_file, settings_from
 from .store import Store
 
 _EXC_STATES = ("open", "answered", "delivered", "closed", "all")
@@ -89,6 +89,7 @@ class GraphService:
     @property
     def store(self) -> Store:
         if self._store is None:
+            _private_dir(self.gs.state_dir)
             self._store = Store(self.gs.state_dir / "graph.sqlite3")
             roots.ensure(self._store)
         return self._store
@@ -126,7 +127,7 @@ class GraphService:
         return parse(text)
 
     # -- Temporal ----
-    async def _temporal(self) -> Any:
+    async def _temporal(self, *, worker: bool = False) -> Any:
         if not temporal_available():
             raise GraphUnavailable(INSTALL_HINT)
         if self._client is not None:
@@ -138,12 +139,53 @@ class GraphService:
             if not (await asyncio.to_thread(server.health))["ok"]:
                 info = await asyncio.to_thread(server.start)
                 self.gs = _with_address(self.gs, info.address)
+            else:  # a healthy server may sit on the address recorded in server.json
+                known = await asyncio.to_thread(server.info)
+                if known is not None:
+                    self.gs = _with_address(self.gs, known.address)
+            if worker:
+                await asyncio.to_thread(self._ensure_worker)
         try:
             self._client = await asyncio.wait_for(Client.connect(self.gs.address), 15)
         except Exception as exc:  # noqa: BLE001
             raise GraphUnavailable(
                 f"Temporal server not reachable at {self.gs.address}: {exc}") from exc
         return self._client
+
+    def _ensure_worker(self) -> None:
+        """Autostart (spec 8.2): a live worker, else a detached `subagent graph worker`."""
+        import fcntl
+        import os
+        import subprocess
+        import sys
+        import time
+
+        from .admission import Workers
+
+        state_dir = _private_dir(self.gs.state_dir)
+        workers = Workers(self.store)
+        with open(private_file(state_dir / "worker.lock"), "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if any(workers.alive(w["worker_id"]) for w in workers.list()):
+                return
+            known = {w["worker_id"] for w in workers.list()}
+            code = "import sys; from subagent.cli import main; sys.exit(main(['graph', 'worker']))"
+            try:
+                with open(private_file(state_dir / "worker.log"), "ab") as log:
+                    subprocess.Popen(
+                        [sys.executable, "-c", code], cwd=str(self.settings.workspace),
+                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                        start_new_session=True, env=dict(os.environ))
+            except OSError as exc:
+                from ..config import log as _log
+
+                _log.warning("graph worker could not be started: %s", exc)
+                return
+            deadline = time.monotonic() + 20.0  # hold the lock until it has registered
+            while time.monotonic() < deadline:
+                if any(w["worker_id"] not in known for w in workers.list()):
+                    return
+                time.sleep(0.2)
 
     async def _view(self, root: str) -> dict[str, Any]:
         """What Temporal says about `root`: reachable, exists, status, snapshot, result."""
@@ -204,6 +246,9 @@ class GraphService:
                                        or not isinstance(budget_usd, (int, float))
                                        or budget_usd < 0):
             return _error("invalid_argument", "budget_usd must be a non-negative number")
+        undeclared = sorted(set(inputs or {}) - set(loaded.inputs))
+        if undeclared:
+            return _error("invalid_argument", f"undeclared inputs: {undeclared}")
         merged = dict(loaded.inputs)
         merged.update(inputs or {})
         digest, inputs_digest = graph_hash(doc), _digest(merged)
@@ -212,7 +257,7 @@ class GraphService:
             from temporalio.common import WorkflowIDReusePolicy
             from temporalio.exceptions import WorkflowAlreadyStartedError
 
-            client = await self._temporal()
+            client = await self._temporal(worker=True)
         except GraphUnavailable as err:
             return _error("unavailable", str(err))
         except ImportError:
@@ -237,7 +282,7 @@ class GraphService:
             graph_version=loaded.version, inputs_digest=inputs_digest)
         gi = GraphInput(doc=doc, inputs=merged, root_run_id=root, run_path=root,
                         parent_path=None, depth=0, priority=priority, pool=pool)
-        attached = False
+        attached, state = False, "running"
         try:
             await client.start_workflow(
                 "subagent.graph.GraphWorkflow", gi.as_dict(), id=root,
@@ -245,10 +290,13 @@ class GraphService:
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
         except WorkflowAlreadyStartedError:
             attached = True
+            view = await self._view(root)
+            state = self._state(view, await asyncio.to_thread(roots.get, self.store, root),
+                                account)
         except Exception as exc:  # noqa: BLE001
             return _error("unavailable", f"could not start the workflow: {exc}")
         return {"ok": True, "root_run_id": root, "workflow_id": root, "graph_id": loaded.id,
-                "graph_hash": digest, "state": "running", "attached": attached,
+                "graph_hash": digest, "state": state, "attached": attached,
                 "budget": {"pool": pool, "cap_usd": account.cap_usd,
                            "remaining_usd": account.remaining_usd, "capped": account.capped}}
 

@@ -220,10 +220,14 @@ class Interpreter:
     def _expr_scope(self, ctx: _Ctx) -> dict[str, Any]:
         return {"nodes": ctx.nodes, "inputs": self.inputs, "item": ctx.item, "loop": ctx.loop}
 
-    def _record(self, result: NodeResult, ctx: _Ctx) -> None:
+    async def _record(self, result: NodeResult, ctx: _Ctx) -> None:
         view = result.as_dict()
         ctx.nodes[result.id] = view
-        self._all[ids.node_scope(result.id, ctx.fe)] = view
+        scope = ids.node_scope(result.id, ctx.fe)
+        self._all[scope] = view
+        hook = getattr(self.rt, "record_node", None)
+        if hook is not None:
+            await hook(self.inp, result, scope)
 
     def _scope(self, node: Node, scope: str, request_id: str, attempt: int = 1) -> Scope:
         priority = getattr(node, "priority", None)
@@ -240,7 +244,7 @@ class Interpreter:
             if result.status in OK or node.on_failure == "continue":
                 continue
             for rest in nodes[index + 1:]:
-                self._record(NodeResult(id=rest.id, kind=rest.kind, status="not_run"), ctx)
+                await self._record(NodeResult(id=rest.id, kind=rest.kind, status="not_run"), ctx)
             status = result.status if result.status in ("budget_exhausted", "cancelled") \
                 else "failed"
             return status, f"node {node.id} {result.status}: {result.error}"
@@ -250,7 +254,7 @@ class Interpreter:
         retry = 0
         while True:
             result = await self._run_one(node, ctx, retry)
-            self._record(result, ctx)
+            await self._record(result, ctx)
             if (result.status in OK or result.status == "cancelled"
                     or node.on_failure != "exception"):
                 return result
@@ -271,7 +275,7 @@ class Interpreter:
                 continue
             if answer == "skip":
                 result = dataclasses.replace(result, status="skipped")
-                self._record(result, ctx)
+                await self._record(result, ctx)
             return result
 
     async def _run_one(self, node: Node, ctx: _Ctx, retry: int) -> NodeResult:
@@ -425,7 +429,7 @@ class Interpreter:
         for (key, branch, bctx), task in zip(branches, tasks, strict=True):
             if task.cancelled():
                 result = NodeResult(id=branch.id, kind=branch.kind, status="cancelled")
-                self._record(result, bctx)
+                await self._record(result, bctx)
                 statuses[key] = "cancelled"
             else:
                 statuses[key] = task.result().status
@@ -455,10 +459,10 @@ class Interpreter:
             if join == "allSettled":
                 await asyncio.gather(*tasks)
                 return None
-            pending = set(tasks)
+            pending = list(tasks)  # ordered: cancellation order must not depend on hashes
             while pending and hit is None:
-                done, pending = await asyncio.wait(pending,
-                                                   return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                pending = [task for task in pending if task not in done]
                 for index, task in enumerate(tasks):
                     if task in done:
                         status = task.result().status

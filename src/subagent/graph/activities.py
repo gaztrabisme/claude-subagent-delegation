@@ -175,6 +175,10 @@ def _settle(ctx: GraphContext, request: TaskRequest, outcome: TaskOutcome,
         entry = ctx.journal.get_in(conn, rid, att)
         if entry is not None and entry.phase == "settled":
             return outcome
+        if entry is not None and entry.phase in ("interrupted", "released"):
+            # reconcile got there first: it already charged and released the reservation
+            return _interrupted(entry.charged_usd if entry.phase == "interrupted" else 0.0,
+                                f"attempt {entry.phase} by reconcile")
         done = ctx.ledger.settle(conn, request_id=rid, attempt=att, actual_usd=outcome.cost_usd)
         if outcome.status == "interrupted" and outcome.cost_usd is None:
             outcome = dataclasses.replace(outcome, cost_usd=done.charged_usd)
@@ -418,6 +422,11 @@ def bind(ctx: GraphContext, *, queue: str | None = None) -> list[Callable]:
                 fairness_key=a.root_run_id, run_path=a.run_path, node_id=a.node_id,
                 reserve_usd=a.reserve_usd, deps=a.deps)
             res = ctx.admission.try_acquire(a.request_id, a.attempt)
+            if res.status == "granted":
+                _trace(ctx, gtrace.write_graph_budget, run_path=a.run_path,
+                       attempt_id=f"{a.request_id}#a{a.attempt}", event="reserve",
+                       amount_usd=a.reserve_usd, cost_source="",
+                       remaining_usd=_remaining(ctx, a.run_path))
             if res.status in ("granted", "refused"):
                 _trace(ctx, gtrace.write_graph_admission, root_run_id=a.root_run_id,
                        attempt_id=f"{a.request_id}#a{a.attempt}", lane=a.lane,
@@ -433,6 +442,22 @@ def bind(ctx: GraphContext, *, queue: str | None = None) -> list[Callable]:
     @activity.defn(name=NAME + "cancel_admission")
     async def cancel_admission(request_id: str, attempt: int) -> None:
         await asyncio.to_thread(ctx.admission.cancel, request_id, attempt)
+        entry = await asyncio.to_thread(ctx.journal.get, request_id, attempt)
+        if entry is not None and entry.phase == "released":
+            _trace(ctx, gtrace.write_graph_budget, run_path=entry.run_path,
+                   attempt_id=f"{request_id}#a{attempt}", event="release", amount_usd=0.0,
+                   cost_source="", remaining_usd=_remaining(ctx, entry.run_path))
+
+    @activity.defn(name=NAME + "close_exception")
+    async def close_exception(exception_id: str, reason: str) -> None:
+        def work() -> None:
+            record = ctx.exceptions.close(exception_id, reason)
+            if record is not None:
+                _trace(ctx, gtrace.write_graph_exception, exception_id=record.exception_id,
+                       root_run_id=record.root_run_id, exception_kind=record.kind,
+                       event="closed", needs_answer=record.needs_answer)
+
+        await asyncio.to_thread(work)
 
     @activity.defn(name=NAME + "run_task")
     async def run_task(req: dict) -> dict:
@@ -479,8 +504,8 @@ def bind(ctx: GraphContext, *, queue: str | None = None) -> list[Callable]:
     async def root_state(root_run_id: str, state: str) -> None:
         await asyncio.to_thread(roots.set_state, ctx.store, root_run_id, state)
 
-    graph_side = [open_account, close_account, admit, cancel_admission, raise_exception,
-                  read_answer, record, root_state]
+    graph_side = [open_account, close_account, admit, cancel_admission, close_exception,
+                  raise_exception, read_answer, record, root_state]
     task_side = [run_task, run_gate]
     if queue == "graph":
         return graph_side

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import os
 import signal
 import time
@@ -20,6 +21,7 @@ from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
+from .. import config
 from ..config import Settings, log
 from . import trace as gtrace
 from .activities import GraphContext, bind
@@ -231,6 +233,11 @@ async def run_registry_worker(settings: Settings, gsettings: GraphSettings,
     from ..runs import Registry
     from .registry_dispatcher import RegistryDispatcher
 
+    if len(os.fsencode(settings.approval_socket)) >= config.UNIX_SOCKET_PATH_MAX:
+        # The worker owns its supervisor socket; a configured path too long to bind falls back
+        # to the short private one instead of ending the worker at start.
+        settings = dataclasses.replace(
+            settings, approval_socket=config._approval_socket_path(settings.approval_socket))
     registry = Registry(settings, entry="graph")
     supervisor = Supervisor(settings, registry, trace=registry.trace)
     supervisor.bind(NoClientSession())

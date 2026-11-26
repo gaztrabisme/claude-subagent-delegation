@@ -188,6 +188,13 @@ class ExceptionQueue:
             "SELECT * FROM exceptions WHERE state='answered' ORDER BY answered_at, rowid")
         return [_record(r) for r in rows]
 
+    def close(self, exception_id: str, reason: str) -> ExceptionRecord | None:
+        """Close one open exception (a timed-out decision); None when it is not open."""
+        with self.store.txn() as conn:
+            cur = conn.execute("UPDATE exceptions SET state='closed', closed_reason=?"
+                               " WHERE exception_id=? AND state='open'", (reason, exception_id))
+            return self._fetch(conn, exception_id) if cur.rowcount else None
+
     def close_for_root(self, root_run_id: str, reason: str) -> int:
         with self.store.txn() as conn:
             cur = conn.execute("UPDATE exceptions SET state='closed', closed_reason=?"

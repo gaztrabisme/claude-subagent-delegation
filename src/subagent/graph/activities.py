@@ -145,6 +145,25 @@ def _trace(ctx: GraphContext, writer: Callable[..., None], **fields: Any) -> Non
         log.warning("graph trace write failed", exc_info=True)
 
 
+def trace_admission_events(ctx: GraphContext) -> None:
+    """Trace what expiry and run_dead did since the last call (spec 10): `expired` plus the
+    budget `release` for a lease that returned its reservation, and `closed` exceptions."""
+    for gone in ctx.admission.drain_expired():
+        attempt_id = f"{gone['request_id']}#a{gone['attempt']}"
+        _trace(ctx, gtrace.write_graph_admission, root_run_id=gone["root_run_id"],
+               attempt_id=attempt_id, lane=gone["lane"], event="expired", reason="",
+               active=ctx.admission.active(gone["lane"]),
+               cap=ctx.admission.caps.get(gone["lane"]))
+        if gone["released"]:
+            _trace(ctx, gtrace.write_graph_budget, run_path=gone["run_path"],
+                   attempt_id=attempt_id, event="release", amount_usd=0.0, cost_source="",
+                   remaining_usd=_remaining(ctx, gone["run_path"]))
+    for record in ctx.admission.drain_closed_exceptions():
+        _trace(ctx, gtrace.write_graph_exception, exception_id=record.exception_id,
+               root_run_id=record.root_run_id, exception_kind=record.kind, event="closed",
+               needs_answer=record.needs_answer)
+
+
 def _resolve_workspace(ctx: GraphContext, value: str) -> Path:
     base = Path(ctx.settings.workspace)
     if not value:
@@ -422,6 +441,7 @@ def bind(ctx: GraphContext, *, queue: str | None = None) -> list[Callable]:
                 fairness_key=a.root_run_id, run_path=a.run_path, node_id=a.node_id,
                 reserve_usd=a.reserve_usd, deps=a.deps)
             res = ctx.admission.try_acquire(a.request_id, a.attempt)
+            trace_admission_events(ctx)
             if res.status == "granted":
                 _trace(ctx, gtrace.write_graph_budget, run_path=a.run_path,
                        attempt_id=f"{a.request_id}#a{a.attempt}", event="reserve",

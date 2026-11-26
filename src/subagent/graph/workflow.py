@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 from datetime import timedelta
 from typing import Any
 
@@ -202,6 +203,7 @@ class TemporalRuntime:
             return NodeResult(id=node.id, kind="subgraph",
                               status="budget_exhausted" if code == "budget_exhausted"
                               else "failed", error=f"{code}: {account.get('message') or code}")
+        child = dataclasses.replace(child, cap_usd=float(account.get("cap_usd", 0.0)))
         handle = await workflow.start_child_workflow(
             WORKFLOW_NAME, child.as_dict(), id=child.run_path, task_queue=self.graph_queue,
             parent_close_policy=ParentClosePolicy.REQUEST_CANCEL)
@@ -231,20 +233,26 @@ class TemporalRuntime:
             "run_path": scope.run_path, "node_id": scope.node_id, "kind": kind,
             "summary": summary, "detail": detail or {}, "options": list(options),
             "default": default, "needs_answer": True})
-        while True:
-            seen = self.wf._pokes
-            found = await self._graph_act("read_answer", xid)
-            if found is not None:
-                return {"answer": found.get("answer"), "note": found.get("note"),
-                        "answered_by": found.get("answered_by"), "timed_out": False}
-            remaining = None if timeout_s is None else timeout_s - (self.now() - started)
-            if remaining is not None and remaining <= 0:
-                await self._graph_act("close_exception", xid, "timeout")
-                return {"answer": default, "note": None, "answered_by": "timeout",
-                        "timed_out": True}
-            with contextlib.suppress(TimeoutError):
-                await workflow.wait_condition(lambda seen=seen: self.wf._pokes != seen,
-                                              timeout=remaining)
+        try:
+            while True:
+                seen = self.wf._pokes
+                found = await self._graph_act("read_answer", xid)
+                if found is not None:
+                    return {"answer": found.get("answer"), "note": found.get("note"),
+                            "answered_by": found.get("answered_by"), "timed_out": False}
+                remaining = None if timeout_s is None else timeout_s - (self.now() - started)
+                if remaining is not None and remaining <= 0:
+                    await self._graph_act("close_exception", xid, "timeout")
+                    return {"answer": default, "note": None, "answered_by": "timeout",
+                            "timed_out": True}
+                with contextlib.suppress(TimeoutError):
+                    await workflow.wait_condition(lambda seen=seen: self.wf._pokes != seen,
+                                                  timeout=remaining)
+        except asyncio.CancelledError:
+            # A cancelled run must not leave its question open for a late answer.
+            with contextlib.suppress(Exception):
+                await self._graph_act("close_exception", xid, "cancelled")
+            raise
 
 
 @workflow.defn(name=WORKFLOW_NAME)
@@ -310,7 +318,7 @@ class GraphWorkflow:
         if self._paused:
             interp.set_paused(True, self._pause_reason)
         is_root = gi.parent_path is None
-        cap_usd = 0.0
+        cap_usd = float(gi.cap_usd or 0.0)
         if is_root:
             account = await runtime._graph_act("open_account", {
                 "run_path": gi.run_path, "parent_path": None, "root_run_id": gi.root_run_id,

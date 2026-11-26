@@ -65,6 +65,7 @@ class GraphInput:
     body_ref: str | None = None
     inline_body: list[dict] | None = None
     inline_output: dict[str, str] | None = None  # additive: the output map of an inline body
+    cap_usd: float | None = None  # additive: a child's granted cap, for its trace record
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)

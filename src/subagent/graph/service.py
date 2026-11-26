@@ -84,6 +84,16 @@ class GraphService:
         self.gs = gsettings if gsettings is not None else settings_from(settings)
         self._store: Store | None = None
         self._client: Any = None
+        self._trace: Any = None
+
+    @property
+    def trace(self) -> Any:
+        """The configured `[core].trace` (spec 10), opened on first use."""
+        if self._trace is None:
+            from ..telemetry.trace import open_trace
+
+            self._trace = open_trace(self.settings.trace, self.settings.session_root)
+        return self._trace
 
     # -- state files ----
     @property
@@ -131,6 +141,8 @@ class GraphService:
         if not temporal_available():
             raise GraphUnavailable(INSTALL_HINT)
         if self._client is not None:
+            if worker and self.gs.autostart:  # a cached client must not skip the worker check
+                await asyncio.to_thread(self._ensure_worker)
             return self._client
         from temporalio.client import Client
 
@@ -153,7 +165,9 @@ class GraphService:
         return self._client
 
     def _ensure_worker(self) -> None:
-        """Autostart (spec 8.2): a live worker, else a detached `subagent graph worker`."""
+        """Autostart (spec 8.2): a live worker, else one detached `subagent graph worker`
+        that runs on this service's resolved address, state dir and task-queue prefix.
+        Raises GraphUnavailable when no worker is alive and none could be started."""
         import fcntl
         import os
         import subprocess
@@ -169,23 +183,29 @@ class GraphService:
             if any(workers.alive(w["worker_id"]) for w in workers.list()):
                 return
             known = {w["worker_id"] for w in workers.list()}
-            code = "import sys; from subagent.cli import main; sys.exit(main(['graph', 'worker']))"
+            code = "import sys; from subagent.cli import main; sys.exit(main(sys.argv[1:]))"
+            argv = [sys.executable, "-P", "-c", code, "graph", "worker",
+                    "--address", self.gs.address, "--state-dir", str(self.gs.state_dir),
+                    "--task-queue-prefix", self.gs.task_queue_prefix]
             try:
                 with open(private_file(state_dir / "worker.log"), "ab") as log:
-                    subprocess.Popen(
-                        [sys.executable, "-c", code], cwd=str(self.settings.workspace),
+                    proc = subprocess.Popen(
+                        argv, cwd=str(self.settings.workspace),
                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                         start_new_session=True, env=dict(os.environ))
             except OSError as exc:
-                from ..config import log as _log
-
-                _log.warning("graph worker could not be started: %s", exc)
-                return
-            deadline = time.monotonic() + 20.0  # hold the lock until it has registered
+                raise GraphUnavailable(f"graph worker could not be started: {exc}") from exc
+            deadline = time.monotonic() + 30.0  # hold the lock until it has registered
             while time.monotonic() < deadline:
                 if any(w["worker_id"] not in known for w in workers.list()):
                     return
+                if proc.poll() is not None:
+                    raise GraphUnavailable(
+                        f"graph worker exited with {proc.returncode} before registering; "
+                        f"see {state_dir / 'worker.log'}")
                 time.sleep(0.2)
+            raise GraphUnavailable(
+                f"graph worker did not register within 30s; see {state_dir / 'worker.log'}")
 
     async def _view(self, root: str) -> dict[str, Any]:
         """What Temporal says about `root`: reachable, exists, status, snapshot, result."""
@@ -473,6 +493,12 @@ class GraphService:
         except ExceptionError as err:
             return _error(err.code, str(err))
         delivered = False
+        with contextlib.suppress(Exception):  # a trace record never fails the answer
+            from . import trace as gtrace
+
+            gtrace.write_graph_exception(
+                self.trace, exception_id=record.exception_id, root_run_id=record.root_run_id,
+                exception_kind=record.kind, event="answered", needs_answer=record.needs_answer)
         if record.state == "answered":  # SQLite first, then the wake-up signal
             try:
                 client = await self._temporal()
@@ -480,7 +506,7 @@ class GraphService:
 
                 class _Ctx:  # the part of a worker context `deliver` uses
                     exceptions = queue
-                    trace = None
+                    trace = self.trace
 
                 delivered = await deliver(client, _Ctx(), record)  # type: ignore[arg-type]
             except GraphUnavailable:

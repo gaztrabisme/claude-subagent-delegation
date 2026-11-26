@@ -11,6 +11,7 @@ import os
 import secrets
 import sqlite3
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -111,6 +112,8 @@ class Admission:
         self.aging_s, self.lane_closed_timeout_s = aging_s, lane_closed_timeout_s
         self.clock = clock
         self.workers = workers or Workers(store, clock=clock)
+        self._expired: deque[dict[str, Any]] = deque()
+        self._closed: deque[Any] = deque()
 
     # -- queue ------------------------------------------------------------
 
@@ -192,10 +195,30 @@ class Admission:
         for row in rows:
             conn.execute("UPDATE leases SET state='expired' WHERE lease_id=?", (row["lease_id"],))
             entry = self.journal.get_in(conn, row["request_id"], row["attempt"])
-            if entry is not None and entry.phase == "admitted":
+            released = entry is not None and entry.phase == "admitted"
+            if released:
                 self.ledger.release(conn, request_id=row["request_id"], attempt=row["attempt"])
                 self.journal.advance(conn, row["request_id"], row["attempt"], "released")
+            self._expired.append({
+                "request_id": row["request_id"], "attempt": row["attempt"],
+                "lane": row["lane"], "released": released,
+                "run_path": entry.run_path if entry is not None else "",
+                "root_run_id": entry.root_run_id if entry is not None else ""})
         return len(rows)
+
+    def drain_expired(self) -> list[dict[str, Any]]:
+        """Leases `_expire` ended since the last call, for the trace (spec 10)."""
+        out: list[dict[str, Any]] = []
+        while self._expired:
+            out.append(self._expired.popleft())
+        return out
+
+    def drain_closed_exceptions(self) -> list[Any]:
+        """Exception records `run_dead` closed since the last call, for the trace."""
+        out: list[Any] = []
+        while self._closed:
+            out.append(self._closed.popleft())
+        return out
 
     def try_acquire(self, request_id: str, attempt: int) -> AdmitResult:
         with self.store.txn() as conn:
@@ -357,6 +380,7 @@ class Admission:
             return
         queue = ExceptionQueue(self.store, clock=self.clock)
         for root in roots:
+            self._closed.extend(queue.list(state="open", root_run_id=root, limit=1_000_000))
             queue.close_for_root(root, "run_dead")
             queue.raise_(key=f"{root}:run_dead", root_run_id=root, run_path=root, node_id=None,
                          kind="run_dead", summary=f"run {root} is dead: Temporal no longer "

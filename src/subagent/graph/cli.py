@@ -91,6 +91,9 @@ def add_graph_parser(sub: argparse._SubParsersAction) -> None:
     worker.add_argument("--dispatcher", choices=("registry", "fake"), default="registry")
     worker.add_argument("--fake-script", dest="fake_script", default=None)
     worker.add_argument("--max-tasks", dest="max_tasks", type=int, default=None)
+    worker.add_argument("--address", default=None, help="Temporal address (autostart passes it)")
+    worker.add_argument("--state-dir", dest="state_dir", default=None)
+    worker.add_argument("--task-queue-prefix", dest="task_queue_prefix", default=None)
     _common(worker)
 
 
@@ -207,6 +210,11 @@ def _worker(args: argparse.Namespace, settings: Any) -> int:
         if args.max_tasks < 1:
             raise ValueError("--max-tasks must be at least 1")
         gs = dataclasses.replace(gs, worker_max_tasks=args.max_tasks)
+    overrides = {k: v for k, v in (
+        ("address", args.address), ("state_dir", Path(args.state_dir) if args.state_dir else None),
+        ("task_queue_prefix", args.task_queue_prefix)) if v is not None}
+    if overrides:  # the parent's resolved values win over this process's re-read config
+        gs = dataclasses.replace(gs, **overrides)
     from .worker import run_registry_worker, run_worker
 
     if args.dispatcher == "fake":

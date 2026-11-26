@@ -24,7 +24,7 @@ from temporalio.worker import Worker
 from .. import config
 from ..config import Settings, log
 from . import trace as gtrace
-from .activities import GraphContext, bind
+from .activities import GraphContext, bind, trace_admission_events
 from .admission import Admission, Workers
 from .dispatch import Dispatcher
 from .exceptions import ExceptionQueue, NoClientSession
@@ -129,6 +129,7 @@ async def _reconcile_once(client: Client, ctx: GraphContext) -> None:
             return None
 
     report = await asyncio.to_thread(ctx.admission.reconcile, root_live=root_live)
+    await asyncio.to_thread(trace_admission_events, ctx)
     if report.interrupted or report.dead:
         log.info("graph reconcile: interrupted=%s dead=%s", report.interrupted, report.dead)
 

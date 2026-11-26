@@ -111,6 +111,15 @@ def _read_jsonl(path: Path) -> list[tuple[dt.datetime, dict[str, Any]]]:
     return out
 
 
+def _inside(path: Path, root: Path) -> bool:
+    """True when path, with symlinks followed, lies within the resolved root."""
+    try:
+        path.resolve().relative_to(root)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return True
+
+
 def _collect_files(projects: Path, sessions: list[str], roles: dict[str, Any]) -> list[_File]:
     """List the session and subagent files, assigning each a role name."""
     agent_to_role: dict[str, str] = {}
@@ -118,14 +127,17 @@ def _collect_files(projects: Path, sessions: list[str], roles: dict[str, Any]) -
         for agent in [agents] if isinstance(agents, str) else agents:
             agent_to_role[agent] = name
     files: list[_File] = []
+    root = projects.resolve()
     for index, sid in enumerate(sessions):
         session_file = projects / f"{sid}.jsonl"
-        if session_file.is_file():
+        if session_file.is_file() and _inside(session_file, root):
             session_records = _read_jsonl(session_file)
             files.append(_File(session_file, "coordinator", index, False, session_records))
         subagents = projects / sid / "subagents"
-        if subagents.is_dir():
+        if subagents.is_dir() and _inside(subagents, root):
             for path in sorted(subagents.glob("agent-*.jsonl")):
+                if not _inside(path, root):
+                    continue
                 agent = path.name.removeprefix("agent-").removesuffix(".jsonl")
                 role = agent_to_role.get(agent, "unassigned")
                 files.append(_File(path, role, index, True, _read_jsonl(path)))
@@ -487,6 +499,15 @@ def main(argv: list[str] | None = None) -> int:
         session_file = args.projects_dir / f"{sid}.jsonl"
         if not session_file.is_file():
             print(f"coord_meter: missing session file: {session_file}", file=sys.stderr)
+            return 2
+        if not _inside(session_file, args.projects_dir.resolve()):
+            print(f"coord_meter: session file resolves outside --projects-dir: {session_file}",
+                  file=sys.stderr)
+            return 2
+        subagents = args.projects_dir / sid / "subagents"
+        if subagents.is_dir() and not _inside(subagents, args.projects_dir.resolve()):
+            print(f"coord_meter: subagents dir resolves outside --projects-dir: {subagents}",
+                  file=sys.stderr)
             return 2
 
     pricing: dict[str, Any] | None = None

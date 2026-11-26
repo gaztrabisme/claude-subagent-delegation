@@ -16,8 +16,15 @@ from subagent import cli, config
 from subagent.lane_status import LaneStatusStore
 from subagent.runs import Registry
 
-from ..conftest import make_settings
+from ..conftest import default_providers, make_settings
 from ._helpers import commit_files, init_git_repo
+
+
+def _routed_providers() -> dict[str, Any]:
+    """Default test providers with a network route for codex (promote requires routes)."""
+    providers = default_providers()
+    providers["codex"]["network_allow"] = ["api.openai.com:443"]
+    return providers
 
 
 def _promote_mod():
@@ -112,7 +119,7 @@ def test_d_promote_cli_prints_short_sha_and_exits_0(tmp_path: Path, monkeypatch,
     mod = _promote_mod()
     repo = tmp_path / "repo"
     sha = init_git_repo(repo, {"pkg.txt": "v1\n"})
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, providers=_routed_providers())
     monkeypatch.setenv(config.CONFIG_ENV, str(tmp_path / "subagent.toml"))
 
     recorded: list[list[str]] = []
@@ -132,7 +139,7 @@ def test_d_promote_runner_failure_exits_1_and_leaves_served_json_unchanged(
     repo = tmp_path / "repo"
     sha1 = init_git_repo(repo, {"pkg.txt": "v1\n"})
     sha2 = commit_files(repo, {"pkg.txt": "v2\n"}, "second")
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, providers=_routed_providers())
     monkeypatch.setenv(config.CONFIG_ENV, str(tmp_path / "subagent.toml"))
 
     prior = {
@@ -155,7 +162,7 @@ def test_d_promote_refuses_live_runs_unless_force(tmp_path: Path, monkeypatch, c
     mod = _promote_mod()
     repo = tmp_path / "repo"
     sha = init_git_repo(repo, {"pkg.txt": "v1\n"})
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, providers=_routed_providers())
     monkeypatch.setenv(config.CONFIG_ENV, str(tmp_path / "subagent.toml"))
 
     recorded: list[list[str]] = []

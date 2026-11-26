@@ -46,9 +46,13 @@ class StubbornProcess:
     def __init__(self, argv, env, release: threading.Event):
         self.argv, self.env, self._release = argv, env, release
         self.killed = False
+        self.init_consumed = threading.Event()
 
     def events(self):
         yield h.init()
+        # The worker asks for the next event only after it has handled the init
+        # event, so this marks a point the product guarantees.
+        self.init_consumed.set()
         self._release.wait(timeout=10)
 
     def kill(self) -> None:
@@ -63,13 +67,20 @@ def test_h1_a_deadline_ended_run_still_working_at_the_next_pass_does_not_close_t
 ):
     clock = _clock(monkeypatch)
     release = threading.Event()
-    makers = [lambda argv, env: StubbornProcess(argv, env, release), h.echo_resume]
+    procs: list[StubbornProcess] = []
+
+    def stubborn(argv, env):
+        procs.append(StubbornProcess(argv, env, release))
+        return procs[-1]
+
+    makers = [stubborn, h.echo_resume]
     reg = h.registry(tmp_path, monkeypatch, makers,
                      provider_extra={"run_timeout": 30.0, "max_agents": 2})
     try:
         agent = reg.create_agent("t", tmp_path, "glm")
         run = agent.delegate("work", "true")
         h.wait_started(reg, run)
+        assert procs[0].init_consumed.wait(timeout=10)  # worker has handled init
         clock.tick(500)
         reg.reap_once()  # ends the run on its deadline
         assert run.state == "working"  # the worker has not finished it yet

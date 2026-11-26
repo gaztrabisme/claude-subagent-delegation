@@ -471,6 +471,21 @@ def _round_passed(tests: Any, run_passed: bool) -> bool:
     return run_passed
 
 
+def _lifted_final_runs(delegations: list[Mapping[str, Any]]) -> set[str]:
+    """Final-round run ids of delegations whose ``verified_pass`` is exactly True."""
+    out: set[str] = set()
+    for d in delegations:
+        if d.get("verified_pass") is not True:
+            continue
+        final = None
+        for entry in _run_entries(d.get("rounds")):
+            if isinstance(entry.get("run_id"), str):
+                final = entry["run_id"]
+        if final is not None:
+            out.add(final)
+    return out
+
+
 def _run_roles(run_rows: list[dict[str, Any]],
                delegations: list[Mapping[str, Any]]) -> dict[str, Any]:
     """Classify runs by role from the delegation trace, never from names.
@@ -480,6 +495,7 @@ def _run_roles(run_rows: list[dict[str, Any]],
     """
     builders, reviews, setups = _role_run_ids(delegations)
     round_tests = _builder_round_tests(delegations)
+    lifted = _lifted_final_runs(delegations)
     builder: dict[str, Any] = {
         "runs": 0, "verified_passed": 0, "pass_rate": None, "by_provider": {},
     }
@@ -496,7 +512,12 @@ def _run_roles(run_rows: list[dict[str, Any]],
                 provider, {"runs": 0, "verified_passed": 0}
             )
             by_provider["runs"] += 1
-            if _round_passed(round_tests.get(run_id), passed):
+            tests = round_tests.get(run_id)
+            no_result = _round_passed(tests, False) != _round_passed(tests, True)
+            ok = _round_passed(tests, passed)
+            if no_result and run_id in lifted:
+                ok = True
+            if ok:
                 builder["verified_passed"] += 1
                 by_provider["verified_passed"] += 1
         elif run_id in reviews:

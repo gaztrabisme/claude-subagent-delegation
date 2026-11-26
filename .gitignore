@@ -20,3 +20,5 @@ build/
 .capture-home/
 .capture-tmp/
 .scratch/
+
+.sock/

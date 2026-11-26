@@ -139,12 +139,19 @@ def run_verification(
             try:
                 argv = sandbox.wrap_argv(
                     argv,
-                    _verification_read_deny(settings),
+                    _verification_read_deny(settings, workspace, private_temp),
                     write_allow=_verification_write_roots(
                         workspace, private_temp, legacy_temp
                     ),
                     write_deny=_verification_write_deny(workspace),
-                    read_deny_subpaths=_verification_read_deny_subpaths(settings),
+                    # Resolution through the workspace's ancestors (getcwd,
+                    # shell startup) needs their metadata even when a narrower
+                    # read deny sits below them, exactly as the child profile
+                    # allows metadata on `agents/`.
+                    read_metadata_allow=_verification_read_metadata_allow(workspace),
+                    read_deny_subpaths=_verification_read_deny_subpaths(
+                        settings, workspace, private_temp
+                    ),
                     write_allow_devices=True,
                     # A verification command may start a loopback server on an
                     # ephemeral port; non-loopback stays denied. Another agent's
@@ -232,23 +239,80 @@ def run_verification(
         shutil.rmtree(private_temp, ignore_errors=True)
 
 
-def _verification_read_deny(settings: Settings) -> list[str]:
-    """Union of every configured provider's deny_read (F4)."""
+def _covers(root: str | Path, target: str | Path) -> bool:
+    """True when `root` is `target` or an ancestor of it, after resolution."""
+    root = Path(root).expanduser().resolve()
+    target = Path(target).expanduser().resolve()
+    return root == target or target.is_relative_to(root)
+
+
+def _would_hide_program(root: str | Path, workspace: Path, private_temp: Path) -> bool:
+    """True when a read deny on `root` would also hide the cwd or TMPDIR.
+
+    A read deny is a subpath rule: if it covers the workspace or the call's
+    private temp, the verification command cannot resolve its own cwd
+    (`getcwd`/`process.cwd` fail with EPERM) or write its TMPDIR. Such a path
+    must never become a read-deny rule; the caller narrows it instead.
+    """
+    return _covers(root, workspace) or _covers(root, private_temp)
+
+
+def _verification_read_deny(
+    settings: Settings, workspace: Path, private_temp: Path
+) -> list[str]:
+    """Union of every configured provider's deny_read (F4).
+
+    A configured `deny_read` can name a directory above the workspace (a
+    shared temp root, a home directory). Denying it as a subpath would take
+    away the workspace itself, so such a broad rule is dropped here rather
+    than producing a profile that cannot even resolve the command's cwd.
+    """
     paths = [
         str(path)
         for cfg in settings.providers.values()
         for path in cfg.deny_read
+        if not _would_hide_program(path, workspace, private_temp)
     ]
     return list(dict.fromkeys(paths))
 
 
-def _verification_read_deny_subpaths(settings: Settings) -> list[str]:
-    """Other agents' session files and the approval socket's directory (F4)."""
-    paths = [str(Path(settings.session_root) / "agents")]
+def _verification_read_metadata_allow(workspace: Path) -> list[str]:
+    """The workspace's ancestors, so path resolution survives a narrow deny.
+
+    This mirrors the child profile's `file-read-metadata` allow on
+    `<session_root>/agents`: metadata on an ancestor is not content, but
+    without it `getcwd` cannot walk from the workspace to `/`.
+    """
+    workspace = Path(workspace).expanduser().resolve()
+    return [str(parent) for parent in workspace.parents]
+
+
+def _verification_read_deny_subpaths(
+    settings: Settings, workspace: Path, private_temp: Path
+) -> list[str]:
+    """Other agents' session files and the approval socket (F4).
+
+    Normally the whole approval socket directory is read-denied. When that
+    directory is the workspace or an ancestor of it (the loop tests put the
+    socket beside the project under one temp root), denying the directory
+    would also hide the workspace and private temp, so only the socket file
+    itself is denied. The agents' approval keys under
+    `<session_root>/agents` stay denied whenever that tree does not contain
+    the workspace or the private temp.
+    """
+    paths: list[str] = []
+    agents = Path(settings.session_root) / "agents"
+    if not _would_hide_program(agents, workspace, private_temp):
+        paths.append(str(agents))
     if settings.approval_socket:
-        socket_dir = Path(settings.approval_socket).expanduser().parent
+        socket = Path(settings.approval_socket).expanduser()
+        socket_dir = socket.parent
         if socket_dir != Path("/"):
-            paths.append(str(socket_dir))
+            if _would_hide_program(socket_dir, workspace, private_temp):
+                # Deny the transport itself, not the directory around the cwd.
+                paths.append(str(socket))
+            else:
+                paths.append(str(socket_dir))
     return list(dict.fromkeys(paths))
 
 

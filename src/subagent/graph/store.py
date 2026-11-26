@@ -88,7 +88,11 @@ class Store:
                 os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         self._local = threading.local()
         self._migrate()
-        for suffix in ("-wal", "-shm"):  # SQLite copies the database file's mode; make sure
+        self._secure_sidecars()
+
+    def _secure_sidecars(self) -> None:
+        """Re-assert 0600 on -wal/-shm whenever SQLite may have just created them."""
+        for suffix in ("-wal", "-shm"):
             with contextlib.suppress(OSError):
                 os.chmod(f"{self.path}{suffix}", 0o600)
 
@@ -131,6 +135,7 @@ class Store:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._secure_sidecars()
             try:
                 yield conn
             except BaseException:
@@ -145,5 +150,7 @@ class Store:
         cached = getattr(self._local, "conn", None)
         if cached is None or self._local.pid != os.getpid():
             cached = self._connect()
+            cached.execute("SELECT 1 FROM meta LIMIT 1").fetchall()
+            self._secure_sidecars()
             self._local.conn, self._local.pid = cached, os.getpid()
         return cached

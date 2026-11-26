@@ -41,8 +41,11 @@ def _private_dir(path: Path) -> Path:
 
 def private_file(path: Path) -> Path:
     """Create `path` if missing and make it owner-only (0600)."""
-    os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
-    os.chmod(path, 0o600)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # on the descriptor we hold: no path swap between create and chmod
+    finally:
+        os.close(fd)
     return path
 
 
@@ -239,8 +242,10 @@ class DevServer:
             record = {"pid": proc.pid, "address": self.address, "db_path": str(self._db),
                       "binary": str(binary), "started_at": time.time()}
             tmp = self._json.with_suffix(".tmp")
-            tmp.write_text(json.dumps(record), encoding="utf-8")
-            os.chmod(tmp, 0o600)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:  # born 0600, never widened by umask
+                os.fchmod(fh.fileno(), 0o600)
+                fh.write(json.dumps(record))
             os.replace(tmp, self._json)
             return self._info(record, by_us=True)
         finally:

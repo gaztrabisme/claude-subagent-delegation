@@ -72,9 +72,13 @@ class EgressProxy:
             def handle(self) -> None:
                 owner._handle(self.request)
 
-        self._server = Server()
+        server = Server()
+        self._server = server
         self._thread = threading.Thread(
-            target=self._server.serve_forever, name="subagent-egress", daemon=True,
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            name="subagent-egress",
+            daemon=True,
         )
         self._thread.start()
         return int(self._server.server_address[1])

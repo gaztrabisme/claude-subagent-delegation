@@ -17,7 +17,6 @@ import json
 import math
 import os
 import secrets
-import socket
 import stat
 import sys
 import threading
@@ -1444,9 +1443,7 @@ class Agent:
         # the run as `close` does. The reaper defers the plain case by one pass.
         # A plain-driver worker thread blocked in the child's stream iterator
         # is left to exit when the child's pipe closes; it is not replaced.
-        # A plain child left to drain is not finished here, so waiting for it
-        # would only delay the reaper pass (and let a later pass relabel it).
-        if (service or finish_stuck) and not run.done.wait(self.END_RUN_WAIT):
+        if not run.done.wait(self.END_RUN_WAIT) and (service or finish_stuck):
             self._finish(run)
 
     def _boot(self) -> None:
@@ -1760,20 +1757,8 @@ class Agent:
     def _stop_egress_proxy(self) -> None:
         proxy, self._egress_proxy = self._egress_proxy, None
         self._egress_port = None
-        if proxy is None:
-            return
-        # socketserver.shutdown() waits for serve_forever's poll (0.5s), which
-        # would make a close exceed R7a's close bound.  Request shutdown and
-        # wake the selector first, then let the proxy stop synchronously.
-        server = getattr(proxy, "_server", None)
-        if server is not None:
-            server._BaseServer__shutdown_request = True
-            try:
-                with socket.create_connection(server.server_address, timeout=0.1):
-                    pass
-            except OSError:
-                pass
-        proxy.stop()
+        if proxy is not None:
+            proxy.stop()
 
     def _dsh_guard_ready(self, path: str, digest: str) -> None:
         self.guard_context.update({
@@ -2356,16 +2341,7 @@ class Agent:
                     trip = watch.see(event)
                     if trip is not None and run.trip is None:
                         run.trip = trip
-                    # A deadline ended by `end_run` belongs to the reaper: it
-                    # leaves a plain child WORKING for a later pass, so this
-                    # worker must keep reading until the child's stream ends
-                    # instead of finishing the run on the trip alone.
-                    deadline_ended = (
-                        run.ended_by_end_run and run.trip is not None
-                        and run.trip[0] == KILL_TIMEOUT
-                        and run.trip[1] == "run deadline exceeded"
-                    )
-                    if (run.trip and not deadline_ended) or self._closing:
+                    if run.trip or self._closing:
                         kind, reason = run.trip or (
                             self._kill_kind or KILL_CANCEL, "agent closing"
                         )

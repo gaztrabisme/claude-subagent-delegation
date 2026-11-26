@@ -130,6 +130,24 @@ def run_verification(
         argv: list[str] = ["/bin/sh", "-c", command]
         if sys.platform == "darwin":
             try:
+                subpaths = _verification_read_deny_subpaths(
+                    settings, workspace, private_temp, guard_context
+                )
+                covering = any(
+                    _would_hide_program(p, workspace, private_temp) for p in subpaths
+                )
+                reopen = (
+                    [str(Path(workspace).resolve()), str(private_temp.resolve())]
+                    if covering
+                    else []
+                )
+                # Denies lying inside the workspace or temp stay effective.
+                inside = [
+                    p
+                    for p in _configured_read_denies(settings, guard_context)
+                    if not _would_hide_program(p, workspace, private_temp)
+                    and (_covers(workspace, p) or _covers(private_temp, p))
+                ]
                 argv = sandbox.wrap_argv(
                     argv,
                     _verification_read_deny(
@@ -142,15 +160,11 @@ def run_verification(
                     # read deny sits below them, exactly as the child profile
                     # allows metadata on `agents/`.
                     read_metadata_allow=_verification_read_metadata_allow(workspace, private_temp),
-                    read_deny_subpaths=_verification_read_deny_subpaths(
-                        settings, workspace, private_temp, guard_context
-                    ),
+                    read_deny_subpaths=subpaths,
                     # Read only: re-opens the program's own paths below a
                     # broad read deny, never a write (which would reopen .git).
-                    read_allow_subpaths=[
-                        str(Path(workspace).resolve()),
-                        str(private_temp.resolve()),
-                    ],
+                    read_allow_subpaths=reopen,
+                    read_deny_after_allow=inside if reopen else [],
                     write_allow_devices=True,
                     # A verification command may start a loopback server on an
                     # ephemeral port; non-loopback stays denied. Another agent's

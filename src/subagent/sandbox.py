@@ -175,6 +175,7 @@ def build_profile(
     network_loopback_any: bool = False,
     network_deny_ports: Sequence[int] = (),
     read_deny_subpaths: Sequence[str] = (),
+    read_deny_after_allow: Sequence[str] = (),
     write_allow_devices: bool = False,
     deny_ipc_escapes: bool = False,
 ) -> str:
@@ -228,6 +229,9 @@ def build_profile(
         rules.append(f'(allow file-read-metadata {_filter(path, "literal")})')
     for path in normalize_paths(read_allow_subpaths):
         rules.append(f'(allow file-read* {_filter(path, "subpath")})')
+    # Denies that lie inside a re-opened path must win over the re-open.
+    for path in normalize_paths(read_deny_after_allow):
+        rules.append(f'(deny file-read* {_filter(path, "subpath")})')
     for path in normalize_paths(write_allow_exact):
         rules.append(f'(allow file-write* {_filter(path, "literal")})')
     ancestors = dict.fromkeys(
@@ -292,6 +296,7 @@ def wrap_argv(
     network_loopback_any: bool = False,
     network_deny_ports: Sequence[int] = (),
     read_deny_subpaths: Sequence[str] = (),
+    read_deny_after_allow: Sequence[str] = (),
     write_allow_devices: bool = False,
     deny_ipc_escapes: bool = False,
 ) -> list[str]:
@@ -317,6 +322,7 @@ def wrap_argv(
                       network_loopback_any=network_loopback_any,
                       network_deny_ports=network_deny_ports,
                       read_deny_subpaths=read_deny_subpaths,
+                      read_deny_after_allow=read_deny_after_allow,
                       write_allow_devices=write_allow_devices,
                       deny_ipc_escapes=deny_ipc_escapes),
         *argv,

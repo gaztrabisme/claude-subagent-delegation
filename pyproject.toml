@@ -23,6 +23,11 @@ subagent-mcp = "subagent.mcp_server:main"
 [project.urls]
 Homepage = "https://github.com/gaztrabisme/claude-subagent-delegation"
 
+[project.optional-dependencies]
+graph = [
+    "temporalio>=1.37.0",
+]
+
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 report = ["pandas>=2.2", "pyarrow>=15"]

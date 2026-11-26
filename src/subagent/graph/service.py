@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +26,8 @@ from .ledger import BudgetRefused, Ledger
 from .schema import GraphError, graph_hash, load_graph, parse
 from .server import DevServer, GraphSettings, _private_dir, private_file, settings_from
 from .store import Store
+
+log = logging.getLogger(__name__)
 
 _EXC_STATES = ("open", "answered", "delivered", "closed", "all")
 _CLOSED_STATUS = {"COMPLETED": None, "FAILED": "failed", "CANCELED": "cancelled",
@@ -493,12 +496,15 @@ class GraphService:
         except ExceptionError as err:
             return _error(err.code, str(err))
         delivered = False
-        with contextlib.suppress(Exception):  # a trace record never fails the answer
+        try:  # a trace record never fails the answer
             from . import trace as gtrace
 
             gtrace.write_graph_exception(
                 self.trace, exception_id=record.exception_id, root_run_id=record.root_run_id,
                 exception_kind=record.kind, event="answered", needs_answer=record.needs_answer)
+        except Exception:  # noqa: BLE001
+            log.warning("graph trace write failed for exception %s", exception_id,
+                        exc_info=True)
         if record.state == "answered":  # SQLite first, then the wake-up signal
             try:
                 client = await self._temporal()

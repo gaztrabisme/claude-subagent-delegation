@@ -86,6 +86,7 @@ class TaskNode(Node):
     retry_on: tuple[str, ...] = DEFAULT_RETRY_ON
     retry_backoff_s: float = 30
     reserve_usd: float = DEFAULT_RESERVE_USD
+    reserve_set: bool = True  # False: neither the node nor `defaults` named a reservation
     priority: int = 3
     role: str | None = None
 
@@ -777,6 +778,7 @@ def _build_node(raw: Mapping[str, Any], defaults: Mapping[str, Any],
             retry_on=tuple(_pick(raw, defaults, "retry_on", DEFAULT_RETRY_ON)),
             retry_backoff_s=raw.get("retry_backoff_s", 30),
             reserve_usd=_pick(raw, defaults, "reserve_usd", DEFAULT_RESERVE_USD),
+            reserve_set="reserve_usd" in raw or "reserve_usd" in defaults,
             priority=_pick(raw, defaults, "priority", 3), role=raw.get("role"))
     if kind == "gate":
         return GateNode(**common, command=raw.get("command"), condition=raw.get("condition"),

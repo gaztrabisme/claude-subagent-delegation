@@ -51,7 +51,7 @@ class AdmitRequest:
     node_id: str
     lane: str
     priority: int
-    reserve_usd: float
+    reserve_usd: float | None  # None: the worker applies [graph].default_reserve_usd
     deps: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -436,6 +436,8 @@ def bind(ctx: GraphContext, *, queue: str | None = None) -> list[Callable]:
     async def admit(req: dict) -> dict:
         def work() -> dict:
             a = AdmitRequest.from_dict(req)
+            if a.reserve_usd is None:
+                a.reserve_usd = ctx.gsettings.default_reserve_usd
             ctx.admission.enqueue(
                 request_id=a.request_id, attempt=a.attempt, lane=a.lane, priority=a.priority,
                 fairness_key=a.root_run_id, run_path=a.run_path, node_id=a.node_id,

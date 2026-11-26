@@ -532,8 +532,9 @@ overrides it. It holds the ledger (a SQLite file), the journal, the exception qu
 Temporal database. The first call that needs Temporal starts a local dev server there when
 `[graph].autostart` is on; `subagent graph server start`, `stop` and `status` manage it by hand.
 
-Tasks run in a worker process: start one with `subagent graph worker` and leave it running. After
-a restart, start the server and a worker again; open runs continue from their journal, and a task
+Tasks run in a worker process. When `[graph].autostart` is true, `graph_start` (and `subagent graph
+start`) starts a detached worker for you if none is running; with `autostart` off, start one with
+`subagent graph worker` and leave it running. After a restart, start the server and a worker again; open runs continue from their journal, and a task
 that was in flight is re-dispatched or reported as interrupted according to its `retry_on`. A run
 whose workflow is gone from Temporal is marked dead. `subagent graph pause ROOT`, `resume ROOT`
 and `cancel ROOT --reason TEXT` control a run; the same verbs exist as tools.
@@ -574,7 +575,7 @@ subagent graph worker --dispatcher fake --fake-script examples/graph/fake-script
 
 - The local Temporal server has no authentication; any local process of the same user can pause
   or cancel a run. Answers are read from the ledger, not from signals.
-- The worker is not started for you; it stops when the machine sleeps.
+- With `[graph].autostart` on, `graph_start` starts a detached worker for you; it stops when the machine sleeps.
 - Live runs on provider CLIs go through the same guard as `delegate`; the offline `fake`
   dispatcher is the only one covered by the test suite.
 - A killed worker may leave a provider process running; its spend is charged to the reservation.

@@ -113,7 +113,7 @@ class TemporalRuntime:
         admit = {"request_id": scope.request_id, "attempt": attempt,
                  "root_run_id": scope.root_run_id, "run_path": scope.run_path,
                  "node_id": node.id, "lane": node.provider or "", "priority": scope.priority,
-                 "reserve_usd": node.reserve_usd, "deps": []}
+                 "reserve_usd": node.reserve_usd if node.reserve_set else None, "deps": []}
         lease: dict[str, Any] | None = None
         try:
             while True:
@@ -250,8 +250,13 @@ class TemporalRuntime:
                                                   timeout=remaining)
         except asyncio.CancelledError:
             # A cancelled run must not leave its question open for a late answer.
-            with contextlib.suppress(Exception):
-                await self._graph_act("close_exception", xid, "cancelled")
+            try:
+                await asyncio.shield(asyncio.ensure_future(
+                    self._graph_act("close_exception", xid, "cancelled", timeout_s=10.0,
+                                    retry=_RECORD)))
+            except Exception as err:  # noqa: BLE001 - the cancellation still propagates
+                workflow.logger.warning(
+                    "graph: closing exception %s on cancellation failed: %s", xid, err)
             raise
 
 

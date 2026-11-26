@@ -1,5 +1,5 @@
 name=$(python3 -c "import os,re;print(re.search(r'You are worker \"(\w+)\"', os.environ['FAKE_PROMPT']).group(1))")
-node -e "require('dummy-dep')" && echo "dep resolved in $name"
+if [ -L node_modules ]; then echo "node_modules linked in $name"; else echo "node_modules not linked in $name"; fi
 mkdir -p src .subagent
 if [ "$name" = a ]; then
   echo 'export const a = () => "A";' > src/a.js

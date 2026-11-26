@@ -47,6 +47,7 @@ from .health import check as health_check
 from .lane_status import LaneStatusStore, probe_stale_lanes
 from .loop import loop
 from .providers.base import ProviderConfig
+from .sandbox import OS_SANDBOX_DRIVERS
 
 # The examples `init` offers, one per file.
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
@@ -353,6 +354,9 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         "binary_path": path,
         "binary_ok": path is not None,
         "api_key_envs": _key_envs(cfg),
+        # True only where the server's OS sandbox is both available and
+        # actually used for this driver's child.
+        "os_boundary": sys.platform == "darwin" and cfg.driver in OS_SANDBOX_DRIVERS,
     }
     network_allow = list(cfg.network_allow)
     parsed_base = urlsplit(cfg.base_url or "")

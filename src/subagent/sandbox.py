@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import sys
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -12,6 +13,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+# Drivers whose child the server confines with its own macOS Seatbelt profile.
+# `doctor` reports this as `os_boundary`: true only where the profile can be
+# applied (macOS), never for a driver that runs without one.
+OS_SANDBOX_DRIVERS = frozenset({"claude", "codex", "dsh", "omp", "antigravity"})
 
 # Character devices an ordinary process opens for writing (shell redirects,
 # subprocess DEVNULL, terminal probes, dtrace helpers, /dev/stdout aliases).
@@ -61,6 +67,30 @@ OWNER_HOME_EXCEPTIONS: dict[str, list[tuple[str, str]]] = {
 
 # The loopback port of the agent's egress proxy while its driver builds argv.
 _EGRESS_PORT: ContextVar[int | None] = ContextVar("subagent_egress_port", default=None)
+
+# Every egress proxy currently serving an agent. Verification must not be able
+# to reach one: a CONNECT proxy forwards to hosts its own agent is allowed to
+# use, so a loopback connect through it is an outbound route (R2).
+_LIVE_EGRESS_PORTS: set[int] = set()
+_LIVE_EGRESS_LOCK = threading.Lock()
+
+
+def register_egress_proxy_port(port: int) -> None:
+    """Record a started agent's egress proxy port (thread-safe)."""
+    with _LIVE_EGRESS_LOCK:
+        _LIVE_EGRESS_PORTS.add(int(port))
+
+
+def unregister_egress_proxy_port(port: int) -> None:
+    """Forget a stopped agent's egress proxy port (thread-safe)."""
+    with _LIVE_EGRESS_LOCK:
+        _LIVE_EGRESS_PORTS.discard(int(port))
+
+
+def live_egress_ports() -> set[int]:
+    """The ports of every egress proxy alive right now (thread-safe copy)."""
+    with _LIVE_EGRESS_LOCK:
+        return set(_LIVE_EGRESS_PORTS)
 
 
 @contextmanager
@@ -142,7 +172,10 @@ def build_profile(
     read_allow_subpaths: Sequence[str] = (),
     network_loopback_ports: Sequence[int] | None = None,
     network_unix_sockets: Sequence[str] = (),
+    network_loopback_any: bool = False,
+    network_deny_ports: Sequence[int] = (),
     read_deny_subpaths: Sequence[str] = (),
+    read_deny_after_allow: Sequence[str] = (),
     write_allow_devices: bool = False,
     deny_ipc_escapes: bool = False,
 ) -> str:
@@ -150,8 +183,11 @@ def build_profile(
 
     `read_deny_subpaths` denies reads only (writes stay governed by the write
     rules); `read_allow_subpaths` re-allows reads below one of them. A network
-    policy (`network_loopback_ports` not None, or unix sockets) denies all
-    outbound network except loopback TCP on those ports and those socket paths.
+    policy (`network_loopback_ports` not None, unix sockets,
+    `network_loopback_any` or `network_deny_ports`) denies all outbound network
+    except loopback TCP on the listed ports, loopback on any port, and those
+    socket paths. `network_deny_ports` is emitted after those allows so a
+    specific loopback port (another agent's egress proxy) stays unreachable.
     """
     rules = ["(version 1)", "(allow default)"]
     if write_allow is not None:
@@ -193,6 +229,9 @@ def build_profile(
         rules.append(f'(allow file-read-metadata {_filter(path, "literal")})')
     for path in normalize_paths(read_allow_subpaths):
         rules.append(f'(allow file-read* {_filter(path, "subpath")})')
+    # Denies that lie inside a re-opened path must win over the re-open.
+    for path in normalize_paths(read_deny_after_allow):
+        rules.append(f'(deny file-read* {_filter(path, "subpath")})')
     for path in normalize_paths(write_allow_exact):
         rules.append(f'(allow file-write* {_filter(path, "literal")})')
     ancestors = dict.fromkeys(
@@ -207,8 +246,14 @@ def build_profile(
     # parent; it cannot cover the socket file or its direct siblings.
     for path in normalize_paths(write_allow_subpaths):
         rules.append(f'(allow file-write* {_filter(path, "subpath")})')
-    if network_loopback_ports is not None or network_unix_sockets:
+    if (network_loopback_ports is not None or network_unix_sockets
+            or network_loopback_any or network_deny_ports):
         rules.append("(deny network-outbound)")
+        if network_loopback_any:
+            # A verification command may start a loopback server on an
+            # ephemeral port, so the port cannot be known when the profile is
+            # built. This rule still excludes every non-loopback address.
+            rules.append('(allow network-outbound (remote ip "localhost:*"))')
         for port in dict.fromkeys(int(port) for port in (network_loopback_ports or ())):
             if not 1 <= port <= 65535:
                 raise ValueError("network loopback ports must be between 1 and 65535")
@@ -219,6 +264,13 @@ def build_profile(
             rules.append(
                 f'(allow network-outbound (remote unix-socket {_filter(path, "literal")}))'
             )
+        # Later rules win: these exclusions override the loopback allows above.
+        # An agent's egress proxy forwards to its provider allowlist, so a
+        # verification command that reached it would have a network route.
+        for port in dict.fromkeys(int(port) for port in network_deny_ports):
+            if not 1 <= port <= 65535:
+                raise ValueError("denied egress ports must be between 1 and 65535")
+            rules.append(f'(deny network-outbound (remote ip "localhost:{port}"))')
     if deny_ipc_escapes:
         rules.append("(deny appleevent-send)")
         services = " ".join(f'(global-name "{name}")' for name in IPC_ESCAPE_MACH_SERVICES)
@@ -241,12 +293,20 @@ def wrap_argv(
     read_allow_subpaths: Sequence[str] = (),
     network_loopback_ports: Sequence[int] | None = None,
     network_unix_sockets: Sequence[str] = (),
+    network_loopback_any: bool = False,
+    network_deny_ports: Sequence[int] = (),
     read_deny_subpaths: Sequence[str] = (),
+    read_deny_after_allow: Sequence[str] = (),
     write_allow_devices: bool = False,
     deny_ipc_escapes: bool = False,
 ) -> list[str]:
     """Pass arguments directly to sandbox-exec; never fall back on sandbox failure."""
-    network_policy = network_loopback_ports is not None or bool(network_unix_sockets)
+    network_policy = (
+        network_loopback_ports is not None
+        or bool(network_unix_sockets)
+        or network_loopback_any
+        or bool(network_deny_ports)
+    )
     if not paths and not network_policy:
         return argv
     check_platform(paths if paths else ("network-policy",))
@@ -259,7 +319,10 @@ def wrap_argv(
                       read_allow_subpaths=read_allow_subpaths,
                       network_loopback_ports=network_loopback_ports,
                       network_unix_sockets=network_unix_sockets,
+                      network_loopback_any=network_loopback_any,
+                      network_deny_ports=network_deny_ports,
                       read_deny_subpaths=read_deny_subpaths,
+                      read_deny_after_allow=read_deny_after_allow,
                       write_allow_devices=write_allow_devices,
                       deny_ipc_escapes=deny_ipc_escapes),
         *argv,

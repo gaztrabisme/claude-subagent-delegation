@@ -51,7 +51,6 @@ from ..secrets import redact_secrets
 from ..verify import run_verification
 from . import checkpoint, session
 from .common import (
-    DEPENDENCY_DIRS,
     STATE_DIR,
     changed_between,
     git_prefix,
@@ -868,9 +867,10 @@ def _parallel_work(
                  "session_record": None}
             # Track the worktree before any later setup can fail, so finally can remove it.
             workers.append(w)
-            for dep in DEPENDENCY_DIRS:
-                if (root / dep).exists() and not (proj / dep).exists():
-                    (proj / dep).symlink_to(root / dep)
+            # B4: never link the root's dependency folders into a worktree. A
+            # shared node_modules/.venv would let one worker's install change
+            # the root's or a sibling's; a worktree keeps its own real folder,
+            # or none at all.
             guard = TestGuard(
                 proj,
                 info["test_globs"],

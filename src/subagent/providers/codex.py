@@ -468,6 +468,9 @@ class CodexProvider:
     def binary(self, cfg: ProviderConfig) -> str:
         return cfg.binary or DEFAULT_BINARY
 
+    def secret_files(self, cfg: ProviderConfig) -> tuple[Path, ...]:
+        return (source_codex_home() / "auth.json",)
+
     def boot(
         self, settings: Settings, agent_id: str, cfg: ProviderConfig
     ) -> tuple[str | None, Session]:

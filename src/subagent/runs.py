@@ -44,6 +44,7 @@ from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
 from .guard.classify import _git_metadata_roots, protect, provider_guard_context
 from .lane_state import LaneState
 from .lane_status import LaneStatusStore, codex_usage
+from .process_tree import descendant_pids
 from .providers.base import (
     DRIVER_ANTIGRAVITY,
     DRIVER_CODEX,
@@ -71,6 +72,8 @@ from .sandbox import (
     check_platform,
     egress_port,
     normalize_paths,
+    register_egress_proxy_port,
+    unregister_egress_proxy_port,
     wrap_argv,
 )
 from .secrets import redact_secrets
@@ -1721,6 +1724,19 @@ class Agent:
             process.enable_cancel_fence()
         return process
 
+    def _egress_allowed_pids(self) -> set[int]:
+        """The live child's pid and its descendants; empty before the child starts.
+
+        Read at connection time, not at spawn time: every attempt gets a new
+        child, and the previous one is already dead when the next is published.
+        """
+        process = self._current
+        proc = getattr(process, "_proc", None)
+        pid = getattr(proc, "pid", None)
+        if not isinstance(pid, int):
+            return set()
+        return {pid, *descendant_pids(pid)}
+
     def _start_egress_proxy(self) -> None:
         if self._egress_proxy is not None:
             return
@@ -1739,8 +1755,14 @@ class Agent:
                     provider=self.cfg.name, host=host, port=port,
                 )
 
-        proxy = EgressProxy(allow, on_refusal=refused)
+        proxy = EgressProxy(
+            allow, on_refusal=refused,
+            # Computed per connection: a continue starts a new child, and only
+            # that child's tree may use this proxy. An empty set fails closed.
+            allowed_pids=self._egress_allowed_pids,
+        )
         self._egress_port = proxy.start()
+        register_egress_proxy_port(self._egress_port)
         self._egress_proxy = proxy
 
     def _egress_environment(self) -> dict[str, str]:
@@ -1756,9 +1778,15 @@ class Agent:
 
     def _stop_egress_proxy(self) -> None:
         proxy, self._egress_proxy = self._egress_proxy, None
-        self._egress_port = None
-        if proxy is not None:
-            proxy.stop()
+        port, self._egress_port = self._egress_port, None
+        try:
+            if proxy is not None:
+                proxy.stop()
+        finally:
+            # Keep the port denied until the listener is closed, then release
+            # it for verification.
+            if port is not None:
+                unregister_egress_proxy_port(port)
 
     def _dsh_guard_ready(self, path: str, digest: str) -> None:
         self.guard_context.update({

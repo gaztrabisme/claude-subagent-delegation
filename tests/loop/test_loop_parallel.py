@@ -53,7 +53,8 @@ class Parallel(Sandbox):
         self.assertEqual(self.worktrees(root), 1)
         log = self.read(root, r["log"])
         self.assertIn("[a]", log)
-        self.assertIn("dep resolved in a", log)  # node_modules linked into the worktree
+        self.assertIn("node_modules not linked in a", log)  # B4: no node_modules symlink in the worktree
+        self.assertNotIn("node_modules linked in a", log)
 
     def test_autopilot_fixes_failed_merge(self):
         root = self.project({"a.test.js": A_TEST, "b.test.js": B_TEST})

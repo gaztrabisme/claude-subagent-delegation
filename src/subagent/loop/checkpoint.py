@@ -166,7 +166,8 @@ def prune(root, keep):
 def worktree_add(root, record):
     """Check the checkpoint out in a temporary worktree outside the project.
 
-    Returns (worktree_dir, project_root_inside_it). Dependency dirs are symlinked in by the caller.
+    Returns (worktree_dir, project_root_inside_it). The caller never shares
+    the root's dependency directories into the worktree.
     """
     if record["kind"] != "git":
         raise RuntimeError("worktrees need a git repository")

@@ -13,7 +13,8 @@ SKIP_DIRS = {
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
     "dist", "build", "target", ".next", ".nuxt", "coverage", ".turbo",
 }
-# Dependency directories shared (symlinked) into parallel worktrees.
+# Dependency directories a parallel worktree never shares with the root: each
+# worktree either has none or its own real directory.
 DEPENDENCY_DIRS = ["node_modules", ".venv", "venv"]
 TAIL_LINES = 60
 

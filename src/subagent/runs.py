@@ -71,6 +71,8 @@ from .sandbox import (
     check_platform,
     egress_port,
     normalize_paths,
+    register_egress_proxy_port,
+    unregister_egress_proxy_port,
     wrap_argv,
 )
 from .secrets import redact_secrets
@@ -1741,6 +1743,7 @@ class Agent:
 
         proxy = EgressProxy(allow, on_refusal=refused)
         self._egress_port = proxy.start()
+        register_egress_proxy_port(self._egress_port)
         self._egress_proxy = proxy
 
     def _egress_environment(self) -> dict[str, str]:
@@ -1756,9 +1759,15 @@ class Agent:
 
     def _stop_egress_proxy(self) -> None:
         proxy, self._egress_proxy = self._egress_proxy, None
-        self._egress_port = None
-        if proxy is not None:
-            proxy.stop()
+        port, self._egress_port = self._egress_port, None
+        try:
+            if proxy is not None:
+                proxy.stop()
+        finally:
+            # Keep the port denied until the listener is closed, then release
+            # it for verification.
+            if port is not None:
+                unregister_egress_proxy_port(port)
 
     def _dsh_guard_ready(self, path: str, digest: str) -> None:
         self.guard_context.update({

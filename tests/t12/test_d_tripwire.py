@@ -96,7 +96,7 @@ def cut_scenario(tmp_path, book: str, setup):
     o = make_repo(tmp_path, "o")
     pad(m, PREV, 5)
     pad(o, PREV, 1)
-    pad(m, CUR, 5)
+    pad(m, CUR, 12)
     pad(o, CUR, 1)
     bookfile = tmp_path / "book.md"
     bookfile.write_text(book, encoding="utf-8")

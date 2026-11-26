@@ -77,7 +77,10 @@ allowed_tmp = Path(targets["allowed_tmp"])
 outside_dir = Path(targets["outside_dir"])
 
 (ws / "inside.txt").write_text("ok", encoding="utf-8")
-(allowed_tmp / "temp.txt").write_text("ok", encoding="utf-8")
+import os
+own_tmp = Path(os.environ["TMPDIR"])
+(own_tmp / "temp.txt").write_text("ok", encoding="utf-8")
+Path("own_tmp.txt").write_text(str(own_tmp), encoding="utf-8")
 
 outside_blocked = False
 outside_error = None
@@ -185,7 +188,9 @@ def test_b2_macos_allows_workspace_and_temp_writes_but_denies_outside(
     assert result.passed is True, result.reason
     assert result.sandboxed is True
     assert (ws / "inside.txt").read_text(encoding="utf-8") == "ok"
-    assert (allowed_tmp / "temp.txt").read_text(encoding="utf-8") == "ok"
+    own_tmp = Path((ws / "own_tmp.txt").read_text(encoding="utf-8"))
+    assert own_tmp.resolve() != allowed_tmp.resolve()
+    assert not (allowed_tmp / "temp.txt").exists()
     assert not (outside_dir / "escape.txt").exists()
 
 

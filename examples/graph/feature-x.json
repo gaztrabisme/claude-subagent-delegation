@@ -1,0 +1,43 @@
+{
+  "schema": "subagent.graph/1",
+  "id": "feature-x",
+  "version": 1,
+  "description": "Plan, two parallel builds, then a review loop and an owner decision.",
+  "workspace": "worktrees/feature-x",
+  "inputs": {"ticket": "Add the export command"},
+  "budget_usd": 6.0,
+  "defaults": {"provider": "codex", "reserve_usd": 0.8, "timeout_s": 2400},
+  "body": [
+    {"id": "plan", "kind": "task", "role": "planner",
+     "prompt": "Write PLAN.md for: {{ inputs.ticket }}. Put the two package names in .subagent/result.json as {\"packages\": [..]}.",
+     "verification": "test -s PLAN.md"},
+    {"id": "builds", "kind": "parallel", "join": "allSettled", "branches": [
+      {"id": "build_a", "kind": "task", "role": "builder", "workspace": "worktrees/feature-x-a",
+       "prompt": "Build {{ nodes.plan.output.result_json.packages.0 }} per PLAN.md.",
+       "verification": "uv run pytest -q tests/a"},
+      {"id": "build_b", "kind": "task", "role": "builder", "provider": "deepseek",
+       "workspace": "worktrees/feature-x-b",
+       "prompt": "Build {{ nodes.plan.output.result_json.packages.1 }} per PLAN.md.",
+       "verification": "uv run pytest -q tests/b"}
+    ]},
+    {"id": "both_built", "kind": "gate",
+     "condition": {"path": "nodes.builds.output.failed", "op": "eq", "value": 0},
+     "on_failure": "exception"},
+    {"id": "review_loop", "kind": "loop", "max_iterations": 2,
+     "until": {"path": "nodes.review.output.verdict", "op": "eq", "value": "PASS"},
+     "body": [
+       {"id": "review", "kind": "task", "role": "reviewer", "provider": "gemini",
+        "reserve_usd": 0.3,
+        "prompt": "Review the diff of both worktrees; write {\"verdict\": \"PASS\"|\"FAIL\", \"findings\": [..]} to .subagent/result.json.",
+        "verification": "true"},
+       {"id": "fix", "kind": "task", "role": "builder",
+        "when": {"path": "nodes.review.output.verdict", "op": "eq", "value": "FAIL"},
+        "prompt": "Fix these findings: {{ nodes.review.output.result_json.findings }}",
+        "verification": "uv run pytest -q tests"}
+     ]},
+    {"id": "merge_ok", "kind": "owner_decision",
+     "question": "Review passed for {{ inputs.ticket }}. Merge?",
+     "options": ["merge", "hold"], "default": "hold", "timeout_s": 86400}
+  ],
+  "output": {"verdict": "nodes.review.output.verdict", "decision": "nodes.merge_ok.output.answer"}
+}

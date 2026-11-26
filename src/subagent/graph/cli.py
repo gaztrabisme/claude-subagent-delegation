@@ -198,6 +198,8 @@ def _worker(args: argparse.Namespace, settings: Any) -> int:
     from . import temporal_available
     from .server import settings_from
 
+    if args.dispatcher == "fake" and not args.fake_script:
+        raise ValueError("--dispatcher fake requires --fake-script")
     if not temporal_available():
         raise GraphUnavailable("install the graph extra: uv sync --extra graph")
     gs = settings_from(settings)

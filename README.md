@@ -422,6 +422,166 @@ hidden tests passed. Copilot's credits rose about 45%, and runs took longer.
 
 Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](docs/benchmark.md).
 
+## Durable graphs
+
+### What it is
+
+A graph is a JSON document that describes a set of agent steps (`task`), checks (`gate`),
+fan-outs (`parallel`), nested graphs (`subgraph`), owner decisions (`owner_decision`) and bounded
+retries (`loop`). Starting it runs it on a local Temporal server, so a run survives a
+restart of the MCP server, the CLI or the machine. Each task runs through the same providers,
+guard and verification as `delegate`, under a budget and a per-provider slot limit.
+
+Install the extra with `uv sync --extra graph`, and put the Temporal CLI on `PATH` or point the
+`TEMPORAL_BIN` environment variable at it. Without them `graph_validate` still works; every other
+tool and graph CLI verb answers `unavailable` and names the fix.
+
+### Quick start
+
+Write `graph.json`: a plan, two builds in parallel and a review.
+
+```json
+{
+  "schema": "subagent.graph/1",
+  "id": "feature-x",
+  "version": 1,
+  "inputs": {"ticket": "Add the export command"},
+  "budget_usd": 4.0,
+  "defaults": {"provider": "codex", "reserve_usd": 0.8},
+  "body": [
+    {"id": "plan", "kind": "task",
+     "prompt": "Write PLAN.md for: {{ inputs.ticket }}.",
+     "verification": "test -s PLAN.md"},
+    {"id": "builds", "kind": "parallel", "branches": [
+      {"id": "build_a", "kind": "task", "prompt": "Build package A per PLAN.md.",
+       "verification": "uv run pytest -q tests/a"},
+      {"id": "build_b", "kind": "task", "prompt": "Build package B per PLAN.md.",
+       "verification": "uv run pytest -q tests/b"}
+    ]},
+    {"id": "review", "kind": "task", "provider": "gemini",
+     "prompt": "Review the diff and write a verdict to .subagent/result.json.",
+     "verification": "true"}
+  ]
+}
+```
+
+```sh
+subagent graph validate graph.json
+subagent graph start graph.json --input ticket="Add the export command" --budget 4
+subagent graph status ROOT
+```
+
+`validate` prints every problem with its path. `start` prints a `root_run_id`; pass it as `ROOT`.
+A full example with a review loop and an owner decision is in `examples/graph/feature-x.json`.
+Add `--json` to any verb for machine output. Exit codes: 0 ok, 2 invalid input, 3 unavailable,
+4 not found or conflict, 1 otherwise.
+
+### The document
+
+The top level takes `schema` (`"subagent.graph/1"`), `id`, `version`, and optionally
+`description`, `workspace`, `inputs`, `budget_usd`, `defaults`, `graphs` (named reusable bodies),
+`body` and `output`. Unknown keys are errors.
+
+| Kind | What it does |
+|---|---|
+| `task` | One agent step on one provider; needs `prompt` and `verification`. |
+| `gate` | A deterministic check: a `command` run under the guard, or a `condition`. |
+| `parallel` | `branches` or a `for_each` template, joined by `allSettled`, `failFast` or `any`. |
+| `subgraph` | A named or inline body run as a child with its own budget cap. |
+| `owner_decision` | A question with 2 to 10 options that waits for an answer. |
+| `loop` | A body repeated up to `max_iterations` (1 to 10) until a condition holds. |
+
+Every node may carry `when` (a false condition skips it) and `on_failure` (`fail`, `continue` or
+`exception`). A condition is `{"path": P, "op": OP, "value": V}` with `eq ne in gt gte lt lte
+exists truthy`, or `all`, `any` and `not` over conditions. A template is a string with
+`{{ path }}` holes such as `{{ nodes.plan.output.result_json.packages.0 }}` or `{{ inputs.ticket }}`.
+Limits: 200 nodes per body, 500 per graph, 64 branches per `parallel`, subgraph nesting depth 3.
+
+### Budgets
+
+A run has one root cap (`budget_usd` in the document or on the start call, else the `[graph]`
+default) and may draw from a named `pool`. A task reserves `reserve_usd` before it is dispatched;
+when it ends the reservation settles to the actual cost and the rest is released. A subgraph
+takes its own cap out of the parent's remaining budget. Nothing is dispatched that would exceed a
+cap. Providers stop on steps, time and tokens rather than dollars, so a task can cost more than
+its reservation; the overrun is recorded, shown in `graph_status`, and blocks further admission in
+that subtree.
+
+### Lanes
+
+Each provider has a number of slots (its `max_agents`, or `[graph.lanes.<provider>].slots`). A
+task waits for a slot before it starts, ordered by `priority` (1 is most urgent, default 3) and
+then fairly between graphs, so one large graph cannot starve another. A lane that is closed or
+over its usage envelope refuses admission; the task is retried after a backoff when its
+`retry_on` list includes `lane_refused`. There is no automatic failover to another provider: use
+`on_failure: "continue"` and an alternate task guarded by `when`.
+
+### Exceptions
+
+Anything that needs a person lands in one queue: an `owner_decision` node, a node with
+`on_failure: "exception"`, a refused budget, a test change request from a worker. List the queue
+with `subagent graph exceptions --json` or the `graph_exceptions` tool, and answer one with
+`subagent graph answer EXCEPTION_ID ANSWER` or the `graph_answer` tool. The answer is stored in
+the ledger first and then delivered to the run, so it is not lost if the run is busy. An answer
+for an exception that is already answered, or whose run has closed, is refused.
+
+### Operating it
+
+State lives in the graph state directory: `session_root / graph` unless `[graph].state_dir`
+overrides it. It holds the ledger (a SQLite file), the journal, the exception queue and the
+Temporal database. The first call that needs Temporal starts a local dev server there when
+`[graph].autostart` is on; `subagent graph server start`, `stop` and `status` manage it by hand.
+
+Tasks run in a worker process: start one with `subagent graph worker` and leave it running. After
+a restart, start the server and a worker again; open runs continue from their journal, and a task
+that was in flight is re-dispatched or reported as interrupted according to its `retry_on`. A run
+whose workflow is gone from Temporal is marked dead. `subagent graph pause ROOT`, `resume ROOT`
+and `cancel ROOT --reason TEXT` control a run; the same verbs exist as tools.
+
+The tools are `graph_validate`, `graph_start`, `graph_status`, `graph_pause`, `graph_resume`,
+`graph_cancel`, `graph_list`, `graph_exceptions` and `graph_answer`.
+
+### From another project
+
+Put a `[graph]` table in the project's `.subagent/config.toml`:
+
+```toml
+[graph]
+state_dir = "graph-state"     # default: session_root / graph
+autostart = true              # start the local server on first use
+budget_usd = 10.0             # default root cap
+default_reserve_usd = 0.50
+max_depth = 3
+worker_max_tasks = 8
+
+[graph.lanes.codex]
+slots = 2
+
+[graph.pools.nightly]
+budget_usd = 20.0
+```
+
+An orchestrator session calls the nine `graph_*` tools on the `subagent` MCP server. To dry-run a
+graph in a project's own tests without any provider, use `FakeDispatcher`
+(`subagent.graph.dispatch`): it plays scripted steps per node id. The same script format feeds a
+real worker:
+
+```sh
+subagent graph worker --dispatcher fake --fake-script examples/graph/fake-script.json
+```
+
+### Limits and known gaps
+
+- The local Temporal server has no authentication; any local process of the same user can pause
+  or cancel a run. Answers are read from the ledger, not from signals.
+- The worker is not started for you; it stops when the machine sleeps.
+- Live runs on provider CLIs go through the same guard as `delegate`; the offline `fake`
+  dispatcher is the only one covered by the test suite.
+- A killed worker may leave a provider process running; its spend is charged to the reservation.
+- A new Temporal CLI version may need a fresh database, which marks open runs dead.
+- No automatic provider failover, no patching of a running graph, and no reference to another
+  run's nodes.
+
 ## Limitations
 
 - **Guard coverage depends on the driver.** The loop still checkpoints work and verifies tests,

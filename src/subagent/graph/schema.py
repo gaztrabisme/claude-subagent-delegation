@@ -305,7 +305,7 @@ class _Validator:
     def unknown_keys(self, node: Mapping[str, Any], allowed: Sequence[str], path: str) -> None:
         for key in node:
             if key not in allowed:
-                self.add(f"{path}.{key}", "unknown_key", f"unknown key {key!r}")
+                self.add(path, "unknown_key", f"unknown key {key!r}")
 
     def required(self, node: Mapping[str, Any], keys: Sequence[str], path: str) -> None:
         for key in keys:

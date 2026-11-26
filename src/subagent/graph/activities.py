@@ -447,7 +447,7 @@ def bind(ctx: GraphContext, *, queue: str | None = None) -> list[Callable]:
         def work() -> dict:
             record = ctx.exceptions.raise_(**kwargs)
             _trace(ctx, gtrace.write_graph_exception, exception_id=record.exception_id,
-                   root_run_id=record.root_run_id, kind=record.kind, event="raised",
+                   root_run_id=record.root_run_id, exception_kind=record.kind, event="raised",
                    needs_answer=record.needs_answer)
             return record.as_dict()
 

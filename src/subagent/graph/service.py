@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,18 @@ def _error(code: str, message: str, problems: list[dict[str, Any]] | None = None
     if problems is not None:
         error["problems"] = problems
     return {"ok": False, "error": error}
+
+
+def _iso(value: Any) -> Any:
+    """Epoch seconds as an ISO-8601 UTC string ending in Z; anything else unchanged."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    return datetime.fromtimestamp(value, UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _no_extra() -> dict[str, Any] | None:
+    """The `unavailable` error when the graph extra is missing, else None (spec 9)."""
+    return None if temporal_available() else _error("unavailable", INSTALL_HINT)
 
 
 def _problems(err: GraphError) -> list[dict[str, Any]]:
@@ -279,6 +292,8 @@ class GraphService:
         return str((row or {}).get("state") or "running")
 
     async def status(self, root_run_id: str, *, detail: bool = False) -> dict[str, Any]:
+        if (missing := _no_extra()) is not None:
+            return missing
         account = await asyncio.to_thread(self._account_or_none, root_run_id)
         if account is None or account.depth != 0:
             return _error("not_found", f"unknown root run {root_run_id!r}")
@@ -290,10 +305,10 @@ class GraphService:
             "ok": True, "root_run_id": root_run_id, "graph_id": account.graph_id,
             "graph_version": (row or {}).get("graph_version"),
             "state": self._state(view, row, account), "paused": bool(snap.get("paused")),
-            "started_at": view.get("start_time") or (row or {}).get("started_at")
-            or account.created_at,
-            "updated_at": view.get("close_time") or (row or {}).get("updated_at")
-            or account.created_at,
+            "started_at": _iso(view.get("start_time") or (row or {}).get("started_at")
+                               or account.created_at),
+            "updated_at": _iso(view.get("close_time") or (row or {}).get("updated_at")
+                               or account.created_at),
             "budget": self._budget(account),
             "nodes": snap.get("nodes") or (view.get("result") or {}).get("nodes") or {},
             "children": [{"run_path": a.run_path, "state": a.state, "cap_usd": a.cap_usd,
@@ -312,6 +327,8 @@ class GraphService:
     # -- pause, resume, cancel ----
     async def _control(self, root_run_id: str, action: str, *args: Any) -> dict[str, Any] | None:
         """None when the signal was accepted; otherwise the error to return."""
+        if (missing := _no_extra()) is not None:
+            return missing
         account = await asyncio.to_thread(self._account_or_none, root_run_id)
         if account is None or account.depth != 0:
             return _error("not_found", f"unknown root run {root_run_id!r}")
@@ -353,6 +370,8 @@ class GraphService:
 
     # -- list and exceptions ----
     async def list(self, *, state: str | None = None, limit: int = 50) -> dict[str, Any]:
+        if (missing := _no_extra()) is not None:
+            return missing
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
             return _error("invalid_argument", "limit must be an integer from 1 to 500")
 
@@ -368,8 +387,8 @@ class GraphService:
                     continue
                 opened = queue.list(state="open", root_run_id=row["root_run_id"], limit=10_000)
                 out.append({"root_run_id": row["root_run_id"], "graph_id": row["graph_id"],
-                            "state": row["state"], "started_at": row["started_at"],
-                            "updated_at": row["updated_at"], "spent_usd": account.spent_usd,
+                            "state": row["state"], "started_at": _iso(row["started_at"]),
+                            "updated_at": _iso(row["updated_at"]), "spent_usd": account.spent_usd,
                             "cap_usd": account.cap_usd, "open_exceptions": len(opened)})
                 if len(out) >= limit:
                     break
@@ -379,6 +398,8 @@ class GraphService:
 
     async def exceptions(self, *, root_run_id: str | None = None, state: str = "open",
                          kind: str | None = None, limit: int = 100) -> dict[str, Any]:
+        if (missing := _no_extra()) is not None:
+            return missing
         if state not in _EXC_STATES:
             return _error("invalid_argument", f"state must be one of {list(_EXC_STATES)}")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
@@ -395,6 +416,8 @@ class GraphService:
     # -- answer ----
     async def answer(self, exception_id: str, answer: str, *, note: str | None = None,
                      answered_by: str = "orchestrator") -> dict[str, Any]:
+        if (missing := _no_extra()) is not None:
+            return missing
         queue = self.queue
         try:
             record = await asyncio.to_thread(queue.answer, exception_id, answer, note=note,

@@ -141,6 +141,10 @@ app = MCPServer(
     lifespan=_lifespan,
 )
 
+from .graph.mcp_tools import register as _register_graph_tools  # noqa: E402
+
+_register_graph_tools(app)
+
 # How often a wait reports progress back to the client while it blocks.
 PROGRESS_INTERVAL = 3.0
 

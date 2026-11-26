@@ -1,0 +1,10 @@
+{
+  "script": {
+    "plan": [{"status": "completed", "cost_usd": 0.05,
+              "result_json": {"packages": ["exporter", "cli-flag"]}}],
+    "build_a": [{"status": "completed", "cost_usd": 0.10}],
+    "build_b": [{"status": "completed", "cost_usd": 0.10}],
+    "review": [{"status": "completed", "cost_usd": 0.05, "result_json": {"verdict": "PASS", "findings": []}}]
+  },
+  "default": {"status": "completed", "cost_usd": 0.01}
+}

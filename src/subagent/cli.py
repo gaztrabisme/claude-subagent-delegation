@@ -1115,6 +1115,9 @@ def _parser() -> argparse.ArgumentParser:
 
     providers_command.register(sub)
     install_command.register(sub)
+    from .graph.cli import add_graph_parser
+
+    add_graph_parser(sub)
 
     _loop_parsers(sub)
     return parser

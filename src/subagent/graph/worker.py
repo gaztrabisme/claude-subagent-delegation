@@ -155,7 +155,7 @@ async def deliver(client: Client, ctx: GraphContext, record: Any) -> bool:
     if ctx.trace is not None:
         gtrace.write_graph_exception(
             ctx.trace, exception_id=record.exception_id, root_run_id=record.root_run_id,
-            kind=record.kind, event="delivered", needs_answer=record.needs_answer)
+            exception_kind=record.kind, event="delivered", needs_answer=record.needs_answer)
     return True
 
 

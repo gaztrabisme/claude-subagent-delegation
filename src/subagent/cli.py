@@ -954,8 +954,19 @@ def cmd_promote(args: argparse.Namespace) -> int:
         return 1
     from .promote import PromoteError, promote
 
+    if args.no_probe:
+        print("warning: lane probes skipped (--no-probe)")
     try:
-        result = promote(root, args.commit, settings, force=args.force)
+        result = promote(
+            root,
+            args.commit,
+            settings,
+            force=args.force,
+            require_routes=True,
+            probe=not args.no_probe,
+            skip_probe=args.skip_probe or (),
+            allow_failed=args.allow_failed or (),
+        )
     except PromoteError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return exc.code
@@ -1086,6 +1097,17 @@ def _parser() -> argparse.ArgumentParser:
     promote_command.add_argument("commit", metavar="COMMIT")
     promote_command.add_argument(
         "--force", action="store_true", help="promote even while lanes have live runs"
+    )
+    promote_command.add_argument(
+        "--no-probe", action="store_true", help="do not probe the configured cloud lanes"
+    )
+    promote_command.add_argument(
+        "--skip-probe", metavar="NAME", action="append",
+        help="do not probe this provider (repeatable)",
+    )
+    promote_command.add_argument(
+        "--allow-failed-lane", dest="allow_failed", metavar="NAME", action="append",
+        help="promote even when this lane's probe fails (repeatable)",
     )
 
     sub.add_parser("report", help="summarize a trace into tables and an HTML dashboard",

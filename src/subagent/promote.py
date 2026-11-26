@@ -14,8 +14,10 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from subprocess import TimeoutExpired
 from subprocess import run as _subprocess_run
 from typing import Any
 from urllib.parse import urlsplit
@@ -133,6 +135,68 @@ def _install(
         )
 
 
+PROBE_HINT = (
+    "; fix the lane, or pass --allow-failed-lane NAME or --skip-probe NAME"
+)
+
+
+def _first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _probe_lane(name: str, runner: Any) -> tuple[bool, str]:
+    """Run one doctor prompt for `name`; return (passed, failure detail)."""
+    try:
+        result = runner(
+            [sys.executable, "-m", "subagent", "doctor",
+             "--provider", name, "--prompt"],
+            capture_output=True,
+            text=True,
+            timeout=400,
+        )
+    except TimeoutExpired as exc:
+        return False, _first_line(str(exc)) or "timeout"
+    if result.returncode == 0:
+        return True, ""
+    detail = _first_line(getattr(result, "stderr", "") or "")
+    if not detail:
+        detail = _first_line(getattr(result, "stdout", "") or "")
+    if not detail:
+        detail = f"exit {result.returncode}"
+    return False, detail
+
+
+def _probe_lanes(
+    settings: Settings,
+    runner: Any,
+    skip_probe: Iterable[str],
+    allow_failed: Iterable[str],
+) -> None:
+    """Probe each non-local lane once; refuse the promotion if one fails."""
+    skip = set(skip_probe)
+    allowed = set(allow_failed)
+    failures = []
+    for name, cfg in settings.providers.items():
+        if cfg.local:
+            continue
+        if name in skip:
+            print(f"warning: lane probe skipped for {name}")
+            continue
+        passed, detail = _probe_lane(name, runner)
+        if passed:
+            continue
+        if name in allowed:
+            print(f"warning: lane probe failed for {name}, allowed")
+            continue
+        failures.append(f"lane probe failed: {name} ({detail})")
+    if failures:
+        raise PromoteError("; ".join(failures) + PROBE_HINT)
+
+
 def promote(
     repo: Path,
     commit: str,
@@ -140,11 +204,19 @@ def promote(
     *,
     force: bool = False,
     require_routes: bool = False,
+    probe: bool = False,
+    skip_probe: Iterable[str] = (),
+    allow_failed: Iterable[str] = (),
     runner: Any = _subprocess_run,
 ) -> dict[str, Any]:
     """Install `commit` from `repo` and record it in ``served.json``."""
     repo = Path(repo).resolve()
     sha = _resolve(repo, commit, runner)
+    skip_probe = tuple(skip_probe)
+    allow_failed = tuple(allow_failed)
+    for name in (*skip_probe, *allow_failed):
+        if name not in settings.providers:
+            raise PromoteError(f"unknown provider {name}")
     if require_routes:
         missing = missing_routes(settings)
         if missing:
@@ -171,6 +243,8 @@ def promote(
         print(f"warning: live runs on {', '.join(live)}; promoting anyway")
     install_root.mkdir(parents=True, exist_ok=True)
     _install(repo, sha, install_root, runner)
+    if probe:
+        _probe_lanes(settings, runner, skip_probe, allow_failed)
     payload = {
         "commit": sha,
         "install_path": str(install_root),

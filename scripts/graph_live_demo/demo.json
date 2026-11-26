@@ -3,30 +3,76 @@
   "id": "graph-live-demo",
   "version": 1,
   "description": "Plan, two parallel builds (add, mul), a review and a join gate. Used by run_demo.py.",
-  "inputs": {"provider": "omlx", "budget_usd": 0.5},
+  "inputs": {
+    "provider": "omlx",
+    "budget_usd": 0.5
+  },
   "budget_usd": 0.5,
-  "defaults": {"provider": "omlx", "max_steps": 30, "timeout_s": 600, "retries": 1,
-               "reserve_usd": 0.1},
+  "defaults": {
+    "provider": "omlx",
+    "max_steps": 20,
+    "timeout_s": 600,
+    "retries": 1,
+    "reserve_usd": 0.02
+  },
   "body": [
-    {"id": "plan", "kind": "task", "role": "planner",
-     "prompt": "In this project, write PLAN.md listing exactly two functions to implement: add(a, b) in ops_add.py and mul(a, b) in ops_mul.py (return the sum and the product). Do not implement them.",
-     "verification": "test -s PLAN.md && grep -q add PLAN.md && grep -q mul PLAN.md"},
-    {"id": "builds", "kind": "parallel", "join": "allSettled", "branches": [
-      {"id": "build_add", "kind": "task", "role": "builder",
-       "prompt": "Follow PLAN.md. Implement add(a, b) in ops_add.py only; touch no other file. Run: python3 -m pytest -q tests/test_calc.py -k add",
-       "verification": "python3 -m pytest -q tests/test_calc.py -k add"},
-      {"id": "build_mul", "kind": "task", "role": "builder",
-       "prompt": "Follow PLAN.md. Implement mul(a, b) in ops_mul.py only; touch no other file. Run: python3 -m pytest -q tests/test_calc.py -k mul",
-       "verification": "python3 -m pytest -q tests/test_calc.py -k mul"}
-    ]},
-    {"id": "review", "kind": "task", "role": "reviewer",
-     "prompt": "Read ops_add.py, ops_mul.py and PLAN.md. Write REVIEW.md whose last line is exactly 'VERDICT: PASS' or 'VERDICT: FAIL'.",
-     "verification": "grep -Eq '^VERDICT: (PASS|FAIL)$' REVIEW.md"},
-    {"id": "joined", "kind": "gate",
-     "condition": {"all": [
-       {"path": "nodes.build_add.status", "op": "eq", "value": "completed"},
-       {"path": "nodes.build_mul.status", "op": "eq", "value": "completed"}]}}
+    {
+      "id": "plan",
+      "kind": "task",
+      "role": "planner",
+      "prompt": "In this project, write PLAN.md listing exactly two functions to implement: add(a, b) in ops_add.py and mul(a, b) in ops_mul.py (return the sum and the product). Do not implement them.",
+      "verification": "test -s PLAN.md && grep -q add PLAN.md && grep -q mul PLAN.md"
+    },
+    {
+      "id": "builds",
+      "kind": "parallel",
+      "join": "allSettled",
+      "branches": [
+        {
+          "id": "build_add",
+          "kind": "task",
+          "role": "builder",
+          "prompt": "Follow PLAN.md. Implement add(a, b) in ops_add.py only; touch no other file. Run: python3 -m pytest -q tests/test_calc.py -k add",
+          "verification": "python3 -m pytest -q tests/test_calc.py -k add"
+        },
+        {
+          "id": "build_mul",
+          "kind": "task",
+          "role": "builder",
+          "prompt": "Follow PLAN.md. Implement mul(a, b) in ops_mul.py only; touch no other file. Run: python3 -m pytest -q tests/test_calc.py -k mul",
+          "verification": "python3 -m pytest -q tests/test_calc.py -k mul"
+        }
+      ]
+    },
+    {
+      "id": "review",
+      "kind": "task",
+      "role": "reviewer",
+      "prompt": "Read ops_add.py, ops_mul.py and PLAN.md. Write REVIEW.md whose last line is exactly 'VERDICT: PASS' or 'VERDICT: FAIL'.",
+      "verification": "grep -Eq '^VERDICT: (PASS|FAIL)$' REVIEW.md"
+    },
+    {
+      "id": "joined",
+      "kind": "gate",
+      "condition": {
+        "all": [
+          {
+            "path": "nodes.build_add.status",
+            "op": "eq",
+            "value": "completed"
+          },
+          {
+            "path": "nodes.build_mul.status",
+            "op": "eq",
+            "value": "completed"
+          }
+        ]
+      }
+    }
   ],
-  "output": {"add": "nodes.build_add.status", "mul": "nodes.build_mul.status",
-             "gate": "nodes.joined.status"}
+  "output": {
+    "add": "nodes.build_add.status",
+    "mul": "nodes.build_mul.status",
+    "gate": "nodes.joined.status"
+  }
 }

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import pytest
+
 from subagent.graph.journal import Journal, JournalEntry, JournalError
 
 from ._helpers import make_store

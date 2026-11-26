@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from subagent.graph import ids
 from subagent.graph.ledger import Account, BudgetRefused
 

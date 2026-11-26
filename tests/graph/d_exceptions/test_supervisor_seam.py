@@ -41,7 +41,6 @@ def test_no_client_session_has_no_elicitation_or_capability_methods():
 
 def test_agent_supervisor_on_a_no_client_session_runs_the_agent_tier(tmp_path):
     from subagent.graph.exceptions import NoClientSession
-
     from subagent.guard.classify import ALLOW
     from subagent.guard.supervisor import Supervisor
 
@@ -59,7 +58,6 @@ def test_agent_supervisor_on_a_no_client_session_runs_the_agent_tier(tmp_path):
 
 def test_agent_supervisor_denial_is_a_verdict_not_a_queue_record(tmp_path):
     from subagent.graph.exceptions import NoClientSession
-
     from subagent.guard.classify import DENY
     from subagent.guard.supervisor import Supervisor
 
@@ -75,7 +73,6 @@ def test_agent_supervisor_denial_is_a_verdict_not_a_queue_record(tmp_path):
 @pytest.mark.parametrize("mode", ["auto", "elicitation", "sampling"])
 def test_without_an_agent_reviewer_escalation_denies_at_the_deterministic_tier(tmp_path, mode):
     from subagent.graph.exceptions import NoClientSession
-
     from subagent.guard.classify import DENY
     from subagent.guard.supervisor import Supervisor
 

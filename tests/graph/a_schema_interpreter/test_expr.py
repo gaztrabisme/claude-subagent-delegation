@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from subagent.graph.expr import MISSING, ExprError, check, evaluate, references, render, resolve
 
 SCOPE = {

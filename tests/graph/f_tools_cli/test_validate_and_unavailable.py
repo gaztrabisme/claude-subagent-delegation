@@ -17,6 +17,7 @@ INSTALL_HINT = "uv sync --extra graph"
 
 def _tools(tmp_path):
     from subagent.graph.mcp_tools import register
+
     from subagent.graph.server import GraphSettings
     from subagent.graph.service import GraphService
 

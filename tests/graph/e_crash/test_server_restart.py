@@ -10,14 +10,14 @@ from ._cluster import crash_graph, task_node, task_statuses, wait_for
 
 
 def pause_graph():
-    return {"schema": "subagent.graph/1", "id": "pausing", "version": 1,
+    return {"schema": "subagent.graph/1", "id": "pausing", "version": 1, "budget_usd": 5.0,
             "defaults": {"provider": "codex", "reserve_usd": 0.5},
             "body": [task_node("p1", "codex"), task_node("p2", "codex"), task_node("p3", "codex")],
             "output": {"p3": "nodes.p3.status"}}
 
 
 def decision_graph():
-    return {"schema": "subagent.graph/1", "id": "deciding", "version": 1,
+    return {"schema": "subagent.graph/1", "id": "deciding", "version": 1, "budget_usd": 5.0,
             "defaults": {"provider": "codex", "reserve_usd": 0.5},
             "body": [task_node("d1", "codex"),
                      {"id": "ask", "kind": "owner_decision", "question": "Ship it?",

@@ -6,6 +6,7 @@ import json
 import time
 
 import pytest
+
 from subagent.graph.dispatch import FakeDispatcher, FakeStep
 from subagent.graph.interpreter import STATUSES, GraphInput, GraphResult, NodeResult
 
@@ -588,9 +589,8 @@ def test_condition_gate_on_failure_continue(settings):
 
 
 def _stub_verification(monkeypatch, passed, calls):
-    from subagent.graph import local as local_module
-
     from subagent import verify
+    from subagent.graph import local as local_module
 
     def stub(command, workspace, settings, budget=None):
         calls.append((command, workspace))

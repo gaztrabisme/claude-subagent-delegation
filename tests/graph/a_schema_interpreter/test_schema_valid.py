@@ -8,6 +8,7 @@ import json
 import sys
 
 import pytest
+
 from subagent.graph import SCHEMA_ID, Graph, GraphError, Problem, graph_hash, load_graph, validate
 from subagent.graph.schema import parse
 

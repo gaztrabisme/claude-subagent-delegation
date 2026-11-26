@@ -11,17 +11,17 @@ from subagent.telemetry.trace import SCHEMA, Trace
 REQUIRED = {
     "graph_run": {"root_run_id", "run_path", "graph_id", "graph_hash", "event", "state",
                   "depth", "cap_usd", "spent_usd"},
-    "graph_node": {"root_run_id", "run_path", "node_id", "kind", "scope", "status", "attempts",
+    "graph_node": {"root_run_id", "run_path", "node_id", "node_kind", "scope", "status", "attempts",
                    "request_id", "cost_usd", "error"},
     "graph_admission": {"root_run_id", "attempt_id", "lane", "event", "reason", "active", "cap"},
     "graph_budget": {"run_path", "attempt_id", "event", "amount_usd", "cost_source",
                      "remaining_usd"},
-    "graph_exception": {"exception_id", "root_run_id", "kind", "event", "needs_answer"},
+    "graph_exception": {"exception_id", "root_run_id", "exception_kind", "event", "needs_answer"},
 }
 SAMPLE = {
     "root_run_id": "gr-000000000001", "run_path": "gr-000000000001", "graph_id": "g",
     "graph_hash": "h" * 64, "event": "started", "state": "running", "depth": 0, "cap_usd": 5.0,
-    "spent_usd": 0.0, "node_id": "plan", "kind": "task", "scope": "plan", "status": "completed",
+    "spent_usd": 0.0, "node_id": "plan", "node_kind": "task", "exception_kind": "needs_owner", "scope": "plan", "status": "completed",
     "attempts": 1, "request_id": "gr-000000000001/plan", "cost_usd": 0.1, "error": None,
     "attempt_id": "gr-000000000001/plan#a1", "lane": "codex", "reason": None, "active": 1,
     "cap": 2, "amount_usd": 0.5, "cost_source": "reservation", "remaining_usd": 4.5,
@@ -71,6 +71,12 @@ def test_writer_emits_exactly_required_keys_plus_common(tmp_path, kind):
     assert isinstance(record["ts"], (int, float))
     for key, value in fields_for(kind).items():
         assert record[key] == value
+    # the record's own "kind" is the graph kind; the node/exception kind lives in a renamed key
+    if kind == "graph_node":
+        assert record["kind"] == "graph_node" and record["node_kind"] == SAMPLE["node_kind"]
+    if kind == "graph_exception":
+        assert record["kind"] == "graph_exception"
+        assert record["exception_kind"] == SAMPLE["exception_kind"]
 
 
 @pytest.mark.parametrize("kind", sorted(REQUIRED))

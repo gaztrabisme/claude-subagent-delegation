@@ -57,9 +57,10 @@ class Cluster:
         self.prefix = gsettings.task_queue_prefix
 
     async def __aenter__(self):
+        from temporalio.worker import Worker
+
         from subagent.graph.activities import bind
         from subagent.graph.workflow import GraphWorkflow
-        from temporalio.worker import Worker
 
         activities = bind(self.ctx)
         self._graph = Worker(self.env.client, task_queue=f"{self.prefix}-graph",
@@ -123,7 +124,8 @@ def test_worked_example_same_graph_result_as_local_runtime(graph_settings, tmp_p
     require_temporal()
     (tmp_path / "x").mkdir()
     local, _, _ = run_graph(graph_settings, worked_example(), fd(worked_script()),
-                            answers=answer_with("merge"), exceptions=make_queue(tmp_path / "x"))
+                            answers=answer_with("merge", by="orchestrator"),
+                            exceptions=make_queue(tmp_path / "x"))
 
     async def go():
         async with start_local(tmp_path) as env:
@@ -190,8 +192,9 @@ def test_replay_of_recorded_history_is_deterministic(graph_settings, tmp_path):
     require_temporal()
 
     async def go():
-        from subagent.graph.workflow import GraphWorkflow
         from temporalio.worker import Replayer
+
+        from subagent.graph.workflow import GraphWorkflow
 
         async with start_local(tmp_path) as env:
             ctx, gs = build_context(graph_settings, tmp_path / "t", fd(worked_script()),

@@ -198,10 +198,9 @@ class Cluster:
     # --- clients and state --------------------------------------------------
 
     def service(self):
+        from subagent import config
         from subagent.graph.server import settings_from
         from subagent.graph.service import GraphService
-
-        from subagent import config
 
         settings = config.load(extra=self.config_path)
         gs = settings_from(settings, raw=config.read_config(extra=self.config_path)["graph"])

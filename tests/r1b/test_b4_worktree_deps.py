@@ -96,7 +96,7 @@ def test_b4_parallel_worktrees_have_no_dependency_symlinks(tmp_path: Path, monke
     lock = threading.Lock()
 
     class InspectingWorker:
-        def __init__(self, server, proj, test_cmd, guard=None, live=None):
+        def __init__(self, server, proj, test_cmd, guard=None, live=None, override_envelope=None):
             self.proj = proj
             self.agent = None
             self.run = None
@@ -143,7 +143,7 @@ def test_b4_install_in_one_worktree_does_not_mutate_root_or_sibling(
     sibling_saw_mutation: list[str] = []
 
     class MutatingWorker:
-        def __init__(self, server, proj, test_cmd, guard=None, live=None):
+        def __init__(self, server, proj, test_cmd, guard=None, live=None, override_envelope=None):
             self.proj = proj
             self.agent = None
             self.run = None

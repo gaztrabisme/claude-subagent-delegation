@@ -23,22 +23,29 @@ pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS
 _PROBE = HEADER + """
 import socket
 
-def status_line(port, target):
+def exchange(port, payload):
+    # Classify what a client sees after the TCP connect to the proxy succeeded.
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=5.0) as s:
-            s.settimeout(5.0)
-            s.sendall(f"CONNECT {target} HTTP/1.1\\r\\nHost: {target}\\r\\n\\r\\n".encode())
+        s = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    except OSError as exc:
+        return f"connect-failed:{type(exc).__name__}:{exc.errno}"
+    with s:
+        s.settimeout(3.0)
+        try:
+            s.sendall(payload)
             data = b""
             while b"\\r\\n" not in data:
                 chunk = s.recv(1024)
                 if not chunk:
                     break
                 data += chunk
-            return data.split(b"\\r\\n", 1)[0].decode("latin-1") or "closed"
-    except PermissionError as exc:
-        return f"PermissionError:{exc.errno}"
-    except OSError as exc:
-        return f"OSError:{exc.errno}"
+        except ConnectionResetError:
+            return "reset"
+        except socket.timeout:
+            return "timeout"
+        except OSError as exc:
+            return f"post-connect-error:{type(exc).__name__}"
+        return data.split(b"\\r\\n", 1)[0].decode("latin-1") or "closed"
 
 def try_connect(port):
     try:
@@ -47,7 +54,13 @@ def try_connect(port):
     except OSError as exc:
         return f"{type(exc).__name__}:{exc.errno}"
 
-R["proxy"] = status_line(T["proxy_port"], T["target"])
+up = T["target"]
+R["connect"] = exchange(
+    T["proxy_port"], f"CONNECT {up} HTTP/1.1\\r\\nHost: {up}\\r\\n\\r\\n".encode()
+)
+R["plain"] = exchange(
+    T["proxy_port"], f"GET http://{up}/ HTTP/1.1\\r\\nHost: {up}\\r\\nConnection: close\\r\\n\\r\\n".encode()
+)
 own = socket.socket()
 own.bind(("127.0.0.1", 0))
 own.listen(1)
@@ -120,18 +133,24 @@ def _settle() -> None:
 
 
 def test_rf6a_verification_gets_no_route_through_foreign_egress_proxy(tmp_path, monkeypatch) -> None:
-    """RF6a: a proxy whose allowed pids exclude verification gives the probe no 200 and no upstream connection."""
-    with _proxy_and_upstream(lambda: {os.getpid()}, monkeypatch, register=True) as (port, upstream):
+    """RF6a: a proxy whose allowed pids exclude verification refuses CONNECT and plain HTTP; upstream sees nothing.
+
+    The proxy port is deliberately NOT registered in sandbox.live_egress_ports():
+    the pid check alone must produce the refusal, not the Seatbelt port deny.
+    """
+    with _proxy_and_upstream(lambda: {os.getpid()}, monkeypatch, register=False) as (port, upstream):
         _, result, data = run_script(
             tmp_path, _PROBE, targets={"proxy_port": port, "target": f"127.0.0.1:{upstream.port}"}
         )
         _settle()
         accepted = upstream.accepted
     assert result.sandboxed is True
-    proxy = data.get("proxy", "")
-    assert proxy, data
-    assert " 200" not in proxy and not proxy.startswith("HTTP/1.1 2"), data
-    assert proxy.startswith(("PermissionError", "OSError", "closed", "HTTP/1.1 403")), data
+    for key in ("connect", "plain"):
+        seen = data.get(key, "")
+        assert seen, data
+        assert not seen.startswith("HTTP/1.1 2"), (key, data)
+        # Refused by the proxy after the TCP connect: a 403, a close, a reset or a timeout.
+        assert seen.startswith("HTTP/1.1 403") or seen in {"closed", "reset", "timeout"}, (key, data)
     assert accepted == 0, f"upstream saw {accepted} connection(s) via foreign proxy"
     assert data.get("own") == "connected", data
 
@@ -143,6 +162,21 @@ def test_rf6b_client_in_allowed_pids_gets_route(monkeypatch) -> None:
         _settle()
         accepted = upstream.accepted
     assert status.startswith("HTTP/1.1 200"), status
+    assert accepted == 1
+
+
+def test_rf6b2_plain_http_from_allowed_pid_reaches_upstream(monkeypatch) -> None:
+    """RF6b2: positive control for the plain-HTTP path: an allowed pid's absolute-form GET reaches upstream."""
+    with (
+        _proxy_and_upstream(lambda: {os.getpid()}, monkeypatch, register=False) as (port, upstream),
+        socket.create_connection(("127.0.0.1", port), timeout=5.0) as s,
+    ):
+        s.sendall(
+            f"GET http://127.0.0.1:{upstream.port}/ HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{upstream.port}\r\nConnection: close\r\n\r\n".encode()
+        )
+        _settle()
+        accepted = upstream.accepted
     assert accepted == 1
 
 

@@ -166,10 +166,14 @@ def provider_homes(settings) -> tuple[str, ...]:
 
 def provider_guard_context(settings) -> dict[str, list[str]]:
     """Build the settings-derived guard context shared by agents and callers."""
+    claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
+    claude_config_dirs = [str((Path(claude_config).expanduser() if claude_config else
+                               _home() / ".claude").resolve())]
     return {
         "secret_env_names": list(settings.guard_secret_env_names),
         "secret_files": [str(path) for path in provider_secret_files(settings)],
         "provider_homes": list(provider_homes(settings)),
+        "claude_config_dirs": claude_config_dirs,
     }
 
 
@@ -354,6 +358,7 @@ def _secret_paths(context: dict | None = None) -> tuple[Path, ...]:
         paths = list(_provider_secret_files) if declared is None else []
         paths.extend(Path(value) for value in (declared or ()))
         homes = tuple(context.get("provider_homes", _provider_homes))
+        paths.extend(Path(value) for value in (context.get("claude_config_dirs") or ()))
     paths.extend(_temporary_roots())
     for home in homes:
         paths.append(_home() / home)
@@ -482,6 +487,13 @@ def is_sensitive(path: Path, context: dict | None = None, *, provider: bool = Tr
     """
     if provider and _provider_secret(path, context):
         return "configured provider credential files are off-limits to a delegated agent"
+    if context:
+        for raw in context.get("claude_config_dirs") or ():
+            if _under_folded(path, frozenset({Path(raw)})):
+                return (
+                    "the owner's Claude configuration directory is off-limits "
+                    "to a delegated agent"
+                )
     name = path.name.lower()
     if name in SENSITIVE_NAMES or name.startswith(".env."):
         return f"{path.name} carries credentials"
@@ -773,6 +785,14 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
         return Verdict(ALLOW, "empty command", facts)
     if SECRET_ENV.search(command) or _reads_secret_environment(command, tokens, context):
         return Verdict(DENY, "refused: reads the child's API key from its environment", facts)
+    if re.search(r"\$\{\s*!", command):
+        return Verdict(
+            DENY, "refused: indirect shell expansion cannot be cleared of secrets", facts
+        )
+    for index, token in enumerate(tokens[:-1]):
+        target = tokens[index + 1]
+        if token in REDIRECTS and target.startswith(("/dev/tcp/", "/dev/udp/")):
+            return Verdict(DENY, "refused: shell network redirection", facts)
 
     segments, unsupported = _split(tokens)
     substitution = bool(SUBSTITUTION.search(command))
@@ -793,6 +813,8 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
 
     separate_segments = len(segments) > 1 and unsupported is None and not substitution
     leaked = _sensitive_argument(argv, cwd, context)
+    if leaked is None:
+        leaked = _sensitive_shell_operand(command, cwd, context)
     if not separate_segments:
         leaked = _shell_provider_secret(command, workspace, cwd, context) or leaked
     if leaked is not None:
@@ -865,6 +887,8 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
     if base in READ_ONLY:
         exposed = _read_only_exposure(base, words)
         if exposed is not None:
+            if base == "ps":
+                return Verdict(DENY, f"refused: {exposed}", facts)
             return Verdict(ESCALATE, exposed, facts)
         return Verdict(ALLOW, f"`{base}` is read-only", facts)
     if base == "git":
@@ -878,7 +902,7 @@ def classify_bash(command: str, workspace: Path, cwd: Path | None = None,
             return Verdict(ESCALATE, refused, facts)
         return Verdict(ALLOW, "test or build runner", facts)
     if base in INTERPRETERS:
-        return _classify_interpreter(base, words, tokens, workspace, cwd, facts)
+        return _classify_interpreter(base, words, tokens, workspace, cwd, facts, context)
     runner, refused = _package_runner(base, words, workspace, cwd)
     if refused is not None:
         return Verdict(ESCALATE, refused, facts)
@@ -1129,6 +1153,12 @@ def _read_only_exposure(base: str, words: list[str]) -> str | None:
     """Why a read-only verb is not read-only as written, or None."""
     rest = words[1:]
     letters = _short_letters(rest)
+    if base == "ps" and any(
+        "e" in (arg[1:] if arg.startswith("-") else arg).lower()
+        and (arg.startswith("-") or (arg.isalpha() and not arg.startswith("--")))
+        for arg in rest
+    ):
+        return "`ps` environment output exposes other processes' credentials"
     if base == "find":
         action = next((w for w in rest if w in FIND_ACTIONS), None)
         if action:
@@ -1274,7 +1304,8 @@ def _package_runner(
 
 
 def _classify_interpreter(
-    base: str, argv: list[str], tokens: list[str], workspace: Path, cwd: Path, facts: dict
+    base: str, argv: list[str], tokens: list[str], workspace: Path, cwd: Path, facts: dict,
+    context: dict | None = None,
 ) -> Verdict:
     """`python foo.py` where foo.py is the agent's own work is routine.
 
@@ -1331,6 +1362,11 @@ def _classify_interpreter(
     if _unresolvable(script) or "://" in script:
         return Verdict(ESCALATE, f"`{base}` script {script} cannot be resolved", facts)
     path = _resolve(script, cwd)
+    secret_reason = is_sensitive(path, context)
+    if secret_reason is None and _provider_secret(path, context):
+        secret_reason = "configured provider credential files are off-limits to a delegated agent"
+    if secret_reason:
+        return Verdict(DENY, f"refused: {secret_reason}", {**facts, "script": str(path)})
     if not (_inside_both(path, workspace) and path.resolve().is_file()):
         facts["scripts_outside_workspace"] = [str(path)]
         return Verdict(
@@ -1683,14 +1719,100 @@ def _sensitive_argument(
             if value.startswith("~") and _unresolvable(value):
                 return value, f"{value} cannot be resolved, so it cannot be cleared"
             value = _expand_home(value)
+            path = _resolve(value, cwd)
             if not _path_like(value):
-                continue
+                try:
+                    if not path.exists() and not path.is_symlink():
+                        continue
+                except OSError:
+                    continue
             if UNEXPANDED.search(value):
                 continue
-            path = _resolve(value, cwd)
             why = is_sensitive(path, context, provider=False)
             if why:
                 return path, why
+    return None
+
+
+def _sensitive_roots(context: dict | None) -> tuple[Path, ...]:
+    """Protected roots that recursive reads and shell globs may reach."""
+    roots = [_home() / item for item in SENSITIVE_HOME]
+    homes = _provider_homes if context is None else tuple(
+        context.get("provider_homes", _provider_homes)
+    )
+    roots.extend(_home() / item for item in homes)
+    if context:
+        roots.extend(Path(value) for value in (context.get("claude_config_dirs") or ()))
+        roots.extend(Path(value) for value in (context.get("secret_files") or ()))
+    else:
+        roots.extend(_provider_secret_files)
+    return tuple(dict.fromkeys(roots))
+
+
+def _root_contains_sensitive(path: Path, roots: tuple[Path, ...]) -> bool:
+    candidates = [path]
+    with suppress(OSError, RuntimeError):
+        candidates.append(path.resolve())
+    for candidate in candidates:
+        parts = _folded_parts(candidate)
+        for root in roots:
+            root_parts = _folded_parts(root)
+            if len(parts) <= len(root_parts) and root_parts[:len(parts)] == parts:
+                return True
+    return False
+
+
+def _sensitive_shell_operand(
+    command: str, cwd: Path, context: dict | None,
+) -> tuple[Path | str, str] | None:
+    """Resolve command-specific read operands, including bare symlinks and globs."""
+    try:
+        paths, recursive_roots = shell_paths.operands(command)
+    except (ValueError, shell_paths.CurlFileSyntaxError):
+        return None
+    protected_roots = _sensitive_roots(context)
+
+    def expanded(pattern: str) -> str | None:
+        if pattern.startswith("~"):
+            head = pattern.split("/", 1)[0]
+            try:
+                pattern = str(Path(head).expanduser()) + pattern[len(head):]
+            except RuntimeError:
+                return None
+        elif pattern.startswith("$HOME") or pattern.startswith("${HOME}"):
+            pattern = _expand_home(pattern)
+        if UNEXPANDED.search(shell_paths.active_pattern(pattern)):
+            return None
+        return pattern if pattern.startswith("/") else str(cwd / pattern)
+
+    for word, _recursive in paths:
+        pattern = shell_paths.literal_value(word.pattern)
+        target = expanded(pattern)
+        if target is None:
+            continue
+        candidates = [Path(target)]
+        patterns, exhausted = shell_paths.brace_patterns(target)
+        if exhausted and _root_contains_sensitive(Path(_glob_root(target)), protected_roots):
+            return Path(target), "shell glob may reach a protected credential path"
+        for concrete in patterns:
+            if any(char in shell_paths.active_pattern(concrete) for char in "*?[<"):
+                found, _ = shell_paths.bounded_glob(concrete)
+                candidates.extend(found)
+        for candidate in candidates:
+            # Declared provider secret files are judged by
+            # _shell_provider_secret, which follows `cd` and shell quoting.
+            why = is_sensitive(candidate, context, provider=False)
+            if why:
+                return candidate, why
+    for word in recursive_roots:
+        target = expanded(shell_paths.literal_value(word.pattern))
+        if target is None:
+            continue
+        root = Path(target)
+        if _root_contains_sensitive(root, protected_roots):
+            return root, "recursive search includes a protected credential path"
+        if _provider_secret(root, context, recursive=True):
+            return root, "recursive search includes configured provider credential files"
     return None
 
 

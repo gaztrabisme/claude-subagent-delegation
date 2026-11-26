@@ -32,6 +32,7 @@ the dangerous ones never depend on a model and the routine ones cost nothing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -103,6 +104,12 @@ class Supervisor:
         # Denials keyed by agent id, drained by the loop after each run.
         self.denials: dict[str, list[dict[str, Any]]] = {}
         self._used_nonces: dict[str, set[str]] = {}
+        register = getattr(registry, "register_agent_cleanup", None)
+        if callable(register):
+            register(self._drop_agent_memory)
+
+    def _drop_agent_memory(self, agent_id: str) -> None:
+        self._used_nonces.pop(agent_id, None)
 
     # -- session binding ------------------------------------------------
 
@@ -153,15 +160,15 @@ class Supervisor:
         plus the agent's guard context (protected paths, .subagent allowlist).
         """
         del fallback  # Caller supplied workspaces are never an authority.
-        if not agent_id or self.registry is None:
+        if not isinstance(agent_id, str) or not agent_id or self.registry is None:
             raise ValueError("approval request does not name a live agent")
         agent = self.registry.find_agent(agent_id)
         if agent is None or getattr(agent, "closed", False):
             raise ValueError("approval request does not name a live agent")
-        return (
-            agent.workspace,
-            getattr(agent, "guard_context", None) or self.default_guard_context,
-        )
+        guard_context = getattr(agent, "guard_context", None)
+        if not isinstance(guard_context, dict) or not guard_context:
+            raise ValueError("live agent has no guard context")
+        return agent.workspace, guard_context
 
     async def decide(
         self,
@@ -385,6 +392,8 @@ class Supervisor:
                 agent_id = request.get("agent_id")
                 if isinstance(agent_id, str) and agent_id and self.registry is not None:
                     agent = self.registry.find_agent(agent_id)
+                if agent is not None and getattr(agent, "closed", False):
+                    self._drop_agent_memory(agent_id)
                 nonce = request.get("nonce")
                 known_key = getattr(agent, "approval_key", None) if agent is not None else None
                 if (agent is None or getattr(agent, "closed", False) or not valid_nonce(nonce)
@@ -405,11 +414,27 @@ class Supervisor:
                     })
                     await stream.send((json.dumps(reply) + "\n").encode())
                     return
+                if len(used) >= 100_000:
+                    reply = sign(agent.approval_key, {
+                        "action": DENY,
+                        "reason": "denied: approval nonce memory is full",
+                        "nonce": nonce,
+                    })
+                    await stream.send((json.dumps(reply) + "\n").encode())
+                    return
                 used.add(normalized_nonce)
 
                 # Authentication and replay checks complete before any caller
                 # data is interpreted for classification or escalation.
                 workspace, guard_context = self.workspace_for(agent_id, None)
+                if self._dsh_tampered(agent_id, agent, guard_context):
+                    reply = sign(agent.approval_key, {
+                        "action": DENY,
+                        "reason": "denied: DSH guard bootstrap changed after readiness",
+                        "nonce": nonce,
+                    })
+                    await stream.send((json.dumps(reply) + "\n").encode())
+                    return
                 verdict = await self.decide(
                     request.get("tool_name") or "",
                     request.get("tool_input") or {},
@@ -430,6 +455,30 @@ class Supervisor:
                     reply["nonce"] = request.get("nonce") if request is not None else None
                     reply = sign(agent.approval_key, reply)
             await stream.send((json.dumps(reply) + "\n").encode())
+
+    def _dsh_tampered(self, agent_id: str, agent: Any, context: dict) -> bool:
+        path = context.get("dsh_cordis_path")
+        expected = context.get("dsh_cordis_sha256")
+        if not isinstance(path, str) or not isinstance(expected, str):
+            return bool(context.get("dsh_guard_tampered"))
+        if context.get("dsh_guard_tampered"):
+            return True
+        try:
+            digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:
+            digest = ""
+        if digest == expected:
+            return False
+        context["dsh_guard_tampered"] = True
+        if not context.get("dsh_guard_tamper_traced"):
+            context["dsh_guard_tamper_traced"] = True
+            if self.trace is not None:
+                self.trace.guard_tamper(
+                    agent_id=agent_id,
+                    run_id=str(context.get("dsh_cordis_run_id") or ""),
+                    path=path,
+                )
+        return True
 
 
 async def _read_line(stream, limit: int = 1_048_576) -> str:

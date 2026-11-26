@@ -172,6 +172,9 @@ class ProviderConfig:
     effort: str | None = None
     # Optional OS-enforced child read/write exclusions, expanded by config.py.
     deny_read: tuple[str, ...] = ()
+    # Exact proxy destinations permitted for this provider lane. Host-only
+    # entries default to TLS port 443; wildcards cover subdomains only.
+    network_allow: tuple[str, ...] = ()
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         """The first set key in `api_key_envs`, else `api_key_default`."""

@@ -51,6 +51,7 @@ base_url = "https://api.z.ai/api/anthropic"
 model = "glm-5.3-flash[1m]"
 api_key_env = ["GLM_API_KEY", "ZAI_API_KEY"]
 vendor = "zai"
+network_allow = ["api.z.ai"]
 
 [providers.glm.pricing]
 kind = "flat_plan"
@@ -62,6 +63,7 @@ base_url = "https://api.deepseek.com/anthropic"
 model = "deepseek-v4-pro"
 api_key_env = "DEEPSEEK_API_KEY"
 vendor = "deepseek"
+network_allow = ["api.deepseek.com"]
 
 [providers.deepseek.pricing]
 # Peak rates, USD per 1M tokens; off-peak is half.
@@ -72,6 +74,7 @@ cache_read = 0.044
 
 [providers.codex]
 driver = "codex"
+network_allow = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
 
 [providers.codex.pricing]
 kind = "flat_plan"
@@ -80,6 +83,7 @@ kind = "flat_plan"
 [providers.copilot]
 driver = "copilot"
 model = "claude-sonnet-5"
+network_allow = ["api.github.com", "github.com", "copilot-proxy.githubusercontent.com"]
 
 [providers.copilot.pricing]
 kind = "credits"

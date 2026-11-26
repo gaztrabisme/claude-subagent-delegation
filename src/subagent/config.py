@@ -24,7 +24,9 @@ import stat
 import sys
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,24 @@ from .providers.base import (
 )
 
 log = logging.getLogger("sam")
+
+_CHILD_EGRESS_ENV: ContextVar[dict[str, str] | None] = ContextVar(
+    "subagent_child_egress_env", default=None
+)
+_EGRESS_ENV_NAMES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
+
+
+@contextmanager
+def child_egress_environment(values: Mapping[str, str]) -> Iterator[None]:
+    """Apply this agent's proxy variables while a provider builds its child env."""
+    if any(name not in _EGRESS_ENV_NAMES or not isinstance(value, str)
+           for name, value in values.items()):
+        raise ValueError("child egress environment contains an unsupported value")
+    token = _CHILD_EGRESS_ENV.set(dict(values))
+    try:
+        yield
+    finally:
+        _CHILD_EGRESS_ENV.reset(token)
 
 APPROVAL_HOOK = Path(__file__).parent / "guard" / "approval_hook.py"
 
@@ -109,13 +129,35 @@ def _unsafe_short_socket_path(path: Path) -> bool:
     return False
 
 
+def _under_temporary_root(path: Path) -> bool:
+    """Resolve aliases before deciding whether the preferred socket is temporary."""
+    candidate = Path(path).expanduser()
+    resolved = candidate.resolve()
+    roots = (
+        Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp"),
+        Path("/var/folders"), Path("/private/var/folders"),
+    )
+    for root in roots:
+        for canonical in (root, root.resolve()):
+            if candidate.is_relative_to(canonical) or resolved.is_relative_to(canonical):
+                return True
+    return False
+
+
 def _approval_socket_path(preferred: str | Path) -> str:
     """Use a preferred socket path or a private, short home-based fallback."""
     path = Path(preferred)
-    if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
+    if (len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX
+            or _under_temporary_root(path.parent)):
         uid = os.getuid()
         private_dir = SHORT_SOCKET_ROOT / f"subagent-{uid}"
         path = private_dir / f"a-{os.getpid()}-{next(_APPROVAL_SOCKET_IDS)}.sock"
+        if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
+            # The fallback root can itself sit in a long path (an operator
+            # override, a checkout). Then use a compact directory and a short
+            # random basename that still avoids stale/live collisions.
+            private_dir = SHORT_SOCKET_ROOT / f"u{uid:x}"
+            path = private_dir / os.urandom(7).hex()
         if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_MAX:
             raise ConfigError("short approval socket path still exceeds the Unix socket limit")
         if _unsafe_short_socket_path(path):
@@ -326,7 +368,7 @@ _PROVIDER_KEYS = frozenset({
     "send_sampling", "max_agents", "compact_window", "max_steps", "run_timeout",
     "idle_timeout", "no_progress_steps", "no_progress_seconds",
     "slot_release_grace_seconds", "adapter", "binary", "experimental", "health",
-    "probe", "pricing", "thinking", "deny_read", "monthly_usd_cap",
+    "probe", "pricing", "thinking", "deny_read", "network_allow", "monthly_usd_cap",
 })
 
 
@@ -376,6 +418,11 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         isinstance(path, str) and path.strip() for path in deny_read
     ):
         raise ConfigError(f"provider {name!r} deny_read must be a list of nonempty paths")
+    network_allow = table.get("network_allow", [])
+    if not isinstance(network_allow, list) or not all(
+        isinstance(host, str) and host.strip() for host in network_allow
+    ):
+        raise ConfigError(f"provider {name!r} network_allow must be a list of nonempty hosts")
     monthly_usd_cap = _num(table, "monthly_usd_cap", None, positive=False)
     extra = {k: v for k, v in table.items() if k not in _PROVIDER_KEYS}
     if monthly_usd_cap is not None:
@@ -418,6 +465,7 @@ def _provider(name: str, table: Mapping[str, Any], core: Mapping[str, Any]) -> P
         pricing=_pricing(table),
         thinking=thinking,
         deny_read=tuple(str(Path(path).expanduser()) for path in deny_read),
+        network_allow=tuple(network_allow),
         extra=extra,
     )
 
@@ -635,13 +683,15 @@ class Settings:
         PASSWORD are excluded even when explicitly listed.
         """
         allowed = {"PATH", "HOME", "LANG", "TERM", "TMPDIR", *self.child_env_passthrough}
-        return {
+        env = {
             name: value
             for name, value in os.environ.items()
             if value is not None
             and (name in allowed or name.startswith("LC_"))
             and not any(marker in name.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
         }
+        env.update(_CHILD_EGRESS_ENV.get() or {})
+        return env
 
     def hooks_config(
         self, agent_id: str, cfg: ProviderConfig | None = None, model: str | None = None
@@ -721,15 +771,11 @@ class Settings:
             "SUBAGENT_HOOK_TIMEOUT": str(self.supervisor_timeout + 20),
         })
         if login:
-            # Only honour a config dir the parent already uses. Forcing one (the
-            # old default was ~/.claude) makes Claude Code skip its credential
-            # store, which on macOS is the login Keychain: the child then reports
-            # "Not logged in" while the parent shell is authenticated.
-            parent_config = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
-            if parent_config:
-                env["CLAUDE_CONFIG_DIR"] = str(Path(parent_config).expanduser().resolve())
-            else:
-                env.pop("CLAUDE_CONFIG_DIR", None)
+            # R1a round 6 (H2, H3): the login child runs on its own per-agent
+            # config directory, never the owner's. The claude driver copies
+            # only the owner's credential into it (from the owner's config
+            # file, or on macOS from the Keychain item) before each launch.
+            env["CLAUDE_CONFIG_DIR"] = str(self.agent_home(agent_id))
             env.pop("ANTHROPIC_BASE_URL", None)
             env.pop("ANTHROPIC_AUTH_TOKEN", None)
             env.pop("ANTHROPIC_API_KEY", None)
@@ -776,6 +822,24 @@ class Settings:
             return (
                 f"workspace {root} contains {label} ({path}); a child there could "
                 "rewrite its own guard. Delegate into a subdirectory or a worktree."
+            )
+        # R1a A4: the approval socket's directory, by its configured spelling
+        # or its real path, must not be the workspace or lie inside it.
+        socket_spelling = Path(self.approval_socket).expanduser().absolute().parent
+        socket_dirs = (socket_spelling, socket_spelling.resolve())
+        if any(candidate == root or candidate.is_relative_to(root) for candidate in socket_dirs):
+            return (
+                f"workspace {root} contains the approval socket directory ({socket_dirs[-1]}); "
+                "a child there could access its supervisor transport"
+            )
+        # The session root holds every agent's state (hook settings, homes,
+        # keys); a workspace containing it would make other agents' writable.
+        session_spelling = Path(self.session_root).expanduser().absolute()
+        session_dirs = (session_spelling, session_spelling.resolve())
+        if any(candidate == root or candidate.is_relative_to(root) for candidate in session_dirs):
+            return (
+                f"workspace {root} contains the session root ({session_dirs[-1]}); "
+                "a child there could rewrite other agents' state"
             )
         return None
 

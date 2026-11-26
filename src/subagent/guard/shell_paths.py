@@ -6,10 +6,12 @@ checks; the main classifier still decides whether the command may run.
 
 from __future__ import annotations
 
+import codecs
 import ctypes
 import glob
 import os
 import re
+import shlex
 import stat
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -47,6 +49,18 @@ def words(command: str) -> list[Word]:
     Numeric zsh globs are a word component, rather than I/O redirections. An
     unmatched quote raises; the existing classifier handles the parse error.
     """
+    # Bash's ANSI-C quoted strings are values, not shell variables. Decode them
+    # before parsing so an escaped dot, tilde, or slash has the same protected
+    # path meaning as its literal spelling.
+    def decode_ansi(match: re.Match[str]) -> str:
+        try:
+            value = codecs.decode(match.group(1), "unicode_escape")
+        except (UnicodeDecodeError, ValueError):
+            # Malformed encodings remain conspicuous and will not match a path.
+            value = match.group(1)
+        return shlex.quote(value)
+
+    command = re.sub(r"\$'((?:\\.|[^'\\])*)'", decode_ansi, command)
     output: list[Word] = []
     if '\x00' in command:
         raise ValueError('NUL is not valid in a shell argument')

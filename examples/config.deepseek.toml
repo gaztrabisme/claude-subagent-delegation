@@ -10,6 +10,7 @@ base_url = "https://api.deepseek.com/anthropic"
 model = "deepseek-v4-pro"
 api_key_env = "DEEPSEEK_API_KEY"
 vendor = "deepseek"
+network_allow = ["api.deepseek.com"]
 
 [providers.deepseek.pricing]
 # Peak rates, USD per 1M tokens. Off-peak is half; peak is used here so the

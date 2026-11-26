@@ -47,6 +47,11 @@ def registry(tmp_path: Path):
     reg.shutdown()
 
 
+# R1a A9/A11: on macOS every codex child runs under the server's outer profile,
+# so Codex's own sandbox is opened; elsewhere it keeps workspace-write.
+_INNER_MODE = "danger-full-access" if sys.platform == "darwin" else "workspace-write"
+
+
 def _workspace(tmp_path: Path) -> Path:
     ws = tmp_path / "ws"
     ws.mkdir(exist_ok=True)
@@ -181,7 +186,8 @@ def test_argv_is_sandboxed_and_never_bypasses(fake_codex, registry, tmp_path: Pa
     _run(agent)
     argv = fake_codex.calls()[0]["argv"]
     assert argv[:2] == ["exec", "--json"]
-    assert argv[argv.index("-s") + 1] == "workspace-write"
+    # R1a A11: the inner sandbox opens only under the outer macOS profile (A9).
+    assert argv[argv.index("-s") + 1] == _INNER_MODE
     assert argv[argv.index("-C") + 1] == str(ws)
     for flag in ("--skip-git-repo-check", "--ignore-rules", "--dangerously-bypass-hook-trust"):
         assert flag in argv
@@ -234,25 +240,33 @@ def test_codex_merged_deny_read_uses_outer_write_allow_without_nested_sandbox(
 
     for process in captured:
         argv = process.argv
-        assert argv.count("/usr/bin/sandbox-exec") == int(configured or per_call)
-        assert argv[argv.index("-s") + 1] == (
-            "danger-full-access" if configured or per_call else "workspace-write"
-        )
-        if not (configured or per_call):
-            assert argv[0] == str(tmp_path / "bin" / "codex")
-            continue
+        # R1a A9: on macOS the codex child is always wrapped, deny_read or not,
+        # and (A11) only then opens Codex's own sandbox.
+        assert argv.count("/usr/bin/sandbox-exec") == 1
+        assert argv[argv.index("-s") + 1] == "danger-full-access"
         assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
         rules = argv[2].splitlines()
         assert rules[:3] == [
             '(version 1)', '(allow default)', '(deny file-write* (subpath "/"))',
         ]
         home = Path(process.env["CODEX_HOME"]).resolve()
-        assert home == registry.settings.session_root / "agents" / agent.agent_id / "codex-home"
-        allowed = [workspace.resolve(), Path("/private/tmp"), temp.resolve(), home,
-                   Path("/dev"), cache]
+        agent_dir = registry.settings.session_root / "agents" / agent.agent_id
+        assert home == agent_dir / "codex-home"
+        # A9.1: the agent's own temp directory, never /private/tmp or the
+        # server's TMPDIR.
+        assert Path(process.env["TMPDIR"]).resolve() == (agent_dir / "tmp").resolve()
+        # R1a round 4: a per-agent cache (the child's XDG_CACHE_HOME) instead
+        # of the user's shared cache, and only the standard devices, not /dev.
+        assert Path(process.env["XDG_CACHE_HOME"]).resolve() == (agent_dir / "cache").resolve()
+        allowed = [workspace.resolve(), (agent_dir / "tmp").resolve(), home,
+                   (agent_dir / "cache").resolve()]
         assert rules[3] == '(allow file-write* ' + " ".join(
             f'(subpath "{path}")' for path in allowed
         ) + ')'
+        assert '(subpath "/private/tmp")' not in rules[3]
+        assert f'(subpath "{temp.resolve()}")' not in rules[3]
+        assert '(subpath "/dev")' not in argv[2]
+        assert f'(subpath "{cache}")' not in argv[2]
         assert (f'(deny file-read* (subpath "{provider_path}"))' in rules) == configured
         assert (f'(deny file-read* (subpath "{call_path}"))' in rules) == per_call
 
@@ -335,10 +349,19 @@ def test_codex_deny_read_allows_only_real_user_temp_and_cache_roots(codex_sandbo
         return subprocess.CompletedProcess(argv, 0, stdout=f"{cache_alias}\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", getconf)
-    rules = spawn().argv[2].splitlines()
-    for path in (temp, cache, Path("/private/tmp"), Path("/dev")):
+    process = spawn()
+    rules = process.argv[2].splitlines()
+    # R1a A9.1: the write roots are the agent's own temp directory (its child
+    # TMPDIR) and, since round 4, its own cache (XDG_CACHE_HOME), not the
+    # server's TMPDIR, /private/tmp, the user's shared cache or all of /dev.
+    agent_tmp = Path(process.env["TMPDIR"]).resolve()
+    agent_cache = Path(process.env["XDG_CACHE_HOME"]).resolve()
+    assert agent_tmp.name == "tmp" and agent_tmp.parent.name == "a1"
+    assert agent_cache.name == "cache" and agent_cache.parent.name == "a1"
+    for path in (agent_tmp, agent_cache):
         assert f'(subpath "{path}")' in rules[3]
-    for path in (temp_alias, cache_alias, Path("/private/var/folders")):
+    for path in (temp, temp_alias, cache, cache_alias, Path("/private/tmp"),
+                 Path("/private/var/folders"), Path("/dev")):
         assert f'(subpath "{path}")' not in rules[3]
 
 
@@ -410,7 +433,7 @@ def test_codex_effort_unset_leaves_argv_unchanged(fake_codex, registry, tmp_path
     agent = registry.create_agent("c", ws, provider="codex")
     _run(agent)
     assert fake_codex.calls()[0]["argv"] == [
-        "exec", "--json", "-C", str(ws), "-s", "workspace-write", "--skip-git-repo-check",
+        "exec", "--json", "-C", str(ws), "-s", _INNER_MODE, "--skip-git-repo-check",
         "--ignore-rules", "--dangerously-bypass-hook-trust", "-",
     ]
 

@@ -121,9 +121,8 @@ def test_deny_read_merges_and_wraps_only_when_nonempty(
     _wait(agent.submit("continue", verification="true"))
     for process in registry.captured:
         argv = process.argv
-        if not (configured or per_call):
-            assert argv[0] != "/usr/bin/sandbox-exec"
-            continue
+        # R1a A9: on macOS a claude-driver child is wrapped whether or not
+        # deny_read is set; the deny_read paths appear only when given.
         assert argv[:2] == ["/usr/bin/sandbox-exec", "-p"]
         assert (provider_path in argv[2]) == configured
         assert (call_path in argv[2]) == per_call

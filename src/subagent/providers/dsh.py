@@ -7,13 +7,14 @@ which asks the shared subagent approval hook and denies on any error.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import secrets
 import selectors
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from typing import Any
 from ..config import APPROVAL_HOOK, Settings, prepare_private_directory
 from ..guard.classify import _git_metadata_roots, _redact_private_paths, protect, release
 from ..router import Refusal, clip
-from ..sandbox import approval_socket_write_deny, wrap_argv
+from ..sandbox import SANDBOX_EXEC, agent_profile_kwargs, wrap_argv
 from .base import DRIVER_DSH, Process, ProviderConfig, Session
 
 DEFAULT_BINARY = "dsh"
@@ -34,6 +35,24 @@ _GUARD_INACTIVE = re.compile(
     r"failed to import|could not load|could not import|unable to load))",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                        cwd: Path) -> list[str]:
+    """The DSH child's write roots (H1): the workspace and its agent directory.
+
+    The agent directory holds DSH_HOME (sessions, storages, spills, install
+    id) and TMPDIR (Q6). Devices are the standard ones every A9 profile
+    allows, not all of /dev (R5). The profiles, the guard bridge patch and the
+    server's patches stay write-denied (see `DshProvider.argv`).
+    """
+    _dsh_home(settings, agent_id)
+    return [
+        str(cwd),  # Project files are the worker's deliverable.
+        str(_agent_dir(settings, agent_id)),  # Own DSH home, temp and patches.
+    ]
+
+
 USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
 AUTH_CODES = (
     "MISSING_CREDENTIAL",
@@ -493,11 +512,14 @@ class DshProcess(Process):
         translator: DshTranslator,
         protected_root: Path | None = None,
         login_patch: Path | None = None,
+        cordis_path: Path | None = None,
     ):
         super().__init__(argv, env, cwd, prompt)
         self.dsh_translator = translator
         self.protected_root = protected_root
         self.login_patch = login_patch
+        self.cordis_path = cordis_path
+        self.guard_ready_callback: Callable[[str, str], None] | None = None
 
     def events(self) -> Iterator[dict[str, Any]]:
         if self.protected_root is not None:
@@ -533,6 +555,14 @@ class DshProcess(Process):
                 text = line.decode("utf-8", errors="replace")
                 if text.rstrip("\r\n") == expected_ready and self.env.get(NONCE_ENV):
                     guard_ready = True
+                    if self.cordis_path is not None and self.guard_ready_callback is not None:
+                        try:
+                            digest = hashlib.sha256(self.cordis_path.read_bytes()).hexdigest()
+                            self.guard_ready_callback(str(self.cordis_path), digest)
+                        except OSError:
+                            # Missing/unreadable bootstrap will be caught by the
+                            # approval side as a failed hash check.
+                            self.guard_ready_callback(str(self.cordis_path), "")
                     return
                 stderr_buf.append(text)
                 if _GUARD_INACTIVE.search("".join(stderr_buf)):
@@ -707,15 +737,7 @@ class DshProvider:
         )
         # DSH rewrites only this generated bootstrap file on every launch.
         # The profile directory and every patch remain write-denied.
-        write_allow = [
-            str(cwd),
-            str(agent_tmp),
-            str(dsh_home / "sessions"),
-            str(dsh_home / "storages"),
-            str(dsh_home / "spills"),
-            str(dsh_home / ".anonymous-user-id"),
-            "/dev",
-        ]
+        write_allow = sandbox_write_roots(settings, agent_id, cfg, cwd)
         write_deny = [
             str(cwd / ".env"),
             str(cwd / ".git"),
@@ -731,24 +753,30 @@ class DshProvider:
             str(bridge_root),
             str(bridge_entry),
             str(bridge_patch),
-            approval_socket_write_deny(settings.approval_socket, write_allow),
         ]
         owner_home = _owner_dsh_home().resolve()
         deny_paths = [*cfg.deny_read, str(owner_home), str(owner_home / "storages")]
         read_allow = [str(owner_home / ".credentials.yaml")] if login else []
         read_metadata_allow = [str(owner_home)] if login else []
-        argv = wrap_argv(
-            argv,
-            deny_paths,
-            write_allow=write_allow,
+        # One profile carries R1-0's rules and R1a's (A9 read isolation, A10
+        # network policy); the server never wraps a DSH argv a second time.
+        argv = wrap_argv(argv, deny_paths, **agent_profile_kwargs(
+            session_root=settings.session_root,
+            agent_id=agent_id,
+            approval_socket=settings.approval_socket,
+            base_url=cfg.base_url,
+            write_roots=write_allow,
             write_deny=write_deny,
             read_allow=read_allow,
             read_metadata_allow=read_metadata_allow,
             write_allow_exact=[str(headless_cordis)],
             write_allow_subpaths=[str(agent_tmp)],
-        )
-        if argv[:2] != ["/usr/bin/sandbox-exec", "-p"]:
+            workspace=cwd,
+            driver=DRIVER_DSH,
+        ))
+        if argv[:2] != [SANDBOX_EXEC, "-p"]:
             raise RuntimeError("DSH requires the outer macOS sandbox-exec profile")
+        session.data["cordis_path"] = str(headless_cordis)
         return argv
 
     def env(
@@ -800,10 +828,11 @@ class DshProvider:
         if cfg.extra.get("auth") == "login":
             protected_root = _owner_dsh_home()
             login_patch = _agent_dir(settings, agent_id) / "dsh-login.patch.yml"
-        return DshProcess(
+        process = DshProcess(
             argv, env, str(cwd), prompt, self.translator(session), protected_root,
-            login_patch,
+            login_patch, Path(session.data["cordis_path"]),
         )
+        return process
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:
         parts: list[str] = []

@@ -28,7 +28,18 @@ import socket
 import stat
 import sys
 
-TIMEOUT_S = float(os.environ.get("SUBAGENT_HOOK_TIMEOUT", "150"))
+DEFAULT_TIMEOUT_S = 150.0
+
+
+def _timeout() -> float:
+    """The supervisor wait, read when the hook runs (inside its catch-all)."""
+    raw = os.environ.get("SUBAGENT_HOOK_TIMEOUT", "")
+    if not raw.strip():
+        return DEFAULT_TIMEOUT_S
+    value = float(raw)
+    if not value > 0 or value == float("inf"):
+        raise ValueError("SUBAGENT_HOOK_TIMEOUT must be a positive number of seconds")
+    return value
 
 # Codex (0.153.4) sends the same stdin keys as Claude Code (tool_name,
 # tool_input, cwd) plus turn_id, but rejects `permissionDecision: allow` as
@@ -38,6 +49,8 @@ CODEX_SHELL_TOOLS = frozenset({
 })
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.M)
 _NONCE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DECISION_EMITTED = False
+_VERIFIED_ALLOW = False
 
 
 def _canonical_bytes(obj: dict) -> bytes:
@@ -147,6 +160,9 @@ def requests(tool_name: str, tool_input, codex: bool) -> list[tuple[str, object]
 
 
 def emit(decision: str, reason: str, *, code: int) -> None:
+    global _DECISION_EMITTED, _VERIFIED_ALLOW
+    _DECISION_EMITTED = True
+    _VERIFIED_ALLOW = decision == "allow"
     json.dump(
         {
             "hookSpecificOutput": {
@@ -170,7 +186,7 @@ def block(reason: str) -> None:
 
 def ask(socket_path: str, request: dict) -> dict:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(TIMEOUT_S)
+        sock.settimeout(_timeout())
         sock.connect(socket_path)
         sock.sendall((json.dumps(request) + "\n").encode())
         chunks = []
@@ -185,7 +201,11 @@ def ask(socket_path: str, request: dict) -> dict:
     return reply
 
 
-def main() -> None:
+def _main() -> None:
+    try:
+        _timeout()
+    except (TypeError, ValueError) as exc:
+        block(f"blocked: hook timeout is invalid ({type(exc).__name__})")
     socket_path = os.environ.get("SUBAGENT_APPROVAL_SOCKET")
     if not socket_path:
         block(
@@ -232,8 +252,40 @@ def main() -> None:
             block(reason)
     if codex:
         # Exit 0 with no output is Codex's allow; it rejects an explicit one.
+        global _DECISION_EMITTED, _VERIFIED_ALLOW
+        _DECISION_EMITTED = True
+        _VERIFIED_ALLOW = True
         sys.exit(0)
     emit("allow", reason, code=0)
+
+
+def main() -> None:
+    """Run the hook and turn every unexpected failure or exit into a deny."""
+    global _DECISION_EMITTED, _VERIFIED_ALLOW
+    _DECISION_EMITTED = False
+    _VERIFIED_ALLOW = False
+    try:
+        _main()
+    except SystemExit as exc:
+        expected_allow = exc.code == 0 and _VERIFIED_ALLOW
+        expected_deny = exc.code == 2 and _DECISION_EMITTED and not _VERIFIED_ALLOW
+        if expected_allow or expected_deny:
+            raise
+        _final_deny("blocked: hook exited without a verified decision")
+    except BaseException as exc:  # noqa: BLE001 - a hook exception must never allow
+        _final_deny(f"blocked: unexpected hook failure ({type(exc).__name__})")
+
+
+def _final_deny(reason: str) -> None:
+    """Deny with exit 2; if even writing the deny fails, still exit 2, never 1."""
+    try:
+        block(reason)
+    except SystemExit as exc:
+        if exc.code == 2:
+            raise
+    except BaseException:  # noqa: BLE001 - stdout gone: the exit status still denies
+        pass
+    os._exit(2)
 
 
 if __name__ == "__main__":

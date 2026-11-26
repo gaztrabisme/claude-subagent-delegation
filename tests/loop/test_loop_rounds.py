@@ -1,6 +1,7 @@
 """Single worker rounds: test guard, runner test run, background runs, undo, model fallback."""
 
 import json
+import os
 import time
 import unittest
 
@@ -105,16 +106,30 @@ class BackgroundAndUndo(Sandbox):
             "approval_socket = " + json.dumps(str(configured)),
         ))
 
+        session_root = self.tmp / "sessions"
+        # R1a A4: a preferred socket under a temp root (this test's session
+        # root is a mkdtemp) moves to the private home fallback directory.
+        from subagent import config as subagent_config
+
+        fallback_dirs = [subagent_config.SHORT_SOCKET_ROOT / f"subagent-{os.getuid()}",
+                         subagent_config.SHORT_SOCKET_ROOT / f"u{os.getuid():x}"]
+
+        def sockets():
+            found = set(session_root.glob("a[0-9a-f]*"))
+            for directory in fallback_dirs:
+                found.update(path for path in directory.glob("*") if path.is_socket())
+            return found
+
+        before = sockets()
         code, started = self.delegate(
             "run", "--plan", ".subagent/PLAN.md", "--background", cwd=root, scenario="slow"
         )
         self.assertIsInstance(started, dict, started)
         self.assertEqual((code, started["status"]), (0, "started"))
-        session_root = self.tmp / "sessions"
         deadline = time.monotonic() + 4
         child_sockets = []
         while time.monotonic() < deadline:
-            child_sockets = list(session_root.glob("a[0-9a-f]*"))
+            child_sockets = sorted(sockets() - before)
             if child_sockets:
                 break
             time.sleep(0.05)

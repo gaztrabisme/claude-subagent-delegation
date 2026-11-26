@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import config, envelope
 from .commands import init as init_command
@@ -353,7 +354,27 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         "binary_ok": path is not None,
         "api_key_envs": _key_envs(cfg),
     }
+    network_allow = list(cfg.network_allow)
+    parsed_base = urlsplit(cfg.base_url or "")
+    if parsed_base.hostname:
+        port = parsed_base.port or (443 if parsed_base.scheme.lower() == "https" else 80)
+        host = parsed_base.hostname
+        network_allow.append(f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
+    row["network_allow"] = list(dict.fromkeys(network_allow))
+    if cfg.driver == "antigravity":
+        # agy has no hook; say what actually confines it (R1a-agy G4).
+        from .providers.antigravity import ANTIGRAVITY_PROVIDER
+
+        row["guard"] = ANTIGRAVITY_PROVIDER.guard(settings, cfg)
+        row["boundary"] = ANTIGRAVITY_PROVIDER.boundary()
     warning = _thinking_warning(cfg)
+    if not cfg.local and not network_allow:
+        # Its own field, so it never displaces or reorders the existing
+        # warnings; `warning` carries it only when there is no other.
+        row["network_warning"] = (
+            f"warning: provider {cfg.name!r} has no network route; configure network_allow "
+            "or base_url"
+        )
     if cfg.extra.get("auth") == "login":
         if cfg.driver == "dsh":
             login_warning = (
@@ -367,18 +388,20 @@ def _doctor_row(settings: Settings, cfg: ProviderConfig, args: argparse.Namespac
         else:
             login_warning = (
                 f"warning: provider {cfg.name!r} uses the owner's Claude login and plan quota; "
-                "worker sessions are written into the owner's Claude history, and the owner's "
-                "global instructions, commands and skills may load"
+                "only the credential is copied into the worker's own config directory, and a "
+                "token refresh by the worker may rotate the owner's refresh token"
             )
         warning = f"{warning}\n{login_warning}" if warning else login_warning
         if cfg.max_agents > 1:
             concurrency_warning = (
                 f"warning: provider {cfg.name!r} max_agents = {cfg.max_agents}; concurrent "
-                "login children share ~/.claude.json and one OAuth refresh token"
+                "login children each hold a copy of one OAuth refresh token"
             )
             warning = f"{warning}\n{concurrency_warning}"
     if warning:
         row["warning"] = warning
+    elif row.get("network_warning"):
+        row["warning"] = row["network_warning"]
     if cfg.driver == "epi" and not args.no_probe:
         from .providers.epi import EPI_PROVIDER
 
@@ -565,6 +588,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for row in rows:
             if row.get("warning"):
                 print(row["warning"], file=sys.stderr)
+            if row.get("network_warning") and row["network_warning"] != row.get("warning"):
+                print(row["network_warning"], file=sys.stderr)
         if goal_warning:
             print(goal_warning, file=sys.stderr)
         elif goal is not None:

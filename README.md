@@ -192,31 +192,45 @@ usual path; individual loop commands are available for manual workflows.
 `deny_read=[str(session_folder)]` for its `~/.autoresearch/<session>/` scoring scripts
 and validation data. Children never call autoresearch.
 
-On macOS, a nonempty `deny_read` wraps the child and its descendants in
-`sandbox-exec`, denying reads and writes under each canonical path, including
-access through symlinks. It also denies writes to each ancestor directory up to
-but excluding `/`, preventing those directories from being renamed or unlinked
-to reach an excluded subtree under another name. These ancestor rules match
-the directory itself; writes to other children still follow the write policy.
-Other platforms refuse requests with `deny_read` set, and sandbox startup
-failure never falls back to an unsandboxed child.
+On macOS, every `claude`, `codex`, `omp`, and `dsh` child and its descendants run
+inside `sandbox-exec`. Writes are confined to the workspace, that agent's state,
+temporary files, and the driver's runtime directories; the approval socket
+directory is write-denied, and an agent cannot read another agent's state.
+Outbound network is denied except to the agent's loopback egress proxy, its
+approval socket, and a loopback `base_url` port. The proxy permits only the
+provider's `network_allow` entries and its `base_url` host. Host-only entries
+use port 443; `*.example.com` matches subdomains but not the apex. Refused
+destinations are recorded in the run trace. The `antigravity` driver keeps its
+CLI `--sandbox` mode.
 
-For Codex, this outer profile also confines writes to the workspace, the
-per-agent `CODEX_HOME`, `/private/tmp`, the real `TMPDIR`, `/dev`, and the real
-user cache directory returned by `getconf DARWIN_USER_CACHE_DIR` (omitted if
-discovery fails). Explicit write denies override those allows for `.git`
-itself and its contents, a worktree pointer's git directory and common directory,
-and the agent's `hooks.json`, `config.toml`, `auth.json` and installed guard
-script. Symlink entries and their resolved targets are protected. Runtime files
-in `CODEX_HOME` remain writable; ancestor directories of write-protected paths
-are also locked against renaming. Codex uses `danger-full-access` inside this
-outer profile to avoid nesting Seatbelt sandboxes. The shared guard also denies
-file-tool writes to the workspace's `.git` for every driver.
+A nonempty `deny_read` also denies reads and writes under each canonical path,
+including access through symlinks, and denies writes to its ancestors up to but
+excluding `/`. Other platforms still refuse requests with `deny_read` set, and
+sandbox startup failure never falls back to an unsandboxed child. The network
+and general filesystem profiles for the four hook drivers are macOS-only.
 
-This is macOS-only path isolation: reads outside `deny_read` paths remain
-allowed by the outer profile. It does not provide a general read allowlist or
-restrict network access. Paths are resolved when the child starts; copies of
-excluded data at other paths are not covered by that exclusion.
+Set the per-provider egress list in the provider table; the `base_url` host and
+port are added implicitly:
+
+```toml
+[providers.example]
+driver = "claude"
+base_url = "https://api.example.com/v1"
+network_allow = ["auth.example.com", "*.assets.example.net"]
+```
+
+The profile confines writes to the workspace, the agent's own state and the
+driver's runtime directories. Explicit write denies override those allows for
+protected Git state, the approval socket directory and installed guard code.
+Codex uses `danger-full-access` only inside this outer profile, so its own
+workspace mode cannot weaken the Seatbelt network and filesystem rules. The
+shared guard also denies file-tool writes to the workspace's `.git` for every
+driver.
+
+The `deny_read` option remains path isolation: reads outside those paths remain
+allowed. Paths are resolved when the child starts; copies of excluded data at
+other paths are not covered by that exclusion. The four hook drivers also get
+the macOS write and egress profiles described above.
 Providers can also set `deny_read = ["~/.autoresearch"]` in their TOML table;
 provider and per-call restrictions are merged and kept across continuations and
 fallback. The MCP `delegate` tool does not expose this argument.
@@ -416,7 +430,7 @@ Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](
   | Driver | Tool-call protection |
   |---|---|
   | Claude (`claude`) | PreToolUse hook with the subagent classifier. |
-  | Codex (`codex`) | Classifier hook plus Codex `workspace-write` sandbox. |
+  | Codex (`codex`) | Classifier hook inside the macOS filesystem and egress profile; Codex uses full access only inside that outer boundary. |
   | Copilot (`copilot`) | No guard hook. Direct MCP worker use requires `[guard].allow_unguarded = true`. |
   | Grok (`grok`) | Built-in sandbox by default; uses Grok's native hook path when configured. |
   | DeepSeek Harness (`dsh`) | Packaged pre-execute bridge to the subagent approval hook; fails closed. |
@@ -424,7 +438,8 @@ Details, per-run numbers, methodology and how to add tasks: [docs/benchmark.md](
   | Gemini (`gemini`) | No tool-call guard; runs with `--yolo` and is experimental. |
   | Antigravity (`antigravity`) | No installed approval hook; relies on its CLI sandbox and is experimental. |
 
-  With `[guard].supervisor = "off"`, Codex's hook is disabled but its sandbox remains.
+  With `[guard].supervisor = "off"`, Codex's hook is disabled but its macOS
+  filesystem and egress profile remains.
 
 - **Windows is unsupported.**
 - **Claude login uses the owner's account.** The opt-in Claude provider setting `auth = "login"`

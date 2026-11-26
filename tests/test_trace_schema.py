@@ -62,6 +62,9 @@ REQUIRED: dict[str, set[str]] = {
         "orchestrator", "mode", "status", "rounds", "reviews", "usage_total",
         "credits_total", "cost_total", "wall_seconds", "changed_files", "verified_pass",
     },
+    # R1a A10.3 and A12: additive record types, schema version unchanged.
+    "egress_refused": {"agent_id", "run_id", "provider", "host", "port", "type"},
+    "guard_tamper": {"agent_id", "run_id", "path", "type"},
 }
 
 # Fields a kind may also carry, never required.
@@ -71,6 +74,11 @@ OPTIONAL: dict[str, set[str]] = {
             "human_action", "plan_id", "verification_note"},
     "delegation": {"stopped_because", "test_writer", "uat"},
 }
+
+# R1a-agy G3 and addendum R2: additive record types, schema version unchanged.
+REQUIRED["sandbox_bypass"] = {"agent_id", "run_id", "provider", "tool", "command", "type"}
+REQUIRED["bypass_audit_unavailable"] = {"agent_id", "run_id", "provider", "reason", "type"}
+OPTIONAL["sandbox_bypass"] = {"source"}
 
 UAT_KEYS = {"row", "label", "kind", "command", "passed", "output_tail"}
 

@@ -10,11 +10,17 @@ lives under the agent's session directory and is carried by a `Session`.
 
 from __future__ import annotations
 
+import getpass
+import hashlib
+import os
+import pwd
 import re
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from ..config import Settings, log
 from ..router import (
@@ -37,6 +43,129 @@ GUARD = "hook"
 CHILD_TOOLS = "Bash,Read,Edit,Write,Grep,Glob"
 
 DEFAULT_BINARY = "claude"
+
+
+# Files and directories Claude Code loads from its config directory as
+# settings, instructions, hooks or code. The agent's own CLAUDE_CONFIG_DIR is
+# writable (R1a round 6, H5), except these: settings.json installs the guard
+# hook, and the rest could add hooks, agents or plugins to later turns. The
+# server rewrites settings.json before every launch.
+CLAUDE_AUTOLOAD_NAMES = (
+    "settings.json", "settings.local.json", "CLAUDE.md", "CLAUDE.local.md",
+    "keybindings.json", "hooks", "agents", "commands", "skills", "plugins",
+    "output-styles", "statusline",
+)
+
+# The credential Claude Code reads from its config directory when it is not
+# in the macOS Keychain, and the Keychain item it uses for the default
+# config directory.
+CREDENTIAL_FILE = ".credentials.json"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+SECURITY_TOOL = "/usr/bin/security"
+
+# Digest of the owner credential last copied into each login home, so a token
+# the child refreshed in its own home is not overwritten by a stale copy.
+_SEEDED: dict[str, str] = {}
+
+
+def _owner_claude_config() -> tuple[Path, bool]:
+    """The owner's Claude config directory and whether CLAUDE_CONFIG_DIR names it."""
+    config = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if config:
+        return Path(config).expanduser(), True
+    return Path.home() / ".claude", False
+
+
+def _keychain_credential() -> bytes | None:
+    """The owner's Claude Code login from the macOS Keychain, or None.
+
+    Only for the real user's default config directory, and never under a test
+    run: a test must not read the machine's own Keychain.
+    """
+    if sys.platform != "darwin" or os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    try:
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        if Path.home().resolve() != real_home:
+            return None
+        proc = subprocess.run(
+            [SECURITY_TOOL, "find-generic-password", "-s", KEYCHAIN_SERVICE,
+             "-a", getpass.getuser(), "-w"],
+            capture_output=True, timeout=15,
+        )
+    except (OSError, KeyError, subprocess.SubprocessError):
+        return None
+    value = proc.stdout.strip() if proc.returncode == 0 else b""
+    if value and not value.startswith(b"{"):
+        try:
+            value = bytes.fromhex(value.decode("ascii"))
+        except ValueError:
+            return None
+    return value or None
+
+
+def _owner_credential() -> bytes | None:
+    """The owner's login credential: the config-dir file, else the Keychain."""
+    config, named = _owner_claude_config()
+    source = config / CREDENTIAL_FILE
+    try:
+        if source.is_file():
+            return source.read_bytes()
+    except OSError:
+        return None
+    return None if named else _keychain_credential()
+
+
+def prepare_login_home(settings: Settings, agent_id: str) -> Path:
+    """Seed a login agent's own CLAUDE_CONFIG_DIR with the owner's credential only.
+
+    The credential is copied (mode 0600), never linked: a refresh by the child
+    writes its own copy, inside the agent directory. It is re-copied when the
+    owner's credential changed since the last copy, or when the agent copy is
+    missing or is not a regular file.
+    """
+    home = settings.agent_home(agent_id)
+    target = home / CREDENTIAL_FILE
+    data = _owner_credential()
+    if data is None:
+        return home
+    digest = hashlib.sha256(data).hexdigest()
+    keep = (_SEEDED.get(str(home)) == digest and not target.is_symlink()
+            and target.is_file())
+    if keep:
+        return home
+    temp = home / f".{CREDENTIAL_FILE}.{os.getpid()}.{uuid4().hex}.tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(temp, target)  # Replaces a worker-made symlink, never follows it.
+    finally:
+        temp.unlink(missing_ok=True)
+    _SEEDED[str(home)] = digest
+    return home
+
+
+def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                        cwd: Path) -> list[str]:
+    """The claude child's write roots (H1): the workspace and its agent directory.
+
+    The agent directory holds CLAUDE_CONFIG_DIR (both auth modes), TMPDIR and
+    the hook state; nothing in the owner's home is writable.
+    """
+    return [
+        str(cwd),  # Project files are the worker's deliverable.
+        str(settings.session_root / "agents" / agent_id),  # Own homes, temp and state.
+    ]
+
+
+def sandbox_write_deny(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                       cwd: Path) -> list[str]:
+    """Paths the claude child may not write in its own config directory (H5)."""
+    home = settings.agent_home(agent_id)
+    return [str(home / name) for name in CLAUDE_AUTOLOAD_NAMES]
+
 
 # Claude Code 2.1.261 prints this harmless warning to stderr on every request
 # (the wrapper passes the raw model name; the env maps only the aliases).
@@ -299,6 +428,8 @@ class ClaudeProvider:
         self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,
         model: str | None = None,
     ) -> dict[str, str]:
+        if cfg.extra.get("auth") == "login":
+            prepare_login_home(settings, agent_id)
         return settings.child_env(agent_id, cfg, model)
 
     def translator(self, session: Session) -> None:
@@ -319,10 +450,10 @@ class ClaudeProvider:
         env = self.env(settings, agent_id, cfg, session, model)
         process = _spawn_claude(argv, env, str(cwd))
         if cfg.extra.get("auth") == "login":
-            # The dir may be unset: the child must then read the login store the
-            # way the CLI does. Protect it from the child's writes either way.
-            root = (env.get("CLAUDE_CONFIG_DIR") or "").strip()
-            process.protected_root = Path(root) if root else Path.home() / ".claude"
+            # The child runs on its own config directory; the owner's (where
+            # the credential came from) stays guard-protected during the run.
+            config, named = _owner_claude_config()
+            process.protected_root = config.resolve() if named else config
         return process
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:

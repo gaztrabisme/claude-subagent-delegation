@@ -8,6 +8,7 @@ driver = "dsh"
 vendor = "deepseek"
 model = "deepseek-flash"
 api_key_env = "DEEPSEEK_API_KEY"
+network_allow = ["api.deepseek.com"]
 experimental = true
 
 # Account-login authentication uses the owner's local DSH credential store.
@@ -16,6 +17,7 @@ experimental = true
 driver = "dsh"
 vendor = "deepseek"
 auth = "login"
+network_allow = ["api.deepseek.com"]
 model = "deepseek-flash"
 max_agents = 1
 experimental = true

@@ -26,22 +26,46 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..config import APPROVAL_HOOK, Settings, log
+from ..config import APPROVAL_HOOK, Settings, log, prepare_private_directory
 from ..guard.classify import _git_metadata_roots
 from ..router import Refusal, codex_reset
-from ..sandbox import approval_socket_write_deny, wrap_argv
+from ..sandbox import SANDBOX_EXEC, agent_profile_kwargs, check_platform, wrap_argv
 from .base import DRIVER_CODEX, Process, ProviderConfig, Session
 
 GUARD = "sandbox+hook"
 GUARD_NO_HOOK = "sandbox"
 
 DEFAULT_BINARY = "codex"
+
+
+def codex_home_dir(settings: Settings, agent_id: str) -> Path:
+    """The agent's CODEX_HOME under its agent directory."""
+    return settings.session_root / "agents" / agent_id / "codex-home"
+
+
+def sandbox_write_roots(settings: Settings, agent_id: str, cfg: ProviderConfig,
+                        cwd: Path) -> list[str]:
+    """The Codex child's write roots (H1): four narrow roots and nothing broader.
+
+    The workspace, the agent's TMPDIR, its CODEX_HOME and its XDG_CACHE_HOME.
+    The agent directory itself is not a root. Devices are only the standard
+    ones every A9 profile allows (no /dev subpath).
+    """
+    agent_dir = settings.session_root / "agents" / agent_id
+    return [
+        str(cwd),  # Project files are the worker's deliverable.
+        str(agent_dir / "tmp"),  # TMPDIR.
+        str(codex_home_dir(settings, agent_id)),  # CODEX_HOME (config files are write-denied).
+        str(agent_dir / "cache"),  # XDG_CACHE_HOME.
+    ]
+
 
 REFUSAL_USAGE_LIMIT = "codex_usage_limit"
 KIND_CONTEXT_FULL = "context_full"
@@ -321,7 +345,7 @@ def prepare_home(
     provider names no model; hooks.json holds the guard hook and nothing else.
     """
     source = source or source_codex_home()
-    home = settings.session_root / "agents" / agent_id / "codex-home"
+    home = codex_home_dir(settings, agent_id)
     home.mkdir(parents=True, exist_ok=True)
 
     auth = home / "auth.json"
@@ -341,7 +365,7 @@ def prepare_home(
         for key, value in _user_defaults(source).items():
             lines.append(f"{key} = {_toml_string(value)}")
     lines.append('approval_policy = "never"')
-    (home / "config.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_atomic(home / "config.toml", "\n".join(lines) + "\n")
 
     if settings.supervisor == "off":
         hooks: dict[str, Any] = {}
@@ -361,8 +385,18 @@ def prepare_home(
                 }
             ]
         }
-    (home / "hooks.json").write_text(json.dumps({"hooks": hooks}, indent=2), encoding="utf-8")
+    _write_atomic(home / "hooks.json", json.dumps({"hooks": hooks}, indent=2))
     return home
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace `path` whole: a concurrent boot never reads a half-written file."""
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def codex_argv(
@@ -465,8 +499,6 @@ class CodexProvider:
     ) -> list[str]:
         effort = "low" if cfg.thinking == "low" else cfg.effort
         argv = codex_argv(cwd, model or None, session.session_id, self.binary(cfg), effort)
-        if cfg.deny_read:
-            argv[argv.index("-s") + 1] = "danger-full-access"
         return argv
 
     def env(
@@ -493,24 +525,33 @@ class CodexProvider:
     ) -> CodexProcess:
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)
         env = self.env(settings, agent_id, cfg, session, model)
-        if cfg.deny_read:
-            # The outer profile supplies write confinement; a second Seatbelt
-            # sandbox inside it prevents Codex from initializing or editing.
-            write_allow = [
-                str(cwd), "/private/tmp", env.get("TMPDIR") or "/private/tmp",
-                env["CODEX_HOME"], "/dev",
-            ]
-            cache = _darwin_user_cache_dir()
-            if cache:
-                write_allow.append(cache)
+        check_platform(cfg.deny_read)
+        if sys.platform == "darwin":
+            # The outer profile is the filesystem and network boundary (A9,
+            # A10); a second Seatbelt sandbox inside it prevents Codex from
+            # initializing, so the inner mode opens only under that profile.
+            agent_dir = settings.session_root / "agents" / agent_id
+            env["TMPDIR"] = str(prepare_private_directory(agent_dir / "tmp"))
+            env["XDG_CACHE_HOME"] = str(prepare_private_directory(agent_dir / "cache"))
             home = Path(env["CODEX_HOME"])
             write_deny = [
                 str(cwd / ".git"), *(str(root) for root in sorted(_git_metadata_roots(cwd))),
                 *(str(home / name) for name in ("hooks.json", "config.toml", "auth.json")),
                 str(APPROVAL_HOOK),
-                approval_socket_write_deny(settings.approval_socket, write_allow),
             ]
-            argv = wrap_argv(argv, cfg.deny_read, write_allow=write_allow, write_deny=write_deny)
+            argv[argv.index("-s") + 1] = "danger-full-access"
+            argv = wrap_argv(argv, cfg.deny_read, **agent_profile_kwargs(
+                session_root=settings.session_root,
+                agent_id=agent_id,
+                approval_socket=settings.approval_socket,
+                base_url=cfg.base_url,
+                write_roots=sandbox_write_roots(settings, agent_id, cfg, cwd),
+                write_deny=write_deny,
+                workspace=cwd,
+                driver=DRIVER_CODEX,
+            ))
+            if argv[:2] != [SANDBOX_EXEC, "-p"]:
+                raise RuntimeError("codex requires the outer macOS sandbox-exec profile")
         return _spawn_codex(argv, env, str(cwd), prompt)
 
     def refusal(self, cfg: ProviderConfig, events: list[dict[str, Any]]) -> Refusal | None:

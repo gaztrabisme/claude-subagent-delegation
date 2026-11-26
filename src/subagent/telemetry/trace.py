@@ -49,7 +49,11 @@ from ..config import log
 #    needs_human, human_action and plan_id. Native values are never repriced.
 SCHEMA = 3
 
-KINDS = ("run", "hop", "turn", "sample", "run_summary", "verdict", "calibration", "delegation")
+KINDS = (
+    "run", "hop", "turn", "sample", "run_summary", "verdict", "calibration",
+    "delegation", "egress_refused", "guard_tamper", "sandbox_bypass",
+    "bypass_audit_unavailable",
+)
 
 
 class Trace:
@@ -102,6 +106,37 @@ class Trace:
             # failed looks fine, and every later run on that agent hangs. A
             # trace is the least important thing happening in this process.
             log.warning("could not append to %s", self.path, exc_info=True)
+
+    def egress_refused(
+        self, *, agent_id: str, run_id: str, provider: str, host: str, port: int,
+    ) -> None:
+        """Append the additive, destination-specific egress refusal record."""
+        self.write(
+            "egress_refused", type="egress_refused", agent_id=agent_id,
+            run_id=run_id, provider=provider, host=host, port=port,
+        )
+
+    def guard_tamper(self, *, agent_id: str, run_id: str, path: str) -> None:
+        """Append the additive DSH bootstrap tamper record."""
+        self.write("guard_tamper", type="guard_tamper", agent_id=agent_id,
+                   run_id=run_id, path=path)
+
+    def sandbox_bypass(
+        self, *, agent_id: str, run_id: str, provider: str, tool: str, command: str,
+        source: str | None = None,
+    ) -> None:
+        """Append the additive record for a tool step that asked to leave agy's sandbox."""
+        extra = {"source": source} if source is not None else {}
+        self.write("sandbox_bypass", type="sandbox_bypass", agent_id=agent_id,
+                   run_id=run_id, provider=provider, tool=tool, command=command[:500],
+                   **extra)
+
+    def bypass_audit_unavailable(
+        self, *, agent_id: str, run_id: str, provider: str, reason: str,
+    ) -> None:
+        """Append the additive record for a bypass audit that could not read its record."""
+        self.write("bypass_audit_unavailable", type="bypass_audit_unavailable",
+                   agent_id=agent_id, run_id=run_id, provider=provider, reason=reason[:500])
 
     def verdict(
         self,

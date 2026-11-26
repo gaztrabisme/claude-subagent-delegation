@@ -11,12 +11,15 @@ import contextlib
 import copy
 import dataclasses
 import hashlib
+import importlib
 import itertools
 import json
 import math
 import os
 import secrets
+import socket
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -26,15 +29,24 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import adapter, envelope, health, providers, router
-from .config import APPROVAL_HOOK, Settings, log
+from .config import (
+    APPROVAL_HOOK,
+    Settings,
+    child_egress_environment,
+    log,
+    prepare_private_directory,
+)
+from .egress import EgressProxy
 from .goal import Goal
 from .goal_runtime import GoalReviewer, evaluate_goal, pending_uat
-from .guard.classify import protect, provider_guard_context
+from .guard.classify import _git_metadata_roots, protect, provider_guard_context
 from .lane_state import LaneState
 from .lane_status import LaneStatusStore, codex_usage
 from .providers.base import (
+    DRIVER_ANTIGRAVITY,
     DRIVER_CODEX,
     DRIVER_DSH,
     Process,
@@ -54,7 +66,14 @@ from .providers.claude import (  # noqa: F401
 )
 from .providers.omp_config import OMP_HOOK
 from .router import FALLBACK_MODES
-from .sandbox import approval_socket_write_deny, check_platform, normalize_paths, wrap_argv
+from .sandbox import (
+    agent_profile_kwargs,
+    approval_socket_write_deny,
+    check_platform,
+    egress_port,
+    normalize_paths,
+    wrap_argv,
+)
 from .secrets import redact_secrets
 from .telemetry.cost import Pricing, price_run
 from .telemetry.sampler import Telemetry, open_metrics, summarize
@@ -69,6 +88,14 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 
 TERMINAL_STATES = frozenset({COMPLETED, COMPLETED_UNVERIFIED, FAILED, CANCELLED})
+
+# Drivers whose child runs the guard hook: each gets an egress proxy (A10) and,
+# on macOS, one Seatbelt profile (A9). codex and dsh build that profile in their
+# own spawn; the server wraps claude and omp here. antigravity has no hook: the
+# same server-built profile and proxy are its only boundary (R1a-agy G1).
+_HOOK_DRIVERS = frozenset({"claude", "codex", "omp", "dsh"})
+_PROFILE_DRIVERS = _HOOK_DRIVERS | {"antigravity"}
+_SERVER_WRAPPED_DRIVERS = frozenset({"claude", "omp", "antigravity"})
 
 PHASE_QUEUED = "queued"
 PHASE_RUNNING = "running"
@@ -112,6 +139,7 @@ Do not paraphrase an identifier or a path.
 - Preserve any question you could not answer, verbatim.
 - Do not continue the task, propose new work, or take any tool call. Summarize only.
 - Stay under {limit} characters."""
+
 
 
 class RegistryError(RuntimeError):
@@ -940,6 +968,7 @@ class Agent:
         deny_read: list[str] | None = None,
         entry: str = "mcp",
         released_agents: list[str] | None = None,
+        on_close: Callable[[str], None] | None = None,
     ):
         self.trace = trace
         # The route that started this agent's runs (MCP delegate, CLI loop,
@@ -983,6 +1012,10 @@ class Agent:
         self.workspace = workspace
         self.model = model
         self.settings = settings
+        self._on_close = on_close
+        self._egress_proxy: EgressProxy | None = None
+        self._egress_port: int | None = None
+        self._egress_run_id: str | None = None
         self.session_id: str | None = None
         # The acceptance command the delegate was given; a continue that
         # names none is judged against it.
@@ -1353,6 +1386,16 @@ class Agent:
                 self._record_lane_status(run)
         self._thread.join(timeout=8)
         self._closed = not any(r.cancel_pending for r in self.runs())
+        if self._closed:
+            self._stop_egress_proxy()
+            key_file = self.settings.session_root / "agents" / self.agent_id / "approval.key"
+            try:
+                key_file.unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove approval key for %s", self.agent_id, exc_info=True)
+            if self._on_close is not None:
+                callback, self._on_close = self._on_close, None
+                callback(self.agent_id)
         # A second close may resolve a previously uncertain native cancel after
         # the serial worker has stopped. Its retained guard still belongs here.
         for run in self.runs():
@@ -1401,7 +1444,9 @@ class Agent:
         # the run as `close` does. The reaper defers the plain case by one pass.
         # A plain-driver worker thread blocked in the child's stream iterator
         # is left to exit when the child's pipe closes; it is not replaced.
-        if not run.done.wait(self.END_RUN_WAIT) and (service or finish_stuck):
+        # A plain child left to drain is not finished here, so waiting for it
+        # would only delay the reaper pass (and let a later pass relabel it).
+        if (service or finish_stuck) and not run.done.wait(self.END_RUN_WAIT):
             self._finish(run)
 
     def _boot(self) -> None:
@@ -1565,6 +1610,15 @@ class Agent:
         """One turn's child process, on the current provider's driver."""
         paths = normalize_paths([*self.deny_read, *self.cfg.deny_read])
         check_platform(paths)
+        if self.cfg.driver == DRIVER_ANTIGRAVITY and sys.platform != "darwin":
+            # agy's own --sandbox is not a boundary; without the outer profile
+            # there is nothing to run it under (R1a-agy G1).
+            raise RuntimeError(
+                "antigravity driver runs only under the server's macOS sandbox-exec profile"
+            )
+        self._egress_run_id = run.run_id
+        if self.cfg.driver in _PROFILE_DRIVERS:
+            self._start_egress_proxy()
         session = self.session()
         session.session_id = resume
         kwargs = {}
@@ -1586,13 +1640,78 @@ class Agent:
             cfg = dataclasses.replace(cfg, max_steps=step_limit)
         spawn_cfg = (dataclasses.replace(cfg, deny_read=paths)
                      if cfg.driver in (DRIVER_CODEX, DRIVER_DSH) else cfg)
-        process = self.driver.spawn(
-            spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
-            session, self.model, **kwargs,
-        )
+        with child_egress_environment(self._egress_environment()), \
+                egress_port(self._egress_port):
+            process = self.driver.spawn(
+                spawn_cfg, self.settings, self.agent_id, prompt, self.workspace,
+                session, self.model, **kwargs,
+            )
+        child_env = getattr(process, "env", None)
+        if isinstance(child_env, dict):
+            child_env.update(self._egress_environment())
+        cordis_path = getattr(process, "cordis_path", None)
+        if cordis_path is not None:
+            process.guard_ready_callback = self._dsh_guard_ready
+            self.guard_context.update({
+                "dsh_cordis_path": str(cordis_path),
+                "dsh_cordis_sha256": None,
+                "dsh_cordis_run_id": run.run_id,
+                # A12: once a bootstrap change was seen, every later request
+                # of this agent stays denied, across later launches too.
+                "dsh_guard_tampered": bool(self.guard_context.get("dsh_guard_tampered")),
+                "dsh_guard_tamper_traced": bool(
+                    self.guard_context.get("dsh_guard_tamper_traced")
+                ),
+            })
         # Driver processes start lazily in events(), through Process._start().
         # Wrap before publishing or consuming one so all descendants inherit it.
-        if paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
+        # codex and dsh build their one profile themselves (they coordinate
+        # their inner sandbox mode with it); claude, omp and antigravity are
+        # wrapped here.
+        if (sys.platform == "darwin" and self.cfg.driver in _SERVER_WRAPPED_DRIVERS
+                and isinstance(getattr(process, "argv", None), list)):
+            driver_module = importlib.import_module(f".providers.{self.cfg.driver}", __package__)
+            agent_tmp = prepare_private_directory(
+                self.settings.session_root / "agents" / self.agent_id / "tmp"
+            )
+            if isinstance(child_env, dict):
+                child_env["TMPDIR"] = str(agent_tmp)
+            write_deny = [
+                str(APPROVAL_HOOK), str(self.workspace / ".git"),
+                *(str(root) for root in sorted(_git_metadata_roots(self.workspace))),
+                # The driver's own guard configuration and auto-loaded files,
+                # as codex denies its hooks.json, config.toml and auth.json.
+                *driver_module.sandbox_write_deny(
+                    self.settings, self.agent_id, self.cfg, self.workspace
+                ),
+            ]
+            with egress_port(self._egress_port):
+                profile = agent_profile_kwargs(
+                    session_root=self.settings.session_root,
+                    agent_id=self.agent_id,
+                    approval_socket=self.settings.approval_socket,
+                    # The loopback endpoint the child actually dials: for a
+                    # claude lane with an adapter that is the adapter proxy
+                    # (child_env points ANTHROPIC_BASE_URL at it), not the
+                    # upstream, which only the server-side adapter reaches.
+                    base_url=(adapter.child_base_url(self.cfg)
+                              if self.cfg.driver == "claude" else self.cfg.base_url),
+                    write_roots=driver_module.sandbox_write_roots(
+                        self.settings, self.agent_id, self.cfg, self.workspace
+                    ),
+                    write_deny=write_deny,
+                    workspace=self.workspace,
+                    driver=self.cfg.driver,
+                )
+            if self.cfg.driver == DRIVER_ANTIGRAVITY:
+                # Owner credential homes agy has no use for (G1.3), read-denied.
+                profile["read_deny_subpaths"].extend(
+                    getattr(process, "sandbox_read_deny", ())
+                )
+                # agy has no approval hook, so it has no reason to reach the socket.
+                profile["network_unix_sockets"] = []
+            process.argv = wrap_argv(process.argv, paths, **profile)
+        elif paths and self.cfg.driver not in (DRIVER_CODEX, DRIVER_DSH):
             process.argv = wrap_argv(
                 process.argv,
                 paths,
@@ -1604,6 +1723,64 @@ class Agent:
         if capabilities(self.driver).cancel and isinstance(process, Process):
             process.enable_cancel_fence()
         return process
+
+    def _start_egress_proxy(self) -> None:
+        if self._egress_proxy is not None:
+            return
+        allow = list(self.cfg.network_allow)
+        parsed = urlsplit(self.cfg.base_url or "")
+        if parsed.hostname:
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+            allow.append(f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
+
+        def refused(host: str, port: int) -> None:
+            trace = self.trace
+            if trace is not None and self._egress_run_id:
+                trace.egress_refused(
+                    agent_id=self.agent_id, run_id=self._egress_run_id,
+                    provider=self.cfg.name, host=host, port=port,
+                )
+
+        proxy = EgressProxy(allow, on_refusal=refused)
+        self._egress_port = proxy.start()
+        self._egress_proxy = proxy
+
+    def _egress_environment(self) -> dict[str, str]:
+        if self._egress_port is None:
+            return {}
+        proxy = f"http://127.0.0.1:{self._egress_port}"
+        return {
+            "HTTPS_PROXY": proxy,
+            "HTTP_PROXY": proxy,
+            "ALL_PROXY": proxy,
+            "NO_PROXY": "127.0.0.1,localhost",
+        }
+
+    def _stop_egress_proxy(self) -> None:
+        proxy, self._egress_proxy = self._egress_proxy, None
+        self._egress_port = None
+        if proxy is None:
+            return
+        # socketserver.shutdown() waits for serve_forever's poll (0.5s), which
+        # would make a close exceed R7a's close bound.  Request shutdown and
+        # wake the selector first, then let the proxy stop synchronously.
+        server = getattr(proxy, "_server", None)
+        if server is not None:
+            server._BaseServer__shutdown_request = True
+            try:
+                with socket.create_connection(server.server_address, timeout=0.1):
+                    pass
+            except OSError:
+                pass
+        proxy.stop()
+
+    def _dsh_guard_ready(self, path: str, digest: str) -> None:
+        self.guard_context.update({
+            "dsh_cordis_path": path,
+            "dsh_cordis_sha256": digest,
+            "dsh_cordis_run_id": self._egress_run_id,
+        })
 
     def _execute(self, run: Run) -> None:
         with self._dispatch_lock:
@@ -2052,6 +2229,40 @@ class Agent:
     def _turn(self, run: Run, prompt: str, resume: str | None) -> None:
         for event in self._collect(run, prompt, resume=resume):
             self._ingest(run, event)
+        if self.cfg.driver == DRIVER_ANTIGRAVITY:
+            self._bypass_audit(run)
+
+    def _bypass_audit(self, run: Run) -> None:
+        """R1a-agy addendum R2: record bypassing calls from agy's own conversation record.
+
+        On unless `bypass_audit = false` (S56). Observation only: it never changes
+        the run, and any failure becomes one bypass_audit_unavailable record (a
+        missing record, as with a fake agy, is expected and not logged).
+        """
+        from .providers import antigravity
+
+        if not antigravity.bypass_audit_enabled(self.cfg):
+            return
+        if self.trace is None or self.trace.path is None:
+            return  # nowhere to record a finding: read nothing
+        try:
+            findings, reason = antigravity.audit_conversation(self.cfg, run.session_id)
+        except Exception as exc:  # noqa: BLE001 - the audit fails open
+            findings, reason = [], f"audit failed: {type(exc).__name__}"
+        if reason is not None:
+            if reason != "conversation record not found":
+                log.warning("bypass audit for run %s unavailable: %s", run.run_id, reason)
+            self.trace.bypass_audit_unavailable(
+                agent_id=self.agent_id, run_id=run.run_id, provider=self.cfg.name,
+                reason=reason,
+            )
+            return
+        for finding in findings:
+            self.trace.sandbox_bypass(
+                agent_id=self.agent_id, run_id=run.run_id, provider=self.cfg.name,
+                tool=finding["tool"], command=finding["command"],
+                source="conversation_record",
+            )
 
     def _backoff_sleep(self, run: Run, seconds: float) -> bool:
         """Sleep before a rate-limit retry, in short slices so cancel/close
@@ -2145,7 +2356,16 @@ class Agent:
                     trip = watch.see(event)
                     if trip is not None and run.trip is None:
                         run.trip = trip
-                    if run.trip or self._closing:
+                    # A deadline ended by `end_run` belongs to the reaper: it
+                    # leaves a plain child WORKING for a later pass, so this
+                    # worker must keep reading until the child's stream ends
+                    # instead of finishing the run on the trip alone.
+                    deadline_ended = (
+                        run.ended_by_end_run and run.trip is not None
+                        and run.trip[0] == KILL_TIMEOUT
+                        and run.trip[1] == "run deadline exceeded"
+                    )
+                    if (run.trip and not deadline_ended) or self._closing:
                         kind, reason = run.trip or (
                             self._kill_kind or KILL_CANCEL, "agent closing"
                         )
@@ -2356,6 +2576,13 @@ class Agent:
                 )
             text = str(event.get("result") or "")
             run.final_response = text
+            bypass = event.get("sandbox_bypass")
+            if (event.get("error_kind") == "sandbox_bypass" and isinstance(bypass, dict)
+                    and self.trace is not None):
+                self.trace.sandbox_bypass(
+                    agent_id=self.agent_id, run_id=run.run_id, provider=self.cfg.name,
+                    tool=str(bypass.get("tool") or ""), command=str(bypass.get("command") or ""),
+                )
             if event.get("is_error"):
                 run.state = FAILED
                 reported = str(event.get("error") or text or "claude reported an error")
@@ -2625,6 +2852,7 @@ class Registry:
         self._reap_errors: dict[str, list[BaseException]] = {}
         self._requests_lock = threading.RLock()
         self._requests: dict[tuple[str, ...], tuple[dict[str, Any], Run]] = {}
+        self._agent_cleanup_callbacks: list[Callable[[str], None]] = []
         self._counter = itertools.count(1)
         # Agent ids name directories under the shared session root
         # (agents/<id>/claude-home, codex-home), so they must not repeat
@@ -2662,6 +2890,22 @@ class Registry:
             run = submit()
             self._requests[key] = (copy.deepcopy(arguments), run)
             return run
+
+    def register_agent_cleanup(self, callback: Callable[[str], None]) -> None:
+        """Register per-agent security state to discard at close/eviction."""
+        self._agent_cleanup_callbacks.append(callback)
+
+    def _agent_closed(self, agent_id: str) -> None:
+        for callback in tuple(self._agent_cleanup_callbacks):
+            try:
+                callback(agent_id)
+            except Exception:  # noqa: BLE001 - cleanup cannot strand other cleanup
+                log.warning("agent cleanup callback failed for %s", agent_id, exc_info=True)
+        key_file = self.settings.session_root / "agents" / agent_id / "approval.key"
+        try:
+            key_file.unlink(missing_ok=True)
+        except OSError:
+            log.warning("could not remove approval key for %s", agent_id, exc_info=True)
 
     def replay_continue(self, agent_id: str, request_id: str | None,
                         arguments: dict[str, Any]) -> Run | None:
@@ -2788,6 +3032,7 @@ class Registry:
             for agent in closed:
                 self.reap_stuck.pop(agent.agent_id, None)
                 self._reap_errors.pop(agent.agent_id, None)
+                self._agent_closed(agent.agent_id)
                 for run in agent.runs():
                     self._archive[run.run_id] = run
                 self._agents.pop(agent.agent_id, None)
@@ -2889,6 +3134,7 @@ class Registry:
                         deny_read=deny_read,
                         entry=self.entry,
                         released_agents=released,
+                        on_close=self._agent_closed,
                     )
                     self._agents[claimed] = agent
                     return agent
@@ -3013,6 +3259,7 @@ class Registry:
                 telemetry=self.telemetry,
                 on_event=on_event,
                 entry=self.entry,
+                on_close=self._agent_closed,
             )
             session_id = record.get("session_id")
             if session_id:
@@ -3048,6 +3295,10 @@ class Registry:
         if agent is None:
             raise RegistryError(f"unknown agent_id {agent_id!r}")
         return agent
+
+    def cancel(self, agent_id: str, reason: str = "cancelled by caller") -> None:
+        """Close an agent and cancel any current or queued run."""
+        self.agent(agent_id).close(reason)
 
     def find_agent(self, agent_id: str) -> Agent | None:
         with self._lock:

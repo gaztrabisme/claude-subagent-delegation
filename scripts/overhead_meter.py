@@ -245,26 +245,34 @@ def _section(lines: list[str], start: int) -> list[str]:
     return lines[start:end]
 
 
+def _waiting_bounds(lines: list[str]) -> tuple[int, int] | None:
+    """Index range [start, end) of the '## Waiting on the owner' section."""
+    for i, ln in enumerate(lines):
+        if ln.startswith("## Waiting on the owner"):
+            return i, i + len(_section(lines, i))
+    return None
+
+
 def _waiting_rows(text: str | None) -> list[str]:
     """Table data rows of the '## Waiting on the owner' section."""
     if text is None:
         return []
     lines = text.split("\n")
-    for i, ln in enumerate(lines):
-        if ln.startswith("## Waiting on the owner"):
-            rows = []
-            for row in _section(lines, i)[1:]:
-                if not row.startswith("|") or not row.strip("|-: \t"):
-                    continue
-                if _first_cell(row).lower() == "id":
-                    continue
-                rows.append(row)
-            return rows
-    return []
+    bounds = _waiting_bounds(lines)
+    if bounds is None:
+        return []
+    return [row for row in lines[bounds[0] + 1:bounds[1]] if _is_table_row(row)]
 
 
 def _first_cell(row: str) -> str:
     return row.strip().strip("|").split("|", 1)[0].strip()
+
+
+def _is_table_row(row: str) -> bool:
+    """A data row: starts with '|', not the header, not a separator row."""
+    if not row.startswith("|") or not row.strip("|-: \t"):
+        return False
+    return _first_cell(row).lower() != "id"
 
 
 def _added_lines(diff: str) -> list[tuple[str, int | None, str]]:
@@ -292,8 +300,17 @@ def _owner_questions(repos: list[Repo], start: dt.datetime, end: dt.datetime) ->
             if REGISTERS in paths:
                 new = repo.show(sha, REGISTERS)
                 old = repo.show(f"{sha}^", REGISTERS)
-                old_ids = {_first_cell(r) for r in _waiting_rows(old)}
-                rows_added += sum(1 for r in _waiting_rows(new) if _first_cell(r) not in old_ids)
+                if new is not None:
+                    lines = new.split("\n")
+                    bounds = _waiting_bounds(lines)
+                    if bounds is not None:
+                        old_ids = {_first_cell(r) for r in _waiting_rows(old)}
+                        sec_start, sec_end = bounds
+                        for _, num, text in _added_lines(repo.diff(sha, REGISTERS)):
+                            if not num or not sec_start <= num - 1 < sec_end:
+                                continue
+                            if _is_table_row(text) and _first_cell(text) not in old_ids:
+                                rows_added += 1
             if DECISIONS in paths:
                 new = repo.show(sha, DECISIONS)
                 if new is None:

@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from subprocess import run as _subprocess_run
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import Settings
 from .lane_status import LaneStatusStore
@@ -54,6 +55,25 @@ def live_lanes(settings: Settings) -> list[str]:
     """Configured lanes that currently hold a live run lease."""
     store = LaneStatusStore(settings.session_root)
     return [name for name in settings.providers if store.active_count(name) > 0]
+
+
+def missing_routes(settings: Settings) -> list[str]:
+    """Configured non-local providers with no network route, in config order.
+
+    A route is a non-empty ``network_allow`` or a ``base_url`` with a hostname,
+    the same derivation as ``Agent._start_egress_proxy`` and the doctor's
+    ``network_allow`` row.
+    """
+    missing = []
+    for name, cfg in settings.providers.items():
+        if cfg.local:
+            continue
+        if cfg.network_allow:
+            continue
+        if urlsplit(cfg.base_url or "").hostname:
+            continue
+        missing.append(name)
+    return missing
 
 
 def _checked(result: Any, action: str) -> None:
@@ -119,11 +139,19 @@ def promote(
     settings: Settings,
     *,
     force: bool = False,
+    require_routes: bool = False,
     runner: Any = _subprocess_run,
 ) -> dict[str, Any]:
     """Install `commit` from `repo` and record it in ``served.json``."""
     repo = Path(repo).resolve()
     sha = _resolve(repo, commit, runner)
+    if require_routes:
+        missing = missing_routes(settings)
+        if missing:
+            raise PromoteError(
+                "no network route for " + ", ".join(missing)
+                + "; add network_allow or set local = true"
+            )
     install_root = Path(settings.session_root) / "installs" / sha
     existing = served(settings)
     if (

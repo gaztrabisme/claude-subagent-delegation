@@ -111,9 +111,12 @@ def _read_jsonl(path: Path) -> list[tuple[dt.datetime, dict[str, Any]]]:
     return out
 
 
-def _collect_files(projects: Path, sessions: list[str], roles: dict[str, str]) -> list[_File]:
+def _collect_files(projects: Path, sessions: list[str], roles: dict[str, Any]) -> list[_File]:
     """List the session and subagent files, assigning each a role name."""
-    agent_to_role = {agent: name for name, agent in roles.items()}
+    agent_to_role: dict[str, str] = {}
+    for name, agents in roles.items():
+        for agent in [agents] if isinstance(agents, str) else agents:
+            agent_to_role[agent] = name
     files: list[_File] = []
     for index, sid in enumerate(sessions):
         session_file = projects / f"{sid}.jsonl"
@@ -257,7 +260,7 @@ def meter(
     sessions: list[str],
     start: dt.datetime,
     end: dt.datetime,
-    roles: dict[str, str],
+    roles: dict[str, Any],
     pricing: dict[str, Any] | None,
     io_share: bool = False,
 ) -> dict[str, Any]:
@@ -269,6 +272,7 @@ def meter(
     """
     projects = Path(projects_dir)
     role_map = dict(roles)
+    sessions = list(dict.fromkeys(sessions))  # a repeated session counts once
     if pricing is None:
         pricing = tomllib.loads(DEFAULT_PRICING.read_text(encoding="utf-8"))
 
@@ -280,7 +284,7 @@ def meter(
     # has the earliest timestamp; ties break by earlier --session, then file name.
     best_uuid: dict[str, tuple[dt.datetime, int, Path]] = {}
     msg_first: dict[tuple[str, Path], tuple[dt.datetime, int]] = {}
-    msg_best: dict[tuple[str, Path], tuple[int, dict[str, Any]]] = {}
+    msg_best: dict[tuple[str, Path], tuple[tuple[int, int], dict[str, Any]]] = {}
     for file in files:
         for ts, rec in file.records:
             uuid = rec.get("uuid")
@@ -294,9 +298,14 @@ def meter(
                 pair = (mid, file.path)
                 if pair not in msg_first or stamp < msg_first[pair]:
                     msg_first[pair] = stamp
-                output = _as_int(_usage_of(rec).get("output_tokens"))
-                if pair not in msg_best or output > msg_best[pair][0]:
-                    msg_best[pair] = (output, rec)
+                counts = _usage_counts(_usage_of(rec))
+                size = (
+                    counts["input"] + counts["cache_write"] + counts["cache_read"]
+                    + counts["output"],
+                    counts["output"],
+                )
+                if pair not in msg_best or size > msg_best[pair][0]:
+                    msg_best[pair] = (size, rec)
     msg_owner: dict[str, tuple[dt.datetime, int, Path]] = {}
     for (mid, path), (ts, index) in msg_first.items():
         key = (ts, index, path)
@@ -304,8 +313,8 @@ def meter(
             msg_owner[mid] = key
     by_path = {file.path: file for file in files}
 
-    role_names = ["coordinator", *role_map]
-    if any(file.role == "unassigned" for file in files):
+    role_names = list(dict.fromkeys(["coordinator", *role_map]))
+    if any(file.role == "unassigned" for file in files) and "unassigned" not in role_names:
         role_names.append("unassigned")
     stats: dict[str, dict[str, Any]] = {
         name: {"times": [], "human": 0, "models": {}} for name in role_names
@@ -461,12 +470,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
 
-    roles: dict[str, str] = {}
+    roles: dict[str, list[str]] = {}
     for spec in args.role:
         if "=" not in spec:
             parser.error(f"--role needs NAME=AGENT_ID, got {spec!r}")
         name, agent = spec.split("=", 1)
-        roles[name] = agent
+        roles.setdefault(name, []).append(agent)
+
+    for sid in args.session:
+        if sid in ("", ".", "..") or Path(sid).name != sid or "\\" in sid or "/" in sid:
+            print(f"coord_meter: invalid --session id (no path parts allowed): {sid!r}",
+                  file=sys.stderr)
+            return 2
 
     for sid in args.session:
         session_file = args.projects_dir / f"{sid}.jsonl"

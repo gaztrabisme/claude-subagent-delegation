@@ -221,10 +221,17 @@ class GeminiProvider:
         self, settings: Settings, agent_id: str, cfg: ProviderConfig, session: Session,
         model: str | None = None,
     ) -> dict[str, str]:
-        """The parent's environment, with this server's own keys removed."""
-        env = {k: v for k, v in os.environ.items() if v is not None}
-        for leaked in settings.leaked_keys:
-            env.pop(leaked, None)
+        """The runtime allowlist plus the Gemini CLI's own credential.
+
+        The Gemini CLI reads its API key from the name the provider declares
+        (``api_key_env``); only those declared names are added, never the
+        server's other token variables.
+        """
+        env = settings.base_child_env()
+        for name in cfg.api_key_envs:
+            value = os.environ.get(name)
+            if value:
+                env[name] = value
         return env
 
     def translator(self, session: Session) -> Translator:

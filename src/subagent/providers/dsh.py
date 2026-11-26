@@ -14,6 +14,7 @@ import re
 import secrets
 import selectors
 import shutil
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from pathlib import Path
@@ -680,6 +681,14 @@ class DshProvider:
     def boot(
         self, settings: Settings, agent_id: str, cfg: ProviderConfig
     ) -> tuple[str | None, Session]:
+        if sys.platform != "darwin":
+            # DSH runs with its own permission mode set to danger-full-access;
+            # the server's outer Seatbelt profile is the only sandbox it has.
+            return (
+                "dsh requires the macOS sandbox-exec sandbox; refusing to start "
+                "without it off macOS",
+                Session(provider=cfg.name),
+            )
         session = Session(provider=cfg.name, home=_dsh_home(settings, agent_id))
         binary = self.binary(cfg)
         if shutil.which(binary) is None:
@@ -819,6 +828,11 @@ class DshProvider:
         session: Session,
         model: str | None,
     ) -> DshProcess:
+        if sys.platform != "darwin":
+            raise RuntimeError(
+                "dsh requires the macOS sandbox-exec sandbox; refusing to run an "
+                "unsandboxed DSH worker off macOS"
+            )
         # Resolve and verify the bridge before even constructing a process.
         _bridge_bundle()
         argv = self.argv(cfg, settings, agent_id, prompt, cwd, session, model)

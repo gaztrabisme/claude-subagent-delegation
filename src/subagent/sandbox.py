@@ -13,6 +13,11 @@ from urllib.parse import urlsplit
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
+# Drivers whose child the server confines with its own macOS Seatbelt profile.
+# `doctor` reports this as `os_boundary`: true only where the profile can be
+# applied (macOS), never for a driver that runs without one.
+OS_SANDBOX_DRIVERS = frozenset({"claude", "codex", "dsh", "omp", "antigravity"})
+
 # Character devices an ordinary process opens for writing (shell redirects,
 # subprocess DEVNULL, terminal probes, dtrace helpers, /dev/stdout aliases).
 # A write-confined profile keeps exactly these writable, not the rest of /dev.
@@ -142,6 +147,7 @@ def build_profile(
     read_allow_subpaths: Sequence[str] = (),
     network_loopback_ports: Sequence[int] | None = None,
     network_unix_sockets: Sequence[str] = (),
+    network_loopback_any: bool = False,
     read_deny_subpaths: Sequence[str] = (),
     write_allow_devices: bool = False,
     deny_ipc_escapes: bool = False,
@@ -150,8 +156,9 @@ def build_profile(
 
     `read_deny_subpaths` denies reads only (writes stay governed by the write
     rules); `read_allow_subpaths` re-allows reads below one of them. A network
-    policy (`network_loopback_ports` not None, or unix sockets) denies all
-    outbound network except loopback TCP on those ports and those socket paths.
+    policy (`network_loopback_ports` not None, unix sockets, or
+    `network_loopback_any`) denies all outbound network except loopback TCP on
+    those ports, loopback on any port, and those socket paths.
     """
     rules = ["(version 1)", "(allow default)"]
     if write_allow is not None:
@@ -207,8 +214,14 @@ def build_profile(
     # parent; it cannot cover the socket file or its direct siblings.
     for path in normalize_paths(write_allow_subpaths):
         rules.append(f'(allow file-write* {_filter(path, "subpath")})')
-    if network_loopback_ports is not None or network_unix_sockets:
+    if (network_loopback_ports is not None or network_unix_sockets
+            or network_loopback_any):
         rules.append("(deny network-outbound)")
+        if network_loopback_any:
+            # A verification command may start a loopback server on an
+            # ephemeral port, so the port cannot be known when the profile is
+            # built. This rule still excludes every non-loopback address.
+            rules.append('(allow network-outbound (remote ip "localhost:*"))')
         for port in dict.fromkeys(int(port) for port in (network_loopback_ports or ())):
             if not 1 <= port <= 65535:
                 raise ValueError("network loopback ports must be between 1 and 65535")
@@ -241,12 +254,17 @@ def wrap_argv(
     read_allow_subpaths: Sequence[str] = (),
     network_loopback_ports: Sequence[int] | None = None,
     network_unix_sockets: Sequence[str] = (),
+    network_loopback_any: bool = False,
     read_deny_subpaths: Sequence[str] = (),
     write_allow_devices: bool = False,
     deny_ipc_escapes: bool = False,
 ) -> list[str]:
     """Pass arguments directly to sandbox-exec; never fall back on sandbox failure."""
-    network_policy = network_loopback_ports is not None or bool(network_unix_sockets)
+    network_policy = (
+        network_loopback_ports is not None
+        or bool(network_unix_sockets)
+        or network_loopback_any
+    )
     if not paths and not network_policy:
         return argv
     check_platform(paths if paths else ("network-policy",))
@@ -259,6 +277,7 @@ def wrap_argv(
                       read_allow_subpaths=read_allow_subpaths,
                       network_loopback_ports=network_loopback_ports,
                       network_unix_sockets=network_unix_sockets,
+                      network_loopback_any=network_loopback_any,
                       read_deny_subpaths=read_deny_subpaths,
                       write_allow_devices=write_allow_devices,
                       deny_ipc_escapes=deny_ipc_escapes),

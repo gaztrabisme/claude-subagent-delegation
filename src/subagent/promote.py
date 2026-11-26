@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .config import Settings
+from .lane_state import LaneState
 from .lane_status import LaneStatusStore
 
 SERVED_FILE = "served.json"
@@ -180,11 +181,24 @@ def _probe_lanes(
     skip = set(skip_probe)
     allowed = set(allow_failed)
     failures = []
+    closures, _ = LaneState(Path(settings.session_root)).status_entries()
+    now = datetime.now(UTC)
     for name, cfg in settings.providers.items():
         if cfg.local:
             continue
         if name in skip:
             print(f"warning: lane probe skipped for {name}")
+            continue
+        held = cfg.extra.get("held")
+        if isinstance(held, str) and held:
+            print(f"warning: lane probe skipped for {name} (held: {held})")
+            continue
+        until = (closures.get(name) or {}).get("closed_until")
+        if isinstance(until, datetime) and until > now:
+            print(
+                f"warning: lane probe skipped for {name} "
+                f"(closed until {until.isoformat()})"
+            )
             continue
         passed, detail = _probe_lane(name, runner)
         if passed:

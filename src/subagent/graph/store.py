@@ -8,11 +8,14 @@ transaction. Money is stored as integer micro-dollars.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sqlite3
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 BUSY_TIMEOUT_S = 20.0
 
@@ -93,8 +96,12 @@ class Store:
     def _secure_sidecars(self) -> None:
         """Re-assert 0600 on -wal/-shm whenever SQLite may have just created them."""
         for suffix in ("-wal", "-shm"):
-            with contextlib.suppress(OSError):
+            try:
                 os.chmod(f"{self.path}{suffix}", 0o600)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("could not chmod %s%s to 0600: %s", self.path, suffix, exc)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=BUSY_TIMEOUT_S, isolation_level=None)
@@ -150,7 +157,11 @@ class Store:
         cached = getattr(self._local, "conn", None)
         if cached is None or self._local.pid != os.getpid():
             cached = self._connect()
-            cached.execute("SELECT 1 FROM meta LIMIT 1").fetchall()
+            try:
+                cached.execute("SELECT 1 FROM meta LIMIT 1").fetchall()
+            except BaseException:
+                cached.close()
+                raise
             self._secure_sidecars()
             self._local.conn, self._local.pid = cached, os.getpid()
         return cached

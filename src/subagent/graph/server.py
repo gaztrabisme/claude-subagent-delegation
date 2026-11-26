@@ -13,6 +13,7 @@ import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import time
 from collections.abc import Mapping
@@ -39,9 +40,17 @@ def _private_dir(path: Path) -> Path:
     return path
 
 
+def _no_follow() -> int:
+    """O_NOFOLLOW, or fail closed where the platform lacks it."""
+    flag = getattr(os, "O_NOFOLLOW", None)
+    if flag is None:
+        raise OSError("O_NOFOLLOW is unavailable on this platform; refusing to write state files")
+    return flag
+
+
 def private_file(path: Path) -> Path:
     """Create `path` if missing and make it owner-only (0600)."""
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | _no_follow(), 0o600)
     try:
         os.fchmod(fd, 0o600)  # on the descriptor we hold: no path swap between create and chmod
     finally:
@@ -242,7 +251,16 @@ class DevServer:
             record = {"pid": proc.pid, "address": self.address, "db_path": str(self._db),
                       "binary": str(binary), "started_at": time.time()}
             tmp = self._json.with_suffix(".tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            nofollow = _no_follow()
+            try:
+                st = os.lstat(tmp)
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError(f"{tmp} is not a regular file; refusing to write through it")
+                os.unlink(tmp)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:  # born 0600, never widened by umask
                 os.fchmod(fh.fileno(), 0o600)
                 fh.write(json.dumps(record))

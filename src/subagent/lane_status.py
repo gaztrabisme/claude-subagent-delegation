@@ -848,6 +848,10 @@ def _run_event(line: bytes) -> tuple[float, str] | None:
         return None
     if not isinstance(record, dict) or record.get("kind") != "run":
         return None
+    if record.get("refusal_code") == "envelope":
+        # Refused at admission by the envelope: it never ran, so it does not
+        # use up the lane's run caps.
+        return None
     lane = record.get("lane")
     if not isinstance(lane, str):
         return None

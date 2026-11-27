@@ -25,6 +25,8 @@ REGISTERS = "wiki/status/registers.md"
 DECISIONS = "wiki/decisions.md"
 METHOD_PREFIX = "## Method:"
 owner_RE = re.compile(r"the owner, \d{4}-\d\d-\d\d.*[\"“]")
+NO_READING = "no reading: no outside project listed"
+DECISION_RE = re.compile(r"^## (S\d+)(?!\d)")
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
@@ -138,7 +140,8 @@ def _load_repos(path: Path) -> tuple[list[Repo], list[str]]:
     if not isinstance(data, dict) or not isinstance(data.get("repos"), list):
         raise InputError("repos file must be an object with a 'repos' list")
     base = path.resolve().parent
-    repos = []
+    repos: list[Repo] = []
+    seen: set[tuple[str, str]] = set()
     for spec in data["repos"]:
         if not isinstance(spec, dict):
             raise InputError("each repo must be an object")
@@ -151,7 +154,14 @@ def _load_repos(path: Path) -> tuple[list[Repo], list[str]]:
             isinstance(spec["records"], list) and all(isinstance(r, str) for r in spec["records"])
         ):
             raise InputError(f"repo {spec['name']}: records must be a list of strings")
-        repos.append(Repo(spec, base))
+        repo = Repo(spec, base)
+        ident = (os.path.realpath(repo.path), repo.branch)
+        if ident in seen or any(
+            r.name == repo.name and os.path.realpath(r.path) == ident[0] for r in repos
+        ):
+            continue
+        seen.add(ident)
+        repos.append(repo)
     book = data.get("rulebook", [])
     if not isinstance(book, list) or not all(isinstance(b, str) for b in book):
         raise InputError("rulebook must be a list of strings")
@@ -279,13 +289,25 @@ def _added_lines(diff: str) -> list[tuple[str, int | None, str]]:
     """(file, new-side line number, text) for each added diff line."""
     out = []
     cur, n = "", 0
+    in_header = False
     for ln in diff.split("\n"):
-        if ln.startswith("+++ "):
-            cur = ln[6:] if ln.startswith("+++ b/") else ""
+        if in_header:
+            if ln.startswith("+++ "):
+                cur = ln[6:] if ln.startswith("+++ b/") else ""
+            elif ln.startswith("@@"):
+                in_header = False
+                m = HUNK_RE.match(ln)
+                n = int(m.group(1)) if m else 0
+            elif ln.startswith("diff --git "):
+                cur, n = "", 0
+            continue
+        if ln.startswith("diff --git "):
+            in_header = True
+            cur, n = "", 0
         elif ln.startswith("@@"):
             m = HUNK_RE.match(ln)
             n = int(m.group(1)) if m else 0
-        elif ln.startswith("+") and not ln.startswith("+++"):
+        elif ln.startswith("+"):
             out.append((cur, n, ln[1:]))
             n += 1
     return out
@@ -316,8 +338,12 @@ def _owner_questions(repos: list[Repo], start: dt.datetime, end: dt.datetime) ->
                 if new is None:
                     continue
                 lines = new.split("\n")
+                old = repo.show(f"{sha}^", DECISIONS)
+                old_ids = {m.group(1) for ln in (old or "").split("\n")
+                           if (m := DECISION_RE.match(ln))}
                 for _, num, text in _added_lines(repo.diff(sha, DECISIONS)):
-                    if not text.startswith("## S") or not num or num > len(lines):
+                    m = DECISION_RE.match(text)
+                    if m is None or m.group(1) in old_ids or not num or num > len(lines):
                         continue
                     if any(owner_RE.search(ln) for ln in _section(lines, num - 1)):
                         answers += 1
@@ -328,8 +354,11 @@ def _owner_questions(repos: list[Repo], start: dt.datetime, end: dt.datetime) ->
 def _tripwire(threshold: float, cur: float | None, prev: float | None,
               repos: list[Repo], cur_commits: dict[str, list[dict[str, Any]]],
               records_only: dict[str, set[str]], book: list[str],
-              texts: dict[str, str]) -> dict[str, Any]:
-    tripped = cur is not None and prev is not None and cur > threshold and prev > threshold
+              texts: dict[str, str], reason: str | None = None,
+              unreadable: bool = False) -> dict[str, Any]:
+    tripped: bool | None = (
+        None if reason or unreadable
+        else cur is not None and prev is not None and cur > threshold and prev > threshold)
     cut: list[dict[str, Any]] = []
     if tripped:
         cands: list[dict[str, Any]] = []
@@ -362,7 +391,7 @@ def _tripwire(threshold: float, cur: float | None, prev: float | None,
         cands.sort(key=lambda x: (x["effect"], -x["cost"], x["name"]))
         cut = [{k: x[k] for k in ("kind", "name", "file", "cost", "effect")} for x in cands[:3]]
     return {"threshold": threshold, "current": cur, "previous": prev, "tripped": tripped,
-            "cut_list": cut}
+            "cut_list": cut, "reason": reason}
 
 
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
@@ -383,8 +412,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     for repo in repos:
         if repo.problem:
             warnings.append(repo.problem)
-    if not any(r.cls == "outside" for r in repos):
+    no_outside = not any(r.cls == "outside" for r in repos)
+    if no_outside:
         warnings.append("no outside repo listed")
+        warnings.append(NO_READING)
+    unreadable = any(r.problem for r in repos)
 
     cur_commits: dict[str, list[dict[str, Any]]] = {}
     records_only: dict[str, set[str]] = {}
@@ -411,6 +443,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     m_share = _pct(m_cur, m_cur + o_cur)
     o_share = round(100 - m_share, 1) if m_share is not None else None
     prev_share = _pct(m_prev, m_prev + o_prev)
+    if unreadable:
+        m_share = o_share = prev_share = None
 
     rulebook, texts = _rulebook(book, base, warnings)
     coordination = _coordination(args.meter, (start, end), merged, warnings)
@@ -425,7 +459,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "coordination": coordination,
         "owner_questions": _owner_questions(repos, start, end),
         "tripwire": _tripwire(float(args.threshold), m_share, prev_share, repos, cur_commits,
-                              records_only, book, texts),
+                              records_only, book, texts,
+                              NO_READING if no_outside else None, unreadable),
         "warnings": warnings,
     }
 

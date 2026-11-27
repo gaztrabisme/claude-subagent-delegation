@@ -190,6 +190,10 @@ class Trace:
              if h.get("outcome") == "refused"),
             None,
         )
+        refused_codes = [
+            h.get("code") for h in (getattr(run, "hops", []) or [])
+            if h.get("outcome") == "refused"
+        ]
         extra: dict[str, Any] = {}
         native = getattr(run, "native_outcome", None)
         if native is not None:
@@ -270,6 +274,7 @@ class Trace:
             verification_passed=(verification_dict.get("passed") if verification_dict else None),
             guard_verdicts=verdicts,
             refusal_code=refusal,
+            refused_codes=refused_codes,
             usage=run.usage.as_dict(),
             cost=getattr(run, "cost", None),
             # Lengths, not text: the trace is for measuring, not for archiving

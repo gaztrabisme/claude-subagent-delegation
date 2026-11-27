@@ -848,7 +848,12 @@ def _run_event(line: bytes) -> tuple[float, str] | None:
         return None
     if not isinstance(record, dict) or record.get("kind") != "run":
         return None
-    if record.get("refusal_code") == "envelope" and record.get("finish_reason") == "no_lane":
+    codes = record.get("refused_codes")
+    if (
+        record.get("refusal_code") == "envelope"
+        and record.get("finish_reason") == "no_lane"
+        and (not isinstance(codes, list) or all(c == "envelope" for c in codes))
+    ):
         # Refused at admission by the envelope and no lane took the run: it
         # never ran, so it does not use up any lane's run caps. A fallback
         # lane that ran after an envelope refusal still counts.

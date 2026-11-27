@@ -126,8 +126,12 @@ class TemporalRuntime:
                 self.queued[attempt_id] = None
                 await workflow.sleep(max(0.01, float(res.get("poll_s") or 2.0)))
         except asyncio.CancelledError:
-            with contextlib.suppress(Exception):  # cleanup must not mask the cancellation
+            try:  # cleanup must not mask the cancellation
                 await self._graph_act("cancel_admission", scope.request_id, attempt)
+            except Exception as err:  # noqa: BLE001 - the cancellation still propagates
+                workflow.logger.warning(
+                    "graph: cancel_admission for %s attempt %s failed: %s",
+                    scope.request_id, attempt, err)
             raise
         finally:
             self.queued.pop(attempt_id, None)
@@ -250,10 +254,18 @@ class TemporalRuntime:
                                                   timeout=remaining)
         except asyncio.CancelledError:
             # A cancelled run must not leave its question open for a late answer.
+            close = asyncio.ensure_future(
+                self._graph_act("close_exception", xid, "cancelled", timeout_s=10.0,
+                                retry=_RECORD))
+            while not close.done():  # a second cancel must not abandon the close
+                try:
+                    await asyncio.shield(close)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - read back from close.result() below
+                    break
             try:
-                await asyncio.shield(asyncio.ensure_future(
-                    self._graph_act("close_exception", xid, "cancelled", timeout_s=10.0,
-                                    retry=_RECORD)))
+                close.result()
             except Exception as err:  # noqa: BLE001 - the cancellation still propagates
                 workflow.logger.warning(
                     "graph: closing exception %s on cancellation failed: %s", xid, err)

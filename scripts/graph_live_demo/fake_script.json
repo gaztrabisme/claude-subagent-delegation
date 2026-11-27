@@ -1,0 +1,10 @@
+{
+  "script": {
+    "plan": [{"status": "completed", "cost_usd": 0.02, "sleep_s": 2}],
+    "build_add": [{"status": "completed", "cost_usd": 0.03, "sleep_s": 25}],
+    "build_mul": [{"status": "completed", "cost_usd": 0.03, "sleep_s": 25}],
+    "review": [{"status": "completed", "cost_usd": 0.02, "sleep_s": 2,
+                "result_json": {"verdict": "PASS"}}]
+  },
+  "default": {"status": "completed", "cost_usd": 0.01}
+}

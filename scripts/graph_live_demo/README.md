@@ -6,14 +6,14 @@ with no repeated work and consistent cost figures.
 
 ## Run
 
-Offline, no provider (scripted fake dispatcher, about one minute):
+Offline, no provider (scripted fake dispatcher, the default, about one minute):
 
     uv run --extra graph python scripts/graph_live_demo/run_demo.py --dispatcher fake
 
 Real providers (spends money or local compute; needs the `temporal` CLI on PATH or
 `TEMPORAL_BIN`, and the provider configured in your user config):
 
-    uv run --extra graph python scripts/graph_live_demo/run_demo.py --provider omlx --budget 0.50 --max-minutes 40
+    uv run --extra graph python scripts/graph_live_demo/run_demo.py --dispatcher registry --provider omlx --budget 0.50 --max-minutes 40
 
 Options: `--provider` (default `omlx`), `--budget` (root cap, default 0.50), `--max-minutes`
 (total wait, default 40). The provider and budget are written into a per-run copy of `demo.json`

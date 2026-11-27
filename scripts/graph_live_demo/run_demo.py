@@ -2,7 +2,8 @@
 """Live demo of the durable graph: start a run, restart the Temporal dev server mid-run,
 and check that the run still finishes with no duplicate work and matching cost figures.
 
-Real mode (default) runs tasks on a provider. `--dispatcher fake` plays a script offline.
+The default is `--dispatcher fake`, which plays a script offline. Real mode runs tasks on a
+provider (spends money or local compute) and needs `--dispatcher registry`.
 Run from anywhere: uv run --extra graph python scripts/graph_live_demo/run_demo.py [options]
 """
 
@@ -55,10 +56,12 @@ class Demo:
         (self.run_dir / "graph.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
         cfg = self.project / ".subagent"
         cfg.mkdir()
+        autostart = "false" if self.fake else "true"
         (cfg / "config.toml").write_text(
-            f'[core]\nsession_root = "{self.run_dir / "sessions"}"\ntrace = "{self.trace}"\n\n'
-            f'[graph]\nstate_dir = "{self.state}"\naddress = "{self.address}"\n'
-            f'autostart = true\nbudget_usd = {self.args.budget}\n'
+            f'[core]\nsession_root = {_toml(self.run_dir / "sessions")}\n'
+            f'trace = {_toml(self.trace)}\n\n'
+            f'[graph]\nstate_dir = {_toml(self.state)}\naddress = {_toml(self.address)}\n'
+            f'autostart = {autostart}\nbudget_usd = {self.args.budget}\n'
             f'default_reserve_usd = 0.1\n', encoding="utf-8")
         self.audit = self.run_dir / "fake-audit.jsonl"
         if self.fake:
@@ -112,15 +115,13 @@ class Demo:
         if self.worker_proc is not None:
             pids.add(self.worker_proc.pid)
         for pid in pids:
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGTERM)
+            _signal_group(pid, signal.SIGTERM)
         deadline = time.time() + 40
         while time.time() < deadline and any(_alive(p) for p in pids):
             time.sleep(0.5)
         for pid in pids:
             if _alive(pid):
-                with contextlib.suppress(OSError):
-                    os.kill(pid, signal.SIGKILL)
+                _signal_group(pid, signal.SIGKILL)
         if self.worker_proc is not None:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 self.worker_proc.wait(timeout=5)
@@ -142,6 +143,20 @@ class Demo:
                    for e in status.get("journal") or [])
 
     def run(self) -> int:
+        def on_signal(signum: int, _frame: object) -> None:
+            for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                signal.signal(sig, signal.SIG_IGN)  # a second signal must not cut cleanup short
+            raise SystemExit(128 + signum)
+
+        previous = {sig: signal.signal(sig, on_signal)
+                    for sig in (signal.SIGTERM, signal.SIGHUP)}
+        try:
+            return self._run()
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def _run(self) -> int:
         self.setup()
         deadline = time.time() + self.args.max_minutes * 60
         print(f"run dir: {self.run_dir}")
@@ -254,11 +269,27 @@ class Demo:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dispatcher", choices=("registry", "fake"), default="registry")
+    parser.add_argument("--dispatcher", choices=("registry", "fake"), default="fake")
     parser.add_argument("--provider", default="omlx")
     parser.add_argument("--budget", type=float, default=0.50)
     parser.add_argument("--max-minutes", type=float, default=40.0)
     return Demo(parser.parse_args()).run()
+
+
+def _toml(value: object) -> str:
+    return json.dumps(str(value))  # a JSON string is a valid TOML basic string
+
+
+def _signal_group(pid: int, sig: int) -> None:
+    """Signal the pid's process group when it leads one (workers do), else the pid alone."""
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, sig)
+            return
+    except OSError:
+        pass
+    with contextlib.suppress(OSError):
+        os.kill(pid, sig)
 
 
 def _alive(pid: int) -> bool:

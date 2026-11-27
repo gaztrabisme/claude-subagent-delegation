@@ -9,6 +9,7 @@ import concurrent.futures
 import contextlib
 import fcntl
 import json
+import math
 import os
 import shutil
 import signal
@@ -371,6 +372,8 @@ def _num(table: Mapping[str, Any], key: str, default: float, *, minimum: float,
             integer and not isinstance(value, int)):
         raise ConfigError(f"{path}.{key} must be {'an integer' if integer else 'a number'}, "
                           f"got {value!r}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ConfigError(f"{path}.{key} must be finite, got {value!r}")
     if exclusive and value <= minimum:
         raise ConfigError(f"{path}.{key} must be greater than {minimum:g}, got {value!r}")
     if value < minimum:

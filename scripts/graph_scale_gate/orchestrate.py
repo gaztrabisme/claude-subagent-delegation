@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -43,6 +44,7 @@ SERVER_PATTERN = re.compile(
     r"database is locked|history corruption|corrupt(?:ed)? history|"
     r"matcher.{0,80}(?:error|failed|panic)|(?:error|failed|panic).{0,80}matcher",
     re.IGNORECASE)
+ENV_ALLOW = ("PATH", "HOME", "LANG", "TERM", "TMPDIR")
 PYTHON_PATTERN = re.compile(r"Traceback \(most recent call last\)|^(ERROR|CRITICAL)\b")
 
 
@@ -77,6 +79,22 @@ def descendants(pid: int) -> list[int]:
             found.append(child)
             todo.append(child)
     return found
+
+
+@contextlib.contextmanager
+def _signals_blocked() -> Any:
+    """Defer SIGTERM/SIGINT so a signal cannot land between Popen and tracking the pid."""
+    sigs = {signal.SIGTERM, signal.SIGINT}
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def _unblock() -> None:
+    """Runs in the child before exec: the parent's blocked-signal mask must not leak into it."""
+    signal.pthread_sigmask(signal.SIG_SETMASK, ())
 
 
 class Aborted(BaseException):
@@ -136,12 +154,14 @@ class Gate:
         self.run_dir.mkdir(parents=True)
         self.audit_log = self.run_dir / "audit.jsonl"
         self.port = args.port or free_port()
-        self.temporal = os.environ.get("TEMPORAL_BIN", "/opt/homebrew/bin/temporal")
+        self.temporal = os.environ.get("TEMPORAL_BIN") or shutil.which("temporal") or "temporal"
         self.server: subprocess.Popen[Any] | None = None
         self.worker: subprocess.Popen[Any] | None = None
         self.clients: dict[str, subprocess.Popen[Any]] = {}
         self.tracked: set[int] = set()
-        self.env = {**os.environ, "GATE_AUDIT_LOG": str(self.audit_log),
+        # Children get an allowlisted environment, not the parent's (no stray secrets).
+        base = {k: os.environ[k] for k in ENV_ALLOW if k in os.environ}
+        self.env = {**base, "GATE_AUDIT_LOG": str(self.audit_log),
                     "GATE_CONFIG": str(self.run_dir / "config.json"),
                     "PYTHONUNBUFFERED": "1"}
         os.environ.update(GATE_AUDIT_LOG=self.env["GATE_AUDIT_LOG"])
@@ -164,10 +184,11 @@ class Gate:
                "--db-filename", str(self.run_dir / "temporal.db")]
         for item in DYNAMIC_CONFIG:
             cmd += ["--dynamic-config-value", item]
-        self.server = subprocess.Popen(cmd, stdout=self.log("server.log"),
-                                       stderr=subprocess.STDOUT, env=self.env,
-                                       start_new_session=True)
-        self.tracked.add(self.server.pid)
+        with _signals_blocked():
+            self.server = subprocess.Popen(cmd, stdout=self.log("server.log"),
+                                           stderr=subprocess.STDOUT, env=self.env,
+                                           start_new_session=True, preexec_fn=_unblock)
+            self.tracked.add(self.server.pid)
         asyncio.run(self._health(started))
         audit("server_ready", pid=self.server.pid, restart=restart,
               cold_start_seconds=round(time.monotonic() - started, 3))
@@ -194,10 +215,12 @@ class Gate:
         audit("server_stopped", pid=pid)
 
     def spawn(self, name: str, *argv: str) -> subprocess.Popen[Any]:
-        proc = subprocess.Popen([sys.executable, str(HERE / argv[0]), *argv[1:]],
-                                cwd=REPO, env=self.env, stdout=self.log(f"{name}.log"),
-                                stderr=subprocess.STDOUT, start_new_session=True)
-        self.tracked.add(proc.pid)
+        with _signals_blocked():
+            proc = subprocess.Popen([sys.executable, str(HERE / argv[0]), *argv[1:]],
+                                    cwd=REPO, env=self.env, stdout=self.log(f"{name}.log"),
+                                    stderr=subprocess.STDOUT, start_new_session=True,
+                                    preexec_fn=_unblock)
+            self.tracked.add(proc.pid)
         return proc
 
     # -- the run ---------------------------------------------------------
@@ -239,7 +262,7 @@ class Gate:
                      [self.worker, *self.clients.values()])
             victim = self.clients["root-1"]
             victim.kill()
-            victim.wait()
+            victim.wait(30)
             audit("client_killed", client_pid=victim.pid, signal="SIGKILL")
             self.stop_server()
             self.start_server(restart=True)
@@ -250,7 +273,8 @@ class Gate:
                      [self.worker, restarted])
             subprocess.run([sys.executable, str(HERE / "gate_client.py"), "signal",
                             "--workflow-id", PAUSED_WORKFLOW], cwd=REPO, env=self.env,
-                           check=True, stdout=self.log("signal.log"), stderr=subprocess.STDOUT)
+                           check=True, stdout=self.log("signal.log"), stderr=subprocess.STDOUT,
+                           timeout=120)
             for name, proc in self.clients.items():
                 try:
                     proc.wait(a.timeout)
@@ -262,13 +286,16 @@ class Gate:
         except (Exception, Aborted) as exc:  # noqa: BLE001 - report, then shut down and audit
             print(f"ABORT: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         finally:
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                signal.signal(sig, signal.SIG_IGN)
             try:
-                self.shutdown()
+                with _signals_blocked():  # no signal can land before SIG_IGN is in place
+                    for sig in (signal.SIGTERM, signal.SIGINT):
+                        signal.signal(sig, signal.SIG_IGN)
             finally:
-                for sig, handler in previous.items():
-                    signal.signal(sig, handler)
+                try:
+                    self.shutdown()
+                finally:
+                    for sig, handler in previous.items():
+                        signal.signal(sig, handler)
         return self.report(trace)
 
     def shutdown(self) -> None:

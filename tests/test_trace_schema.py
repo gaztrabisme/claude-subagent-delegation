@@ -37,7 +37,7 @@ REQUIRED: dict[str, set[str]] = {
         "workspace", "guard", "state", "finish_reason", "elapsed_seconds", "wall_seconds",
         "ttft_seconds", "turns", "tool_calls", "continues", "end_state",
         "verification_passed", "guard_verdicts", "refusal_code", "usage", "prompt_chars",
-        "result_chars", "distilled", "truncated", "verification", "error",
+        "result_chars", "distilled", "truncated", "verification", "error", "refused_codes",
     },
     "hop": {
         "run_id", "agent_id", "hop", "lane", "provider", "driver", "guard", "model",
@@ -101,6 +101,10 @@ def problems(record: dict[str, Any]) -> list[str]:
             usage["credits"], (int, float)
         ):
             found.append(f"{label}: usage credits not a number")
+        refused = record.get("refused_codes")
+        if not isinstance(refused, list) or not all(c is None or isinstance(c, str)
+                                                    for c in refused):
+            found.append(f"{label}: refused_codes {refused!r}")
         verdicts = record.get("guard_verdicts")
         if not isinstance(verdicts, dict) or set(verdicts) != {"allow", "deny", "escalate"}:
             found.append(f"{label}: guard_verdicts {verdicts!r}")
@@ -281,7 +285,8 @@ def test_native_provider_field_shape_errors_are_rejected(tmp_path: Path):
     record = _native_record(tmp_path)
     for fields in ({"cash_usd": "unknown"}, {"credits": True}, {"needs_human": 1},
                    {"usage_unreported": [["bad"]]}, {"turn_usage": "bad"},
-                   {"extra": []}, {"uat": [{"passed": True}]}):
+                   {"extra": []}, {"uat": [{"passed": True}]},
+                   {"refused_codes": "envelope"}):
         assert problems({**record, **fields}), fields
 
 

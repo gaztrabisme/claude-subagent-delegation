@@ -79,15 +79,29 @@ def descendants(pid: int) -> list[int]:
     return found
 
 
+class Aborted(BaseException):
+    """Raised from SIGTERM/SIGINT so the run unwinds into `shutdown`."""
+
+
+def _killpg(proc: subprocess.Popen[Any], sig: int) -> None:
+    # Every child starts its own session, so its pid is its process-group id.
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        with contextlib.suppress(OSError):
+            os.kill(proc.pid, sig)
+
+
 def stop(proc: subprocess.Popen[Any] | None, grace: float = 30.0) -> None:
     if proc is None or proc.poll() is not None:
         return
-    proc.terminate()
+    _killpg(proc, signal.SIGTERM)
     try:
         proc.wait(grace)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(10)
+        _killpg(proc, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(10)
 
 
 def read_events(log: Path) -> list[dict[str, Any]]:
@@ -151,7 +165,8 @@ class Gate:
         for item in DYNAMIC_CONFIG:
             cmd += ["--dynamic-config-value", item]
         self.server = subprocess.Popen(cmd, stdout=self.log("server.log"),
-                                       stderr=subprocess.STDOUT, env=self.env)
+                                       stderr=subprocess.STDOUT, env=self.env,
+                                       start_new_session=True)
         self.tracked.add(self.server.pid)
         asyncio.run(self._health(started))
         audit("server_ready", pid=self.server.pid, restart=restart,
@@ -181,7 +196,7 @@ class Gate:
     def spawn(self, name: str, *argv: str) -> subprocess.Popen[Any]:
         proc = subprocess.Popen([sys.executable, str(HERE / argv[0]), *argv[1:]],
                                 cwd=REPO, env=self.env, stdout=self.log(f"{name}.log"),
-                                stderr=subprocess.STDOUT)
+                                stderr=subprocess.STDOUT, start_new_session=True)
         self.tracked.add(proc.pid)
         return proc
 
@@ -204,6 +219,13 @@ class Gate:
         for root in ROOTS:
             audit("plan", requests=[e for e in entries if e["root_id"] == root])
         print(f"run dir: {self.run_dir}", flush=True)
+
+        def on_signal(signum: int, _frame: Any) -> None:
+            for sig in (signal.SIGTERM, signal.SIGINT):  # a second signal must not cut shutdown
+                signal.signal(sig, signal.SIG_IGN)
+            raise Aborted(signal.Signals(signum).name)
+
+        previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
         try:
             self.start_server(restart=False)
             self.worker = self.spawn("worker", "gate_worker.py")
@@ -237,17 +259,25 @@ class Gate:
             wait_for(lambda: sum(1 for e in read_events(self.audit_log)
                                  if e.get("type") == "root_done") >= len(ROOTS), 60,
                      "root_done x2", [])
-        except Exception as exc:  # noqa: BLE001 - report, then still shut down and audit
+        except (Exception, Aborted) as exc:  # noqa: BLE001 - report, then shut down and audit
             print(f"ABORT: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         finally:
-            self.shutdown()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(sig, signal.SIG_IGN)
+            try:
+                self.shutdown()
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
         return self.report(trace)
 
     def shutdown(self) -> None:
         for proc in self.clients.values():
             if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+                self.tracked.update(descendants(proc.pid))
+                _killpg(proc, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(10)
         if self.worker is not None:
             self.tracked.update(descendants(self.worker.pid))
             stop(self.worker, 120.0)

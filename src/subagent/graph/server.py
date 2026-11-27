@@ -231,25 +231,6 @@ class DevServer:
             self.address = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
             env = {k: v for k, v in os.environ.items()
                    if k in ("PATH", "HOME", "LANG", "TERM", "TMPDIR")}
-            with open(private_file(self._log), "ab") as log:
-                proc = subprocess.Popen(
-                    [str(binary), "server", "start-dev", "--ip", host, "--port", str(port),
-                     "--headless", "--db-filename", str(self._db), "--log-level", "warn"],
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True, env=env)
-            self._proc = proc
-            deadline = time.monotonic() + self.startup_timeout_s
-            while True:
-                if proc.poll() is None and self._probe(host, port):
-                    break
-                if proc.poll() is not None or time.monotonic() >= deadline:
-                    self._kill(proc)
-                    raise GraphUnavailable(
-                        "Temporal dev server did not become healthy in "
-                        f"{self.startup_timeout_s:g}s; see {self._log}")
-                time.sleep(0.2)
-            record = {"pid": proc.pid, "address": self.address, "db_path": str(self._db),
-                      "binary": str(binary), "started_at": time.time()}
             tmp = self._json.with_suffix(".tmp")
             nofollow = _no_follow()
             try:
@@ -260,11 +241,36 @@ class DevServer:
                 if not stat.S_ISREG(st.st_mode):
                     raise OSError(f"{tmp} is not a regular file; refusing to write through it")
                 os.unlink(tmp)
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:  # born 0600, never widened by umask
-                os.fchmod(fh.fileno(), 0o600)
-                fh.write(json.dumps(record))
-            os.replace(tmp, self._json)
+            with open(private_file(self._log), "ab") as log:
+                proc = subprocess.Popen(
+                    [str(binary), "server", "start-dev", "--ip", host, "--port", str(port),
+                     "--headless", "--db-filename", str(self._db), "--log-level", "warn"],
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True, env=env)
+            self._proc = proc
+            try:
+                deadline = time.monotonic() + self.startup_timeout_s
+                while True:
+                    if proc.poll() is None and self._probe(host, port):
+                        break
+                    if proc.poll() is not None or time.monotonic() >= deadline:
+                        self._kill(proc)
+                        raise GraphUnavailable(
+                            "Temporal dev server did not become healthy in "
+                            f"{self.startup_timeout_s:g}s; see {self._log}")
+                    time.sleep(0.2)
+                record = {"pid": proc.pid, "address": self.address, "db_path": str(self._db),
+                          "binary": str(binary), "started_at": time.time()}
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+                # born 0600, never widened by umask
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    os.fchmod(fh.fileno(), 0o600)
+                    fh.write(json.dumps(record))
+                os.replace(tmp, self._json)
+            except BaseException:
+                self._kill(proc)
+                self._proc = None
+                raise
             return self._info(record, by_us=True)
         finally:
             with contextlib.suppress(OSError):
@@ -359,12 +365,14 @@ class GraphSettings:
 
 
 def _num(table: Mapping[str, Any], key: str, default: float, *, minimum: float,
-         integer: bool = False, path: str = "[graph]") -> Any:
+         integer: bool = False, path: str = "[graph]", exclusive: bool = False) -> Any:
     value = table.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)) or (
             integer and not isinstance(value, int)):
         raise ConfigError(f"{path}.{key} must be {'an integer' if integer else 'a number'}, "
                           f"got {value!r}")
+    if exclusive and value <= minimum:
+        raise ConfigError(f"{path}.{key} must be greater than {minimum:g}, got {value!r}")
     if value < minimum:
         raise ConfigError(f"{path}.{key} must be at least {minimum:g}, got {value!r}")
     return value if integer else float(value)
@@ -410,7 +418,8 @@ def settings_from(settings: Settings, raw: Mapping[str, Any] | None = None) -> G
         state_dir=(Path(state).expanduser() if state else settings.session_root / "graph"),
         address=address, task_queue_prefix=prefix, autostart=autostart,
         budget_usd=_num(raw, "budget_usd", 10.0, minimum=0.0),
-        default_reserve_usd=_num(raw, "default_reserve_usd", 0.50, minimum=0.0),
+        default_reserve_usd=_num(raw, "default_reserve_usd", 0.50, minimum=0.0,
+                                  exclusive=True),
         max_depth=_num(raw, "max_depth", 3, minimum=1, integer=True),
         admit_poll_s=_num(raw, "admit_poll_s", 2.0, minimum=0.01),
         lease_ttl_s=_num(raw, "lease_ttl_s", 60.0, minimum=1.0),

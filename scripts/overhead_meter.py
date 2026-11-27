@@ -416,7 +416,10 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     if no_outside:
         warnings.append("no outside repo listed")
         warnings.append(NO_READING)
-    unreadable = any(r.problem for r in repos)
+    broken = [r.name for r in repos if r.problem]
+    unreadable = bool(broken)
+    reading_reason = (f"no reading: repo {broken[0]} unreadable" if unreadable
+                      else NO_READING if no_outside else None)
 
     cur_commits: dict[str, list[dict[str, Any]]] = {}
     records_only: dict[str, set[str]] = {}
@@ -460,7 +463,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "owner_questions": _owner_questions(repos, start, end),
         "tripwire": _tripwire(float(args.threshold), m_share, prev_share, repos, cur_commits,
                               records_only, book, texts,
-                              NO_READING if no_outside else None, unreadable),
+                              reading_reason, unreadable),
         "warnings": warnings,
     }
 

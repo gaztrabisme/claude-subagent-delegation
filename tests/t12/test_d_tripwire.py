@@ -36,7 +36,8 @@ def tw(tmp_path, *args, **kw):
 
 def test_tripped_when_both_windows_strictly_above(tmp_path):
     t = tw(tmp_path, rf=scenario(tmp_path, (9, 1), (5, 0)))
-    assert list(t) == ["threshold", "current", "previous", "tripped", "cut_list"]
+    assert list(t) == ["threshold", "current", "previous", "tripped", "cut_list", "reason"]
+    assert t["reason"] is None
     assert t["threshold"] == 80.0
     assert t["current"] == 90.0 and t["previous"] == 100.0
     assert t["tripped"] is True

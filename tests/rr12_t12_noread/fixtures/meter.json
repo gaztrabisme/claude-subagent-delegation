@@ -1,0 +1,13 @@
+{
+  "window": {"start": "2026-11-25T07:35:00Z", "end": "2026-11-25T08:45:18Z"},
+  "sessions": ["s1"],
+  "roles": {
+    "coordinator": {"human_messages": 6, "share_of_claude_tokens": 0.2, "usd": 1.0,
+                    "tokens": {"input": 100, "cache_write": 5, "cache_read": 9999, "output": 50}},
+    "m-s": {"human_messages": 0, "share_of_claude_tokens": 0.3, "usd": 1.0,
+            "tokens": {"input": 200, "cache_write": 5, "cache_read": 9999, "output": 50}},
+    "worker-x": {"human_messages": 0, "share_of_claude_tokens": 0.5, "usd": 1.0,
+                 "tokens": {"input": 400, "cache_write": 5, "cache_read": 9999, "output": 200}}
+  },
+  "total": {"tokens": {"total": 12345678}, "usd": 12.3456, "messages": 100}
+}

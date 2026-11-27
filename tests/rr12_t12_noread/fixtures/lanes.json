@@ -1,0 +1,10 @@
+{
+  "codex": {"state": "open", "usage": {"kind": "percent", "used_percent": 55, "window": "30d"}, "spend": null, "slots": 2, "reason": "ok at 10.9.8.7 via /Users/someone/.codex/auth.json"},
+  "glm": {"state": "closed", "usage": null, "spend": null, "slots": 0, "reason": "closed: key at /Users/someone/.glm/key host 10.9.8.7"},
+  "deepseek": {"state": "open", "usage": null, "spend": {"month_usd": 9.5, "cap_usd": 20}, "slots": 3, "reason": "reading /Users/someone/.dsh from 10.9.8.7"},
+  "gpubox": {"state": "closed", "usage": null, "spend": null, "slots": 0, "reason": "ssh gpubox@10.9.8.7 refused"},
+  "omlx": {"state": "open", "usage": null, "spend": {"month_usd": 0, "cap_usd": null}, "slots": 1, "reason": "http://10.9.8.7:8000 up"},
+  "gemini": {"state": "open", "usage": null, "spend": null, "slots": 1, "reason": "ok /Users/someone/.gemini"},
+  "gemini-neon": {"state": "closed", "usage": null, "spend": null, "slots": 0, "reason": "refused once /Users/someone/.gemini-neon"},
+  "epi": {"state": "unknown", "usage": null, "spend": null, "slots": null, "reason": "not probed 10.9.8.7"}
+}

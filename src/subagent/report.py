@@ -471,18 +471,19 @@ def _round_passed(tests: Any, run_passed: bool) -> bool:
     return run_passed
 
 
-def _lifted_final_runs(delegations: list[Mapping[str, Any]]) -> set[str]:
-    """Final-round run ids of delegations whose ``verified_pass`` is exactly True."""
-    out: set[str] = set()
+def _lifted_final_runs(delegations: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Final-round run id -> that final entry's ``tests``, for delegations whose
+    ``verified_pass`` is exactly True."""
+    out: dict[str, Any] = {}
     for d in delegations:
         if d.get("verified_pass") is not True:
             continue
         final = None
         for entry in _run_entries(d.get("rounds")):
             if isinstance(entry.get("run_id"), str):
-                final = entry["run_id"]
+                final = entry
         if final is not None:
-            out.add(final)
+            out[final["run_id"]] = final.get("tests")
     return out
 
 
@@ -512,7 +513,7 @@ def _run_roles(run_rows: list[dict[str, Any]],
                 provider, {"runs": 0, "verified_passed": 0}
             )
             by_provider["runs"] += 1
-            tests = round_tests.get(run_id)
+            tests = lifted[run_id] if run_id in lifted else round_tests.get(run_id)
             no_result = _round_passed(tests, False) != _round_passed(tests, True)
             ok = _round_passed(tests, passed)
             if no_result and run_id in lifted:
